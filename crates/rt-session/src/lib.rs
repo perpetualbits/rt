@@ -323,7 +323,11 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             | Action::ScrimUp
             | Action::ScrimDown
             | Action::ToggleFocusFollowsMouse
-            | Action::Preferences => None,
+            | Action::Preferences
+            | Action::ZoomIn
+            | Action::ZoomOut
+            | Action::ZoomReset
+            | Action::Fullscreen => None,
         }
     }
 

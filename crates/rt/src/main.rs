@@ -843,6 +843,34 @@ impl App {
                 active.prefs_open = !active.prefs_open; // toggle the dialog
                 active.window.request_redraw();
             }
+            Action::ZoomIn => {
+                active.settings.font_size = (active.settings.font_size + 2.0).min(72.0);
+                Self::persist(&active.settings);
+                Self::refresh_fonts(active, false); // same family, new size
+                active.window.request_redraw();
+            }
+            Action::ZoomOut => {
+                active.settings.font_size = (active.settings.font_size - 2.0).max(6.0);
+                Self::persist(&active.settings);
+                Self::refresh_fonts(active, false);
+                active.window.request_redraw();
+            }
+            Action::ZoomReset => {
+                active.settings.font_size = rt_config::Settings::default().font_size;
+                Self::persist(&active.settings);
+                Self::refresh_fonts(active, false);
+                active.window.request_redraw();
+            }
+            Action::Fullscreen => {
+                // Toggle borderless fullscreen on the current monitor.
+                let fs = if active.window.fullscreen().is_some() {
+                    None
+                } else {
+                    Some(winit::window::Fullscreen::Borderless(None))
+                };
+                active.window.set_fullscreen(fs);
+                active.window.request_redraw();
+            }
             // Everything else is a session action.
             other => match active.session.apply(other) {
                 Some(SessionEvent::CloseWindow) => std::process::exit(0), // last pane closed
@@ -921,6 +949,26 @@ impl App {
             }
         }
         None
+    }
+
+    /// Reload the renderer's fonts from the current settings (rebuilding the
+    /// font chains if the family changed), re-measure the cell, and resize every
+    /// pane to the new (cols, rows). Shared by the preferences dialog and the
+    /// zoom actions.
+    fn refresh_fonts(active: &mut Active, family_changed: bool) {
+        if family_changed {
+            active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
+        }
+        let px = active.settings.font_size;
+        match active.renderer.reload_fonts(&active.font_blobs, px) {
+            Ok(()) => {
+                let cell = active.renderer.cell_size(); // new cell metrics
+                active.session.set_cell(cell);
+                let size = active.window.inner_size();
+                active.session.relayout(Rect::new(0.0, 0.0, size.width as f32, size.height as f32));
+            }
+            Err(e) => log::warn!("font reload failed: {e}"),
+        }
     }
 
     /// Persist the current settings to the config file, logging (not failing) on
@@ -1225,19 +1273,7 @@ impl App {
             // Fonts: reload the family (if changed) and/or size, then re-measure
             // the cell and resize every pane to the new (cols, rows).
             if fonts_changed {
-                if family_changed {
-                    active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
-                }
-                let px = active.settings.font_size;
-                match active.renderer.reload_fonts(&active.font_blobs, px) {
-                    Ok(()) => {
-                        let cell = active.renderer.cell_size(); // new cell metrics
-                        active.session.set_cell(cell);
-                        let size = active.window.inner_size();
-                        active.session.relayout(Rect::new(0.0, 0.0, size.width as f32, size.height as f32));
-                    }
-                    Err(e) => log::warn!("font reload failed: {e}"),
-                }
+                Self::refresh_fonts(active, family_changed);
             }
         }
         if close {

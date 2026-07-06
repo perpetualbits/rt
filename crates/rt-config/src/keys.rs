@@ -124,6 +124,7 @@ impl Chord {
             "minus" => return Some(Key::Char('-')), // and '-' as "minus"
             "period" => return Some(Key::Char('.')), // GTK name for '.'
             "comma" => return Some(Key::Char(',')), // GTK name for ','
+            "equal" => return Some(Key::Char('=')), // GTK name for '='
             _ => {}
         }
         // Function keys: an 'F'/'f' followed by 1..=12.

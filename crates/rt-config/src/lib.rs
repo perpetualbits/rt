@@ -65,6 +65,14 @@ pub enum Action {
     ToggleFocusFollowsMouse,
     /// Open/close the preferences dialog.
     Preferences,
+    /// Increase the font size (zoom in).
+    ZoomIn,
+    /// Decrease the font size (zoom out).
+    ZoomOut,
+    /// Reset the font size to the default.
+    ZoomReset,
+    /// Toggle fullscreen.
+    Fullscreen,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -315,6 +323,13 @@ impl Keymap {
             ("<Control><Alt>Down", Action::OpacityDown), // more see-through
             ("<Control><Alt>Right", Action::ScrimUp),    // stronger scrim (less legible behind)
             ("<Control><Alt>Left", Action::ScrimDown),   // weaker scrim (more legible behind)
+            // Font zoom (Terminator's zoom_in/out/normal). Ctrl+= and Ctrl++
+            // both zoom in ('+' needs Shift on most layouts); Ctrl+- and Ctrl+0.
+            ("<Control>equal", Action::ZoomIn),
+            ("<Shift><Control>plus", Action::ZoomIn),
+            ("<Control>minus", Action::ZoomOut),
+            ("<Control>0", Action::ZoomReset),
+            ("F11", Action::Fullscreen),                 // fullscreen toggle
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {
