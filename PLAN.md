@@ -158,10 +158,13 @@ rt/
 - ☑ Session seam: per-pane column count + `column_layout()` + column scroll;
   column-aware `relayout` sizes the PTY to one column. Tested.
 - ☑ Config: `ColumnsMore`/`ColumnsFewer` actions, `Ctrl+.`/`Ctrl+,` bindings.
-- ☑ Renderer: column-major layout of `N×rows` lines + separators + wheel scroll
-  + alt-screen fallback. **Verified**: `docs/screenshots/newspaper-columns.png`
-  (3 cols, `seq 1 200` flows 139→140, 170→171). See `docs/COLUMNS.md`.
-- ☐ Scroll indicator; auto-snap-to-bottom; selection across columns.
+- ☑ Renderer: column-major layout of the tall screen + separators + wheel scroll
+  (terminal scrollback). **Verified**: `docs/screenshots/newspaper-columns.png`
+  (shell) and `docs/screenshots/vim-columns.png` (vim!). See `docs/COLUMNS.md`.
+- ☑ Model rework (user request): PTY made `col_cells × count·rows` (tall) so
+  full-screen apps (vim/vi/neovim) columnize **transparently** — no alt-screen
+  fallback. Starts single-column always.
+- ☐ Scroll indicator; selection across columns; column count in saved layouts.
 
 ### M5 — Terminator features  ◐  (controller logic done + tested; GL wiring next)
 - ☑ Keybinding config parse (`rt-config`): Terminator accelerator syntax +

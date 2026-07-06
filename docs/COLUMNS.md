@@ -1,30 +1,39 @@
 # Newspaper columns
 
-A feature unique to rt (Terminator has no equivalent): a single pane can display
-its output as **N newspaper columns**. Text that reaches the bottom of column 1
-continues at the top of column 2, and so on — like a newspaper page. Screenshot:
-`docs/screenshots/newspaper-columns.png` (3 columns showing `seq 1 200`: col 1
-ends at 139, col 2 begins at 140; col 2 ends at 170, col 3 begins at 171).
+A feature unique to rt (Terminator has none): a single pane can display its
+output as **N newspaper columns**. Text that reaches the bottom of column 1
+continues at the top of column 2, and so on — like a newspaper page. Screenshots:
+- `docs/screenshots/newspaper-columns.png` — a shell running `seq 1 200` in 3
+  columns (col 1 ends 139, col 2 begins 140; col 2 ends 170, col 3 begins 171).
+- `docs/screenshots/vim-columns.png` — **vim** editing a 300-line file in 3
+  columns (col 1 = lines 1–101, col 2 = 102–202, col 3 = 203–300 + status line).
 
-## The model
+## The model (transparent to the app)
 
-A newspaper-column pane is a **view transformation over the terminal's line
-buffer**, not a change to the terminal itself:
+The key idea: **the app is told it has one tall, narrow screen; we re-tile that
+screen into columns purely at display time.** The application — shell, `vim`,
+`vi`, `neovim`, anything — never knows.
 
-1. **The PTY runs at one column's width.** If a pane is 100 cells wide and shows
-   3 columns (with a 2-cell gap between each), each column is
-   `(100 − 2·2) / 3 = 32` cells wide, and the shell wraps at 32. This is what
-   makes the text flow as narrow newspaper columns.
-2. **The viewport shows `N × rows` lines at once**, laid out *column-major*: the
-   first `rows` lines fill column 1 top-to-bottom, the next `rows` fill column 2,
-   etc. The newest line sits at the bottom of the last column (bottom-anchored).
-3. **Scrolling shifts the whole run by whole lines.** Scroll up (toward older
-   history) and the line leaving the bottom of column *n* reappears at the top of
-   column *n+1*; scroll down and the line leaving the top of column *n* reappears
-   at the bottom of column *n−1*. This falls out automatically from (2): moving
-   the run's first line earlier by one shifts every line one slot earlier in
-   column-major order, which is exactly one position "back" across the column
-   boundary.
+1. **The PTY is `col_cells` wide × `N × rows` tall.** If a pane is 100 cells
+   wide and 40 tall and shows 3 columns (2-cell gaps), each column is
+   `(100 − 2·2)/3 = 32` cells wide, and the screen handed to the app is
+   `32 × 120` (3·40). The app draws into that whole tall screen as usual.
+2. **We slice the visible screen back into columns column-major.** Row `r` of
+   the tall screen is drawn in column `r / rows` at line `r % rows`. So the
+   first `rows` lines are column 1, the next `rows` are column 2, etc.
+3. **Scrolling shifts the whole tall viewport by whole lines**, driven by the
+   terminal's own scrollback (mouse wheel → `Term::scroll_display`). Because the
+   viewport is laid out column-major, a line leaving the bottom of column *n*
+   reappears at the top of column *n+1* when scrolling up, and the mirror when
+   scrolling down — the flow the feature promises — with the app none the wiser.
+
+### Why this beats the first attempt
+The first implementation kept the PTY at pane height and pulled the *extra*
+lines a multi-column view needs out of **scrollback**. That only works for a
+shell whose history is the content; a full-screen app (`vim`) draws only into
+its screen and uses no scrollback, so it would fill just one column. Making the
+screen itself taller (this model) means full-screen apps columnize transparently
+— see `vim-columns.png`. There is **no alt-screen special-case** any more.
 
 ## Controls
 
@@ -32,41 +41,35 @@ buffer**, not a change to the terminal itself:
 |-----|--------|
 | `Ctrl+.` | add a column (`ColumnsMore`, up to `MAX_COLUMNS = 8`) |
 | `Ctrl+,` | remove a column (`ColumnsFewer`, floor 1 = normal pane) |
-| mouse wheel | scroll the focused pane's column view through history |
+| mouse wheel | scroll the focused pane's viewport through scrollback |
 
+rt **starts every pane single-column**; columns are opt-in via `Ctrl+.`.
 (`Ctrl+symbol` without Shift is used deliberately: winit reports *shifted*
 symbols as different characters, which would break a `Ctrl+Shift+.` binding.)
 
 ## Where it lives (the seams that avoided an overhaul)
 
-The feature was deliberately built on two foundations placed early, because they
-are expensive to retrofit:
+- **`rt-engine::TermPane`** — `scroll(delta)` drives the terminal scrollback;
+  `snapshot()` returns the visible screen (which *is* `N × rows` tall in column
+  mode). `snapshot_lines(top,rows)`/`line_bounds()`/`is_alt_screen()` remain as
+  history-aware primitives (tested in `crates/rt-engine/tests/history.rs`).
+- **`rt-session`** — per-pane column count + `column_layout(id,rect) →
+  {count, col_cells, rows, gap}`, shared by `relayout` (which sizes the PTY to
+  `col_cells × count·rows`) and the renderer. Tested in
+  `crates/rt-session/tests/controller.rs`.
+- **Renderer** (`crates/rt/src/main.rs::redraw`) tiles the tall screen into
+  columns and draws separators in the gaps.
 
-- **`rt-engine::TermPane::snapshot_lines(top, rows)`** — a history-aware read of
-  an arbitrary line range (into scrollback), plus `line_bounds()` and
-  `is_alt_screen()`. Column view needs `N × rows` lines at once; the plain
-  `snapshot()` only ever returned the visible screen. Tested in
-  `crates/rt-engine/tests/history.rs`.
-- **Per-pane view state in `rt-session`** — `columns_of(id)`, `col_scroll_of(id)`,
-  and `column_layout(id, rect) → {count, col_cells, rows, gap}`, shared by
-  `relayout` (to size the PTY to one column) and the renderer (to place columns).
-  Tested in `crates/rt-session/tests/controller.rs`.
+## On full-screen apps
 
-The renderer (`crates/rt/src/main.rs::redraw`) then just walks the `N × rows`
-lines column-major and blits them, drawing thin separators in the gaps.
-
-## Deliberate limitation
-
-Newspaper flow is meaningless for a full-screen TUI (`vim`, `htop`, `less`),
-which owns the whole screen via the terminal's **alternate screen**. So when
-`is_alt_screen()` is true the pane always renders as a single column, regardless
-of the column count, and reverts to columns when the TUI exits. This mirrors how
-alt-screen already suspends scrollback in normal terminals.
+`vim`/`vi`/`neovim` work great columnized — they lay out text top-to-bottom in a
+narrow screen, which is exactly newspaper flow. Programs that assume a roughly
+normal aspect ratio and paint fixed regions (e.g. `btop`/`htop`) will look wrong
+in columns; that is the user's call — use a single column (`Ctrl+,` to 1) for
+those. rt does not try to detect and override the user's choice.
 
 ## Not yet done
 
-- A scroll *indicator* / position marker for the column view.
-- Preserving the column count across an alt-screen round-trip is automatic, but
-  the scroll offset is not reset on new output at the bottom — a future tweak may
-  auto-snap to bottom when the user is already at bottom and new output arrives.
+- A scroll-position indicator for the column view.
 - Selection/copy across column boundaries.
+- Per-pane column count persisted in saved layouts.

@@ -99,7 +99,6 @@ pub struct Session<B: Backend, F: FnMut(usize, usize) -> B> {
     panes: HashMap<PaneId, B>,         // one backend per live leaf
     groups: HashMap<PaneId, u32>,      // pane -> group id (for Broadcast::Group)
     columns: HashMap<PaneId, u16>,     // pane -> newspaper column count (absent = 1)
-    col_scroll: HashMap<PaneId, usize>, // pane -> lines scrolled up in column view
     focus: PaneId,                     // the currently focused pane
     broadcast: Broadcast,              // current input fan-out mode
     bounds: Rect,                      // window content rectangle in pixels
@@ -124,7 +123,6 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             panes,
             groups: HashMap::new(), // no groups assigned initially
             columns: HashMap::new(), // every pane starts single-column
-            col_scroll: HashMap::new(), // no column scrolling yet
             focus: first,           // focus starts on the only pane
             broadcast: Broadcast::Off,
             bounds,
@@ -154,15 +152,15 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.columns.get(&id).copied().unwrap_or(1).max(1) // absent means single-column
     }
 
-    /// How many lines pane `id`'s column view is scrolled up into history.
-    pub fn col_scroll_of(&self, id: PaneId) -> usize {
-        self.col_scroll.get(&id).copied().unwrap_or(0) // absent means bottom-anchored
-    }
-
     /// Compute the newspaper-column geometry for pane `id` occupying `rect`.
-    /// Shared by [`Session::relayout`] (to size the PTY to one column's width)
-    /// and by the renderer (to place each column). For a single-column pane,
-    /// `col_cells` is simply the pane's full width.
+    /// Shared by [`Session::relayout`] (to size the PTY) and by the renderer (to
+    /// place each column). For a single-column pane, `col_cells` is the pane's
+    /// full width and `rows` the full height.
+    ///
+    /// Note `rows` is the height of *one* column (= the pane height). In column
+    /// mode the PTY is made `count × rows` tall (see [`Session::relayout`]) so
+    /// the app sees one tall screen; this `rows` is how the renderer slices that
+    /// tall screen back into columns.
     pub fn column_layout(&self, id: PaneId, rect: Rect) -> ColumnLayout {
         let (full_cols, rows) = cells_in(rect, self.cell); // full pane cell dims
         let count = self.columns_of(id); // 1..=MAX_COLUMNS
@@ -174,15 +172,6 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             (full_cols.saturating_sub(gap_total) / count as usize).max(1) // per-column width
         };
         ColumnLayout { count, col_cells, rows, gap: COL_GAP }
-    }
-
-    /// Scroll pane `id`'s column view by `delta` lines (positive = toward older
-    /// history/up, negative = toward newer/down), clamped at 0 (the bottom).
-    /// The upper bound is enforced by the renderer against available history.
-    pub fn scroll_columns(&mut self, id: PaneId, delta: isize) {
-        let cur = self.col_scroll_of(id) as isize; // current offset as signed
-        let next = (cur + delta).max(0) as usize; // clamp so we never scroll below the newest
-        self.col_scroll.insert(id, next); // store the new offset
     }
 
     /// Borrow a pane's backend by id (renderer reads snapshots through the
@@ -307,11 +296,15 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     pub fn relayout(&mut self, bounds: Rect) {
         self.bounds = bounds; // remember the new window size
         for (id, rect) in self.tree.rects(bounds) {
-            // A column pane runs its PTY at ONE column's width so the shell
-            // wraps per newspaper column; a normal pane uses the full width.
-            let layout = self.column_layout(id, rect); // count/col_cells/rows
+            // Column mode makes the PTY ONE column WIDE and `count` columns
+            // TALL (count*rows), so the app underneath just sees a single tall,
+            // narrow screen; we re-tile those rows into columns at display time.
+            // This is why full-screen apps (vim/vi/neovim) columnize
+            // transparently — they never know the screen is being re-tiled.
+            let layout = self.column_layout(id, rect); // count/col_cells/rows(=one column's height)
             if let Some(p) = self.panes.get_mut(&id) {
-                p.resize(layout.col_cells, layout.rows); // size PTY to a single column
+                let pty_rows = layout.rows * layout.count as usize; // total screen height fed to the app
+                p.resize(layout.col_cells, pty_rows.max(1)); // narrow + tall
             }
         }
     }
@@ -355,7 +348,6 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.panes.remove(&closing); // drop backend → PTY shutdown+join (Drop)
         self.groups.remove(&closing); // forget any group membership
         self.columns.remove(&closing); // forget its column count
-        self.col_scroll.remove(&closing); // forget its scroll offset
         if self.tree.is_empty() {
             return Some(SessionEvent::CloseWindow); // no panes left → close window
         }

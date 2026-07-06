@@ -282,7 +282,11 @@ impl ApplicationHandler for App {
                 };
                 if lines != 0 {
                     let focus = active.session.focus(); // scroll the focused pane
-                    active.session.scroll_columns(focus, lines); // shift its column viewport
+                    // Drive the terminal's own scrollback; in column mode the
+                    // whole tall viewport shifts, giving the cross-column flow.
+                    if let Some(pane) = active.session.pane(focus) {
+                        pane.scroll(lines); // &self method: locks the Term internally
+                    }
                     active.window.request_redraw(); // repaint at the new offset
                 }
             }
@@ -380,11 +384,9 @@ impl App {
             let n = active.session.columns_of(id); // newspaper column count (1 = normal)
             // Copy the pane's current grid and draw each non-blank cell.
             if let Some(pane) = active.session.pane(id) {
-                // Newspaper columns only make sense on the primary screen; a
-                // full-screen TUI (alt screen) always renders as a single column.
-                if n <= 1 || pane.is_alt_screen() {
+                let snap = pane.snapshot(); // the visible screen (in column mode it is count*rows tall)
+                if n <= 1 {
                     // --- ordinary single-column pane ---
-                    let snap = pane.snapshot(); // just the visible screen
                     for (row_idx, row) in snap.rows.iter().enumerate() {
                         for (col_idx, cell) in row.iter().enumerate() {
                             if cell.c != ' ' {
@@ -394,20 +396,18 @@ impl App {
                     }
                 } else {
                     // --- newspaper-column pane ---
+                    // The app was given a `count*rows`-tall screen; we simply
+                    // re-tile its visible lines into `count` columns. Row r of
+                    // the tall screen lands in column r/rows at line r%rows —
+                    // transparent to the app (vim included), unlike a scrollback
+                    // trick that only full-height shells could exploit.
                     let layout = active.session.column_layout(id, rect); // count/col_cells/rows/gap
-                    let b = pane.line_bounds(); // available line-index range
-                    let need = layout.count as usize * layout.rows; // lines shown at once
-                    let scroll = active.session.col_scroll_of(id) as i32; // lines scrolled into history
-                    // Bottom-anchored by default; scrolling moves `top` earlier.
-                    let mut top = b.bottommost - need as i32 + 1 - scroll; // first shown line
-                    if top < b.topmost {
-                        top = b.topmost; // clamp so we can't scroll past the oldest line
-                    }
-                    // Fetch the whole run in one call; row r maps column-major.
-                    let snap = pane.snapshot_lines(top, need);
                     let step = (layout.col_cells + layout.gap) as f32 * cell_w; // px between column origins
                     for (r, row) in snap.rows.iter().enumerate() {
                         let nc = r / layout.rows; // which newspaper column this line lands in
+                        if nc >= layout.count as usize {
+                            break; // guard against a transient over-tall snapshot during resize
+                        }
                         let line = r % layout.rows; // row within that column
                         let ox = rect.x + nc as f32 * step; // this column's left pixel
                         for (col_idx, cell) in row.iter().enumerate() {

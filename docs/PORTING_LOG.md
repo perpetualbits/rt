@@ -179,3 +179,39 @@ verification instead — doubles as the seed of the saved-layouts feature.
 Workspace: 33 tests green (core 9, engine 3, config 6, session 10, rt 5).
 
 **Next:** multi-pane split screenshot; then M6 packaging, or grid colours/cursor.
+
+## 2026-07-06 — Session 1: newspaper columns reworked to a "tall screen" model
+
+User feedback: vim/vi/neovim should columnize too — the app should just see one
+tall, narrow screen, with the column re-tiling transparent to it; only apps like
+btop that assume a normal aspect ratio are the user's problem (use one column).
+Also confirmed rt must start single-column (it already does).
+
+This exposed that the first model was wrong for full-screen apps. v1 kept the PTY
+at pane height and filled the extra column lines from **scrollback** — fine for a
+shell, but a full-screen app draws only into its screen and uses no scrollback,
+so vim would fill just one column (hence the alt-screen fallback I'd added).
+
+Reworked to the user's model: in column mode the PTY is now `col_cells` wide ×
+`count·rows` **tall**. The app draws into that whole tall screen normally; the
+renderer slices the visible screen column-major (row r → column r/rows, line
+r%rows). Consequences:
+- **Full-screen apps columnize transparently** — verified with vim editing a
+  300-line file across 3 columns (`docs/screenshots/vim-columns.png`): col1
+  1–101, col2 102–202, col3 203–300 + the `1,1 All` status line. The old
+  alt-screen fallback is deleted entirely.
+- Scrolling now drives the terminal's own scrollback (`TermPane::scroll` →
+  `Term::scroll_display(Scroll::Delta)`); the tall viewport shifts and the
+  cross-column flow falls out. Removed the session's manual col-scroll offset.
+- `relayout` sizes the PTY to `col_cells × count·rows`; the session test now
+  asserts a column pane is (23 wide, 160 tall) for 4 columns of 40 rows.
+
+Tooling: this compositor has no wlr-screencopy (grim fails) and no GNOME
+screenshot D-Bus, but runs Xwayland — so screenshots go through a throwaway X11
+build (render code is backend-agnostic; committed config verified Wayland-only,
+zero x11 crates). ydotool/wtype now available for live Wayland key injection if
+needed later.
+
+Workspace: 32 tests green (core 9, engine 3, config 6, session 9, rt 5).
+
+**Next:** M6 packaging, or rendering polish (grid colours + cursor).

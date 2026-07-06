@@ -333,6 +333,20 @@ impl TermPane {
         Snapshot { cols, rows: grid }
     }
 
+    /// Scroll the terminal's scrollback view by `delta` lines: positive scrolls
+    /// up (toward older history), negative scrolls down (toward the newest line).
+    /// Takes `&self` because it locks the shared `Term` internally.
+    ///
+    /// In a newspaper-column pane the whole (tall) viewport shifts by whole
+    /// lines, so a line leaving the bottom of one column reappears at the top of
+    /// the next — the flow the feature promises — while the app underneath is
+    /// none the wiser (it just sees an ordinary scrollback scroll).
+    pub fn scroll(&self, delta: isize) {
+        use alacritty_terminal::grid::Scroll; // the scroll command enum
+        let mut term = self.term.lock(); // exclusive access to move the viewport
+        term.scroll_display(Scroll::Delta(delta as i32)); // shift by whole lines
+    }
+
     /// The line-index bounds of everything currently in the grid, so a caller
     /// (notably newspaper-column view) can compute which slice of the line
     /// buffer to show and how far it may scroll.
