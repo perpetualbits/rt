@@ -718,6 +718,128 @@ impl Tree {
         }
     }
 
+    /// Record the child-index path from the root down to `pane` in `path`,
+    /// returning whether it was found. Each element indexes into a `Split`'s or
+    /// `Tabs`' children in order; the empty path means the root itself is the
+    /// leaf. Used by [`Tree::resize`] and [`Tree::rotate`] to locate a pane's
+    /// enclosing splits.
+    fn path_to(node: &Node, pane: PaneId, path: &mut Vec<usize>) -> bool {
+        match node {
+            Node::Leaf(id) => *id == pane, // found it (path holds the route)
+            Node::Split { children, .. } => {
+                for (i, c) in children.iter().enumerate() {
+                    path.push(i); // descend into child i
+                    if Self::path_to(&c.node, pane, path) {
+                        return true;
+                    }
+                    path.pop(); // backtrack
+                }
+                false
+            }
+            Node::Tabs { children, .. } => {
+                for (i, c) in children.iter().enumerate() {
+                    path.push(i);
+                    if Self::path_to(c, pane, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+                false
+            }
+        }
+    }
+
+    /// Borrow the node reached by following `path` from the root, or `None` if the
+    /// path is stale. The mutable analogue of the walk in
+    /// [`Tree::set_split_ratio`], shared by resize/rotate.
+    fn node_at_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
+        let mut node = &mut self.root;
+        for &i in path {
+            node = match node {
+                Node::Split { children, .. } if i < children.len() => &mut children[i].node,
+                Node::Tabs { children, .. } if i < children.len() => &mut children[i],
+                _ => return None, // path no longer valid
+            };
+        }
+        Some(node)
+    }
+
+    /// Grow the focused pane toward `dir` by `step` (a fraction of the enclosing
+    /// split's extent), shrinking the neighbour it moves into. Finds the deepest
+    /// ancestor split whose axis matches `dir`, so e.g. resizing Right adjusts the
+    /// nearest left/right split. No-op (returns `false`) if the pane is unknown,
+    /// there is no matching split, or there is no neighbour on that side.
+    pub fn resize(&mut self, pane: PaneId, dir: Direction, step: f32) -> bool {
+        let mut path = Vec::new();
+        if !Self::path_to(&self.root, pane, &mut path) {
+            return false; // unknown pane
+        }
+        // The split axis this direction adjusts.
+        let want = match dir {
+            Direction::Left | Direction::Right => Orientation::LeftRight,
+            Direction::Up | Direction::Down => Orientation::TopBottom,
+        };
+        // Walk the path, remembering the deepest split whose orientation matches.
+        let mut best: Option<usize> = None; // number of edges from root to that split
+        {
+            let mut node = &self.root;
+            for depth in 0..path.len() {
+                if let Node::Split { orient, .. } = node {
+                    if *orient == want {
+                        best = Some(depth); // a candidate; keep the deepest
+                    }
+                }
+                node = match node {
+                    Node::Split { children, .. } => &children[path[depth]].node,
+                    Node::Tabs { children, .. } => &children[path[depth]],
+                    _ => break,
+                };
+            }
+        }
+        let Some(depth) = best else { return false }; // no split on this axis
+        let ci = path[depth]; // which child of that split holds our pane
+        let Some(node) = self.node_at_mut(&path[..depth]) else { return false };
+        if let Node::Split { children, .. } = node {
+            let n = children.len();
+            // Choose the neighbour we push against: toward the end for Right/Down,
+            // toward the start for Left/Up.
+            let neighbor = match dir {
+                Direction::Right | Direction::Down => (ci + 1 < n).then(|| ci + 1),
+                Direction::Left | Direction::Up => (ci > 0).then(|| ci - 1),
+            };
+            let Some(nb) = neighbor else { return false }; // pane is at the edge
+            let total: f32 = children.iter().map(|c| c.weight).sum(); // current weight sum
+            let d = step * total; // move this much weight across the boundary
+            // Only apply if the neighbour stays usable (≥5% of the split).
+            if children[nb].weight - d >= 0.05 * total {
+                children[ci].weight += d; // focused pane grows
+                children[nb].weight -= d; // neighbour shrinks by the same
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Flip the orientation of the split that directly contains `pane`
+    /// (left/right ↔ top/bottom) — rt's take on Terminator's rotate. No-op if the
+    /// pane is unknown or its immediate parent is not a split (e.g. a lone root
+    /// leaf, or a direct tab child).
+    pub fn rotate(&mut self, pane: PaneId) -> bool {
+        let mut path = Vec::new();
+        if !Self::path_to(&self.root, pane, &mut path) || path.is_empty() {
+            return false; // unknown, or the root leaf has no parent split
+        }
+        let parent = &path[..path.len() - 1]; // drop the last edge → the parent node
+        if let Some(Node::Split { orient, .. }) = self.node_at_mut(parent) {
+            *orient = match *orient {
+                Orientation::LeftRight => Orientation::TopBottom,
+                Orientation::TopBottom => Orientation::LeftRight,
+            };
+            return true;
+        }
+        false
+    }
+
     /// The gutter rectangles *between* split children, for the given window
     /// `bounds`, so the renderer can draw visible pane dividers. Each rect is one
     /// full gutter (DIVIDER wide/tall); vertical gutters have `w < h`, horizontal

@@ -319,6 +319,18 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
                 self.split(Orientation::LeftRight); // Ctrl+Shift+E behaviour
                 Some(SessionEvent::Redraw)
             }
+            // Split along the focused pane's longer axis (split_auto).
+            Action::SplitAuto => {
+                self.split_auto();
+                Some(SessionEvent::Redraw)
+            }
+            // Flip the enclosing split's orientation.
+            Action::Rotate => self.rotate_focus(),
+            // Keyboard split resize: grow the focused pane toward the arrow.
+            Action::ResizeLeft => self.resize_focus(Direction::Left),
+            Action::ResizeRight => self.resize_focus(Direction::Right),
+            Action::ResizeUp => self.resize_focus(Direction::Up),
+            Action::ResizeDown => self.resize_focus(Direction::Down),
             Action::NewTab => {
                 self.new_tab(); // open a tab beside the focus
                 Some(SessionEvent::Redraw)
@@ -488,6 +500,51 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             self.panes.insert(new_id, backend); // register it
             self.focus = new_id; // focus follows the split
             self.relayout(self.bounds); // the sibling shrank; resize everyone
+        }
+    }
+
+    /// Split the focused pane along its *longer* axis (Terminator's split_auto):
+    /// a wide pane splits left/right, a tall one top/bottom, so each split keeps
+    /// panes as square as possible. Falls back to a left/right split if the
+    /// focused pane's rectangle can't be found.
+    fn split_auto(&mut self) {
+        // Look up the focused pane's current rectangle to compare its dimensions.
+        let orient = self
+            .tree
+            .rects(self.bounds)
+            .into_iter()
+            .find(|(id, _)| *id == self.focus)
+            .map(|(_, r)| {
+                if r.w >= r.h {
+                    Orientation::LeftRight // wider than tall → side by side
+                } else {
+                    Orientation::TopBottom // taller than wide → stacked
+                }
+            })
+            .unwrap_or(Orientation::LeftRight); // no rect (shouldn't happen): sane default
+        self.split(orient);
+    }
+
+    /// Grow the focused pane toward `dir` by one keyboard step, resizing the
+    /// nearest split on that axis. Returns `Redraw` if anything moved.
+    fn resize_focus(&mut self, dir: Direction) -> Option<SessionEvent> {
+        const STEP: f32 = 0.03; // 3% of the split's extent per keypress
+        if self.tree.resize(self.focus, dir, STEP) {
+            self.relayout(self.bounds); // panes changed size → reflow + resize PTYs
+            Some(SessionEvent::Redraw)
+        } else {
+            None // at an edge or no matching split: nothing changed
+        }
+    }
+
+    /// Flip the orientation of the split containing the focused pane. Returns
+    /// `Redraw` when it actually rotated.
+    fn rotate_focus(&mut self) -> Option<SessionEvent> {
+        if self.tree.rotate(self.focus) {
+            self.relayout(self.bounds); // the arrangement changed → reflow
+            Some(SessionEvent::Redraw)
+        } else {
+            None // lone pane / non-split parent: nothing to rotate
         }
     }
 

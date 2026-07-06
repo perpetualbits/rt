@@ -42,6 +42,8 @@ impl Menu {
         let items = vec![
             Item::Action("Split Horizontally", Action::SplitHoriz),
             Item::Action("Split Vertically", Action::SplitVert),
+            Item::Action("Split Automatically", Action::SplitAuto),
+            Item::Action("Rotate Split", Action::Rotate),
             Item::Action("New Tab", Action::NewTab),
             Item::Action("Maximise / Restore Pane", Action::ToggleZoom),
             Item::Action("Search Scrollback…", Action::Search),

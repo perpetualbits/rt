@@ -124,6 +124,45 @@ fn directional_navigation_is_spatial() {
 }
 
 #[test]
+fn rotate_flips_the_enclosing_split() {
+    // a|b side by side; rotating flips the parent split so they stack instead.
+    let (mut tree, a) = Tree::new();
+    let b = tree.split(a, Orientation::LeftRight).unwrap();
+    // Before: a is left of b (same row).
+    let before = tree.rects(window());
+    let ra = before.iter().find(|(id, _)| *id == a).unwrap().1;
+    let rb = before.iter().find(|(id, _)| *id == b).unwrap().1;
+    assert!(ra.x < rb.x && (ra.y - rb.y).abs() < 0.001, "expected side-by-side to start");
+    // Rotate the split containing a.
+    assert!(tree.rotate(a));
+    let after = tree.rects(window());
+    let ra = after.iter().find(|(id, _)| *id == a).unwrap().1;
+    let rb = after.iter().find(|(id, _)| *id == b).unwrap().1;
+    // Now they stack: a above b, sharing the x column.
+    assert!(ra.y < rb.y && (ra.x - rb.x).abs() < 0.001, "expected stacked after rotate");
+    // Rotating a lone pane does nothing (no parent split).
+    let (mut solo, s) = Tree::new();
+    assert!(!solo.rotate(s));
+}
+
+#[test]
+fn resize_grows_the_focused_pane() {
+    // a|b at 50/50; growing a to the right must widen a and narrow b.
+    let (mut tree, a) = Tree::new();
+    let b = tree.split(a, Orientation::LeftRight).unwrap();
+    let w0 = tree.rects(window()).iter().find(|(id, _)| *id == a).unwrap().1.w;
+    assert!(tree.resize(a, Direction::Right, 0.1)); // push the boundary right
+    let rects = tree.rects(window());
+    let ra = rects.iter().find(|(id, _)| *id == a).unwrap().1;
+    let rb = rects.iter().find(|(id, _)| *id == b).unwrap().1;
+    assert!(ra.w > w0, "a should be wider after growing right");
+    assert!(ra.w > rb.w, "a should now be wider than b");
+    // Resizing along an axis with no matching split is a no-op (a|b has no
+    // top/bottom split, so a vertical resize changes nothing).
+    assert!(!tree.resize(a, Direction::Up, 0.1));
+}
+
+#[test]
 fn divider_drag_resizes_binary_split() {
     // Split left|right (50/50), grab the divider, and resize to ~25/75.
     let (mut tree, a) = Tree::new();

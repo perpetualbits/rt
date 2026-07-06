@@ -53,8 +53,10 @@ Where the widget toolkit pays off.
 10. **URL detection + open** ✅ — Ctrl+click on an http/https/ftp/file/mailto URL
     opens it via xdg-open (trailing sentence punctuation trimmed). (cat. §5, §11)
 11. **Pane zoom / maximise** ✅ — toggle_zoom (Ctrl+Shift+X / menu). (cat. §3, §4)
-12. **Rotate / resize / auto splits** (rotate_cw/ccw, resize_*; split_auto picks
-    the longer axis). Drag-to-resize the split gutter ✅. (cat. §3, §4)
+12. **Rotate / resize / auto splits** ✅ — Rotate (Ctrl+Shift+R) flips the enclosing
+    split's orientation; keyboard resize (Ctrl+Shift+arrows) grows the focused pane
+    into its neighbour on that axis; split_auto (Ctrl+Shift+A) splits along the
+    pane's longer axis. Drag-to-resize the split gutter ✅. (cat. §3, §4)
 13. **Scrollback search bar** ✅ `[user — wanted this specifically]` — Ctrl+Shift+F
     (or menu) opens a find bar over the whole scrollback; case-insensitive
     substring match; every hit highlighted (current hit brighter), Enter/Shift+Enter

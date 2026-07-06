@@ -77,6 +77,18 @@ pub enum Action {
     ToggleZoom,
     /// Open the scrollback-search bar (find text in this pane's history).
     Search,
+    /// Split the focused pane along its longer axis (Terminator's split_auto).
+    SplitAuto,
+    /// Flip the orientation of the split containing the focused pane.
+    Rotate,
+    /// Grow the focused pane leftward (shrinking its left neighbour).
+    ResizeLeft,
+    /// Grow the focused pane rightward (shrinking its right neighbour).
+    ResizeRight,
+    /// Grow the focused pane upward (shrinking its upper neighbour).
+    ResizeUp,
+    /// Grow the focused pane downward (shrinking its lower neighbour).
+    ResizeDown,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -336,6 +348,13 @@ impl Keymap {
             ("F11", Action::Fullscreen),                 // fullscreen toggle
             ("<Shift><Control>x", Action::ToggleZoom),   // maximise/restore the focused pane
             ("<Shift><Control>f", Action::Search),       // open the scrollback-search bar
+            // Keyboard split resize (Terminator resizes by mouse; rt adds keys).
+            ("<Shift><Control>Left", Action::ResizeLeft),
+            ("<Shift><Control>Right", Action::ResizeRight),
+            ("<Shift><Control>Up", Action::ResizeUp),
+            ("<Shift><Control>Down", Action::ResizeDown),
+            ("<Shift><Control>r", Action::Rotate),       // rotate the enclosing split
+            ("<Shift><Control>a", Action::SplitAuto),    // split along the longer axis
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {
