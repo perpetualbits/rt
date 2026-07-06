@@ -68,6 +68,16 @@ Rationale for reusing `alacritty_terminal` instead of GTK VTE: it removes the
 GTK main-loop reentrancy that is the suspected source of Terminator's random
 crashes, and it is measurably faster at parsing throughput.
 
+### ADR-0002 (session 1 user decisions)
+- **Renderer:** winit + **OpenGL**, mirroring alacritty's GPU glyph-atlas
+  renderer for maximum speed (chosen over a simpler CPU/softbuffer path). Cost:
+  heavier native deps (GL/EGL) that make aarch64/rv64 cross-compiles harder —
+  handled in M6 via per-arch containers.
+- **Sequencing:** *features first*. Build the runnable Terminator-UX binary
+  (splits, tabs, focus nav, broadcast, keybindings) before the packaging matrix.
+- The feature/controller logic (`rt-session`) is written as pure, headless-
+  testable code so it is verifiable in CI even though the GL window is not.
+
 ---
 
 ## 3. Workspace layout (target)
@@ -129,10 +139,15 @@ rt/
 - ☐ Then multi-pane: draw the layout tree's leaves into their rects.
 - ⚠ Requires a display; may only be verifiable on the user's machine.
 
-### M5 — Terminator features  ☐
-- ☐ Splits (Ctrl+Shift+O/E), tabs, focus navigation, close/rebalance.
-- ☐ Broadcast/group input. Saved layouts.
-- ☐ Keybinding config parse.
+### M5 — Terminator features  ◐  (controller logic done + tested; GL wiring next)
+- ☑ Keybinding config parse (`rt-config`): Terminator accelerator syntax +
+  default map + `Action` enum. 6 tests.
+- ☑ Controller (`rt-session`): splits (Ctrl+Shift+O→TopBottom, E→LeftRight),
+  new tab, close+refocus+collapse, spatial focus nav, broadcast Off/Group/All
+  input fan-out, relayout/resize. Generic over a `Backend` trait so it is
+  tested headless with a mock (8 tests). Real `rt_engine::TermPane` bridges in.
+- ☐ Saved layouts (serialise the tree). Tab cycling (needs a tree tab API).
+- ☐ Wire the controller into the GL binary + physical-key → `Chord` mapping.
 
 ### M6 — Packaging matrix  ☐  (3 formats × 3 arches = 9 artifacts)
 Formats: **.deb**, **.rpm**, **arch** (`.pkg.tar.zst`).

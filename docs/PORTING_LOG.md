@@ -80,3 +80,34 @@ Workspace status: rt-core 9 tests + rt-engine 2 tests, all passing.
 
 **Next:** M2b `rt-config` (keybindings, Terminator-style, pure/testable), then
 the `rt` binary wiring core+engine, then M6 packaging scaffolding.
+
+## 2026-07-06 — Session 1: keybindings + controller (M5 logic)
+
+User decisions (ADR-0002): renderer = winit + **GL** (alacritty-style, max
+speed); sequencing = **features first**.
+
+**rt-config** ports Terminator's keybindings: a total, fallible parser for the
+`<Shift><Control>o` accelerator grammar (named keys, F-keys, `plus`/`minus`
+symbol names, case-insensitive modifiers), the default keymap transcribed from
+`config.py:126-210`, and an `Action` enum decoupled from physical keys. User
+bindings front-insert to override defaults. 6 tests.
+
+**rt-session** is the controller — the real "Terminator features" layer, written
+as pure control flow so it verifies headless. It owns the tree + a
+`HashMap<PaneId, Backend>` + focus + broadcast mode, and turns `Action`s into
+splits/tabs/close/focus-nav plus broadcast input fan-out (Off/Group/All). It is
+generic over a `Backend` trait: production uses `rt_engine::TermPane`, tests use
+a mock that records writes/sizes. This single-owner design (no deferred
+callbacks, no reparenting) is the structural fix for Terminator's close-time
+races. 8 tests: split-focuses-new, directional focus, broadcast-all,
+broadcast-group subset, close-last→CloseWindow, close-one→refocus.
+
+Split orientation mapping nailed down: Terminator "split_horiz" (Ctrl+Shift+O)
+= horizontal divider = panes stacked = `Orientation::TopBottom`; "split_vert"
+(Ctrl+Shift+E) = side by side = `Orientation::LeftRight`.
+
+Workspace: 25 tests green (core 9, engine 2, config 6, session 8).
+
+**Next:** the `rt` GL binary — winit `ApplicationHandler`, GL glyph-atlas
+renderer over the tree's `rects()`, and physical winit key → `rt_config::Chord`
+→ `Action` → `session.apply()` wiring.

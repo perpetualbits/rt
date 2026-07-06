@@ -1,0 +1,11 @@
+[package]
+name = "rt-session"                  # the controller: turns Actions into tree+engine changes
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "rt session controller: layout tree + pane backends + focus + broadcast"
+
+[dependencies]
+rt-core = { path = "../rt-core" }    # the layout tree + geometry
+rt-config = { path = "../rt-config" } # the Action enum we dispatch on
+rt-engine = { path = "../rt-engine" } # the real pane backend (behind the Backend trait)
