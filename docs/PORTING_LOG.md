@@ -344,3 +344,25 @@ native (zero x11 crates).
 Noted follow-up: BOLD still only brightens colour; a bold *weight* face isn't
 loaded (a bold chain mirroring the italic one would fix it). 36 tests green;
 default build Wayland-native.
+
+## 2026-07-06 — Session 1: right-click context menu
+
+Terminator's right-click menu, ported to rt's GL layer (no widget toolkit).
+`crates/rt/src/menu.rs`: a `Menu` of rows (Action | Separator) with pixel
+hit-testing and self-drawing (panel + border + hover highlight + centred labels)
+using the terminal `Renderer`. Entries: Split H/V, New Tab, Close Terminal,
+More/Fewer Columns, More/Less Opaque, Stronger/Weaker Blur — every entry carries
+an `rt_config::Action`, so a click runs the exact same code as the keybinding.
+
+Wiring in main: track the cursor (`CursorMoved`), right-press opens the menu at
+the mouse (clamped to the window), left-press activates the hit row (or just
+closes), Escape closes. Refactored action dispatch into one `App::apply_action`
+shared by keybindings and the menu so they can't drift.
+
+Verified the menu RENDERS correctly (`docs/screenshots/context-menu.png`, via an
+`RT_MENU=1` startup hook). Could NOT inject a synthetic right-click in the
+sandbox (ydotoold not running; winit ignores xdotool's XSendEvent), so the
+open-on-right-click path is verified by construction + the shared, already-tested
+apply_action. On a real Wayland session winit delivers the MouseInput normally.
+
+36 tests green; default build Wayland-native.

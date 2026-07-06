@@ -12,6 +12,7 @@
 
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
+mod menu; // right-click context menu (Terminator-style)
 mod render; // the GL glyph-atlas renderer
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
@@ -25,9 +26,9 @@ use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use render::{Color, Renderer};
@@ -52,6 +53,8 @@ struct Active {
     keymap: Keymap,                       // Terminator-style bindings
     mods: ModifiersState,                 // live modifier state (updated on change)
     settings: rt_config::Settings,        // window appearance (background opacity, …)
+    mouse: (f32, f32),                    // last cursor position in physical pixels
+    menu: Option<menu::Menu>,             // the open right-click context menu, if any
 }
 
 /// The winit application object. Holds only the font bytes until `resumed`
@@ -295,7 +298,20 @@ impl ApplicationHandler for App {
             keymap: Keymap::defaults(),
             mods: ModifiersState::empty(),
             settings,
+            mouse: (0.0, 0.0),
+            menu: None,
         });
+        // Debug/verification hook: RT_MENU opens the context menu at startup so
+        // its rendering can be screenshotted without synthetic mouse input.
+        if std::env::var("RT_MENU").is_ok() {
+            if let Some(active) = self.active.as_mut() {
+                let (cw, ch) = active.renderer.cell_size();
+                let size = active.window.inner_size();
+                let mut m = menu::Menu::new(200.0, 150.0); // fixed, visible spot
+                m.clamp(size.width as f32, size.height as f32, cw, ch);
+                active.menu = Some(m);
+            }
+        }
         // Poll so we keep re-checking PTYs for async output even without input.
         event_loop.set_control_flow(ControlFlow::Poll);
         if let Some(active) = &self.active {
@@ -358,6 +374,45 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // Track the cursor; when a menu is open, update its hover highlight.
+            WindowEvent::CursorMoved { position, .. } => {
+                active.mouse = (position.x as f32, position.y as f32); // physical px
+                if let Some(m) = active.menu.as_mut() {
+                    let (cw, ch) = active.renderer.cell_size(); // cell metrics for hit layout
+                    if m.set_hover(active.mouse.0, active.mouse.1, cw, ch) {
+                        active.window.request_redraw(); // hovered row changed
+                    }
+                }
+            }
+
+            // Mouse button presses: right opens the context menu; left either
+            // activates a menu item (if open) or is ignored for now.
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => match button {
+                MouseButton::Right => {
+                    log::debug!("right-click at {:?} → open menu", active.mouse);
+                    // Open the menu at the cursor, clamped inside the window.
+                    let (cw, ch) = active.renderer.cell_size();
+                    let size = active.window.inner_size();
+                    let mut m = menu::Menu::new(active.mouse.0, active.mouse.1);
+                    m.clamp(size.width as f32, size.height as f32, cw, ch);
+                    active.menu = Some(m);
+                    active.window.request_redraw();
+                }
+                MouseButton::Left => {
+                    // A click anywhere closes the menu; if it landed on an item,
+                    // run that item's action (same path as its keybinding).
+                    if let Some(m) = active.menu.take() {
+                        let (cw, ch) = active.renderer.cell_size();
+                        let action = m.hit(active.mouse.0, active.mouse.1, cw, ch).and_then(|i| m.action_at(i));
+                        active.window.request_redraw();
+                        if let Some(a) = action {
+                            Self::apply_action(active, a); // may exit on the last pane
+                        }
+                    }
+                }
+                _ => {} // middle/other buttons: nothing yet
+            },
+
             // Time to paint.
             WindowEvent::RedrawRequested => {
                 self.redraw();
@@ -407,61 +462,63 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// Handle one key *press*: translate to a chord, look it up, and either run
-    /// the bound action or type the key into the focused PTY(s).
+    /// Run a semantic [`Action`](rt_config::Action) against the live state. This
+    /// is the single place actions are executed, called both by keybindings and
+    /// by the context menu, so the two can never drift apart.
+    ///
+    /// Window-level appearance actions (opacity/scrim) are handled here because
+    /// the session owns no window handle; everything else goes to the session.
+    /// A `CloseWindow` result exits the process (the OS reaps the child PTYs).
+    fn apply_action(active: &mut Active, action: rt_config::Action) {
+        use rt_config::Action;
+        match action {
+            Action::OpacityUp => {
+                let v = active.settings.adjust_opacity(0.05); // +5% opaque
+                log::info!("background opacity = {v:.2}");
+                active.window.request_redraw();
+            }
+            Action::OpacityDown => {
+                let v = active.settings.adjust_opacity(-0.05); // more see-through
+                log::info!("background opacity = {v:.2}");
+                active.window.request_redraw();
+            }
+            Action::ScrimUp => {
+                let v = active.settings.adjust_scrim(0.05); // stronger wash
+                log::info!("scrim strength = {v:.2}");
+                active.window.request_redraw();
+            }
+            Action::ScrimDown => {
+                let v = active.settings.adjust_scrim(-0.05); // weaker wash
+                log::info!("scrim strength = {v:.2}");
+                active.window.request_redraw();
+            }
+            // Everything else is a session action.
+            other => match active.session.apply(other) {
+                Some(SessionEvent::CloseWindow) => std::process::exit(0), // last pane closed
+                Some(SessionEvent::Redraw) => active.window.request_redraw(),
+                // No-op or clipboard (not yet wired to the OS): nothing to do.
+                _ => {}
+            },
+        }
+    }
+
+    /// Handle one key *press*: close an open menu on Escape, otherwise translate
+    /// to a chord and either run the bound action or type the key into the
+    /// focused PTY(s).
     fn on_key_press(&mut self, key_event: winit::event::KeyEvent) {
         let Some(active) = self.active.as_mut() else { return };
+        // Escape dismisses an open context menu (and is then consumed).
+        if active.menu.is_some() && matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
+            active.menu = None;
+            active.window.request_redraw();
+            return;
+        }
         let mods = active.mods; // current modifier state
-        // First, is this chord bound to an rt action?
+        // Is this chord bound to an rt action?
         if let Some(chord) = input::chord_from_winit(&key_event.logical_key, mods) {
             if let Some(action) = active.keymap.action_for(&chord) {
-                // Window-level appearance actions are handled here (the session
-                // owns no window). Adjust opacity and repaint.
-                match action {
-                    rt_config::Action::OpacityUp => {
-                        let v = active.settings.adjust_opacity(0.05); // +5% opaque
-                        log::info!("background opacity = {v:.2}");
-                        active.window.request_redraw();
-                        return; // consumed
-                    }
-                    rt_config::Action::OpacityDown => {
-                        let v = active.settings.adjust_opacity(-0.05); // -5% (more see-through)
-                        log::info!("background opacity = {v:.2}");
-                        active.window.request_redraw();
-                        return; // consumed
-                    }
-                    rt_config::Action::ScrimUp => {
-                        let v = active.settings.adjust_scrim(0.05); // +5% scrim (less legible behind)
-                        log::info!("scrim strength = {v:.2}");
-                        active.window.request_redraw();
-                        return; // consumed
-                    }
-                    rt_config::Action::ScrimDown => {
-                        let v = active.settings.adjust_scrim(-0.05); // -5% scrim (more legible behind)
-                        log::info!("scrim strength = {v:.2}");
-                        active.window.request_redraw();
-                        return; // consumed
-                    }
-                    _ => {} // fall through to the session for everything else
-                }
-                // Run the action; handle any session event it returns.
-                if let Some(ev) = active.session.apply(action) {
-                    match ev {
-                        SessionEvent::CloseWindow => {
-                            // Last pane closed / close_window pressed: exit.
-                            // (We can't reach the ActiveEventLoop here; set a
-                            // flag by requesting a redraw that will observe an
-                            // empty tree — simplest is to exit via the window.)
-                            // For now, drop active state to close the app.
-                            self.active = None;
-                            std::process::exit(0); // clean exit; PTYs shut down on drop
-                        }
-                        SessionEvent::Redraw => active.window.request_redraw(),
-                        // Clipboard is not yet wired to the OS; ignore for now.
-                        SessionEvent::Copy | SessionEvent::Paste => {}
-                    }
-                }
-                return; // the key was consumed as an action
+                Self::apply_action(active, action); // shared with the menu
+                return; // consumed
             }
         }
         // Not a binding: treat as ordinary typing. Encode to PTY bytes and feed
@@ -598,6 +655,12 @@ impl App {
                 active.renderer.fill_rect(rect.x, rect.y, t, rect.h, focus_border); // left
                 active.renderer.fill_rect(rect.right() - t, rect.y, t, rect.h, focus_border); // right
             }
+        }
+
+        // The context menu draws last so it sits above the terminal content.
+        if let Some(m) = active.menu.as_ref() {
+            let (cw, ch) = active.renderer.cell_size(); // cell metrics for menu layout
+            m.draw(&mut active.renderer, cw, ch); // panel + rows + hover highlight
         }
 
         active.renderer.end_frame(); // upload + draw call

@@ -41,3 +41,14 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   opacity/scrim sliders).
 - ☐ Multi-pane split only verified by tests, not yet screenshotted.
 - ☐ Clipboard copy/paste not wired to the OS.
+
+## Features implemented since
+- ☑ **Right-click context menu** (Terminator-style): Split Horizontally/
+  Vertically, New Tab, Close Terminal, More/Fewer Columns, More Opaque/
+  Transparent, Stronger/Weaker Blur. Each entry runs the same `Action` path as
+  its keybinding. Rendered in the GL layer (`crates/rt/src/menu.rs`). Verified
+  rendering: `docs/screenshots/context-menu.png`. Live right-click open is
+  standard winit `MouseInput` — couldn't inject synthetic mouse in the dev
+  sandbox (no ydotoold; winit ignores xdotool's synthetic X events), so the
+  open-on-right-click is confirmed by construction; `RT_MENU=1` opens it at
+  startup for inspection.
