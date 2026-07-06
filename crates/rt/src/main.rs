@@ -62,6 +62,8 @@ struct Active {
     selecting: bool,                      // true while the left button is held for a drag-select
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
     bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
+    last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
+    click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
     egui_state: egui_winit::State,        // egui-winit input bridge
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
@@ -501,6 +503,8 @@ impl ApplicationHandler for App {
             selecting: false,
             dragging_divider: None,
             bell_flash: None,
+            last_click: None,
+            click_count: 0,
             egui_ctx,
             egui_state,
             egui_painter,
@@ -722,11 +726,52 @@ impl ApplicationHandler for App {
                             active.window.request_redraw();
                         } else {
                             active.session.focus_at(mx, my); // click-to-focus
-                            // Start a selection at this cell (cleared on release
-                            // if it stays a zero-length click).
+                            // Ctrl+click on a URL opens it in the default handler
+                            // (the common terminal idiom); consume the click.
+                            if active.mods.control_key() {
+                                if let Some((pane, col, row)) = Self::cell_at(active, mx, my) {
+                                    if let Some(url) = Self::url_at(active, pane, col, row) {
+                                        Self::open_url(&url);
+                                        return;
+                                    }
+                                }
+                            }
+                            // Determine the click count (single / double / triple)
+                            // from timing + proximity to the previous press.
+                            let now = Instant::now();
+                            let count = match active.last_click {
+                                Some((t, (lx, ly)))
+                                    if now.duration_since(t) < Duration::from_millis(400)
+                                        && (mx - lx).abs() < 5.0
+                                        && (my - ly).abs() < 5.0 =>
+                                {
+                                    (active.click_count % 3) + 1 // 1→2→3→1
+                                }
+                                _ => 1,
+                            };
+                            active.last_click = Some((now, (mx, my)));
+                            active.click_count = count;
+                            // Single = start a drag-select; double = word; triple = line.
                             if let Some((pane, col, row)) = Self::cell_at(active, mx, my) {
-                                active.selection = Some(Selection { pane, anchor: (col, row), head: (col, row) });
-                                active.selecting = true;
+                                match count {
+                                    2 => {
+                                        if let Some((s, e)) = Self::word_at(active, pane, col, row) {
+                                            active.selection = Some(Selection { pane, anchor: (s, row), head: (e, row) });
+                                        }
+                                        active.selecting = false;
+                                        Self::copy_selection_to_primary(active);
+                                    }
+                                    3 => {
+                                        let last = Self::line_last_col(active, pane, row);
+                                        active.selection = Some(Selection { pane, anchor: (0, row), head: (last, row) });
+                                        active.selecting = false;
+                                        Self::copy_selection_to_primary(active);
+                                    }
+                                    _ => {
+                                        active.selection = Some(Selection { pane, anchor: (col, row), head: (col, row) });
+                                        active.selecting = true;
+                                    }
+                                }
                             }
                             active.window.request_redraw();
                         }
@@ -982,6 +1027,99 @@ impl App {
             }
         }
         None
+    }
+
+    /// Word boundaries around `(col, row)` for double-click selection: expand
+    /// left and right over "word" characters (alphanumerics plus the punctuation
+    /// that usually belongs to paths/URLs). Returns the inclusive `(start, end)`
+    /// columns, or `None` if the row/column is out of range. A click on a
+    /// non-word character selects just that one cell.
+    fn word_at(active: &Active, pane: rt_core::PaneId, col: usize, row: usize) -> Option<(usize, usize)> {
+        let snap = active.session.pane(pane)?.snapshot(); // the pane's grid
+        let line = snap.rows.get(row)?; // the clicked row
+        if col >= line.len() {
+            return None; // click past the end of the row
+        }
+        // A "word" char: alphanumeric plus the symbols common in paths/URLs.
+        let is_word = |c: char| c.is_alphanumeric() || "-_./~:@%+#=?&".contains(c);
+        if !is_word(line[col].c) {
+            return Some((col, col)); // lone symbol/space → single-cell select
+        }
+        let mut s = col; // grow the start leftwards
+        while s > 0 && is_word(line[s - 1].c) {
+            s -= 1;
+        }
+        let mut e = col; // grow the end rightwards
+        while e + 1 < line.len() && is_word(line[e + 1].c) {
+            e += 1;
+        }
+        Some((s, e))
+    }
+
+    /// Detect a URL at `(col, row)` for Ctrl+click opening. Expands over URL
+    /// characters around the click, then accepts the run only if it begins with
+    /// a known scheme. Trailing sentence punctuation is trimmed so a URL at the
+    /// end of a sentence still opens cleanly. Returns the URL, or `None`.
+    fn url_at(active: &Active, pane: rt_core::PaneId, col: usize, row: usize) -> Option<String> {
+        let snap = active.session.pane(pane)?.snapshot(); // the pane's grid
+        let line = snap.rows.get(row)?; // the clicked row
+        if col >= line.len() {
+            return None;
+        }
+        // URL characters per RFC 3986 (a permissive superset); notably excludes
+        // whitespace, quotes and brackets that would end a URL in running text.
+        let is_url = |c: char| !c.is_whitespace() && !"\"'<>`(){}[]".contains(c);
+        if !is_url(line[col].c) {
+            return None;
+        }
+        let mut s = col; // grow left over URL characters
+        while s > 0 && is_url(line[s - 1].c) {
+            s -= 1;
+        }
+        let mut e = col; // grow right over URL characters
+        while e + 1 < line.len() && is_url(line[e + 1].c) {
+            e += 1;
+        }
+        let raw: String = line[s..=e].iter().map(|cell| cell.c).collect();
+        // Drop trailing punctuation that is usually sentence, not URL, syntax.
+        let url = raw.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        // Only treat it as a link if it carries a recognised scheme.
+        const SCHEMES: [&str; 5] = ["http://", "https://", "ftp://", "file://", "mailto:"];
+        if SCHEMES.iter().any(|p| url.starts_with(p)) {
+            Some(url.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Open a URL with the desktop's default handler via `xdg-open`, detached so
+    /// it never blocks rt. Failures are logged, not fatal (rt's no-crash policy).
+    fn open_url(url: &str) {
+        // Spawn xdg-open without waiting; ignore the handle so it runs detached.
+        match std::process::Command::new("xdg-open").arg(url).spawn() {
+            Ok(_) => log::info!("opened URL: {url}"),
+            Err(e) => log::warn!("xdg-open failed for {url}: {e}"),
+        }
+    }
+
+    /// The last non-blank column on `row` (for triple-click line selection),
+    /// clamped to a valid index. Falls back to 0 for an empty/blank line.
+    fn line_last_col(active: &Active, pane: rt_core::PaneId, row: usize) -> usize {
+        let Some(pane) = active.session.pane(pane) else { return 0 };
+        let snap = pane.snapshot();
+        let Some(line) = snap.rows.get(row) else { return 0 };
+        line.iter().rposition(|cell| cell.c != ' ').unwrap_or(0)
+    }
+
+    /// Copy-on-select for the word/line selections made by double/triple-click
+    /// (drag-selection copies on button release instead). Pushes the current
+    /// selection text to the PRIMARY buffer for middle-click paste.
+    fn copy_selection_to_primary(active: &Active) {
+        if let Some(text) = Self::selected_text(active) {
+            if let Some(cb) = &active.clipboard {
+                cb.store_primary(text);
+            }
+        }
     }
 
     /// Reload the renderer's fonts from the current settings (rebuilding the
