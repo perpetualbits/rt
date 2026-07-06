@@ -349,15 +349,29 @@ impl ApplicationHandler for App {
     /// so terminal output appears without the user touching the keyboard.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(active) = self.active.as_mut() else { return };
-        // Drain events from every live pane; if any produced output/title/bell,
-        // we need to repaint.
+        // Drain events from every live pane. Output/title/bell means repaint; a
+        // pane whose shell exited is collected for closing after the loop (we
+        // can't mutate the session while iterating its panes).
         let mut dirty = false; // did anything change this tick?
+        let mut exited: Vec<rt_core::PaneId> = Vec::new(); // panes whose shell died
         for id in active.session.tree().all_panes() {
             if let Some(pane) = active.session.pane(id) {
-                // Any drained event means the grid or title may have changed.
-                if !pane.drain_events().is_empty() {
-                    dirty = true;
+                for ev in pane.drain_events() {
+                    match ev {
+                        rt_engine::PaneEvent::Exited => exited.push(id), // reap this pane
+                        _ => dirty = true, // Wakeup/Title/Bell → needs a redraw
+                    }
                 }
+            }
+        }
+        // Close every pane whose child exited. If that empties the window, quit.
+        for id in exited {
+            match active.session.close_pane(id) {
+                Some(SessionEvent::CloseWindow) => {
+                    self.active = None; // drop everything (PTYs shut down on Drop)
+                    std::process::exit(0); // clean exit
+                }
+                _ => dirty = true, // a pane closed; repaint the survivors
             }
         }
         if dirty {

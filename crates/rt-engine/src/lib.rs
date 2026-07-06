@@ -167,6 +167,9 @@ impl EventListener for Proxy {
             AlacEvent::Bell => self.push(PaneEvent::Bell),
             // New content parsed → ask the GUI to redraw.
             AlacEvent::Wakeup => self.push(PaneEvent::Wakeup),
+            // The child process exited (shell `exit`/`quit`/Ctrl-D). Tell the
+            // GUI so it closes this pane — otherwise a dead shell lingers.
+            AlacEvent::ChildExit(_status) => self.push(PaneEvent::Exited),
             // The terminal wants to send bytes back to the program (query
             // replies, bracketed-paste acks, etc.). Forward to the PTY.
             AlacEvent::PtyWrite(text) => {

@@ -199,7 +199,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
                 self.new_tab(); // open a tab beside the focus
                 Some(SessionEvent::Redraw)
             }
-            Action::CloseTerm => self.close_focused(), // may request CloseWindow
+            Action::CloseTerm => self.close_pane(self.focus), // may request CloseWindow
             Action::CloseWindow => Some(SessionEvent::CloseWindow), // GUI closes us
             // Directional focus movement; a no-op (no neighbour) still redraws
             // harmlessly but we only redraw if focus actually changed.
@@ -341,14 +341,18 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         }
     }
 
-    /// Close the focused pane: drop its backend (which cleanly shuts down the
-    /// PTY via `Drop`), remove it from the tree, and pick a new focus. Returns
-    /// `CloseWindow` if that was the last pane.
-    fn close_focused(&mut self) -> Option<SessionEvent> {
-        let closing = self.focus; // the pane we are removing
+    /// Close pane `closing`: drop its backend (which cleanly shuts down the PTY
+    /// via `Drop`), remove it from the tree, and re-seat focus if needed.
+    /// Returns `CloseWindow` if that was the last pane, `Redraw` otherwise, or
+    /// `None` if the id was not in the tree.
+    ///
+    /// Public because it is driven both by the `CloseTerm` action (close the
+    /// focused pane) and by the run-loop when a pane's shell exits on its own
+    /// (Ctrl-D / `exit`) — the fix for "the pane stays open after bash exits".
+    pub fn close_pane(&mut self, closing: PaneId) -> Option<SessionEvent> {
         // Remove from the tree first; if it was not present, do nothing.
         if !self.tree.close(closing) {
-            return None; // focus id was stale; nothing to do
+            return None; // stale id; nothing to do
         }
         self.panes.remove(&closing); // drop backend → PTY shutdown+join (Drop)
         self.groups.remove(&closing); // forget any group membership
@@ -356,9 +360,12 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         if self.tree.is_empty() {
             return Some(SessionEvent::CloseWindow); // no panes left → close window
         }
-        // Re-seat focus on some surviving visible pane (nearest by traversal).
-        if let Some((id, _)) = self.tree.rects(self.bounds).into_iter().next() {
-            self.focus = id; // pick the first visible pane as the new focus
+        // If the pane we closed held focus, re-seat it on a surviving visible
+        // pane (nearest by traversal). If some other pane exited, focus is fine.
+        if self.focus == closing {
+            if let Some((id, _)) = self.tree.rects(self.bounds).into_iter().next() {
+                self.focus = id; // pick the first visible pane as the new focus
+            }
         }
         self.relayout(self.bounds); // survivors may have grown; resize them
         Some(SessionEvent::Redraw)
