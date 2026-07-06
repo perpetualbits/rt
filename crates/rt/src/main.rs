@@ -57,9 +57,8 @@ struct Active {
 /// The winit application object. Holds only the font bytes until `resumed`
 /// builds the `Active` state.
 struct App {
-    fonts: Vec<Vec<u8>>,        // primary monospace font bytes, then fallback fonts
-    italic_fonts: Vec<Vec<u8>>, // italic/oblique faces (may be empty)
-    active: Option<Active>,     // populated on first resume
+    fonts: render::FontBlobs, // regular/bold/italic/bold-italic font byte chains
+    active: Option<Active>,   // populated on first resume
 }
 
 /// Locate a monospace font (plus fallback fonts for coverage gaps) on the
@@ -70,58 +69,67 @@ struct App {
 /// The fallbacks matter because the usual primary — DejaVu Sans Mono — lacks
 /// some ranges (notably braille U+2800–U+28FF, used by `spiral_stress`). We add
 /// TrueType fonts that DO cover them so the renderer can fall back per glyph.
-fn load_fonts() -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-    // The primary monospace font: first match wins. Must be present.
-    const PRIMARY: &[&str] = &[
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-    ];
-    // Fallback fonts consulted for glyphs the primary lacks. TrueType only
-    // (fontdue can't read CFF/OTF); the renderer skips any that fail to parse.
-    const FALLBACK: &[&str] = &[
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // proportional but has braille + much more
-        "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf", // monospace with braille
-        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-    ];
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
-    // Load the first available primary.
-    for path in PRIMARY {
-        if let Ok(bytes) = std::fs::read(path) {
-            log::info!("primary font {path}"); // record the choice
-            blobs.push(bytes);
-            break;
+fn load_fonts() -> Option<render::FontBlobs> {
+    // Read every existing path in `paths` into a chain of byte blobs.
+    let load = |paths: &[&str], label: &str| -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for p in paths {
+            if let Ok(bytes) = std::fs::read(p) {
+                log::info!("{label} font {p}"); // record each face we picked
+                out.push(bytes);
+            }
         }
-    }
-    if blobs.is_empty() {
+        out
+    };
+    // Regular chain: a monospace primary (first match) then coverage fallbacks
+    // for ranges DejaVu Sans Mono lacks (e.g. braille). TrueType only (fontdue
+    // can't read CFF/OTF); the renderer skips any that fail to parse.
+    let regular = load(
+        &[
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+            // coverage fallbacks (appended after the primary):
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        ],
+        "regular",
+    );
+    if regular.is_empty() {
         return None; // no primary → the app cannot render text
     }
-    // Load whichever fallbacks exist (all optional).
-    for path in FALLBACK {
-        if let Ok(bytes) = std::fs::read(path) {
-            log::info!("fallback font {path}"); // note each extra coverage source
-            blobs.push(bytes);
-        }
-    }
-    // Italic/oblique faces for the ITALIC attribute (all optional): a monospace
-    // oblique first, then a proportional oblique as a coverage fallback.
-    const ITALIC: &[&str] = &[
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
-    ];
-    let mut italic: Vec<Vec<u8>> = Vec::new();
-    for path in ITALIC {
-        if let Ok(bytes) = std::fs::read(path) {
-            log::info!("italic font {path}"); // note the oblique face
-            italic.push(bytes);
-        }
-    }
-    Some((blobs, italic))
+    // Bold, italic, and bold-italic chains — all optional; each falls back to
+    // the regular face when absent.
+    let bold = load(
+        &[
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ],
+        "bold",
+    );
+    let italic = load(
+        &[
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        ],
+        "italic",
+    );
+    let bold_italic = load(
+        &[
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+        ],
+        "bold-italic",
+    );
+    Some(render::FontBlobs { regular, bold, italic, bold_italic })
 }
 
 impl ApplicationHandler for App {
@@ -208,7 +216,7 @@ impl ApplicationHandler for App {
         };
 
         // --- build the renderer ------------------------------------------
-        let mut renderer = match Renderer::new(gl, &self.fonts, &self.italic_fonts, 18.0) {
+        let mut renderer = match Renderer::new(gl, &self.fonts, 18.0) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e}");
@@ -542,8 +550,8 @@ impl App {
                         }
                         let fg = Color::rgb(cell.fg[0], cell.fg[1], cell.fg[2]); // per-cell foreground
                         if cell.c != ' ' {
-                            // Glyph, in the oblique face when the cell is italic.
-                            active.renderer.draw_char(ox, rect.y, col_idx, sub, cell.c, fg, cell.attrs.italic);
+                            // Glyph, in the bold/oblique face per the cell's attributes.
+                            active.renderer.draw_char(ox, rect.y, col_idx, sub, cell.c, fg, cell.attrs.bold, cell.attrs.italic);
                         }
                         // Text-attribute lines (drawn even on blank cells so an
                         // underlined space still shows a rule).
@@ -568,7 +576,7 @@ impl App {
                         if let Some(under) = snap.rows.get(cur.line).and_then(|rw| rw.get(cur.col)) {
                             if under.c != ' ' {
                                 let ub = under.bg; // draw the glyph in the cell bg for contrast
-                                active.renderer.draw_char(ox, rect.y, cur.col, sub, under.c, Color::rgb(ub[0], ub[1], ub[2]), under.attrs.italic);
+                                active.renderer.draw_char(ox, rect.y, cur.col, sub, under.c, Color::rgb(ub[0], ub[1], ub[2]), under.attrs.bold, under.attrs.italic);
                             }
                         }
                     }
@@ -604,7 +612,7 @@ impl App {
 fn main() {
     env_logger::init(); // honour RUST_LOG for diagnostics
     // A font is mandatory; fail early with guidance if none is installed.
-    let (fonts, italic_fonts) = match load_fonts() {
+    let fonts = match load_fonts() {
         Some(f) => f,
         None => {
             eprintln!(
@@ -616,7 +624,7 @@ fn main() {
     };
     // Build the winit event loop and hand it our application.
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App { fonts, italic_fonts, active: None };
+    let mut app = App { fonts, active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);

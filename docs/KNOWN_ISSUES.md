@@ -25,9 +25,9 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   strikeout are thin bars in the cell's fg. Verified:
   `docs/screenshots/text-attributes.png`. (Colour, bold→bright, dim, inverse,
   hidden were already handled.)
-- ☐ **Bold weight** not rendered: BOLD only brightens the colour; a heavier font
-  face isn't loaded. Minor follow-up (load DejaVu Sans Mono Bold as a weight
-  chain, mirroring the italic chain).
+- ☑ **Bold weight** now rendered from a bold font chain (DejaVu Sans Mono Bold +
+  fallbacks), with a bold-italic chain for cells that are both. Bold still
+  brightens ANSI colours too (standard). Verified: `docs/screenshots/bold.png`.
 
 ## Lifecycle
 - ☑ **Pane/window stays open after its shell exits** (Ctrl-D / `exit` / `quit`).

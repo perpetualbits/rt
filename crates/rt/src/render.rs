@@ -27,6 +27,17 @@ use glow::HasContext; // brings the raw GL methods into scope
 /// render blank); a production version would grow or evict.
 const ATLAS: i32 = 1024;
 
+/// The font byte blobs for each weight/style the renderer needs. Each is a
+/// fallback chain (first entry preferred). Any but `regular` may be empty; when
+/// a style has no face installed, the renderer falls back to `regular`.
+#[derive(Default)]
+pub struct FontBlobs {
+    pub regular: Vec<Vec<u8>>,     // upright normal weight (must be non-empty)
+    pub bold: Vec<Vec<u8>>,        // bold weight
+    pub italic: Vec<Vec<u8>>,      // oblique/italic
+    pub bold_italic: Vec<Vec<u8>>, // bold + oblique
+}
+
 /// An RGBA colour in 0..=1 floats, matching the shader's vertex colour input.
 #[derive(Clone, Copy)]
 pub struct Color(pub f32, pub f32, pub f32, pub f32);
@@ -72,13 +83,15 @@ pub struct Renderer {
     vbo: glow::Buffer,                 // dynamic vertex buffer, re-uploaded each frame
     atlas_tex: glow::Texture,          // the R8 coverage atlas
     u_screen: glow::UniformLocation,   // uniform: viewport size in pixels
-    fonts: Vec<Font>,                  // primary monospace font + fallbacks for coverage gaps
-    italic_fonts: Vec<Font>,           // italic/oblique faces (empty if none installed)
+    fonts: Vec<Font>,                  // regular chain: primary + coverage fallbacks
+    bold_fonts: Vec<Font>,             // bold faces (empty if none installed)
+    italic_fonts: Vec<Font>,           // italic/oblique faces (empty if none)
+    bold_italic_fonts: Vec<Font>,      // bold-italic faces (empty if none)
     font_px: f32,                      // pixel size glyphs are rasterised at
     cell_w: f32,                       // monospace cell width in pixels
     cell_h: f32,                       // cell height (line advance) in pixels
     ascent: f32,                       // baseline offset from the cell top
-    glyphs: HashMap<(char, bool), Glyph>, // rasterised-glyph cache, keyed by (char, italic)
+    glyphs: HashMap<(char, bool, bool), Glyph>, // glyph cache, keyed by (char, bold, italic)
     shelf_x: i32,                      // next free x in the current atlas shelf
     shelf_y: i32,                      // top y of the current shelf
     shelf_h: i32,                      // height of the current shelf
@@ -96,14 +109,9 @@ impl Renderer {
     /// for solid fills, measures the monospace cell from the primary font, and is
     /// then ready for `begin_frame`/`draw_*`/`end_frame`. Returns an error string
     /// on any GL or font failure so `main` can report it instead of panicking.
-    pub fn new(
-        gl: glow::Context,
-        font_blobs: &[Vec<u8>],
-        italic_blobs: &[Vec<u8>],
-        font_px: f32,
-    ) -> Result<Self, String> {
+    pub fn new(gl: glow::Context, blobs: &FontBlobs, font_px: f32) -> Result<Self, String> {
         // Parse a slice of font blobs into `Font`s, skipping any that fail. Used
-        // for both the regular chain (primary required) and the italic chain.
+        // for each weight/style chain; only the regular primary is required.
         let parse_chain = |blobs: &[Vec<u8>], primary_required: bool| -> Result<Vec<Font>, String> {
             let mut out: Vec<Font> = Vec::new();
             for (i, blob) in blobs.iter().enumerate() {
@@ -117,8 +125,10 @@ impl Renderer {
             }
             Ok(out)
         };
-        let fonts = parse_chain(font_blobs, true)?; // regular chain; primary must parse
-        let italic_fonts = parse_chain(italic_blobs, false)?; // italic chain; all optional
+        let fonts = parse_chain(&blobs.regular, true)?; // regular chain; primary must parse
+        let bold_fonts = parse_chain(&blobs.bold, false)?; // bold chain; optional
+        let italic_fonts = parse_chain(&blobs.italic, false)?; // italic chain; optional
+        let bold_italic_fonts = parse_chain(&blobs.bold_italic, false)?; // bold-italic; optional
         // The primary font (index 0) defines the monospace cell metrics.
         let font = &fonts[0];
         // Measure the monospace cell: 'M' advance for width, line metrics for
@@ -206,7 +216,9 @@ impl Renderer {
                 atlas_tex,
                 u_screen,
                 fonts,
+                bold_fonts,
                 italic_fonts,
+                bold_italic_fonts,
                 font_px,
                 cell_w,
                 cell_h,
@@ -311,37 +323,42 @@ impl Renderer {
     /// Rasterise (if needed) and cache a glyph, returning its atlas placement.
     /// Returns `None` for glyphs that don't fit the atlas or have no bitmap
     /// (e.g. space), so callers simply skip drawing them.
-    fn glyph(&mut self, c: char, italic: bool) -> Option<Glyph> {
-        // Fast path: already cached for this (char, italic) combination.
-        if let Some(g) = self.glyphs.get(&(c, italic)) {
+    fn glyph(&mut self, c: char, bold: bool, italic: bool) -> Option<Glyph> {
+        // Fast path: already cached for this (char, bold, italic) combination.
+        if let Some(g) = self.glyphs.get(&(c, bold, italic)) {
             return Some(*g);
         }
-        // Choose the font chain: the italic faces when italic is requested and
-        // any are installed, otherwise the regular chain. Then within the chosen
-        // chain pick the first font that actually has this character
-        // (`lookup_glyph_index != 0`) — the fallback logic that renders braille
-        // etc. from a secondary font. If italic has no glyph anywhere, fall back
-        // to the upright chain so we at least show the character.
-        let chain: &[Font] = if italic && !self.italic_fonts.is_empty() {
-            &self.italic_fonts
-        } else {
-            &self.fonts
+        // Preference-ordered chains for this style. Exact style first, then
+        // progressively looser matches, ending at the regular chain (widest
+        // coverage + braille/etc. fallbacks). Within each chain we take the first
+        // font that actually has the glyph (`lookup_glyph_index != 0`).
+        let prefs: &[&[Font]] = match (bold, italic) {
+            (true, true) => &[
+                self.bold_italic_fonts.as_slice(),
+                self.bold_fonts.as_slice(),
+                self.italic_fonts.as_slice(),
+                self.fonts.as_slice(),
+            ],
+            (true, false) => &[self.bold_fonts.as_slice(), self.fonts.as_slice()],
+            (false, true) => &[self.italic_fonts.as_slice(), self.fonts.as_slice()],
+            (false, false) => &[self.fonts.as_slice()],
         };
-        let (chain, idx) = match chain.iter().position(|f| f.lookup_glyph_index(c) != 0) {
-            Some(i) => (chain, i), // found in the chosen chain
-            None if italic => {
-                // Not in the italic chain: try the regular chain upright.
-                let i = self.fonts.iter().position(|f| f.lookup_glyph_index(c) != 0).unwrap_or(0);
-                (&self.fonts[..], i)
+        // Find the first (chain, font index) that covers this character.
+        let mut chosen: Option<(&[Font], usize)> = None;
+        for chain in prefs {
+            if let Some(i) = chain.iter().position(|f| f.lookup_glyph_index(c) != 0) {
+                chosen = Some((chain, i));
+                break;
             }
-            None => (chain, 0), // nobody has it; use the primary (notdef/blank)
-        };
+        }
+        // Nobody covers it: fall back to the primary (draws notdef/blank).
+        let (chain, idx) = chosen.unwrap_or((self.fonts.as_slice(), 0));
         // Rasterise the glyph to a coverage bitmap at our pixel size.
         let (metrics, bitmap) = chain[idx].rasterize(c, self.font_px);
         // Empty glyphs (space) have zero-size bitmaps; nothing to pack/draw.
         if metrics.width == 0 || metrics.height == 0 {
             let g = Glyph { u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0, w: 0.0, h: 0.0, left: 0.0, top: 0.0 };
-            self.glyphs.insert((c, italic), g); // cache the "blank" so we don't retry
+            self.glyphs.insert((c, bold, italic), g); // cache the "blank" so we don't retry
             return None;
         }
         let gw = metrics.width as i32; // glyph bitmap width
@@ -387,7 +404,7 @@ impl Renderer {
             left: metrics.xmin as f32,   // horizontal bearing
             top: metrics.ymin as f32 + gh as f32, // top = height above baseline
         };
-        self.glyphs.insert((c, italic), g); // cache for next time
+        self.glyphs.insert((c, bold, italic), g); // cache for next time
         Some(g)
     }
 
@@ -428,14 +445,15 @@ impl Renderer {
     }
 
     /// Draw a 1-cell character at cell column/row within a pane whose top-left
-    /// pixel is `(ox, oy)`. Skips blanks. `fg` is the glyph colour; `italic`
-    /// selects the oblique face (falling back to upright if none is installed).
-    pub fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color, italic: bool) {
+    /// pixel is `(ox, oy)`. Skips blanks. `fg` is the glyph colour; `bold`/
+    /// `italic` select the heavier / oblique faces (each falling back to the
+    /// regular face if none is installed).
+    pub fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color, bold: bool, italic: bool) {
         // Compute this cell's top-left pixel inside the pane.
         let cell_x = ox + col as f32 * self.cell_w; // pen x
         let cell_y = oy + row as f32 * self.cell_h; // cell top y
         // Fetch/rasterise the glyph; blanks return None and draw nothing.
-        let g = match self.glyph(ch, italic) {
+        let g = match self.glyph(ch, bold, italic) {
             Some(g) if g.w > 0.0 => g, // a real, drawable glyph
             _ => return,               // blank or un-cacheable: skip
         };

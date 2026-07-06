@@ -51,6 +51,7 @@ pub enum PaneEvent {
 /// face), and strikeout (a line through the middle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellAttrs {
+    pub bold: bool,      // render with a heavier (bold) face
     pub underline: bool, // draw a line under the glyph
     pub italic: bool,    // render with a slanted/oblique face
     pub strikeout: bool, // draw a line through the glyph
@@ -405,6 +406,7 @@ impl TermPane {
     fn attrs_of(flags: alacritty_terminal::term::cell::Flags) -> CellAttrs {
         use alacritty_terminal::term::cell::Flags;
         CellAttrs {
+            bold: flags.contains(Flags::BOLD),                  // heavier weight face
             underline: flags.intersects(Flags::ALL_UNDERLINES), // any underline style
             italic: flags.contains(Flags::ITALIC),              // slanted face
             strikeout: flags.contains(Flags::STRIKEOUT),        // line through the glyph
