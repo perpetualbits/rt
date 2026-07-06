@@ -616,6 +616,64 @@ impl Tree {
         }
     }
 
+    /// The gutter rectangles *between* split children, for the given window
+    /// `bounds`, so the renderer can draw visible pane dividers. Each rect is one
+    /// full gutter (DIVIDER wide/tall); vertical gutters have `w < h`, horizontal
+    /// ones `w > h`.
+    pub fn dividers(&self, bounds: Rect) -> Vec<Rect> {
+        let mut out = Vec::new();
+        Self::collect_dividers(&self.root, bounds, &mut out);
+        out
+    }
+
+    /// Recursive worker for [`Tree::dividers`]; mirrors the rectangle division of
+    /// [`Tree::layout_node`], emitting a gutter after each child but the last.
+    fn collect_dividers(node: &Node, bounds: Rect, out: &mut Vec<Rect>) {
+        match node {
+            Node::Leaf(_) => {}
+            Node::Split { orient, children } => {
+                let total: f32 = children.iter().map(|c| c.weight).sum();
+                let total = if total > 0.0 { total } else { 1.0 };
+                let gutters = DIVIDER * (children.len().saturating_sub(1) as f32);
+                let last = children.len().saturating_sub(1);
+                match orient {
+                    Orientation::LeftRight => {
+                        let usable = (bounds.w - gutters).max(0.0);
+                        let mut cursor = bounds.x;
+                        for (i, child) in children.iter().enumerate() {
+                            let w = usable * (child.weight / total);
+                            Self::collect_dividers(&child.node, Rect::new(cursor, bounds.y, w, bounds.h), out);
+                            cursor += w;
+                            if i < last {
+                                out.push(Rect::new(cursor, bounds.y, DIVIDER, bounds.h)); // vertical gutter
+                                cursor += DIVIDER;
+                            }
+                        }
+                    }
+                    Orientation::TopBottom => {
+                        let usable = (bounds.h - gutters).max(0.0);
+                        let mut cursor = bounds.y;
+                        for (i, child) in children.iter().enumerate() {
+                            let h = usable * (child.weight / total);
+                            Self::collect_dividers(&child.node, Rect::new(bounds.x, cursor, bounds.w, h), out);
+                            cursor += h;
+                            if i < last {
+                                out.push(Rect::new(bounds.x, cursor, bounds.w, DIVIDER)); // horizontal gutter
+                                cursor += DIVIDER;
+                            }
+                        }
+                    }
+                }
+            }
+            Node::Tabs { children, active } => {
+                if let Some(child) = children.get(*active) {
+                    let body = Rect::new(bounds.x, bounds.y + TAB_STRIP, bounds.w, (bounds.h - TAB_STRIP).max(0.0));
+                    Self::collect_dividers(child, body, out);
+                }
+            }
+        }
+    }
+
     /// The first leaf pane found in `node` (depth-first, following active tabs).
     /// Returns `None` for the empty sentinel or an empty subtree.
     fn first_leaf(node: &Node) -> Option<PaneId> {

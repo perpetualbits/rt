@@ -208,6 +208,11 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.tree.tab_bars(bounds)
     }
 
+    /// The divider gutter rectangles between panes, for drawing pane dividers.
+    pub fn dividers(&self, bounds: Rect) -> Vec<Rect> {
+        self.tree.dividers(bounds)
+    }
+
     /// Select the tab whose first pane is `first_pane` (from a clicked
     /// [`TabBar`] tab), move focus into it, and reflow. Returns `true` if the
     /// tab was found. This is what a click on a tab label calls.

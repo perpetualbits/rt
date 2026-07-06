@@ -1179,6 +1179,20 @@ impl App {
             }
         }
 
+        // Pane dividers: a thin line centred in each split gutter so the
+        // boundary between panes is visible (most of the gutter stays the
+        // translucent background).
+        let divider_col = Color::rgb(0x3a, 0x3a, 0x46);
+        for d in active.session.dividers(bounds) {
+            if d.w < d.h {
+                // Vertical gutter (left/right split): a vertical line.
+                active.renderer.fill_rect(d.x + d.w * 0.5 - 0.5, d.y, 1.0, d.h, divider_col);
+            } else {
+                // Horizontal gutter (top/bottom split): a horizontal line.
+                active.renderer.fill_rect(d.x, d.y + d.h * 0.5 - 0.5, d.w, 1.0, divider_col);
+            }
+        }
+
         // Tab strips: draw each visible Tabs node's bar in its reserved region
         // (above the active tab's content, which the pane loop already drew).
         let tab_bg = Color::rgb(0x14, 0x14, 0x1a); // inactive tab background
