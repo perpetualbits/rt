@@ -75,6 +75,21 @@ impl Snapshot {
     }
 }
 
+/// Line-index bounds of the grid, returned by [`TermPane::line_bounds`]. All
+/// values are in `alacritty_terminal`'s integer line space: `0..screen_lines`
+/// is the visible screen, negative indices are scrollback history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineBounds {
+    /// Oldest readable line (`<= 0`); the top of scrollback.
+    pub topmost: i32,
+    /// Newest readable line (`screen_lines - 1`); the bottom of the screen.
+    pub bottommost: i32,
+    /// Height of the visible screen in rows.
+    pub screen_lines: usize,
+    /// Width of the grid in columns.
+    pub cols: usize,
+}
+
 /// Fixed initial grid dimensions expressed as an `alacritty_terminal`
 /// `Dimensions`. The engine is told how many columns/lines it has; the renderer
 /// recomputes this from pixel size ÷ cell size and calls [`TermPane::resize`].
@@ -316,6 +331,65 @@ impl TermPane {
             }
         }
         Snapshot { cols, rows: grid }
+    }
+
+    /// The line-index bounds of everything currently in the grid, so a caller
+    /// (notably newspaper-column view) can compute which slice of the line
+    /// buffer to show and how far it may scroll.
+    ///
+    /// Returns [`LineBounds`] with the topmost (most negative = oldest history)
+    /// and bottommost (newest visible) line indices, the visible height, and the
+    /// column count — all in `alacritty_terminal`'s `Line`/`Column` integer
+    /// space where `0..screen_lines` is the visible screen and negatives are
+    /// scrollback.
+    pub fn line_bounds(&self) -> LineBounds {
+        let term = self.term.lock(); // read access to the grid metrics
+        LineBounds {
+            topmost: term.topmost_line().0,       // oldest line (<= 0), from history size
+            bottommost: term.bottommost_line().0, // newest visible line (screen_lines-1)
+            screen_lines: term.screen_lines(),    // viewport height in rows
+            cols: term.columns(),                 // viewport width in columns
+        }
+    }
+
+    /// Whether the terminal is on its alternate screen (as full-screen TUIs like
+    /// `vim`/`htop`/`less` use). Newspaper-column flow is meaningless there — the
+    /// app owns the whole screen — so the renderer falls back to a single column
+    /// when this is true.
+    pub fn is_alt_screen(&self) -> bool {
+        use alacritty_terminal::term::TermMode; // the mode bitflags
+        let term = self.term.lock(); // read the current terminal mode
+        term.mode().contains(TermMode::ALT_SCREEN) // set while on the alt screen
+    }
+
+    /// Capture an arbitrary run of `rows` lines starting at grid line index
+    /// `top`, reading through scrollback history as needed. Lines outside the
+    /// valid `[topmost, bottommost]` range come back blank, so callers never
+    /// have to bounds-check. This is the history-aware primitive that newspaper
+    /// columns are built on (it fetches the `N × height` lines a multi-column
+    /// view shows at once); [`TermPane::snapshot`] handles the ordinary visible
+    /// screen.
+    pub fn snapshot_lines(&self, top: i32, rows: usize) -> Snapshot {
+        use alacritty_terminal::index::{Column, Line}; // integer grid coordinates
+        let term = self.term.lock(); // read access for the whole capture
+        let grid = term.grid(); // the cell storage
+        let cols = term.columns(); // width to copy per line
+        let topmost = term.topmost_line().0; // oldest readable line index
+        let bottommost = term.bottommost_line().0; // newest readable line index
+        let mut out = Vec::with_capacity(rows); // one inner Vec per requested line
+        for r in 0..rows {
+            let idx = top + r as i32; // the grid line this output row maps to
+            // Start blank; only fill if the line index is actually in the grid.
+            let mut line = vec![SnapCell { c: ' ' }; cols];
+            if idx >= topmost && idx <= bottommost {
+                let row = &grid[Line(idx)]; // borrow the stored row
+                for c in 0..cols {
+                    line[c] = SnapCell { c: row[Column(c)].c }; // copy each glyph
+                }
+            }
+            out.push(line); // append this (possibly blank) line
+        }
+        Snapshot { cols, rows: out }
     }
 
     /// Remove and return all pending high-level events (title/bell/exit/wakeup)

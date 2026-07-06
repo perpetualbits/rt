@@ -143,3 +143,39 @@ Workspace: 30 tests green (core 9, engine 2, config 6, session 8, rt input 5).
 
 **Next:** multi-pane/split visual check + cursor + grid colours; then M6
 packaging (deb/rpm/arch × x86_64/aarch64/rv64).
+
+## 2026-07-06 — Session 1: newspaper columns (rt-original feature)
+
+User request: newspaper columns *within* a pane — text flowing bottom-of-col-1
+→ top-of-col-2, scroll shifting the flow across column boundaries. They asked
+whether to do it now or later; I judged the *data-model seams* worth placing now
+(cheap now, an overhaul later) and built the feature on them.
+
+Two seams landed first, each tested:
+- **Engine**: `snapshot_lines(top, rows)` reads an arbitrary line range through
+  scrollback (the plain `snapshot()` only saw the visible screen — that
+  assumption everywhere would have been the overhaul). Plus `line_bounds()` and
+  `is_alt_screen()`.
+- **Session**: per-pane column count, `column_layout()` (count/col_cells/rows/
+  gap) shared by relayout + renderer, and a column scroll offset. A column pane
+  runs its PTY at ONE column's width so the shell wraps per column.
+
+Config got `ColumnsMore`/`ColumnsFewer` (`Ctrl+.`/`Ctrl+,` — Ctrl+symbol, no
+Shift, because winit remaps shifted symbols to different chars). The renderer
+lays the `N×rows` lines out column-major, draws gap separators, handles wheel
+scroll, and falls back to single-column on the alt screen (TUIs own the screen).
+
+**Visually verified** via a throwaway X11 build (this compositor has no
+wlr-screencopy for grim and no GNOME screenshot D-Bus, but does run Xwayland;
+the render code is backend-agnostic so the shot is faithful). `RT_COLUMNS=3
+RT_EXEC='seq 1 200'` produced exactly the spec: col1 …139, col2 140…170, col3
+171…200+prompt. `docs/screenshots/newspaper-columns.png`, design in
+`docs/COLUMNS.md`. Reverted Cargo.toml to Wayland-only (verified zero x11 crates).
+
+Tooling note: `xdotool` can't drive the Wayland-native window (X11-only); used
+env-driven startup layout (`RT_SPLIT`/`RT_COLUMNS`/`RT_EXEC`) for deterministic
+verification instead — doubles as the seed of the saved-layouts feature.
+
+Workspace: 33 tests green (core 9, engine 3, config 6, session 10, rt 5).
+
+**Next:** multi-pane split screenshot; then M6 packaging, or grid colours/cursor.

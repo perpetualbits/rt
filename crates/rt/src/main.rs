@@ -24,7 +24,7 @@ use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -183,14 +183,41 @@ impl ApplicationHandler for App {
 
         // --- build the session with real PTY panes -----------------------
         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        // Optional demo/verification hook: RT_EXEC runs a command in every new
+        // pane before dropping to an interactive shell. Handy for screenshots
+        // (e.g. RT_EXEC='seq 1 200') and a stepping-stone toward saved layouts.
+        let exec = std::env::var("RT_EXEC").ok();
         // The factory spawns a shell-backed pane at the requested cell size. A
         // spawn failure here is fatal (no PTY available) — we surface it by
         // panicking with a clear message rather than rendering a broken pane.
-        let spawn: Box<dyn FnMut(usize, usize) -> TermPane> = Box::new(|cols, rows| {
-            TermPane::spawn(None, None, cols.max(1), rows.max(1))
+        let spawn: Box<dyn FnMut(usize, usize) -> TermPane> = Box::new(move |cols, rows| {
+            // If RT_EXEC is set, run it then keep an interactive shell open.
+            let shell = exec.as_ref().map(|cmd| {
+                ("/bin/sh".to_string(), vec!["-c".to_string(), format!("{cmd}; exec /bin/sh -i")])
+            });
+            TermPane::spawn(shell, None, cols.max(1), rows.max(1))
                 .expect("failed to spawn a PTY/shell for a pane")
         });
-        let session = Session::new(bounds, cell, spawn);
+        let mut session = Session::new(bounds, cell, spawn);
+
+        // Dev/demo startup layout (seed of the future saved-layouts feature):
+        //   RT_SPLIT=h|v    → perform one split at startup
+        //   RT_COLUMNS=N    → put the initial pane into N-column newspaper mode
+        if let Ok(v) = std::env::var("RT_SPLIT") {
+            let _ = match v.as_str() {
+                "h" => session.apply(rt_config::Action::SplitHoriz), // stacked split
+                "v" => session.apply(rt_config::Action::SplitVert),  // side-by-side split
+                _ => None,
+            };
+        }
+        if let Ok(v) = std::env::var("RT_COLUMNS") {
+            if let Ok(n) = v.parse::<u16>() {
+                // Each ColumnsMore adds one column; go from 1 up to N.
+                for _ in 1..n.max(1) {
+                    session.apply(rt_config::Action::ColumnsMore);
+                }
+            }
+        }
 
         // Store the fully-initialised state and paint once.
         self.active = Some(Active {
@@ -243,6 +270,21 @@ impl ApplicationHandler for App {
                     return;
                 }
                 self.on_key_press(key_event);
+            }
+
+            // Mouse wheel scrolls the focused pane's newspaper-column view
+            // through history (positive y = up = toward older content).
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Normalise both delta kinds to a signed line count.
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as isize, // notch-based devices
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as isize, // touchpads (~20px/line)
+                };
+                if lines != 0 {
+                    let focus = active.session.focus(); // scroll the focused pane
+                    active.session.scroll_columns(focus, lines); // shift its column viewport
+                    active.window.request_redraw(); // repaint at the new offset
+                }
             }
 
             // Time to paint.
@@ -329,19 +371,55 @@ impl App {
         active.renderer.begin_frame(bg); // clear to bg
 
         let focus = active.session.focus(); // which pane is focused
+        let (cell_w, _cell_h) = active.renderer.cell_size(); // px per cell (for column offsets)
+        let sep = Color::rgb(0x2a, 0x2a, 0x33); // subtle inter-column separator colour
         // Draw every visible pane.
         for (id, rect) in active.session.tree().rects(bounds) {
             // Fill this pane's background (in case the clear colour differs).
             active.renderer.fill_rect(rect.x, rect.y, rect.w, rect.h, bg);
+            let n = active.session.columns_of(id); // newspaper column count (1 = normal)
             // Copy the pane's current grid and draw each non-blank cell.
             if let Some(pane) = active.session.pane(id) {
-                let snap = pane.snapshot(); // immutable grid copy
-                for (row_idx, row) in snap.rows.iter().enumerate() {
-                    for (col_idx, cell) in row.iter().enumerate() {
-                        // Skip spaces to save quads (bg already drawn).
-                        if cell.c != ' ' {
-                            active.renderer.draw_char(rect.x, rect.y, col_idx, row_idx, cell.c, fg);
+                // Newspaper columns only make sense on the primary screen; a
+                // full-screen TUI (alt screen) always renders as a single column.
+                if n <= 1 || pane.is_alt_screen() {
+                    // --- ordinary single-column pane ---
+                    let snap = pane.snapshot(); // just the visible screen
+                    for (row_idx, row) in snap.rows.iter().enumerate() {
+                        for (col_idx, cell) in row.iter().enumerate() {
+                            if cell.c != ' ' {
+                                active.renderer.draw_char(rect.x, rect.y, col_idx, row_idx, cell.c, fg);
+                            }
                         }
+                    }
+                } else {
+                    // --- newspaper-column pane ---
+                    let layout = active.session.column_layout(id, rect); // count/col_cells/rows/gap
+                    let b = pane.line_bounds(); // available line-index range
+                    let need = layout.count as usize * layout.rows; // lines shown at once
+                    let scroll = active.session.col_scroll_of(id) as i32; // lines scrolled into history
+                    // Bottom-anchored by default; scrolling moves `top` earlier.
+                    let mut top = b.bottommost - need as i32 + 1 - scroll; // first shown line
+                    if top < b.topmost {
+                        top = b.topmost; // clamp so we can't scroll past the oldest line
+                    }
+                    // Fetch the whole run in one call; row r maps column-major.
+                    let snap = pane.snapshot_lines(top, need);
+                    let step = (layout.col_cells + layout.gap) as f32 * cell_w; // px between column origins
+                    for (r, row) in snap.rows.iter().enumerate() {
+                        let nc = r / layout.rows; // which newspaper column this line lands in
+                        let line = r % layout.rows; // row within that column
+                        let ox = rect.x + nc as f32 * step; // this column's left pixel
+                        for (col_idx, cell) in row.iter().enumerate() {
+                            if cell.c != ' ' {
+                                active.renderer.draw_char(ox, rect.y, col_idx, line, cell.c, fg);
+                            }
+                        }
+                    }
+                    // Thin separators between columns, drawn in each gap.
+                    for nc in 1..layout.count as usize {
+                        let x = rect.x + nc as f32 * step - (layout.gap as f32 * 0.5) * cell_w; // gap centre
+                        active.renderer.fill_rect(x, rect.y, 1.0, rect.h, sep); // 1px vertical rule
                     }
                 }
             }

@@ -142,6 +142,38 @@ fn closing_one_of_two_keeps_window_and_refocuses() {
 }
 
 #[test]
+fn columns_action_changes_count_and_pty_width() {
+    let (mut session, logs) = make(); // 1000x800 window, 10x20 cells -> 100 cols
+    let first = session.focus(); // the only pane
+    assert_eq!(session.columns_of(first), 1); // starts single-column
+    // Ctrl+. three times: 1 -> 2 -> 3 -> 4 columns (each press adds one).
+    session.apply(Action::ColumnsMore);
+    session.apply(Action::ColumnsMore);
+    session.apply(Action::ColumnsMore);
+    assert_eq!(session.columns_of(first), 4);
+    // The PTY should have been resized to one column's width: full 100 cols
+    // minus gaps (2*(4-1)=6), /4 = 23.
+    assert_eq!(logs.borrow()[0].borrow().size, (23, 40));
+    // Ctrl+, floors at 1 no matter how many times pressed.
+    for _ in 0..5 {
+        session.apply(Action::ColumnsFewer);
+    }
+    assert_eq!(session.columns_of(first), 1); // never below 1
+    assert_eq!(logs.borrow()[0].borrow().size, (100, 40)); // back to full width
+}
+
+#[test]
+fn column_scroll_clamps_at_bottom() {
+    let (mut session, _logs) = make();
+    let first = session.focus();
+    assert_eq!(session.col_scroll_of(first), 0); // bottom-anchored initially
+    session.scroll_columns(first, -5); // scrolling down past the bottom...
+    assert_eq!(session.col_scroll_of(first), 0); // ...stays clamped at 0
+    session.scroll_columns(first, 12); // scroll up into history
+    assert_eq!(session.col_scroll_of(first), 12);
+}
+
+#[test]
 fn close_window_action_is_forwarded() {
     let (mut session, _logs) = make();
     assert_eq!(session.apply(Action::CloseWindow), Some(SessionEvent::CloseWindow));

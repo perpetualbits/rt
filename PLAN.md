@@ -152,6 +152,17 @@ rt/
 - ☐ Multi-pane visual check (split rendering); cursor block; colours/attrs from
   the grid (currently one fg colour); tab strip drawing.
 
+### M5b — Newspaper columns (rt-original feature)  ◐  (VISUALLY VERIFIED)
+- ☑ Engine seam: history-aware `snapshot_lines(top,rows)` + `line_bounds()` +
+  `is_alt_screen()`. Tested (`rt-engine/tests/history.rs`).
+- ☑ Session seam: per-pane column count + `column_layout()` + column scroll;
+  column-aware `relayout` sizes the PTY to one column. Tested.
+- ☑ Config: `ColumnsMore`/`ColumnsFewer` actions, `Ctrl+.`/`Ctrl+,` bindings.
+- ☑ Renderer: column-major layout of `N×rows` lines + separators + wheel scroll
+  + alt-screen fallback. **Verified**: `docs/screenshots/newspaper-columns.png`
+  (3 cols, `seq 1 200` flows 139→140, 170→171). See `docs/COLUMNS.md`.
+- ☐ Scroll indicator; auto-snap-to-bottom; selection across columns.
+
 ### M5 — Terminator features  ◐  (controller logic done + tested; GL wiring next)
 - ☑ Keybinding config parse (`rt-config`): Terminator accelerator syntax +
   default map + `Action` enum. 6 tests.

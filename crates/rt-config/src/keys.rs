@@ -122,6 +122,8 @@ impl Chord {
             "page_down" | "pagedown" => return Some(Key::PageDown),
             "plus" => return Some(Key::Char('+')), // GTK spells '+' as "plus"
             "minus" => return Some(Key::Char('-')), // and '-' as "minus"
+            "period" => return Some(Key::Char('.')), // GTK name for '.'
+            "comma" => return Some(Key::Char(',')), // GTK name for ','
             _ => {}
         }
         // Function keys: an 'F'/'f' followed by 1..=12.

@@ -49,6 +49,10 @@ pub enum Action {
     BroadcastAll,
     /// `close_window` — close the whole window.
     CloseWindow,
+    /// rt-specific: add one newspaper column to the focused pane (1 = normal).
+    ColumnsMore,
+    /// rt-specific: remove one newspaper column (clamped at 1 = normal).
+    ColumnsFewer,
 }
 
 /// The keymap: an ordered list of `(chord, action)` bindings.
@@ -85,6 +89,10 @@ impl Keymap {
             ("<Shift><Control>c", Action::Copy),         // copy
             ("<Shift><Control>v", Action::Paste),        // paste
             ("<Shift><Control>q", Action::CloseWindow),  // close_window
+            // rt-specific newspaper-column controls. Deliberately Ctrl+symbol
+            // (no Shift) so winit's shifted-symbol remapping can't break them.
+            ("<Control>period", Action::ColumnsMore),    // Ctrl+.  -> more columns
+            ("<Control>comma", Action::ColumnsFewer),    // Ctrl+,  -> fewer columns
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {

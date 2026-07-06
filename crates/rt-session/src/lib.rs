@@ -38,6 +38,29 @@ impl Backend for rt_engine::TermPane {
     }
 }
 
+/// Maximum newspaper columns a single pane may be split into. A soft cap that
+/// keeps each column wide enough to be readable.
+pub const MAX_COLUMNS: u16 = 8;
+
+/// Cells of horizontal gap drawn between adjacent newspaper columns.
+const COL_GAP: usize = 2;
+
+/// The computed geometry of a pane's newspaper-column view, shared by the
+/// controller (to size the PTY) and the renderer (to place text). When
+/// `count == 1` this describes an ordinary single-column pane and `col_cells`
+/// equals the pane's full width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnLayout {
+    /// Number of newspaper columns (>= 1; 1 means a normal pane).
+    pub count: u16,
+    /// Width of one column in character cells (the PTY runs at this width).
+    pub col_cells: usize,
+    /// Height of the pane in character rows (every column is this tall).
+    pub rows: usize,
+    /// Gap between columns in character cells.
+    pub gap: usize,
+}
+
 /// How typed input fans out to other panes — rt's port of Terminator's
 /// input broadcast / grouping feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -75,6 +98,8 @@ pub struct Session<B: Backend, F: FnMut(usize, usize) -> B> {
     tree: Tree,                        // the split/tab layout
     panes: HashMap<PaneId, B>,         // one backend per live leaf
     groups: HashMap<PaneId, u32>,      // pane -> group id (for Broadcast::Group)
+    columns: HashMap<PaneId, u16>,     // pane -> newspaper column count (absent = 1)
+    col_scroll: HashMap<PaneId, usize>, // pane -> lines scrolled up in column view
     focus: PaneId,                     // the currently focused pane
     broadcast: Broadcast,              // current input fan-out mode
     bounds: Rect,                      // window content rectangle in pixels
@@ -98,6 +123,8 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             tree,
             panes,
             groups: HashMap::new(), // no groups assigned initially
+            columns: HashMap::new(), // every pane starts single-column
+            col_scroll: HashMap::new(), // no column scrolling yet
             focus: first,           // focus starts on the only pane
             broadcast: Broadcast::Off,
             bounds,
@@ -120,6 +147,42 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     /// Immutable access to the layout tree (the renderer calls `.rects(...)`).
     pub fn tree(&self) -> &Tree {
         &self.tree
+    }
+
+    /// How many newspaper columns pane `id` is showing (1 = a normal pane).
+    pub fn columns_of(&self, id: PaneId) -> u16 {
+        self.columns.get(&id).copied().unwrap_or(1).max(1) // absent means single-column
+    }
+
+    /// How many lines pane `id`'s column view is scrolled up into history.
+    pub fn col_scroll_of(&self, id: PaneId) -> usize {
+        self.col_scroll.get(&id).copied().unwrap_or(0) // absent means bottom-anchored
+    }
+
+    /// Compute the newspaper-column geometry for pane `id` occupying `rect`.
+    /// Shared by [`Session::relayout`] (to size the PTY to one column's width)
+    /// and by the renderer (to place each column). For a single-column pane,
+    /// `col_cells` is simply the pane's full width.
+    pub fn column_layout(&self, id: PaneId, rect: Rect) -> ColumnLayout {
+        let (full_cols, rows) = cells_in(rect, self.cell); // full pane cell dims
+        let count = self.columns_of(id); // 1..=MAX_COLUMNS
+        let col_cells = if count <= 1 {
+            full_cols // ordinary pane: the column *is* the whole pane
+        } else {
+            // Subtract the inter-column gaps, then split the rest evenly.
+            let gap_total = COL_GAP * (count as usize - 1); // cells consumed by gaps
+            (full_cols.saturating_sub(gap_total) / count as usize).max(1) // per-column width
+        };
+        ColumnLayout { count, col_cells, rows, gap: COL_GAP }
+    }
+
+    /// Scroll pane `id`'s column view by `delta` lines (positive = toward older
+    /// history/up, negative = toward newer/down), clamped at 0 (the bottom).
+    /// The upper bound is enforced by the renderer against available history.
+    pub fn scroll_columns(&mut self, id: PaneId, delta: isize) {
+        let cur = self.col_scroll_of(id) as isize; // current offset as signed
+        let next = (cur + delta).max(0) as usize; // clamp so we never scroll below the newest
+        self.col_scroll.insert(id, next); // store the new offset
     }
 
     /// Borrow a pane's backend by id (renderer reads snapshots through the
@@ -170,6 +233,20 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             }
             Action::BroadcastAll => {
                 self.broadcast = Broadcast::All;
+                Some(SessionEvent::Redraw)
+            }
+            // Newspaper columns: adjust the focused pane's column count and
+            // resize its PTY (relayout uses the per-pane column width).
+            Action::ColumnsMore => {
+                let n = self.columns.entry(self.focus).or_insert(1); // default single
+                *n = (*n + 1).min(MAX_COLUMNS); // add a column, capped
+                self.relayout(self.bounds); // PTY now runs at the narrower width
+                Some(SessionEvent::Redraw)
+            }
+            Action::ColumnsFewer => {
+                let n = self.columns.entry(self.focus).or_insert(1);
+                *n = n.saturating_sub(1).max(1); // remove a column, floor at 1
+                self.relayout(self.bounds); // PTY widens back out
                 Some(SessionEvent::Redraw)
             }
             // Clipboard is owned by the GUI shell; just forward the intent.
@@ -230,9 +307,11 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     pub fn relayout(&mut self, bounds: Rect) {
         self.bounds = bounds; // remember the new window size
         for (id, rect) in self.tree.rects(bounds) {
-            let (cols, rows) = cells_in(rect, self.cell); // this pane's cell dims
+            // A column pane runs its PTY at ONE column's width so the shell
+            // wraps per newspaper column; a normal pane uses the full width.
+            let layout = self.column_layout(id, rect); // count/col_cells/rows
             if let Some(p) = self.panes.get_mut(&id) {
-                p.resize(cols, rows); // push the size down to the PTY
+                p.resize(layout.col_cells, layout.rows); // size PTY to a single column
             }
         }
     }
@@ -275,6 +354,8 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         }
         self.panes.remove(&closing); // drop backend → PTY shutdown+join (Drop)
         self.groups.remove(&closing); // forget any group membership
+        self.columns.remove(&closing); // forget its column count
+        self.col_scroll.remove(&closing); // forget its scroll offset
         if self.tree.is_empty() {
             return Some(SessionEvent::CloseWindow); // no panes left → close window
         }
