@@ -68,3 +68,26 @@ fn arrows_respect_application_cursor_mode() {
     // Home/End follow the same rule.
     assert_eq!(encode_key(&Key::Named(NamedKey::Home), ModifiersState::empty(), true), Some(b"\x1bOH".to_vec()));
 }
+
+#[test]
+fn encode_text_sends_composed_and_ctrl() {
+    use rt_app::input::encode_text;
+    // A composed dead-key result (e.g. '+space -> ') is sent as its text.
+    assert_eq!(encode_text("'", ModifiersState::empty()), b"'".to_vec());
+    assert_eq!(encode_text("ñ", ModifiersState::empty()), "ñ".as_bytes().to_vec());
+    // Ctrl + letter -> C0 control code.
+    assert_eq!(encode_text("c", ModifiersState::CONTROL), vec![0x03]);
+    // Alt (Meta) prefixes ESC.
+    assert_eq!(encode_text("x", ModifiersState::ALT), vec![0x1b, b'x']);
+}
+
+#[test]
+fn sequence_keys_are_classified() {
+    use rt_app::input::is_sequence_key;
+    assert!(is_sequence_key(&NamedKey::ArrowUp));
+    assert!(is_sequence_key(&NamedKey::Enter));
+    assert!(is_sequence_key(&NamedKey::F5));
+    // Space is NOT a sequence key: it must go through the text path so a
+    // dead-key + space composes correctly.
+    assert!(!is_sequence_key(&NamedKey::Space));
+}

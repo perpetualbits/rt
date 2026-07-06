@@ -801,16 +801,25 @@ impl App {
                 return; // consumed
             }
         }
-        // Not a binding: treat as ordinary typing. Encode to PTY bytes and feed
-        // the focused pane (or the broadcast set). We consult the focused pane's
-        // application-cursor-keys mode so arrows are encoded the way the running
-        // program (mc/vim/…) expects.
+        // Not a binding: ordinary typing. Navigation/editing/function keys become
+        // ANSI escape sequences; everything else sends the key's *produced text*
+        // (`key_event.text`), which already contains dead-key / compose results
+        // (e.g. `'`+space → `'`) that the logical key alone would miss.
         let app_cursor = active
             .session
             .pane(active.session.focus()) // the focused pane's backend
             .map(|p| p.app_cursor_keys()) // its DECCKM state
             .unwrap_or(false); // default to normal cursor keys
-        if let Some(bytes) = input::encode_key(&key_event.logical_key, mods, app_cursor) {
+        let bytes = match &key_event.logical_key {
+            Key::Named(n) if input::is_sequence_key(n) => {
+                input::encode_key(&key_event.logical_key, mods, app_cursor) // arrows/enter/…
+            }
+            _ => match key_event.text.as_ref().filter(|t| !t.is_empty()) {
+                Some(text) => Some(input::encode_text(text, mods)), // the composed text
+                None => input::encode_key(&key_event.logical_key, mods, app_cursor), // fallback (Ctrl combos, etc.)
+            },
+        };
+        if let Some(bytes) = bytes {
             active.session.feed_input(&bytes); // send to the shell(s)
         }
     }

@@ -84,6 +84,90 @@ pub fn chord_from_winit(key: &Key, mods: ModifiersState) -> Option<Chord> {
     Some(Chord::new(mods_from_winit(mods), rt_key)) // combine with modifiers
 }
 
+/// Whether a named key must be sent as an ANSI escape sequence (via
+/// [`encode_key`]) rather than as its produced text. These are the navigation/
+/// editing/function keys; *everything else* (printable characters, and crucially
+/// keys whose text is a dead-key/compose result like `'`+space→`'`) is sent as
+/// [`encode_text`] of `key_event.text`.
+pub fn is_sequence_key(named: &NamedKey) -> bool {
+    matches!(
+        named,
+        NamedKey::ArrowUp
+            | NamedKey::ArrowDown
+            | NamedKey::ArrowLeft
+            | NamedKey::ArrowRight
+            | NamedKey::Home
+            | NamedKey::End
+            | NamedKey::PageUp
+            | NamedKey::PageDown
+            | NamedKey::Insert
+            | NamedKey::Delete
+            | NamedKey::Enter
+            | NamedKey::Backspace
+            | NamedKey::Tab
+            | NamedKey::Escape
+            | NamedKey::F1
+            | NamedKey::F2
+            | NamedKey::F3
+            | NamedKey::F4
+            | NamedKey::F5
+            | NamedKey::F6
+            | NamedKey::F7
+            | NamedKey::F8
+            | NamedKey::F9
+            | NamedKey::F10
+            | NamedKey::F11
+            | NamedKey::F12
+    )
+}
+
+/// The C0 control code for `Ctrl` + a single character, or `None` if the
+/// character doesn't map to one. Covers letters (Ctrl-A=1 … Ctrl-Z=26) and the
+/// standard symbol combos (Ctrl-@/Space=NUL, Ctrl-[ = ESC, etc.).
+fn ctrl_code(c: char) -> Option<u8> {
+    match c {
+        'a'..='z' => Some(c as u8 - 0x60), // a→1 … z→26
+        'A'..='Z' => Some(c as u8 - 0x40), // A→1 … Z→26
+        ' ' | '@' => Some(0x00),           // NUL
+        '[' => Some(0x1b),                 // ESC
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' | '?' => Some(0x1f),
+        _ => None,
+    }
+}
+
+/// Encode the *text* a key produced (already dead-key/compose-resolved by
+/// winit's `key_event.text`) into PTY bytes, applying Ctrl (→ C0 control code)
+/// and Alt (→ ESC/Meta prefix). This is the path that fixes composed characters
+/// like `'`+space→`'`, since it sends the produced text rather than deriving a
+/// character from the logical key.
+pub fn encode_text(text: &str, mods: ModifiersState) -> Vec<u8> {
+    // Ctrl + a lone printable char → its control code (unless the text is
+    // already a control character, which passes straight through below).
+    if mods.control_key() {
+        let mut chars = text.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if let Some(code) = ctrl_code(c) {
+                let mut out = Vec::new();
+                if mods.alt_key() {
+                    out.push(0x1b); // Alt → ESC prefix even with Ctrl
+                }
+                out.push(code);
+                return out;
+            }
+        }
+    }
+    // Otherwise send the text as UTF-8, prefixed by ESC when Alt (Meta) is held.
+    let mut out = Vec::new();
+    if mods.alt_key() {
+        out.push(0x1b);
+    }
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
 /// Build a cursor/Home/End escape sequence with the given final byte, choosing
 /// SS3 (`ESC O x`) when application-cursor-keys mode is on, else CSI (`ESC [ x`).
 /// This one helper keeps all six keys consistent.

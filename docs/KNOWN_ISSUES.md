@@ -95,13 +95,15 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
 - ☑ **Tab & window titles** from OSC (`docs/screenshots/tab-titles.png`).
 - ☑ **Config persistence** — settings saved to `~/.config/rt/config.toml`, loaded
   at startup (opacity, scrim, focus-follows-mouse; more as features land).
-- ☑ **Dead keys / IME** — `[user: ~ \` ' " ^ compose keys didn't work]`. Enabled
-  winit IME (`set_ime_allowed(true)`); composed text (´+o→ó, ~+n→ñ) arrives via
-  `Ime::Commit`; key presses are suppressed while a preedit is active so the
-  dead key and its result aren't both sent (mirrors alacritty). Normal typing
-  verified still works with IME on; dead-key composition needs a compose-capable
-  layout to observe (on the user's machine). Preedit is not yet *rendered*
-  inline (follow-up).
+- ☑ **Dead keys / compose** — `[user: ~ \` ' " ^ ]`. Two-part fix: (1) enabled
+  winit IME (`set_ime_allowed(true)`) so IME/CJK commits arrive via `Ime::Commit`
+  (keys gated during a preedit). (2) **The real fix for `'`+space→`'`:** send
+  `key_event.text` (winit's already dead-key/compose-resolved text) for character
+  input instead of deriving a char from `logical_key` — the composed base char
+  is in `text` while `logical_key` is a `Dead`/unidentified key we were ignoring.
+  Navigation/function keys still use ANSI sequences (`is_sequence_key`); Ctrl/Alt
+  handled in `encode_text`. Unit-tested; normal typing re-verified. Confirm the
+  `'`+space / `\``/`~`/`^`/`"` cases on a compose layout.
 - ☑ **Copy/paste** (Wayland). Mouse drag-selects text (highlight verified,
   `docs/screenshots/selection.png`); Ctrl+Shift+C copies to CLIPBOARD + PRIMARY;
   Ctrl+Shift+V pastes; middle-click pastes PRIMARY; copy-on-select to PRIMARY.
