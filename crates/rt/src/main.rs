@@ -64,6 +64,7 @@ struct Active {
     egui_state: egui_winit::State,        // egui-winit input bridge
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
     prefs_open: bool,                     // whether the preferences dialog is showing
+    palette: std::sync::Arc<std::sync::Mutex<rt_engine::Palette>>, // shared so new panes inherit current colours
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -311,7 +312,34 @@ impl ApplicationHandler for App {
         // Optional demo/verification hook: RT_EXEC runs a command in every new
         // pane before dropping to an interactive shell. Handy for screenshots
         // (e.g. RT_EXEC='seq 1 200') and a stepping-stone toward saved layouts.
+        // Load persisted settings from ~/.config/rt/config.toml so they survive
+        // restarts; env vars below override for demos/screenshots. Loaded here
+        // (before the session) so pane colours come from the configured palette.
+        let mut settings = rt_config::Config::load().settings;
+        if let Ok(v) = std::env::var("RT_OPACITY") {
+            if let Ok(o) = v.parse::<f32>() {
+                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0);
+            }
+        }
+        if let Ok(v) = std::env::var("RT_SCRIM") {
+            if let Ok(s) = v.parse::<f32>() {
+                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM);
+            }
+        }
+        if let Ok(v) = std::env::var("RT_FOCUS") {
+            settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
+        }
+
         let exec = std::env::var("RT_EXEC").ok();
+        // Shared colour palette (built from the configured colours). Every new
+        // pane picks up the *current* palette, so a colour-scheme change applies
+        // to panes created afterwards too.
+        let palette = std::sync::Arc::new(std::sync::Mutex::new(rt_engine::Palette::new(
+            settings.foreground,
+            settings.background,
+            settings.palette,
+        )));
+        let palette_spawn = palette.clone();
         // The factory spawns a shell-backed pane at the requested cell size. A
         // spawn failure here is fatal (no PTY available) — we surface it by
         // panicking with a clear message rather than rendering a broken pane.
@@ -320,8 +348,12 @@ impl ApplicationHandler for App {
             let shell = exec.as_ref().map(|cmd| {
                 ("/bin/sh".to_string(), vec!["-c".to_string(), format!("{cmd}; exec /bin/sh -i")])
             });
-            TermPane::spawn(shell, None, cols.max(1), rows.max(1))
-                .expect("failed to spawn a PTY/shell for a pane")
+            let mut pane = TermPane::spawn(shell, None, cols.max(1), rows.max(1))
+                .expect("failed to spawn a PTY/shell for a pane");
+            if let Ok(p) = palette_spawn.lock() {
+                pane.set_palette(p.clone()); // apply the current colours
+            }
+            pane
         });
         let mut session = Session::new(bounds, cell, spawn);
 
@@ -350,24 +382,6 @@ impl ApplicationHandler for App {
                     session.apply(rt_config::Action::NewTab);
                 }
             }
-        }
-
-        // Load persisted settings from ~/.config/rt/config.toml so they survive
-        // restarts; env vars below override for demos/screenshots.
-        let mut settings = rt_config::Config::load().settings;
-        if let Ok(v) = std::env::var("RT_OPACITY") {
-            if let Ok(o) = v.parse::<f32>() {
-                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0); // clamp to usable range
-            }
-        }
-        if let Ok(v) = std::env::var("RT_SCRIM") {
-            if let Ok(s) = v.parse::<f32>() {
-                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM); // clamp scrim range
-            }
-        }
-        // RT_FOCUS=sloppy|mouse|follow|1 enables focus-follows-mouse at startup.
-        if let Ok(v) = std::env::var("RT_FOCUS") {
-            settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
         }
 
         // egui overlay for chrome (preferences, colour pickers). Shares our GL
@@ -404,6 +418,7 @@ impl ApplicationHandler for App {
             egui_state,
             egui_painter,
             prefs_open: false,
+            palette,
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so its egui rendering can be screenshotted.
@@ -897,7 +912,8 @@ impl App {
         // The background carries the user's opacity in its alpha channel, so a
         // value < 1.0 makes empty areas translucent (the window(s) behind show
         // through, compositor permitting). Glyphs and chrome stay fully opaque.
-        let bg = Color::rgb(0x10, 0x10, 0x14).with_alpha(active.settings.background_opacity);
+        let cfg_bg = active.settings.background; // configured background RGB
+        let bg = Color::rgb(cfg_bg[0], cfg_bg[1], cfg_bg[2]).with_alpha(active.settings.background_opacity);
         let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline (opaque)
 
         let size = active.window.inner_size(); // physical pixels
@@ -962,8 +978,10 @@ impl App {
                         // otherwise draw an explicit (non-default) background.
                         if pane_sel.map_or(false, |s| s.contains(col_idx, sub)) {
                             active.renderer.fill_cell(ox, rect.y, col_idx, sub, sel_bg);
-                        } else if cell.bg != rt_engine::DEFAULT_BG {
-                            let c = cell.bg; // per-cell background colour
+                        } else if cell.bg != cfg_bg {
+                            // A non-default background: draw it opaque (default-bg
+                            // cells stay translucent via the window clear).
+                            let c = cell.bg;
                             active.renderer.fill_cell(ox, rect.y, col_idx, sub, Color::rgb(c[0], c[1], c[2]));
                         }
                         let fg = Color::rgb(cell.fg[0], cell.fg[1], cell.fg[2]); // per-cell foreground
@@ -992,7 +1010,7 @@ impl App {
                     if in_range {
                         use rt_engine::CursorShape;
                         let (ox, sub) = place(cur.line); // cursor's on-screen slot
-                        let cc = rt_engine::CURSOR; // cursor colour
+                        let cc = active.settings.foreground; // cursor colour = configured foreground
                         let ccol = Color::rgb(cc[0], cc[1], cc[2]);
                         let focused = id == focus; // is this the focused pane?
                         if !focused {
@@ -1108,8 +1126,20 @@ impl App {
         let output = ctx.end_pass();
         // Apply + persist any change the user made.
         if settings != active.settings {
+            // If the colours changed, rebuild the palette and apply it live to
+            // every pane (and the shared palette new panes inherit).
+            let colours_changed = settings.foreground != active.settings.foreground
+                || settings.background != active.settings.background
+                || settings.palette != active.settings.palette;
             active.settings = settings;
             Self::persist(&settings);
+            if colours_changed {
+                let pal = rt_engine::Palette::new(settings.foreground, settings.background, settings.palette);
+                if let Ok(mut p) = active.palette.lock() {
+                    *p = pal.clone(); // future panes inherit these colours
+                }
+                active.session.set_all_palettes(pal); // recolour existing panes
+            }
         }
         if close {
             active.prefs_open = false;

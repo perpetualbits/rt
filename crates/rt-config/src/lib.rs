@@ -89,15 +89,47 @@ pub struct Settings {
     /// pointer-focus coincide, since a pane is always focused (over a gutter the
     /// previous focus simply sticks).
     pub focus_follows_mouse: bool,
+    /// Default text colour (RGB). Cells that don't set an explicit foreground
+    /// use this.
+    pub foreground: [u8; 3],
+    /// Default background colour (RGB). The window clears to this (with the
+    /// opacity above), and cells with this background stay translucent.
+    pub background: [u8; 3],
+    /// The 16 ANSI palette colours (0–7 normal, 8–15 bright), RGB each. The
+    /// 256-colour cube and greyscale ramp are derived from these by the engine.
+    pub palette: [[u8; 3]; 16],
 }
+
+/// The default 16-colour ANSI palette (classic xterm values).
+pub const DEFAULT_PALETTE: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00], // 0 black
+    [0xcd, 0x00, 0x00], // 1 red
+    [0x00, 0xcd, 0x00], // 2 green
+    [0xcd, 0xcd, 0x00], // 3 yellow
+    [0x00, 0x00, 0xee], // 4 blue
+    [0xcd, 0x00, 0xcd], // 5 magenta
+    [0x00, 0xcd, 0xcd], // 6 cyan
+    [0xe5, 0xe5, 0xe5], // 7 white
+    [0x7f, 0x7f, 0x7f], // 8 bright black
+    [0xff, 0x00, 0x00], // 9 bright red
+    [0x00, 0xff, 0x00], // 10 bright green
+    [0xff, 0xff, 0x00], // 11 bright yellow
+    [0x5c, 0x5c, 0xff], // 12 bright blue
+    [0xff, 0x00, 0xff], // 13 bright magenta
+    [0x00, 0xff, 0xff], // 14 bright cyan
+    [0xff, 0xff, 0xff], // 15 bright white
+];
 
 impl Default for Settings {
     /// Sensible defaults: fully opaque, no scrim, click-to-focus.
     fn default() -> Self {
         Settings {
-            background_opacity: 1.0,     // opaque until the user dials it down
-            scrim_strength: 0.0,         // no scrim until the user enables it
-            focus_follows_mouse: false,  // click-to-focus by default
+            background_opacity: 1.0,       // opaque until the user dials it down
+            scrim_strength: 0.0,           // no scrim until the user enables it
+            focus_follows_mouse: false,    // click-to-focus by default
+            foreground: [0xd0, 0xd0, 0xd8], // light grey text
+            background: [0x10, 0x10, 0x14], // near-black background
+            palette: DEFAULT_PALETTE,      // classic xterm 16-colour palette
         }
     }
 }
@@ -124,6 +156,57 @@ impl Settings {
         self.scrim_strength
     }
 }
+
+/// A named colour scheme (foreground + background + 16 ANSI palette), for the
+/// preferences dialog's preset picker (rt's port of Terminator's `_Colors` menu).
+pub struct ColorScheme {
+    pub name: &'static str,
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub palette: [[u8; 3]; 16],
+}
+
+/// Built-in colour scheme presets. Selecting one fills fg/bg/palette; the user
+/// can then tweak individual colours.
+pub const SCHEMES: &[ColorScheme] = &[
+    ColorScheme { name: "rt default", foreground: [0xd0, 0xd0, 0xd8], background: [0x10, 0x10, 0x14], palette: DEFAULT_PALETTE },
+    ColorScheme {
+        name: "Solarized Dark",
+        foreground: [131, 148, 150],
+        background: [0, 43, 54],
+        palette: [
+            [7, 54, 66], [220, 50, 47], [133, 153, 0], [181, 137, 0], [38, 139, 210], [211, 54, 130], [42, 161, 152], [238, 232, 213],
+            [0, 43, 54], [203, 75, 22], [88, 110, 117], [101, 123, 131], [131, 148, 150], [108, 113, 196], [147, 161, 161], [253, 246, 227],
+        ],
+    },
+    ColorScheme {
+        name: "Dracula",
+        foreground: [248, 248, 242],
+        background: [40, 42, 54],
+        palette: [
+            [0, 0, 0], [255, 85, 85], [80, 250, 123], [241, 250, 140], [189, 147, 249], [255, 121, 198], [139, 233, 253], [191, 191, 191],
+            [77, 77, 77], [255, 110, 103], [90, 247, 142], [244, 249, 157], [202, 169, 250], [255, 146, 208], [154, 237, 254], [230, 230, 230],
+        ],
+    },
+    ColorScheme {
+        name: "Gruvbox Dark",
+        foreground: [235, 219, 178],
+        background: [40, 40, 40],
+        palette: [
+            [40, 40, 40], [204, 36, 29], [152, 151, 26], [215, 153, 33], [69, 133, 136], [177, 98, 134], [104, 157, 106], [168, 153, 132],
+            [146, 131, 116], [251, 73, 52], [184, 187, 38], [250, 189, 47], [131, 165, 152], [211, 134, 155], [142, 192, 124], [235, 219, 178],
+        ],
+    },
+    ColorScheme {
+        name: "Nord",
+        foreground: [216, 222, 233],
+        background: [46, 52, 64],
+        palette: [
+            [59, 66, 82], [191, 97, 106], [163, 190, 140], [235, 203, 139], [129, 161, 193], [180, 142, 173], [136, 192, 208], [229, 233, 240],
+            [76, 86, 106], [191, 97, 106], [163, 190, 140], [235, 203, 139], [129, 161, 193], [180, 142, 173], [143, 188, 187], [236, 239, 244],
+        ],
+    },
+];
 
 /// The persisted rt configuration (`~/.config/rt/config.toml`). Currently just
 /// wraps [`Settings`]; keybinding overrides and colour schemes will join it as

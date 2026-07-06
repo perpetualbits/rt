@@ -103,7 +103,12 @@ fn config_roundtrips_through_toml() {
     use rt_config::{Config, Settings};
     // A non-default config should survive serialise -> parse unchanged.
     let cfg = Config {
-        settings: Settings { background_opacity: 0.8, scrim_strength: 0.3, focus_follows_mouse: true },
+        settings: Settings {
+            background_opacity: 0.8,
+            scrim_strength: 0.3,
+            focus_follows_mouse: true,
+            ..Settings::default()
+        },
     };
     let text = toml::to_string(&cfg).expect("serialises");
     let back: Config = toml::from_str(&text).expect("parses");

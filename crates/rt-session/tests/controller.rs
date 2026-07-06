@@ -30,6 +30,7 @@ impl Backend for MockBackend {
     fn resize(&mut self, cols: usize, rows: usize) {
         self.log.borrow_mut().size = (cols, rows); // record the latest size
     }
+    fn set_palette(&mut self, _palette: rt_engine::Palette) {} // no-op for the mock
 }
 
 /// A spawner that hands out mock backends and stashes each one's log in a shared

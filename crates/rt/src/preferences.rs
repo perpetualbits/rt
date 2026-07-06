@@ -32,6 +32,40 @@ pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool) {
             );
 
             ui.separator();
+            ui.heading("Colours");
+            // Foreground / background swatches (egui colour pickers).
+            ui.horizontal(|ui| {
+                ui.label("Text");
+                ui.color_edit_button_srgb(&mut settings.foreground);
+                ui.label("Background");
+                ui.color_edit_button_srgb(&mut settings.background);
+            });
+            // The 16 ANSI palette colours, in two rows of eight.
+            ui.label("ANSI palette");
+            ui.horizontal(|ui| {
+                for c in settings.palette.iter_mut().take(8) {
+                    ui.color_edit_button_srgb(c);
+                }
+            });
+            ui.horizontal(|ui| {
+                for c in settings.palette.iter_mut().skip(8) {
+                    ui.color_edit_button_srgb(c);
+                }
+            });
+            // Preset schemes (Terminator's `_Colors` menu): clicking one fills
+            // fg/bg/palette, which the user can then tweak above.
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Preset:");
+                for scheme in rt_config::SCHEMES {
+                    if ui.button(scheme.name).clicked() {
+                        settings.foreground = scheme.foreground;
+                        settings.background = scheme.background;
+                        settings.palette = scheme.palette;
+                    }
+                }
+            });
+
+            ui.separator();
             ui.heading("Behaviour");
             // Focus mode: click-to-focus vs focus-follows-mouse (sloppy).
             ui.checkbox(&mut settings.focus_follows_mouse, "Focus follows mouse");

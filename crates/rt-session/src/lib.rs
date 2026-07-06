@@ -25,6 +25,8 @@ pub trait Backend {
     fn write(&self, bytes: &[u8]);
     /// Resize this pane to `cols` × `rows` character cells.
     fn resize(&mut self, cols: usize, rows: usize);
+    /// Apply a colour palette to this pane (for live colour-scheme changes).
+    fn set_palette(&mut self, palette: rt_engine::Palette);
 }
 
 // Bridge the real engine pane into the `Backend` trait. This is the only place
@@ -35,6 +37,9 @@ impl Backend for rt_engine::TermPane {
     }
     fn resize(&mut self, cols: usize, rows: usize) {
         rt_engine::TermPane::resize(self, cols, rows); // delegate
+    }
+    fn set_palette(&mut self, palette: rt_engine::Palette) {
+        rt_engine::TermPane::set_palette(self, palette); // delegate
     }
 }
 
@@ -319,6 +324,13 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             | Action::ScrimDown
             | Action::ToggleFocusFollowsMouse
             | Action::Preferences => None,
+        }
+    }
+
+    /// Apply a colour `palette` to every live pane (a colour-scheme change).
+    pub fn set_all_palettes(&mut self, palette: rt_engine::Palette) {
+        for p in self.panes.values_mut() {
+            p.set_palette(palette.clone());
         }
     }
 

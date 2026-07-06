@@ -15,7 +15,7 @@
 //! the direct antidote to Terminator's unguarded-callback crashes.
 
 mod palette; // xterm 256-colour palette + cell-colour resolution
-pub use palette::{Rgb, CURSOR, DEFAULT_BG, DEFAULT_FG}; // colours the renderer needs
+pub use palette::{Palette, Rgb, CURSOR, DEFAULT_BG, DEFAULT_FG}; // colours + configurable palette
 // (CursorShape/CursorPos are defined below and used by the renderer.)
 
 use std::borrow::Cow; // Msg::Input takes a Cow<[u8]>; we always own our bytes
@@ -457,13 +457,13 @@ impl TermPane {
                     let idx = n as usize; // NamedColor's discriminant doubles as an index
                     match idx {
                         0..=15 => self.palette.indexed(idx as u8), // the 16 ANSI colours
-                        256 => DEFAULT_FG,                          // Foreground
-                        257 => DEFAULT_BG,                          // Background
-                        258 => palette::CURSOR,                     // Cursor colour
-                        267 => DEFAULT_FG,                          // BrightForeground
-                        268 => palette::dim(DEFAULT_FG),            // DimForeground
+                        256 => self.palette.fg,                     // Foreground (configurable)
+                        257 => self.palette.bg,                     // Background (configurable)
+                        258 => self.palette.cursor,                 // Cursor colour
+                        267 => self.palette.fg,                     // BrightForeground
+                        268 => palette::dim(self.palette.fg),       // DimForeground
                         259..=266 => palette::dim(self.palette.indexed((idx - 259) as u8)), // DimBlack..White
-                        _ => if is_bg { DEFAULT_BG } else { DEFAULT_FG }, // any other named default
+                        _ => if is_bg { self.palette.bg } else { self.palette.fg }, // any other named default
                     }
                 }
             }
@@ -494,6 +494,13 @@ impl TermPane {
             fg = bg;
         }
         (fg, bg)
+    }
+
+    /// Replace this pane's colour palette (foreground/background/cursor + the
+    /// 16 ANSI colours and derived cube/greyscale). Used to apply configured or
+    /// preset colour schemes live; the next `snapshot` resolves cells against it.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
     }
 
     /// Scroll the terminal's scrollback view by `delta` lines: positive scrolls

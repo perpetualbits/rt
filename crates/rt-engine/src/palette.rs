@@ -46,15 +46,25 @@ const ANSI16: [Rgb; 16] = [
 #[derive(Clone)]
 pub struct Palette {
     colors: [Rgb; 256], // fully materialised 256-colour table
+    pub fg: Rgb,         // default foreground (Named::Foreground resolves here)
+    pub bg: Rgb,         // default background (Named::Background resolves here)
+    pub cursor: Rgb,     // cursor colour (Named::Cursor)
 }
 
 impl Palette {
-    /// Build the standard xterm 256-colour palette once. Cheap (256 entries),
-    /// so a `TermPane` builds one at spawn and reuses it for every snapshot.
+    /// Build the standard xterm 256-colour palette with rt's default fg/bg.
     pub fn xterm() -> Self {
+        Self::new(DEFAULT_FG, DEFAULT_BG, ANSI16)
+    }
+
+    /// Build a palette from a foreground, background, and the 16 ANSI base
+    /// colours; the 216-colour cube and 24-step greyscale ramp are derived. This
+    /// is what makes rt's colours configurable (fed from `rt_config::Settings`).
+    /// The cursor colour defaults to the foreground.
+    pub fn new(fg: Rgb, bg: Rgb, ansi16: [Rgb; 16]) -> Self {
         let mut colors = [[0u8; 3]; 256]; // start black
         // 0–15: the ANSI base colours.
-        colors[..16].copy_from_slice(&ANSI16);
+        colors[..16].copy_from_slice(&ansi16);
         // 16–231: the 6×6×6 colour cube. Each axis level 0..5 maps to a byte:
         // 0 → 0, otherwise 55 + 40·level (the xterm convention).
         for i in 0..216usize {
@@ -71,7 +81,7 @@ impl Palette {
             let v = (8 + 10 * i) as u8; // grey level
             colors[232 + i] = [v, v, v];
         }
-        Palette { colors }
+        Palette { colors, fg, bg, cursor: fg }
     }
 
     /// The RGB for a 0–255 palette index.
