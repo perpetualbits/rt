@@ -251,6 +251,12 @@ impl TermPane {
             pty_opts.shell = Some(Shell::new(program, args)); // explicit shell override
         }
         pty_opts.working_directory = working_directory; // may be None → shell's default
+        // Advertise a terminal type the child's terminfo/ncurses will recognise.
+        // We emit standard xterm-compatible sequences, and we resolve 24-bit
+        // colour, so xterm-256color + truecolor is accurate. Without this, apps
+        // like `mc` inherit whatever TERM launched rt and mis-decode our keys.
+        pty_opts.env.insert("TERM".to_string(), "xterm-256color".to_string());
+        pty_opts.env.insert("COLORTERM".to_string(), "truecolor".to_string());
 
         // Cell pixel size is only advisory to the kernel's winsize; the parser
         // cares about cols/rows. 8×16 is a reasonable placeholder until the
@@ -464,6 +470,16 @@ impl TermPane {
             screen_lines: term.screen_lines(),    // viewport height in rows
             cols: term.columns(),                 // viewport width in columns
         }
+    }
+
+    /// Whether the terminal has *application cursor keys* mode enabled (DECCKM).
+    /// Full-screen apps (mc, vim, less…) turn this on; while it is on, the arrow
+    /// and Home/End keys must be encoded as SS3 (`ESC O A`) rather than CSI
+    /// (`ESC [ A`). The input layer queries this to pick the right sequence.
+    pub fn app_cursor_keys(&self) -> bool {
+        use alacritty_terminal::term::TermMode; // the mode bitflags
+        let term = self.term.lock(); // read the current terminal mode
+        term.mode().contains(TermMode::APP_CURSOR) // set by DECCKM (\e[?1h)
     }
 
     /// Whether the terminal is on its alternate screen (as full-screen TUIs like

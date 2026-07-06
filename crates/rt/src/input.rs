@@ -84,13 +84,25 @@ pub fn chord_from_winit(key: &Key, mods: ModifiersState) -> Option<Chord> {
     Some(Chord::new(mods_from_winit(mods), rt_key)) // combine with modifiers
 }
 
+/// Build a cursor/Home/End escape sequence with the given final byte, choosing
+/// SS3 (`ESC O x`) when application-cursor-keys mode is on, else CSI (`ESC [ x`).
+/// This one helper keeps all six keys consistent.
+fn cursor(app_cursor: bool, final_byte: u8) -> Vec<u8> {
+    // 0x1b = ESC; then 'O' for SS3 (application) or '[' for CSI (normal).
+    let mid = if app_cursor { b'O' } else { b'[' };
+    vec![0x1b, mid, final_byte]
+}
+
 /// Encode a plain typed key (one that carried no rt binding) into the bytes to
 /// write to the PTY. Returns `None` for keys that produce no input (e.g. a lone
 /// modifier press, or a named key we do not translate).
 ///
-/// The escape sequences follow the standard xterm conventions that
-/// `alacritty_terminal`'s parser expects on the way back.
-pub fn encode_key(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
+/// `app_cursor` is the terminal's DECCKM (application cursor keys) state: when
+/// true, arrows and Home/End are encoded as SS3 (`ESC O x`) instead of CSI
+/// (`ESC [ x`). Full-screen apps like `mc`/`vim` toggle this, and getting it
+/// wrong is exactly why their arrow navigation appears dead. The sequences
+/// follow standard xterm conventions that `alacritty_terminal`'s parser expects.
+pub fn encode_key(key: &Key, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
     match key {
         Key::Named(named) => match named {
             // Enter sends a carriage return (the shell converts to newline).
@@ -99,18 +111,33 @@ pub fn encode_key(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
             NamedKey::Backspace => Some(vec![0x7f]),
             NamedKey::Tab => Some(b"\t".to_vec()),
             NamedKey::Escape => Some(vec![0x1b]),
-            // Cursor keys: CSI sequences. rt sends the "normal" (non-application)
-            // cursor forms; app-cursor mode handling can be layered later.
-            NamedKey::ArrowUp => Some(b"\x1b[A".to_vec()),
-            NamedKey::ArrowDown => Some(b"\x1b[B".to_vec()),
-            NamedKey::ArrowRight => Some(b"\x1b[C".to_vec()),
-            NamedKey::ArrowLeft => Some(b"\x1b[D".to_vec()),
-            NamedKey::Home => Some(b"\x1b[H".to_vec()),
-            NamedKey::End => Some(b"\x1b[F".to_vec()),
+            // Cursor keys + Home/End: SS3 form in application-cursor mode, CSI
+            // form otherwise. `cursor(final_byte)` builds the right one.
+            NamedKey::ArrowUp => Some(cursor(app_cursor, b'A')),
+            NamedKey::ArrowDown => Some(cursor(app_cursor, b'B')),
+            NamedKey::ArrowRight => Some(cursor(app_cursor, b'C')),
+            NamedKey::ArrowLeft => Some(cursor(app_cursor, b'D')),
+            NamedKey::Home => Some(cursor(app_cursor, b'H')),
+            NamedKey::End => Some(cursor(app_cursor, b'F')),
+            // Editing / navigation keys (CSI ~ sequences).
+            NamedKey::Insert => Some(b"\x1b[2~".to_vec()), // toggles insert/overwrite in editors/mc
+            NamedKey::Delete => Some(b"\x1b[3~".to_vec()),
             NamedKey::PageUp => Some(b"\x1b[5~".to_vec()),
             NamedKey::PageDown => Some(b"\x1b[6~".to_vec()),
-            NamedKey::Delete => Some(b"\x1b[3~".to_vec()),
             NamedKey::Space => Some(b" ".to_vec()),
+            // Function keys F1–F4 use SS3; F5–F12 use CSI ~ codes (xterm).
+            NamedKey::F1 => Some(b"\x1bOP".to_vec()),
+            NamedKey::F2 => Some(b"\x1bOQ".to_vec()),
+            NamedKey::F3 => Some(b"\x1bOR".to_vec()),
+            NamedKey::F4 => Some(b"\x1bOS".to_vec()),
+            NamedKey::F5 => Some(b"\x1b[15~".to_vec()),
+            NamedKey::F6 => Some(b"\x1b[17~".to_vec()),
+            NamedKey::F7 => Some(b"\x1b[18~".to_vec()),
+            NamedKey::F8 => Some(b"\x1b[19~".to_vec()),
+            NamedKey::F9 => Some(b"\x1b[20~".to_vec()),
+            NamedKey::F10 => Some(b"\x1b[21~".to_vec()),
+            NamedKey::F11 => Some(b"\x1b[23~".to_vec()),
+            NamedKey::F12 => Some(b"\x1b[24~".to_vec()),
             _ => None, // other named keys produce nothing
         },
         Key::Character(s) => {

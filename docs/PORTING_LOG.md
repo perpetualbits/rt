@@ -303,3 +303,25 @@ Workspace: 34 tests green. Default build still Wayland-native (zero x11 crates).
 **Still monochrome-era leftovers to revisit:** underline/italic/strikeout
 attributes aren't drawn yet (colours/bold/dim/inverse/hidden are). No context
 menu yet (Terminator's right-click menu) — deferred per user.
+
+## 2026-07-06 — Session 1: user-reported fixes (mc keys, Insert, braille)
+
+Recorded all observations in docs/KNOWN_ISSUES.md. Fixed three now:
+
+1. **mc arrow keys.** Two causes: (a) rt never set TERM, so ncurses used an
+   inherited/wrong terminfo — now set `TERM=xterm-256color` + `COLORTERM=truecolor`
+   in the PTY env; (b) rt always sent CSI arrows, but full-screen apps enable
+   *application cursor keys* (DECCKM), which need SS3 (`ESC O A`). Added
+   `TermPane::app_cursor_keys()` and branch arrow/Home/End encoding on it.
+2. **Insert key.** Wasn't encoded; now sends `ESC [ 2 ~`. Also added F1–F12 input
+   sequences (SS3 for F1–F4, CSI ~ for F5–F12). Unit tests cover app-cursor
+   arrows, Insert, and function keys.
+3. **Braille tofu.** Confirmed DejaVu Sans Mono lacks braille (blocks/box-draw/
+   accents render fine). Added a font-FALLBACK chain in the renderer: primary
+   font + fallbacks (DejaVu Sans, Agave, FreeMono, Noto Symbols2); each glyph is
+   rasterised from the first font whose `lookup_glyph_index(c) != 0`. Verified
+   braille now shows dot patterns (`docs/screenshots/braille-fallback.png`).
+
+Not done yet (recorded): text attributes (underline/italic/strikeout), and the
+Terminator right-click menu. Workspace: 35 tests green; default build Wayland-
+native (zero x11 crates).

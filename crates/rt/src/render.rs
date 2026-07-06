@@ -72,7 +72,7 @@ pub struct Renderer {
     vbo: glow::Buffer,                 // dynamic vertex buffer, re-uploaded each frame
     atlas_tex: glow::Texture,          // the R8 coverage atlas
     u_screen: glow::UniformLocation,   // uniform: viewport size in pixels
-    font: Font,                        // the loaded monospace font
+    fonts: Vec<Font>,                  // primary monospace font + fallbacks for coverage gaps
     font_px: f32,                      // pixel size glyphs are rasterised at
     cell_w: f32,                       // monospace cell width in pixels
     cell_h: f32,                       // cell height (line advance) in pixels
@@ -86,16 +86,28 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Build the renderer from a current GL context and a TrueType font's bytes.
+    /// Build the renderer from a current GL context and a list of font byte
+    /// blobs: `fonts[0]` is the primary monospace font (its metrics define the
+    /// cell); the rest are fallbacks consulted, in order, for glyphs the primary
+    /// lacks (e.g. DejaVu Sans Mono has no braille — see `docs/KNOWN_ISSUES.md`).
     ///
     /// Compiles the shader, creates the atlas with an opaque seed texel at (0,0)
-    /// for solid fills, measures the monospace cell from the font, and is then
-    /// ready for `begin_frame`/`draw_*`/`end_frame`. Returns an error string on
-    /// any GL or font failure so `main` can report it instead of panicking.
-    pub fn new(gl: glow::Context, font_bytes: &[u8], font_px: f32) -> Result<Self, String> {
-        // Parse the font up front; a bad font is a hard, reportable error.
-        let font = Font::from_bytes(font_bytes, fontdue::FontSettings::default())
-            .map_err(|e| format!("font parse failed: {e}"))?;
+    /// for solid fills, measures the monospace cell from the primary font, and is
+    /// then ready for `begin_frame`/`draw_*`/`end_frame`. Returns an error string
+    /// on any GL or font failure so `main` can report it instead of panicking.
+    pub fn new(gl: glow::Context, font_blobs: &[Vec<u8>], font_px: f32) -> Result<Self, String> {
+        // Parse every font blob; skip fallbacks that fail to parse (e.g. CFF/OTF
+        // that fontdue can't read) but require the primary to parse.
+        let mut fonts: Vec<Font> = Vec::new();
+        for (i, blob) in font_blobs.iter().enumerate() {
+            match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
+                Ok(f) => fonts.push(f), // usable font
+                Err(e) if i == 0 => return Err(format!("primary font parse failed: {e}")), // fatal
+                Err(e) => log::warn!("skipping unparseable fallback font #{i}: {e}"), // non-fatal
+            }
+        }
+        // The primary font (index 0) defines the monospace cell metrics.
+        let font = &fonts[0];
         // Measure the monospace cell: 'M' advance for width, line metrics for
         // height/ascent. Unwraps guarded with sensible fallbacks.
         let (metrics, _) = font.rasterize('M', font_px); // reference glyph
@@ -180,7 +192,7 @@ impl Renderer {
                 vbo,
                 atlas_tex,
                 u_screen,
-                font,
+                fonts,
                 font_px,
                 cell_w,
                 cell_h,
@@ -290,8 +302,18 @@ impl Renderer {
         if let Some(g) = self.glyphs.get(&c) {
             return Some(*g);
         }
+        // Pick the first font (primary, then fallbacks) that actually has this
+        // character; `lookup_glyph_index` returns 0 for a missing glyph. This is
+        // what lets braille etc. render from a fallback when the primary
+        // monospace font lacks them. Falls back to the primary (draws its
+        // notdef/blank) if nobody has it.
+        let idx = self
+            .fonts
+            .iter()
+            .position(|f| f.lookup_glyph_index(c) != 0)
+            .unwrap_or(0);
         // Rasterise the glyph to a coverage bitmap at our pixel size.
-        let (metrics, bitmap) = self.font.rasterize(c, self.font_px);
+        let (metrics, bitmap) = self.fonts[idx].rasterize(c, self.font_px);
         // Empty glyphs (space) have zero-size bitmaps; nothing to pack/draw.
         if metrics.width == 0 || metrics.height == 0 {
             let g = Glyph { u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0, w: 0.0, h: 0.0, left: 0.0, top: 0.0 };

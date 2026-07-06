@@ -57,18 +57,21 @@ struct Active {
 /// The winit application object. Holds only the font bytes until `resumed`
 /// builds the `Active` state.
 struct App {
-    font: Vec<u8>,        // TrueType bytes for the monospace font
+    fonts: Vec<Vec<u8>>,    // primary monospace font bytes, then fallback fonts
     active: Option<Active>, // populated on first resume
 }
 
-/// Locate a monospace TrueType font on the system. rt does not ship one (to
-/// avoid bundling a font binary in git); it probes the usual Linux locations.
-/// Returns the font bytes, or `None` if none is found (the app then exits with
-/// a helpful message).
-fn load_font() -> Option<Vec<u8>> {
-    // Common monospace fonts present on virtually all Linux desktops, in order
-    // of preference.
-    const CANDIDATES: &[&str] = &[
+/// Locate a monospace font (plus fallback fonts for coverage gaps) on the
+/// system. rt does not ship fonts (to avoid bundling a binary in git); it probes
+/// the usual Linux locations. Returns `[primary, fallback…]` bytes, or `None` if
+/// no primary is found (the app then exits with a helpful message).
+///
+/// The fallbacks matter because the usual primary — DejaVu Sans Mono — lacks
+/// some ranges (notably braille U+2800–U+28FF, used by `spiral_stress`). We add
+/// TrueType fonts that DO cover them so the renderer can fall back per glyph.
+fn load_fonts() -> Option<Vec<Vec<u8>>> {
+    // The primary monospace font: first match wins. Must be present.
+    const PRIMARY: &[&str] = &[
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
@@ -76,14 +79,34 @@ fn load_font() -> Option<Vec<u8>> {
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
         "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
     ];
-    for path in CANDIDATES {
-        // Try to read each candidate; the first that succeeds wins.
+    // Fallback fonts consulted for glyphs the primary lacks. TrueType only
+    // (fontdue can't read CFF/OTF); the renderer skips any that fail to parse.
+    const FALLBACK: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // proportional but has braille + much more
+        "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf", // monospace with braille
+        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+    ];
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    // Load the first available primary.
+    for path in PRIMARY {
         if let Ok(bytes) = std::fs::read(path) {
-            log::info!("using font {path}"); // record which font we picked
-            return Some(bytes);
+            log::info!("primary font {path}"); // record the choice
+            blobs.push(bytes);
+            break;
         }
     }
-    None // nothing found
+    if blobs.is_empty() {
+        return None; // no primary → the app cannot render text
+    }
+    // Load whichever fallbacks exist (all optional).
+    for path in FALLBACK {
+        if let Ok(bytes) = std::fs::read(path) {
+            log::info!("fallback font {path}"); // note each extra coverage source
+            blobs.push(bytes);
+        }
+    }
+    Some(blobs)
 }
 
 impl ApplicationHandler for App {
@@ -170,7 +193,7 @@ impl ApplicationHandler for App {
         };
 
         // --- build the renderer ------------------------------------------
-        let mut renderer = match Renderer::new(gl, &self.font, 18.0) {
+        let mut renderer = match Renderer::new(gl, &self.fonts, 18.0) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e}");
@@ -405,8 +428,15 @@ impl App {
             }
         }
         // Not a binding: treat as ordinary typing. Encode to PTY bytes and feed
-        // the focused pane (or the broadcast set).
-        if let Some(bytes) = input::encode_key(&key_event.logical_key, mods) {
+        // the focused pane (or the broadcast set). We consult the focused pane's
+        // application-cursor-keys mode so arrows are encoded the way the running
+        // program (mc/vim/…) expects.
+        let app_cursor = active
+            .session
+            .pane(active.session.focus()) // the focused pane's backend
+            .map(|p| p.app_cursor_keys()) // its DECCKM state
+            .unwrap_or(false); // default to normal cursor keys
+        if let Some(bytes) = input::encode_key(&key_event.logical_key, mods, app_cursor) {
             active.session.feed_input(&bytes); // send to the shell(s)
         }
     }
@@ -536,7 +566,7 @@ impl App {
 fn main() {
     env_logger::init(); // honour RUST_LOG for diagnostics
     // A font is mandatory; fail early with guidance if none is installed.
-    let font = match load_font() {
+    let fonts = match load_fonts() {
         Some(f) => f,
         None => {
             eprintln!(
@@ -548,7 +578,7 @@ fn main() {
     };
     // Build the winit event loop and hand it our application.
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App { font, active: None };
+    let mut app = App { fonts, active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
