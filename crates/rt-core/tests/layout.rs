@@ -122,3 +122,23 @@ fn directional_navigation_is_spatial() {
     assert_eq!(tree.neighbor(a, Direction::Up, window()), None); // window edge
     assert_eq!(tree.neighbor(a, Direction::Left, window()), None); // leftmost pane
 }
+
+#[test]
+fn divider_drag_resizes_binary_split() {
+    // Split left|right (50/50), grab the divider, and resize to ~25/75.
+    let (mut tree, a) = Tree::new();
+    let b = tree.split(a, Orientation::LeftRight).unwrap();
+    let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+    // The divider sits near the middle (~497 for 1000px minus the 6px gutter).
+    let h = tree.divider_at(497.0, 400.0, bounds).expect("divider found at the split boundary");
+    assert!(h.horizontal); // a left/right split drags along x
+    tree.set_split_ratio(&h.path, 0.25); // left pane -> ~25%
+    let rects = tree.rects(bounds);
+    let ra = rects.iter().find(|(id, _)| *id == a).unwrap().1;
+    let rb = rects.iter().find(|(id, _)| *id == b).unwrap().1;
+    assert!(ra.w < rb.w); // left is now narrower
+    let frac = ra.w / (ra.w + rb.w);
+    assert!((frac - 0.25).abs() < 0.05, "left fraction was {frac}");
+    // A point in open pane area yields no divider handle.
+    assert!(tree.divider_at(100.0, 400.0, bounds).is_none());
+}

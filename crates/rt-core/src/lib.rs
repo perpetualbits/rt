@@ -17,4 +17,4 @@ pub mod layout; // the recursive split/tab tree — the core Terminator port
 // Re-export the handful of types callers use most, so downstream crates can
 // write `rt_core::Tree` instead of `rt_core::layout::Tree`.
 pub use geom::Rect;
-pub use layout::{Direction, Orientation, PaneId, Tab, TabBar, Tree};
+pub use layout::{Direction, DragHandle, Orientation, PaneId, Tab, TabBar, Tree};

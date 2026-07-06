@@ -213,6 +213,18 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.tree.dividers(bounds)
     }
 
+    /// A draggable divider at `(px, py)`, if any (for drag-to-resize).
+    pub fn divider_at(&self, px: f32, py: f32, bounds: Rect) -> Option<rt_core::DragHandle> {
+        self.tree.divider_at(px, py, bounds)
+    }
+
+    /// Set a split's first-child ratio (while dragging a divider), then reflow
+    /// so the affected panes resize their PTYs.
+    pub fn set_split_ratio(&mut self, handle: &rt_core::DragHandle, ratio: f32) {
+        self.tree.set_split_ratio(&handle.path, ratio);
+        self.relayout(self.bounds);
+    }
+
     /// Select the tab whose first pane is `first_pane` (from a clicked
     /// [`TabBar`] tab), move focus into it, and reflow. Returns `true` if the
     /// tab was found. This is what a click on a tab label calls.

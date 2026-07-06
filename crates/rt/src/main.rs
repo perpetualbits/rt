@@ -60,6 +60,7 @@ struct Active {
     clipboard: Option<smithay_clipboard::Clipboard>, // Wayland clipboard + PRIMARY (None on x11 dev builds)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
+    dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
     egui_state: egui_winit::State,        // egui-winit input bridge
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
@@ -494,6 +495,7 @@ impl ApplicationHandler for App {
             clipboard,
             selection: None,
             selecting: false,
+            dragging_divider: None,
             egui_ctx,
             egui_state,
             egui_painter,
@@ -633,7 +635,14 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
-                if active.selecting {
+                if let Some(handle) = active.dragging_divider.clone() {
+                    // Resize the split: turn the mouse position along the split's
+                    // axis into a first-child ratio.
+                    let axis = if handle.horizontal { active.mouse.0 } else { active.mouse.1 };
+                    let ratio = ((axis - handle.start) / handle.len).clamp(0.05, 0.95);
+                    active.session.set_split_ratio(&handle, ratio);
+                    active.window.request_redraw();
+                } else if active.selecting {
                     // Extend the selection to the cell under the pointer.
                     if let Some((pane, col, row)) = Self::cell_at(active, active.mouse.0, active.mouse.1) {
                         if let Some(sel) = active.selection.as_mut() {
@@ -688,6 +697,12 @@ impl ApplicationHandler for App {
                         let size = active.window.inner_size();
                         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
                         let (mx, my) = active.mouse;
+                        // A press on a split divider starts a drag-to-resize
+                        // (checked before tabs/focus/selection).
+                        if let Some(handle) = active.session.divider_at(mx, my, bounds) {
+                            active.dragging_divider = Some(handle);
+                            return;
+                        }
                         // A tab label click switches tabs; else focus the pane and
                         // begin a text selection at the clicked cell.
                         let clicked_tab = active
@@ -713,6 +728,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 (ElementState::Released, MouseButton::Left) => {
+                    active.dragging_divider = None; // end any divider resize
                     active.selecting = false; // drag finished
                     // A zero-length selection was just a click: discard it, and
                     // (copy-on-select) copy a real selection to PRIMARY.

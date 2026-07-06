@@ -551,6 +551,18 @@ pub struct TabBar {
     pub tabs: Vec<Tab>,
 }
 
+/// A handle to a divider being dragged, from [`Tree::divider_at`]. `path`
+/// locates the split; `horizontal` is true for a left/right split (drag along
+/// x); `start`/`len` are the split's pixel extent along its axis, used to turn a
+/// mouse position into a ratio.
+#[derive(Clone, Debug)]
+pub struct DragHandle {
+    pub path: Vec<usize>,
+    pub horizontal: bool,
+    pub start: f32,
+    pub len: f32,
+}
+
 impl Tree {
     /// Enumerate the tab strips visible for the given window `bounds`, so the
     /// renderer can draw them and the input layer can hit-test clicks. Only
@@ -612,6 +624,96 @@ impl Tree {
                     let body = Rect::new(bounds.x, bounds.y + TAB_STRIP, bounds.w, (bounds.h - TAB_STRIP).max(0.0));
                     Self::collect_tab_bars(child, body, out);
                 }
+            }
+        }
+    }
+
+    /// Locate a draggable divider at point `(px, py)`, returning a handle the
+    /// caller keeps for the duration of a drag. Only binary splits (all rt ever
+    /// creates) are resizable. `None` if the point isn't on a divider.
+    pub fn divider_at(&self, px: f32, py: f32, bounds: Rect) -> Option<DragHandle> {
+        let mut path = Vec::new();
+        Self::find_divider(&self.root, bounds, px, py, &mut path)
+    }
+
+    /// Recursive worker for [`Tree::divider_at`], tracking the child-index path
+    /// to the split so the caller can resize it later.
+    fn find_divider(node: &Node, bounds: Rect, px: f32, py: f32, path: &mut Vec<usize>) -> Option<DragHandle> {
+        match node {
+            Node::Leaf(_) => None,
+            Node::Split { orient, children } => {
+                let total: f32 = children.iter().map(|c| c.weight).sum();
+                let total = if total > 0.0 { total } else { 1.0 };
+                let n = children.len();
+                let gutters = DIVIDER * (n.saturating_sub(1) as f32);
+                let horizontal = matches!(orient, Orientation::LeftRight);
+                let (axis_start, axis_len) = if horizontal { (bounds.x, bounds.w) } else { (bounds.y, bounds.h) };
+                let usable = (axis_len - gutters).max(0.0);
+                // Walk the children, remembering each child's rect for recursion
+                // and testing the gutter after each (binary splits only).
+                let mut cursor = axis_start;
+                let mut rects = Vec::with_capacity(n);
+                for (i, child) in children.iter().enumerate() {
+                    let seg = usable * (child.weight / total);
+                    let rect = if horizontal {
+                        Rect::new(cursor, bounds.y, seg, bounds.h)
+                    } else {
+                        Rect::new(bounds.x, cursor, bounds.w, seg)
+                    };
+                    rects.push(rect);
+                    cursor += seg;
+                    if i < n - 1 {
+                        // Expand the grab zone a few px beyond the visual gutter
+                        // so the divider is easy to grab (6px alone is too fiddly).
+                        const GRAB: f32 = 5.0;
+                        let g = if horizontal {
+                            Rect::new(cursor - GRAB, bounds.y, DIVIDER + 2.0 * GRAB, bounds.h)
+                        } else {
+                            Rect::new(bounds.x, cursor - GRAB, bounds.w, DIVIDER + 2.0 * GRAB)
+                        };
+                        if n == 2 && g.contains(px, py) {
+                            return Some(DragHandle { path: path.clone(), horizontal, start: axis_start, len: axis_len });
+                        }
+                        cursor += DIVIDER;
+                    }
+                }
+                // Not on this split's gutter — descend into the children.
+                for (i, child) in children.iter().enumerate() {
+                    path.push(i);
+                    if let Some(h) = Self::find_divider(&child.node, rects[i], px, py, path) {
+                        return Some(h);
+                    }
+                    path.pop();
+                }
+                None
+            }
+            Node::Tabs { children, active } => {
+                let child = children.get(*active)?;
+                let body = Rect::new(bounds.x, bounds.y + TAB_STRIP, bounds.w, (bounds.h - TAB_STRIP).max(0.0));
+                path.push(*active);
+                let r = Self::find_divider(child, body, px, py, path);
+                path.pop();
+                r
+            }
+        }
+    }
+
+    /// Set the split at `path` to the given first-child `ratio` (0..1). No-op if
+    /// the path doesn't lead to a binary split. Used while dragging a divider.
+    pub fn set_split_ratio(&mut self, path: &[usize], ratio: f32) {
+        let mut node = &mut self.root;
+        for &i in path {
+            node = match node {
+                Node::Split { children, .. } if i < children.len() => &mut children[i].node,
+                Node::Tabs { children, .. } if i < children.len() => &mut children[i],
+                _ => return, // path no longer valid
+            };
+        }
+        if let Node::Split { children, .. } = node {
+            if children.len() == 2 {
+                let r = ratio.clamp(0.05, 0.95); // keep both panes usable
+                children[0].weight = r;
+                children[1].weight = 1.0 - r;
             }
         }
     }
