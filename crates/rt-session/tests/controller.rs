@@ -124,6 +124,37 @@ fn broadcast_group_writes_only_group_members() {
 }
 
 #[test]
+fn group_cycle_advances_then_clears_membership() {
+    let (mut session, _logs) = make();
+    let focus = session.focus(); // the lone starting pane
+    assert_eq!(session.group_of(focus), None); // starts ungrouped
+    // Cycle: None → 1 → 2 → 3 → 4 → None.
+    for expected in [Some(1), Some(2), Some(3), Some(4), None] {
+        session.apply(Action::GroupCycle);
+        assert_eq!(session.group_of(focus), expected);
+    }
+}
+
+#[test]
+fn group_cycle_then_broadcast_reaches_only_the_group() {
+    let (mut session, logs) = make();
+    session.apply(Action::SplitVert); // pane0 | pane1 (focus pane1)
+    session.apply(Action::SplitVert); // pane1 → pane2 (focus pane2)
+    // Group the focused pane (pane2) via the cycle action, then broadcast.
+    session.apply(Action::GroupCycle); // pane2 → group 1
+    session.apply(Action::BroadcastGroup);
+    session.feed_input(b"k");
+    // Only same-group panes receive it: with just pane2 grouped, exactly one pane
+    // (the focus) should have logged the keystroke.
+    let got = logs
+        .borrow()
+        .iter()
+        .filter(|l| l.borrow().writes == vec![b"k".to_vec()])
+        .count();
+    assert_eq!(got, 1, "only the single grouped (focused) pane should receive input");
+}
+
+#[test]
 fn closing_last_pane_requests_window_close() {
     let (mut session, _logs) = make();
     let ev = session.apply(Action::CloseTerm); // close the only pane

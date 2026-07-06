@@ -50,6 +50,7 @@ impl Menu {
             Item::Separator,
             Item::Action("Close Terminal", Action::CloseTerm),
             Item::Separator,
+            Item::Action("Cycle Pane Group", Action::GroupCycle),
             Item::Action("Broadcast: Off", Action::BroadcastOff),
             Item::Action("Broadcast: All", Action::BroadcastAll),
             Item::Action("Broadcast: Group", Action::BroadcastGroup),

@@ -151,6 +151,35 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.broadcast
     }
 
+    /// The group id a pane belongs to, if any (0 = ungrouped/None). The renderer
+    /// draws a small colour-coded marker per group so membership is visible even
+    /// without per-pane titlebars.
+    pub fn group_of(&self, id: PaneId) -> Option<u32> {
+        self.groups.get(&id).copied()
+    }
+
+    /// Cycle the focused pane through group ids: ungrouped → 1 → 2 → … → MAX →
+    /// ungrouped. This is rt's title-bar-free way to build Terminator-style
+    /// groups; combined with `Broadcast::Group`, typing then fans out to every
+    /// pane sharing the focus's group. Returns `Redraw` so the marker updates.
+    fn cycle_group(&mut self) -> Option<SessionEvent> {
+        const MAX_GROUP: u32 = 4; // a small, colour-distinguishable set of groups
+        let next = match self.groups.get(&self.focus).copied() {
+            None => Some(1),                       // ungrouped → group 1
+            Some(g) if g < MAX_GROUP => Some(g + 1), // advance to the next group
+            Some(_) => None,                       // past the last → back to ungrouped
+        };
+        match next {
+            Some(g) => {
+                self.groups.insert(self.focus, g); // join group g
+            }
+            None => {
+                self.groups.remove(&self.focus); // leave all groups
+            }
+        }
+        Some(SessionEvent::Redraw)
+    }
+
     /// Immutable access to the layout tree (the renderer calls `.rects(...)`).
     pub fn tree(&self) -> &Tree {
         &self.tree
@@ -331,6 +360,8 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             Action::ResizeRight => self.resize_focus(Direction::Right),
             Action::ResizeUp => self.resize_focus(Direction::Up),
             Action::ResizeDown => self.resize_focus(Direction::Down),
+            // Cycle the focused pane's input group (Broadcast::Group membership).
+            Action::GroupCycle => self.cycle_group(),
             Action::NewTab => {
                 self.new_tab(); // open a tab beside the focus
                 Some(SessionEvent::Redraw)

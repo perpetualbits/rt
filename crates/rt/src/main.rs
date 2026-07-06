@@ -468,6 +468,19 @@ impl ApplicationHandler for App {
         if std::env::var("RT_ZOOM").is_ok() {
             session.apply(rt_config::Action::ToggleZoom); // maximise the focused pane at startup
         }
+        // Debug/verification hook: build three panes each in a different input
+        // group so the corner group markers can be screenshotted.
+        if std::env::var("RT_DEMO_GROUPS").is_ok() {
+            use rt_config::Action::*;
+            session.apply(GroupCycle); // pane0 → group 1
+            session.apply(SplitVert); // → pane1 focused
+            session.apply(GroupCycle);
+            session.apply(GroupCycle); // pane1 → group 2
+            session.apply(SplitHoriz); // → pane2 focused
+            session.apply(GroupCycle);
+            session.apply(GroupCycle);
+            session.apply(GroupCycle); // pane2 → group 3
+        }
         if let Ok(v) = std::env::var("RT_BROADCAST") {
             let _ = match v.as_str() {
                 "all" => session.apply(rt_config::Action::BroadcastAll),
@@ -1466,6 +1479,21 @@ impl App {
                     };
                     active.renderer.fill_rect(bx, thumb_y, bw, thumb_h, thumb_col);
                 }
+            }
+            // Group marker: a small colour-coded square in the pane's top-right
+            // corner when it belongs to an input group, so Broadcast::Group
+            // membership is visible without a per-pane titlebar. Each group id
+            // gets a distinct hue.
+            if let Some(g) = active.session.group_of(id) {
+                let col = match g {
+                    1 => Color::rgb(0xe0, 0x6c, 0x40), // orange
+                    2 => Color::rgb(0x4c, 0xa0, 0xe0), // blue
+                    3 => Color::rgb(0x6c, 0xc0, 0x50), // green
+                    _ => Color::rgb(0xc0, 0x60, 0xd0), // purple (group 4+)
+                };
+                let m = 10.0; // marker size in pixels
+                let pad = 4.0; // inset from the corner
+                active.renderer.fill_rect(rect.right() - m - pad, rect.y + pad, m, m, col);
             }
             // Outline the focused pane with a thin border (four thin rects).
             if id == focus {

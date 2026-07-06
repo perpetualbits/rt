@@ -75,9 +75,11 @@ Where the widget toolkit pays off.
 18. **Saved layouts:** serialize the tree (serde) + save/load + a launcher; `-l`
     CLI option. The RT_SPLIT/RT_COLUMNS/RT_TABS hooks become the format seed.
     (cat. §8)
-19. **Grouping / broadcast UI:** group titlebar + group menu, broadcast keys
-    (broadcast_off/group/all), create/name/ungroup groups, insert terminal
-    number. (cat. §7)
+19. **Grouping / broadcast UI:** broadcast keys (broadcast_off/group/all) ✅ with a
+    window-border indicator ✅; input groups assignable via GroupCycle (Ctrl+Shift+G
+    or menu) with per-pane colour-coded corner markers ✅ and group-scoped input
+    fan-out ✅. Remaining: a per-pane group *titlebar* for naming/ungrouping and
+    drag-assignment, and insert-terminal-number. (cat. §7)
 
 ## Phase 4 — Profiles, IPC, plugins
 20. **Profiles:** multiple named profiles (colours/font/command/…); per-pane

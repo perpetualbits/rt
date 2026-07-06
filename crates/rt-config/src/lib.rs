@@ -89,6 +89,8 @@ pub enum Action {
     ResizeUp,
     /// Grow the focused pane downward (shrinking its lower neighbour).
     ResizeDown,
+    /// Cycle the focused pane through input groups (for Broadcast::Group).
+    GroupCycle,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -355,6 +357,7 @@ impl Keymap {
             ("<Shift><Control>Down", Action::ResizeDown),
             ("<Shift><Control>r", Action::Rotate),       // rotate the enclosing split
             ("<Shift><Control>a", Action::SplitAuto),    // split along the longer axis
+            ("<Shift><Control>g", Action::GroupCycle),   // cycle the pane's input group
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {
