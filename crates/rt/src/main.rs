@@ -57,8 +57,9 @@ struct Active {
 /// The winit application object. Holds only the font bytes until `resumed`
 /// builds the `Active` state.
 struct App {
-    fonts: Vec<Vec<u8>>,    // primary monospace font bytes, then fallback fonts
-    active: Option<Active>, // populated on first resume
+    fonts: Vec<Vec<u8>>,        // primary monospace font bytes, then fallback fonts
+    italic_fonts: Vec<Vec<u8>>, // italic/oblique faces (may be empty)
+    active: Option<Active>,     // populated on first resume
 }
 
 /// Locate a monospace font (plus fallback fonts for coverage gaps) on the
@@ -69,7 +70,7 @@ struct App {
 /// The fallbacks matter because the usual primary — DejaVu Sans Mono — lacks
 /// some ranges (notably braille U+2800–U+28FF, used by `spiral_stress`). We add
 /// TrueType fonts that DO cover them so the renderer can fall back per glyph.
-fn load_fonts() -> Option<Vec<Vec<u8>>> {
+fn load_fonts() -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
     // The primary monospace font: first match wins. Must be present.
     const PRIMARY: &[&str] = &[
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -106,7 +107,21 @@ fn load_fonts() -> Option<Vec<Vec<u8>>> {
             blobs.push(bytes);
         }
     }
-    Some(blobs)
+    // Italic/oblique faces for the ITALIC attribute (all optional): a monospace
+    // oblique first, then a proportional oblique as a coverage fallback.
+    const ITALIC: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+    ];
+    let mut italic: Vec<Vec<u8>> = Vec::new();
+    for path in ITALIC {
+        if let Ok(bytes) = std::fs::read(path) {
+            log::info!("italic font {path}"); // note the oblique face
+            italic.push(bytes);
+        }
+    }
+    Some((blobs, italic))
 }
 
 impl ApplicationHandler for App {
@@ -193,7 +208,7 @@ impl ApplicationHandler for App {
         };
 
         // --- build the renderer ------------------------------------------
-        let mut renderer = match Renderer::new(gl, &self.fonts, 18.0) {
+        let mut renderer = match Renderer::new(gl, &self.fonts, &self.italic_fonts, 18.0) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e}");
@@ -525,9 +540,18 @@ impl App {
                             let c = cell.bg; // per-cell background colour
                             active.renderer.fill_cell(ox, rect.y, col_idx, sub, Color::rgb(c[0], c[1], c[2]));
                         }
+                        let fg = Color::rgb(cell.fg[0], cell.fg[1], cell.fg[2]); // per-cell foreground
                         if cell.c != ' ' {
-                            let c = cell.fg; // per-cell foreground colour
-                            active.renderer.draw_char(ox, rect.y, col_idx, sub, cell.c, Color::rgb(c[0], c[1], c[2]));
+                            // Glyph, in the oblique face when the cell is italic.
+                            active.renderer.draw_char(ox, rect.y, col_idx, sub, cell.c, fg, cell.attrs.italic);
+                        }
+                        // Text-attribute lines (drawn even on blank cells so an
+                        // underlined space still shows a rule).
+                        if cell.attrs.underline {
+                            active.renderer.draw_underline(ox, rect.y, col_idx, sub, fg);
+                        }
+                        if cell.attrs.strikeout {
+                            active.renderer.draw_strikeout(ox, rect.y, col_idx, sub, fg);
                         }
                     }
                 }
@@ -544,7 +568,7 @@ impl App {
                         if let Some(under) = snap.rows.get(cur.line).and_then(|rw| rw.get(cur.col)) {
                             if under.c != ' ' {
                                 let ub = under.bg; // draw the glyph in the cell bg for contrast
-                                active.renderer.draw_char(ox, rect.y, cur.col, sub, under.c, Color::rgb(ub[0], ub[1], ub[2]));
+                                active.renderer.draw_char(ox, rect.y, cur.col, sub, under.c, Color::rgb(ub[0], ub[1], ub[2]), under.attrs.italic);
                             }
                         }
                     }
@@ -580,7 +604,7 @@ impl App {
 fn main() {
     env_logger::init(); // honour RUST_LOG for diagnostics
     // A font is mandatory; fail early with guidance if none is installed.
-    let fonts = match load_fonts() {
+    let (fonts, italic_fonts) = match load_fonts() {
         Some(f) => f,
         None => {
             eprintln!(
@@ -592,7 +616,7 @@ fn main() {
     };
     // Build the winit event loop and hand it our application.
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App { fonts, active: None };
+    let mut app = App { fonts, italic_fonts, active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);

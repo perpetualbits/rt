@@ -73,11 +73,12 @@ pub struct Renderer {
     atlas_tex: glow::Texture,          // the R8 coverage atlas
     u_screen: glow::UniformLocation,   // uniform: viewport size in pixels
     fonts: Vec<Font>,                  // primary monospace font + fallbacks for coverage gaps
+    italic_fonts: Vec<Font>,           // italic/oblique faces (empty if none installed)
     font_px: f32,                      // pixel size glyphs are rasterised at
     cell_w: f32,                       // monospace cell width in pixels
     cell_h: f32,                       // cell height (line advance) in pixels
     ascent: f32,                       // baseline offset from the cell top
-    glyphs: HashMap<char, Glyph>,      // rasterised-glyph cache
+    glyphs: HashMap<(char, bool), Glyph>, // rasterised-glyph cache, keyed by (char, italic)
     shelf_x: i32,                      // next free x in the current atlas shelf
     shelf_y: i32,                      // top y of the current shelf
     shelf_h: i32,                      // height of the current shelf
@@ -95,17 +96,29 @@ impl Renderer {
     /// for solid fills, measures the monospace cell from the primary font, and is
     /// then ready for `begin_frame`/`draw_*`/`end_frame`. Returns an error string
     /// on any GL or font failure so `main` can report it instead of panicking.
-    pub fn new(gl: glow::Context, font_blobs: &[Vec<u8>], font_px: f32) -> Result<Self, String> {
-        // Parse every font blob; skip fallbacks that fail to parse (e.g. CFF/OTF
-        // that fontdue can't read) but require the primary to parse.
-        let mut fonts: Vec<Font> = Vec::new();
-        for (i, blob) in font_blobs.iter().enumerate() {
-            match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
-                Ok(f) => fonts.push(f), // usable font
-                Err(e) if i == 0 => return Err(format!("primary font parse failed: {e}")), // fatal
-                Err(e) => log::warn!("skipping unparseable fallback font #{i}: {e}"), // non-fatal
+    pub fn new(
+        gl: glow::Context,
+        font_blobs: &[Vec<u8>],
+        italic_blobs: &[Vec<u8>],
+        font_px: f32,
+    ) -> Result<Self, String> {
+        // Parse a slice of font blobs into `Font`s, skipping any that fail. Used
+        // for both the regular chain (primary required) and the italic chain.
+        let parse_chain = |blobs: &[Vec<u8>], primary_required: bool| -> Result<Vec<Font>, String> {
+            let mut out: Vec<Font> = Vec::new();
+            for (i, blob) in blobs.iter().enumerate() {
+                match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
+                    Ok(f) => out.push(f), // usable font
+                    Err(e) if i == 0 && primary_required => {
+                        return Err(format!("primary font parse failed: {e}")); // fatal
+                    }
+                    Err(e) => log::warn!("skipping unparseable font #{i}: {e}"), // non-fatal
+                }
             }
-        }
+            Ok(out)
+        };
+        let fonts = parse_chain(font_blobs, true)?; // regular chain; primary must parse
+        let italic_fonts = parse_chain(italic_blobs, false)?; // italic chain; all optional
         // The primary font (index 0) defines the monospace cell metrics.
         let font = &fonts[0];
         // Measure the monospace cell: 'M' advance for width, line metrics for
@@ -193,6 +206,7 @@ impl Renderer {
                 atlas_tex,
                 u_screen,
                 fonts,
+                italic_fonts,
                 font_px,
                 cell_w,
                 cell_h,
@@ -297,27 +311,37 @@ impl Renderer {
     /// Rasterise (if needed) and cache a glyph, returning its atlas placement.
     /// Returns `None` for glyphs that don't fit the atlas or have no bitmap
     /// (e.g. space), so callers simply skip drawing them.
-    fn glyph(&mut self, c: char) -> Option<Glyph> {
-        // Fast path: already cached.
-        if let Some(g) = self.glyphs.get(&c) {
+    fn glyph(&mut self, c: char, italic: bool) -> Option<Glyph> {
+        // Fast path: already cached for this (char, italic) combination.
+        if let Some(g) = self.glyphs.get(&(c, italic)) {
             return Some(*g);
         }
-        // Pick the first font (primary, then fallbacks) that actually has this
-        // character; `lookup_glyph_index` returns 0 for a missing glyph. This is
-        // what lets braille etc. render from a fallback when the primary
-        // monospace font lacks them. Falls back to the primary (draws its
-        // notdef/blank) if nobody has it.
-        let idx = self
-            .fonts
-            .iter()
-            .position(|f| f.lookup_glyph_index(c) != 0)
-            .unwrap_or(0);
+        // Choose the font chain: the italic faces when italic is requested and
+        // any are installed, otherwise the regular chain. Then within the chosen
+        // chain pick the first font that actually has this character
+        // (`lookup_glyph_index != 0`) — the fallback logic that renders braille
+        // etc. from a secondary font. If italic has no glyph anywhere, fall back
+        // to the upright chain so we at least show the character.
+        let chain: &[Font] = if italic && !self.italic_fonts.is_empty() {
+            &self.italic_fonts
+        } else {
+            &self.fonts
+        };
+        let (chain, idx) = match chain.iter().position(|f| f.lookup_glyph_index(c) != 0) {
+            Some(i) => (chain, i), // found in the chosen chain
+            None if italic => {
+                // Not in the italic chain: try the regular chain upright.
+                let i = self.fonts.iter().position(|f| f.lookup_glyph_index(c) != 0).unwrap_or(0);
+                (&self.fonts[..], i)
+            }
+            None => (chain, 0), // nobody has it; use the primary (notdef/blank)
+        };
         // Rasterise the glyph to a coverage bitmap at our pixel size.
-        let (metrics, bitmap) = self.fonts[idx].rasterize(c, self.font_px);
+        let (metrics, bitmap) = chain[idx].rasterize(c, self.font_px);
         // Empty glyphs (space) have zero-size bitmaps; nothing to pack/draw.
         if metrics.width == 0 || metrics.height == 0 {
             let g = Glyph { u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0, w: 0.0, h: 0.0, left: 0.0, top: 0.0 };
-            self.glyphs.insert(c, g); // cache the "blank" so we don't retry
+            self.glyphs.insert((c, italic), g); // cache the "blank" so we don't retry
             return None;
         }
         let gw = metrics.width as i32; // glyph bitmap width
@@ -363,7 +387,7 @@ impl Renderer {
             left: metrics.xmin as f32,   // horizontal bearing
             top: metrics.ymin as f32 + gh as f32, // top = height above baseline
         };
-        self.glyphs.insert(c, g); // cache for next time
+        self.glyphs.insert((c, italic), g); // cache for next time
         Some(g)
     }
 
@@ -404,13 +428,14 @@ impl Renderer {
     }
 
     /// Draw a 1-cell character at cell column/row within a pane whose top-left
-    /// pixel is `(ox, oy)`. Skips blanks. `fg` is the glyph colour.
-    pub fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color) {
+    /// pixel is `(ox, oy)`. Skips blanks. `fg` is the glyph colour; `italic`
+    /// selects the oblique face (falling back to upright if none is installed).
+    pub fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color, italic: bool) {
         // Compute this cell's top-left pixel inside the pane.
         let cell_x = ox + col as f32 * self.cell_w; // pen x
         let cell_y = oy + row as f32 * self.cell_h; // cell top y
         // Fetch/rasterise the glyph; blanks return None and draw nothing.
-        let g = match self.glyph(ch) {
+        let g = match self.glyph(ch, italic) {
             Some(g) if g.w > 0.0 => g, // a real, drawable glyph
             _ => return,               // blank or un-cacheable: skip
         };
@@ -418,6 +443,24 @@ impl Renderer {
         let gx = cell_x + g.left; // apply horizontal bearing
         let gy = cell_y + self.ascent - g.top; // baseline minus glyph top
         self.push_quad(gx, gy, g.w, g.h, (g.u0, g.v0, g.u1, g.v1), fg); // emit glyph quad
+    }
+
+    /// Draw an underline across a cell: a thin horizontal bar just below the
+    /// text baseline, in `color`. Called for cells with any underline attribute.
+    pub fn draw_underline(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w; // cell left
+        let y = oy + row as f32 * self.cell_h + self.ascent + 1.0; // just under the baseline
+        let thick = (self.cell_h / 16.0).max(1.0); // scale thickness with the font, min 1px
+        self.fill_rect(x, y, self.cell_w, thick, color); // the underline bar
+    }
+
+    /// Draw a strikeout across a cell: a thin horizontal bar through the middle
+    /// of the text (about 60% of the ascent), in `color`.
+    pub fn draw_strikeout(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w; // cell left
+        let y = oy + row as f32 * self.cell_h + self.ascent * 0.6; // through the x-height
+        let thick = (self.cell_h / 16.0).max(1.0); // same thickness as underline
+        self.fill_rect(x, y, self.cell_w, thick, color); // the strikeout bar
     }
 
     /// Finish the frame: upload the accumulated vertices and issue one draw

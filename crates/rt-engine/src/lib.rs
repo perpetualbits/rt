@@ -45,20 +45,33 @@ pub enum PaneEvent {
     Wakeup,
 }
 
-/// A single terminal cell: its glyph plus its already-resolved foreground and
-/// background RGB (attribute flags like bold/dim/inverse/hidden are baked into
-/// these colours by `snapshot`, so the renderer just draws them).
+/// The text-attribute flags a cell can carry that affect *how* the glyph is
+/// drawn (as opposed to colour, which is already baked into `fg`/`bg`). These
+/// are the ones the renderer acts on: underline (any style), italic (slanted
+/// face), and strikeout (a line through the middle).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellAttrs {
+    pub underline: bool, // draw a line under the glyph
+    pub italic: bool,    // render with a slanted/oblique face
+    pub strikeout: bool, // draw a line through the glyph
+}
+
+/// A single terminal cell: its glyph, already-resolved foreground/background RGB
+/// (bold/dim/inverse/hidden are baked into the colours by `snapshot`), and the
+/// drawing attributes the renderer still needs (underline/italic/strikeout).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapCell {
-    pub c: char,   // the glyph to draw in this cell
-    pub fg: Rgb,   // resolved foreground colour
-    pub bg: Rgb,   // resolved background colour
+    pub c: char,          // the glyph to draw in this cell
+    pub fg: Rgb,          // resolved foreground colour
+    pub bg: Rgb,          // resolved background colour
+    pub attrs: CellAttrs, // underline / italic / strikeout
 }
 
 impl SnapCell {
-    /// A blank cell (space) in the default colours — used to pre-fill rows.
+    /// A blank cell (space) in the default colours with no attributes — used to
+    /// pre-fill rows.
     fn blank() -> Self {
-        SnapCell { c: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG }
+        SnapCell { c: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG, attrs: CellAttrs::default() }
     }
 }
 
@@ -361,9 +374,11 @@ impl TermPane {
             // Guard the indices: the iterator stays in range, but bounds-check
             // anyway so a future engine change can never make this panic.
             if line >= 0 && (line as usize) < rows && col < cols {
-                // Resolve this cell's colours (attribute flags folded in).
+                // Resolve this cell's colours (attribute flags folded in) and
+                // its drawing attributes (underline/italic/strikeout).
                 let (fg, bg) = self.resolve_colors(&cell); // fg/bg RGB
-                grid[line as usize][col] = SnapCell { c: cell.c, fg, bg };
+                let attrs = Self::attrs_of(cell.flags); // underline/italic/strikeout
+                grid[line as usize][col] = SnapCell { c: cell.c, fg, bg, attrs };
             }
         }
         // Capture the cursor position, but only when it is actually shown and
@@ -382,6 +397,18 @@ impl TermPane {
             None // hidden or scrolled back
         };
         Snapshot { cols, rows: grid, cursor }
+    }
+
+    /// Extract the drawing attributes (underline/italic/strikeout) from a cell's
+    /// flag bitset. "Underline" covers every underline style (single, double,
+    /// undercurl, dotted, dashed) as a plain underline for now.
+    fn attrs_of(flags: alacritty_terminal::term::cell::Flags) -> CellAttrs {
+        use alacritty_terminal::term::cell::Flags;
+        CellAttrs {
+            underline: flags.intersects(Flags::ALL_UNDERLINES), // any underline style
+            italic: flags.contains(Flags::ITALIC),              // slanted face
+            strikeout: flags.contains(Flags::STRIKEOUT),        // line through the glyph
+        }
     }
 
     /// Resolve one cell's abstract foreground/background `Color`s to concrete
@@ -521,7 +548,8 @@ impl TermPane {
                     // ever used for rendering) are also full-colour.
                     let cell = &row[Column(c)];
                     let (fg, bg) = self.resolve_colors(cell);
-                    line[c] = SnapCell { c: cell.c, fg, bg };
+                    let attrs = Self::attrs_of(cell.flags);
+                    line[c] = SnapCell { c: cell.c, fg, bg, attrs };
                 }
             }
             out.push(line); // append this (possibly blank) line

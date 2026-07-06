@@ -325,3 +325,22 @@ Recorded all observations in docs/KNOWN_ISSUES.md. Fixed three now:
 Not done yet (recorded): text attributes (underline/italic/strikeout), and the
 Terminator right-click menu. Workspace: 35 tests green; default build Wayland-
 native (zero x11 crates).
+
+## 2026-07-06 — Session 1: text attributes (underline/italic/strikeout)
+
+- rt-engine: `SnapCell` gains `CellAttrs { underline, italic, strikeout }`,
+  resolved from the cell flags (`ALL_UNDERLINES`/`ITALIC`/`STRIKEOUT`) in both
+  snapshot paths.
+- renderer: an ITALIC uses a real oblique face — added an `italic_fonts` chain
+  (DejaVu Sans Mono Oblique + fallbacks) parallel to the regular chain; the
+  glyph cache is now keyed by `(char, italic)`, and italic falls back to the
+  upright chain if a face lacks the glyph. Underline/strikeout are thin bars
+  drawn in the cell's fg (`draw_underline`/`draw_strikeout`), scaled with the
+  font. `draw_char` takes an `italic` flag.
+- Verified (`docs/screenshots/text-attributes.png`): underline, italic (slanted
+  oblique), strikeout, Underline+Italic, red underline, a full green italic
+  sentence — all correct.
+
+Noted follow-up: BOLD still only brightens colour; a bold *weight* face isn't
+loaded (a bold chain mirroring the italic one would fix it). 36 tests green;
+default build Wayland-native.
