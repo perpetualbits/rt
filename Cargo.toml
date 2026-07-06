@@ -7,6 +7,7 @@
 resolver = "2"                       # use the modern feature resolver (edition-2021+ default)
 members = [
     "crates/rt-core",                # pure layout-tree + session model (no I/O, headless-testable)
+    "crates/rt-engine",              # PTY + alacritty_terminal wrapper (one backend per pane)
 ]
 
 # Shared release profile: optimise hard and thin-LTO, mirroring alacritty's

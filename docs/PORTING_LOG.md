@@ -59,3 +59,24 @@ short-circuiting `rects()` on `is_empty()`.
 
 **Next:** M3 engine wrapper around `alacritty_terminal` (spawn PTY, feed a
 `Term`, expose a grid snapshot), with a headless `echo hi` test.
+
+## 2026-07-06 — Session 1: engine wrapper (M3) landed
+
+**rt-engine** wraps `alacritty_terminal 0.26.0` (the published version matching
+the source we studied). One `TermPane` = PTY + `Term` + background `EventLoop`
+I/O thread + a channel for input/resize/shutdown. Host-facing API is deliberately
+tiny and panic-free: `spawn`, `write`, `resize`, `snapshot`, `drain_events`, and
+a `Drop` that sends `Shutdown` and joins the thread (deterministic teardown =
+no close-time races à la Terminator #3/#4). Events are distilled to a small
+`PaneEvent` enum drained by the GUI, replacing scattered GTK signal handlers.
+
+Compiled first try. One test failure taught us something: a child that exits
+*instantly* (`printf x`) loses its final output with `drain_on_exit=false` — the
+EOF hangup races the reader. Fixed by spawning the EventLoop with
+`drain_on_exit=true`, so trailing output is fully parsed before teardown. Both
+PTY tests (output-reaches-grid, input-round-trips) now green.
+
+Workspace status: rt-core 9 tests + rt-engine 2 tests, all passing.
+
+**Next:** M2b `rt-config` (keybindings, Terminator-style, pure/testable), then
+the `rt` binary wiring core+engine, then M6 packaging scaffolding.
