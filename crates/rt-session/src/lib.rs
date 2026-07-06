@@ -15,7 +15,7 @@
 use std::collections::HashMap; // pane_id -> backend, and pane_id -> group
 
 use rt_config::Action; // the semantic actions we dispatch on
-use rt_core::{Direction, Orientation, PaneId, Rect, Tree}; // the layout model
+use rt_core::{Direction, Orientation, PaneId, Rect, TabBar, Tree}; // the layout model
 
 /// Abstraction over a pane's terminal backend so the controller is testable
 /// without spawning real shells. The real implementation is
@@ -180,6 +180,38 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.panes.get(&id)
     }
 
+    /// The tab strips to draw/hit-test for the current window `bounds`. Thin
+    /// pass-through to the layout tree.
+    pub fn tab_bars(&self, bounds: Rect) -> Vec<TabBar> {
+        self.tree.tab_bars(bounds)
+    }
+
+    /// Select the tab whose first pane is `first_pane` (from a clicked
+    /// [`TabBar`] tab), move focus into it, and reflow. Returns `true` if the
+    /// tab was found. This is what a click on a tab label calls.
+    pub fn focus_tab(&mut self, first_pane: PaneId) -> bool {
+        if self.tree.activate_tab(first_pane) {
+            self.focus = first_pane; // focus the newly-shown tab's pane
+            self.relayout(self.bounds); // its content region changed
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cycle the focused pane's tab group by `delta`, moving focus into the new
+    /// active tab. Returns `Redraw` if a tab group was found, else `None`.
+    fn cycle_tab_focus(&mut self, delta: isize) -> Option<SessionEvent> {
+        match self.tree.cycle_tab(self.focus, delta) {
+            Some(pane) => {
+                self.focus = pane; // follow the tab switch
+                self.relayout(self.bounds); // reflow the newly-active tab
+                Some(SessionEvent::Redraw)
+            }
+            None => None, // focus isn't inside any Tabs node
+        }
+    }
+
     /// Move focus to the pane whose rectangle contains the point `(px, py)` (in
     /// the same physical-pixel space as the window bounds). Returns `true` if a
     /// pane was found there (whether or not focus actually changed).
@@ -225,9 +257,10 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             Action::GoDown => self.move_focus(Direction::Down),
             Action::GoLeft => self.move_focus(Direction::Left),
             Action::GoRight => self.move_focus(Direction::Right),
-            // Tab cycling is not yet wired into the tree API; treat as redraw
-            // no-ops for now so the binding exists without misbehaving.
-            Action::NextTab | Action::PrevTab => None,
+            // Cycle the tab group containing the focused pane, moving focus into
+            // the newly-active tab.
+            Action::NextTab => self.cycle_tab_focus(1),
+            Action::PrevTab => self.cycle_tab_focus(-1),
             // Broadcast mode changes: update state, ask for a redraw so any
             // indicator refreshes.
             Action::BroadcastOff => {

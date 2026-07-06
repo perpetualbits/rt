@@ -31,6 +31,10 @@ use crate::geom::Rect;
 /// handle within this band.
 const DIVIDER: f32 = 6.0;
 
+/// Height in logical pixels of the tab strip drawn at the top of a `Tabs` node.
+/// The active tab's content is laid out below it.
+const TAB_STRIP: f32 = 24.0;
+
 /// Opaque identity of a pane (a leaf of the tree).
 ///
 /// It is just a `u64` handle. The layout tree never dereferences it; only the
@@ -444,9 +448,8 @@ impl Tree {
             // Only the active tab page is laid out; the rest are hidden.
             Node::Tabs { children, active } => {
                 if let Some(child) = children.get(*active) {
-                    // Reserve a tab strip at the top; the renderer draws tab
-                    // labels there. TAB_STRIP height is a fixed band.
-                    const TAB_STRIP: f32 = 24.0; // pixel height of the tab bar
+                    // Reserve the tab strip at the top; the active tab's content
+                    // fills the region below it.
                     let body = Rect::new(
                         bounds.x,
                         bounds.y + TAB_STRIP,               // push content below the strip
@@ -524,6 +527,176 @@ impl Tree {
             }
         }
         best.map(|(id, _)| id) // strip the distance, return just the pane
+    }
+}
+
+/// One clickable tab in a [`TabBar`], ready for the renderer to draw and the
+/// input layer to hit-test.
+#[derive(Clone, Copy, Debug)]
+pub struct Tab {
+    /// The label/click area of this tab within the strip, in pixels.
+    pub rect: Rect,
+    /// The first leaf pane inside this tab — the pane to focus when the tab is
+    /// selected, and a stable identifier for the tab.
+    pub first_pane: PaneId,
+    /// Whether this is the currently active (visible) tab of its group.
+    pub active: bool,
+    /// 1-based tab number, used as the label until per-pane titles exist.
+    pub number: usize,
+}
+
+/// A tab strip to render: the tabs of one visible `Tabs` node.
+#[derive(Clone, Debug)]
+pub struct TabBar {
+    pub tabs: Vec<Tab>,
+}
+
+impl Tree {
+    /// Enumerate the tab strips visible for the given window `bounds`, so the
+    /// renderer can draw them and the input layer can hit-test clicks. Only
+    /// `Tabs` nodes on the visible (active) path produce a strip.
+    pub fn tab_bars(&self, bounds: Rect) -> Vec<TabBar> {
+        let mut out = Vec::new();
+        Self::collect_tab_bars(&self.root, bounds, &mut out);
+        out
+    }
+
+    /// Recursive worker for [`Tree::tab_bars`]. Mirrors [`Tree::layout_node`]'s
+    /// rectangle division so tab strips land exactly above their content.
+    fn collect_tab_bars(node: &Node, bounds: Rect, out: &mut Vec<TabBar>) {
+        match node {
+            Node::Leaf(_) => {}
+            Node::Split { orient, children } => {
+                // Same weighted division as layout_node (kept in sync by hand).
+                let total: f32 = children.iter().map(|c| c.weight).sum();
+                let total = if total > 0.0 { total } else { 1.0 };
+                let gutters = DIVIDER * (children.len().saturating_sub(1) as f32);
+                match orient {
+                    Orientation::LeftRight => {
+                        let usable = (bounds.w - gutters).max(0.0);
+                        let mut cursor = bounds.x;
+                        for child in children {
+                            let w = usable * (child.weight / total);
+                            Self::collect_tab_bars(&child.node, Rect::new(cursor, bounds.y, w, bounds.h), out);
+                            cursor += w + DIVIDER;
+                        }
+                    }
+                    Orientation::TopBottom => {
+                        let usable = (bounds.h - gutters).max(0.0);
+                        let mut cursor = bounds.y;
+                        for child in children {
+                            let h = usable * (child.weight / total);
+                            Self::collect_tab_bars(&child.node, Rect::new(bounds.x, cursor, bounds.w, h), out);
+                            cursor += h + DIVIDER;
+                        }
+                    }
+                }
+            }
+            Node::Tabs { children, active } => {
+                // Divide the strip width equally among the tabs.
+                let n = children.len().max(1);
+                let segw = bounds.w / n as f32;
+                let tabs = children
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ch)| Tab {
+                        rect: Rect::new(bounds.x + i as f32 * segw, bounds.y, segw, TAB_STRIP),
+                        first_pane: Self::first_leaf(ch).unwrap_or(PaneId(0)),
+                        active: i == *active,
+                        number: i + 1,
+                    })
+                    .collect();
+                out.push(TabBar { tabs });
+                // Recurse into the active tab's body (below the strip).
+                if let Some(child) = children.get(*active) {
+                    let body = Rect::new(bounds.x, bounds.y + TAB_STRIP, bounds.w, (bounds.h - TAB_STRIP).max(0.0));
+                    Self::collect_tab_bars(child, body, out);
+                }
+            }
+        }
+    }
+
+    /// The first leaf pane found in `node` (depth-first, following active tabs).
+    /// Returns `None` for the empty sentinel or an empty subtree.
+    fn first_leaf(node: &Node) -> Option<PaneId> {
+        match node {
+            Node::Leaf(id) if *id != PaneId(u64::MAX) => Some(*id),
+            Node::Leaf(_) => None,
+            Node::Split { children, .. } => children.iter().find_map(|c| Self::first_leaf(&c.node)),
+            Node::Tabs { children, active } => children.get(*active).and_then(Self::first_leaf),
+        }
+    }
+
+    /// Whether `pane` appears anywhere in `node`'s subtree.
+    fn contains(node: &Node, pane: PaneId) -> bool {
+        match node {
+            Node::Leaf(id) => *id == pane,
+            Node::Split { children, .. } => children.iter().any(|c| Self::contains(&c.node, pane)),
+            Node::Tabs { children, .. } => children.iter().any(|c| Self::contains(c, pane)),
+        }
+    }
+
+    /// Make the tab whose first leaf is `first_pane` the active tab of its
+    /// group. Returns `true` if such a tab was found. Used when a tab is
+    /// clicked (its `first_pane` comes from [`Tree::tab_bars`]).
+    pub fn activate_tab(&mut self, first_pane: PaneId) -> bool {
+        Self::activate_node(&mut self.root, first_pane)
+    }
+
+    /// Recursive worker for [`Tree::activate_tab`].
+    fn activate_node(node: &mut Node, target: PaneId) -> bool {
+        match node {
+            Node::Leaf(_) => false,
+            Node::Split { children, .. } => children.iter_mut().any(|c| Self::activate_node(&mut c.node, target)),
+            Node::Tabs { children, active } => {
+                // Is `target` the first leaf of one of this group's tabs?
+                for i in 0..children.len() {
+                    if Self::first_leaf(&children[i]) == Some(target) {
+                        *active = i; // select that tab
+                        return true;
+                    }
+                }
+                // Otherwise recurse into the tab pages (nested Tabs).
+                children.iter_mut().any(|c| Self::activate_node(c, target))
+            }
+        }
+    }
+
+    /// Cycle the tab group *containing the focused pane* by `delta` (wrapping),
+    /// returning the first pane of the newly-active tab (to move focus into it),
+    /// or `None` if the focus is not inside any `Tabs` node. The innermost
+    /// enclosing group is cycled.
+    pub fn cycle_tab(&mut self, focused: PaneId, delta: isize) -> Option<PaneId> {
+        Self::cycle_node(&mut self.root, focused, delta)
+    }
+
+    /// Recursive worker for [`Tree::cycle_tab`].
+    fn cycle_node(node: &mut Node, pane: PaneId, delta: isize) -> Option<PaneId> {
+        match node {
+            Node::Leaf(_) => None,
+            Node::Split { children, .. } => {
+                for c in children.iter_mut() {
+                    if let Some(p) = Self::cycle_node(&mut c.node, pane, delta) {
+                        return Some(p);
+                    }
+                }
+                None
+            }
+            Node::Tabs { children, active } => {
+                let a = *active;
+                // Prefer an inner tab group (innermost wins) before this one.
+                if let Some(p) = Self::cycle_node(&mut children[a], pane, delta) {
+                    return Some(p);
+                }
+                // The focused pane is under this group's active tab: cycle here.
+                if Self::contains(&children[a], pane) {
+                    let n = children.len() as isize;
+                    *active = ((a as isize + delta).rem_euclid(n.max(1))) as usize;
+                    return Self::first_leaf(&children[*active]);
+                }
+                None
+            }
+        }
     }
 }
 

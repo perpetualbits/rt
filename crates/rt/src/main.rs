@@ -279,6 +279,14 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        if let Ok(v) = std::env::var("RT_TABS") {
+            if let Ok(n) = v.parse::<u16>() {
+                // Open N tabs total (each NewTab adds one beside the current).
+                for _ in 1..n.max(1) {
+                    session.apply(rt_config::Action::NewTab);
+                }
+            }
+        }
 
         // Appearance settings. RT_OPACITY (0.05..=1.0) seeds the background
         // opacity for demos/screenshots; a preferences panel will edit it later.
@@ -432,8 +440,23 @@ impl ApplicationHandler for App {
                             Self::apply_action(active, a); // may exit on the last pane
                         }
                     } else {
-                        // No menu: click-to-focus the pane under the cursor.
-                        if active.session.focus_at(active.mouse.0, active.mouse.1) {
+                        // No menu. A click on a tab label selects that tab;
+                        // otherwise it click-to-focuses the pane under the cursor.
+                        let size = active.window.inner_size();
+                        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+                        let (mx, my) = active.mouse;
+                        // Find a tab whose label rect contains the click.
+                        let clicked_tab = active
+                            .session
+                            .tab_bars(bounds)
+                            .into_iter()
+                            .flat_map(|bar| bar.tabs)
+                            .find(|t| t.rect.contains(mx, my))
+                            .map(|t| t.first_pane);
+                        if let Some(first_pane) = clicked_tab {
+                            active.session.focus_tab(first_pane); // switch to that tab
+                            active.window.request_redraw();
+                        } else if active.session.focus_at(mx, my) {
                             active.window.request_redraw(); // repaint the focus border
                         }
                     }
@@ -598,7 +621,7 @@ impl App {
         }
 
         let focus = active.session.focus(); // which pane is focused
-        let (cell_w, _cell_h) = active.renderer.cell_size(); // px per cell (for column offsets)
+        let (cell_w, cell_h) = active.renderer.cell_size(); // px per cell
         let sep = Color::rgb(0x2a, 0x2a, 0x33); // subtle inter-column separator colour
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.)
@@ -706,6 +729,30 @@ impl App {
                 active.renderer.fill_rect(rect.x, rect.bottom() - t, rect.w, t, focus_border); // bottom
                 active.renderer.fill_rect(rect.x, rect.y, t, rect.h, focus_border); // left
                 active.renderer.fill_rect(rect.right() - t, rect.y, t, rect.h, focus_border); // right
+            }
+        }
+
+        // Tab strips: draw each visible Tabs node's bar in its reserved region
+        // (above the active tab's content, which the pane loop already drew).
+        let tab_bg = Color::rgb(0x14, 0x14, 0x1a); // inactive tab background
+        let tab_active = Color::rgb(0x2e, 0x2e, 0x38); // active tab background
+        let tab_line = Color::rgb(0x30, 0x30, 0x38); // separators
+        let txt_on = Color::rgb(0xe0, 0xe0, 0xe8); // active label colour
+        let txt_off = Color::rgb(0x88, 0x88, 0x92); // inactive label colour
+        for bar in active.session.tab_bars(bounds) {
+            for tab in &bar.tabs {
+                let r = tab.rect; // this tab's strip rectangle
+                // Segment background (active tab stands out).
+                active.renderer.fill_rect(r.x, r.y, r.w, r.h, if tab.active { tab_active } else { tab_bg });
+                // Label: the tab number, vertically centred, left-padded.
+                let label = tab.number.to_string(); // "1", "2", …
+                let text_top = r.y + (r.h - cell_h) * 0.5; // centre the glyph line
+                let col = if tab.active { txt_on } else { txt_off };
+                for (i, ch) in label.chars().enumerate() {
+                    active.renderer.draw_char(r.x + 8.0, text_top, i, 0, ch, col, tab.active, false);
+                }
+                // Right separator between tabs.
+                active.renderer.fill_rect(r.right() - 1.0, r.y, 1.0, r.h, tab_line);
             }
         }
 

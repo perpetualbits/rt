@@ -183,6 +183,34 @@ fn click_to_focus_selects_pane_under_point() {
 }
 
 #[test]
+fn tabs_cycle_switch_and_click() {
+    let (mut session, _logs) = make();
+    let a = session.focus();
+    // New tab -> b, which becomes active and focused.
+    session.apply(Action::NewTab);
+    let b = session.focus();
+    assert_ne!(a, b);
+    // There is one tab bar with two tabs.
+    let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+    let bars = session.tab_bars(bounds);
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].tabs.len(), 2);
+    // PrevTab returns to tab A (focus follows).
+    session.apply(Action::PrevTab);
+    assert_eq!(session.focus(), a);
+    // NextTab goes back to B.
+    session.apply(Action::NextTab);
+    assert_eq!(session.focus(), b);
+    // Clicking tab A (focus_tab by its first pane) selects it.
+    assert!(session.focus_tab(a));
+    assert_eq!(session.focus(), a);
+    // The bar now marks A's tab active.
+    let bars = session.tab_bars(bounds);
+    let active_first_pane = bars[0].tabs.iter().find(|t| t.active).unwrap().first_pane;
+    assert_eq!(active_first_pane, a);
+}
+
+#[test]
 fn close_window_action_is_forwarded() {
     let (mut session, _logs) = make();
     assert_eq!(session.apply(Action::CloseWindow), Some(SessionEvent::CloseWindow));
