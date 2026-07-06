@@ -97,3 +97,21 @@ fn user_binding_overrides_default() {
     map.bind(chord, Action::NewTab); // user rebinds it
     assert_eq!(map.action_for(&chord), Some(Action::NewTab)); // override wins
 }
+
+#[test]
+fn config_roundtrips_through_toml() {
+    use rt_config::{Config, Settings};
+    // A non-default config should survive serialise -> parse unchanged.
+    let cfg = Config {
+        settings: Settings { background_opacity: 0.8, scrim_strength: 0.3, focus_follows_mouse: true },
+    };
+    let text = toml::to_string(&cfg).expect("serialises");
+    let back: Config = toml::from_str(&text).expect("parses");
+    assert_eq!(back.settings.background_opacity, 0.8);
+    assert_eq!(back.settings.scrim_strength, 0.3);
+    assert!(back.settings.focus_follows_mouse);
+    // A partial/empty file loads as defaults (serde(default)).
+    let def: Config = toml::from_str("").expect("empty parses");
+    assert_eq!(def.settings.background_opacity, 1.0);
+    assert!(!def.settings.focus_follows_mouse);
+}

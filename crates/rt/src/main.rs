@@ -288,9 +288,9 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Appearance settings. RT_OPACITY (0.05..=1.0) seeds the background
-        // opacity for demos/screenshots; a preferences panel will edit it later.
-        let mut settings = rt_config::Settings::default(); // opaque by default
+        // Load persisted settings from ~/.config/rt/config.toml so they survive
+        // restarts; env vars below override for demos/screenshots.
+        let mut settings = rt_config::Config::load().settings;
         if let Ok(v) = std::env::var("RT_OPACITY") {
             if let Ok(o) = v.parse::<f32>() {
                 settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0); // clamp to usable range
@@ -543,26 +543,31 @@ impl App {
             Action::OpacityUp => {
                 let v = active.settings.adjust_opacity(0.05); // +5% opaque
                 log::info!("background opacity = {v:.2}");
+                Self::persist(&active.settings); // remember across restarts
                 active.window.request_redraw();
             }
             Action::OpacityDown => {
                 let v = active.settings.adjust_opacity(-0.05); // more see-through
                 log::info!("background opacity = {v:.2}");
+                Self::persist(&active.settings);
                 active.window.request_redraw();
             }
             Action::ScrimUp => {
                 let v = active.settings.adjust_scrim(0.05); // stronger wash
                 log::info!("scrim strength = {v:.2}");
+                Self::persist(&active.settings);
                 active.window.request_redraw();
             }
             Action::ScrimDown => {
                 let v = active.settings.adjust_scrim(-0.05); // weaker wash
                 log::info!("scrim strength = {v:.2}");
+                Self::persist(&active.settings);
                 active.window.request_redraw();
             }
             Action::ToggleFocusFollowsMouse => {
                 active.settings.focus_follows_mouse = !active.settings.focus_follows_mouse; // flip mode
                 log::info!("focus-follows-mouse = {}", active.settings.focus_follows_mouse);
+                Self::persist(&active.settings);
                 active.window.request_redraw();
             }
             // Everything else is a session action.
@@ -572,6 +577,15 @@ impl App {
                 // No-op or clipboard (not yet wired to the OS): nothing to do.
                 _ => {}
             },
+        }
+    }
+
+    /// Persist the current settings to the config file, logging (not failing) on
+    /// error. Called after any setting change so it survives a restart.
+    fn persist(settings: &rt_config::Settings) {
+        let cfg = rt_config::Config { settings: *settings }; // wrap for serialisation
+        if let Err(e) = cfg.save() {
+            log::warn!("could not save config: {e}"); // non-fatal
         }
     }
 

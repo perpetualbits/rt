@@ -68,7 +68,8 @@ pub enum Action {
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
 /// spirit). Kept minimal for now; a future preferences panel edits these and a
 /// config file persists them.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)] // missing fields in the file fall back to Default, so old/partial configs load
 pub struct Settings {
     /// Background opacity, `0.05..=1.0`. `1.0` is fully opaque; lower values let
     /// the window(s) behind show through (compositor permitting). Clamped away
@@ -119,6 +120,63 @@ impl Settings {
     pub fn adjust_scrim(&mut self, delta: f32) -> f32 {
         self.scrim_strength = (self.scrim_strength + delta).clamp(0.0, Self::MAX_SCRIM); // stay in range
         self.scrim_strength
+    }
+}
+
+/// The persisted rt configuration (`~/.config/rt/config.toml`). Currently just
+/// wraps [`Settings`]; keybinding overrides and colour schemes will join it as
+/// those features land. `#[serde(default)]` lets an old or hand-edited file omit
+/// anything and still load.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub settings: Settings,
+}
+
+impl Config {
+    /// The path to the config file: `$XDG_CONFIG_HOME/rt/config.toml`, or
+    /// `$HOME/.config/rt/config.toml`. Returns `None` if neither env var is set
+    /// (in which case rt runs with defaults and simply doesn't persist).
+    pub fn path() -> Option<std::path::PathBuf> {
+        // Prefer the XDG base dir; fall back to ~/.config.
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+        Some(base.join("rt").join("config.toml"))
+    }
+
+    /// Load the config from disk, returning [`Config::default`] if the file is
+    /// missing or unreadable, and a best-effort parse otherwise. Never fails —
+    /// a broken config must not stop rt from starting.
+    pub fn load() -> Self {
+        let Some(path) = Self::path() else { return Self::default() };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(cfg) => cfg, // parsed a real config
+                Err(e) => {
+                    // Malformed file: warn and use defaults rather than crash.
+                    eprintln!("rt: ignoring malformed {}: {e}", path.display());
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(), // no file yet → defaults
+        }
+    }
+
+    /// Write the config to disk (creating the directory), so the current
+    /// settings survive a restart. Returns an error only for genuine I/O
+    /// problems; callers typically log and continue.
+    pub fn save(&self) -> std::io::Result<()> {
+        let Some(path) = Self::path() else {
+            return Ok(()); // nowhere to save (no HOME); silently skip
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?; // ensure ~/.config/rt exists
+        }
+        // Serialise to TOML; map a serialisation error to an I/O error kind.
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, text) // atomic enough for a tiny config
     }
 }
 

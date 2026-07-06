@@ -5,6 +5,8 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "rt configuration and keybindings (Terminator-compatible syntax), pure and testable"
 
-# Dependency-free on purpose: parsing Terminator's keybinding strings and holding
-# the config is pure logic, so it unit-tests headlessly like rt-core.
+# serde + toml persist Settings to ~/.config/rt/config.toml. Both are pure Rust,
+# so rt-config still builds/tests headlessly.
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
