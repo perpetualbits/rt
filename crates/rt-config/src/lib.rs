@@ -73,6 +73,8 @@ pub enum Action {
     ZoomReset,
     /// Toggle fullscreen.
     Fullscreen,
+    /// Maximise/restore the focused pane (Terminator's toggle_zoom).
+    ToggleZoom,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -330,6 +332,7 @@ impl Keymap {
             ("<Control>minus", Action::ZoomOut),
             ("<Control>0", Action::ZoomReset),
             ("F11", Action::Fullscreen),                 // fullscreen toggle
+            ("<Shift><Control>x", Action::ToggleZoom),   // maximise/restore the focused pane
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {

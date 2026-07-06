@@ -61,6 +61,7 @@ struct Active {
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
+    bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
     egui_state: egui_winit::State,        // egui-winit input bridge
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
@@ -457,6 +458,9 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        if std::env::var("RT_ZOOM").is_ok() {
+            session.apply(rt_config::Action::ToggleZoom); // maximise the focused pane at startup
+        }
         if let Ok(v) = std::env::var("RT_BROADCAST") {
             let _ = match v.as_str() {
                 "all" => session.apply(rt_config::Action::BroadcastAll),
@@ -496,6 +500,7 @@ impl ApplicationHandler for App {
             selection: None,
             selecting: false,
             dragging_divider: None,
+            bell_flash: None,
             egui_ctx,
             egui_state,
             egui_painter,
@@ -785,7 +790,12 @@ impl ApplicationHandler for App {
                             titles.push((id, t)); // apply after the loop (needs &mut session)
                             dirty = true;
                         }
-                        _ => dirty = true, // Wakeup/Bell → needs a redraw
+                        rt_engine::PaneEvent::Bell => {
+                            // Visible bell: flash the window briefly.
+                            active.bell_flash = Some(Instant::now() + Duration::from_millis(150));
+                            dirty = true;
+                        }
+                        _ => dirty = true, // Wakeup → needs a redraw
                     }
                 }
             }
@@ -961,7 +971,7 @@ impl App {
         let size = active.window.inner_size();
         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
         let (cw, ch) = active.renderer.cell_size();
-        for (id, rect) in active.session.tree().rects(bounds) {
+        for (id, rect) in active.session.visible_rects(bounds) {
             if rect.contains(mx, my) {
                 if active.session.columns_of(id) > 1 {
                     return None; // skip newspaper-column panes for now
@@ -1086,7 +1096,7 @@ impl App {
         let sep = Color::rgb(0x2a, 0x2a, 0x33); // subtle inter-column separator colour
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.)
-        for (id, rect) in active.session.tree().rects(bounds) {
+        for (id, rect) in active.session.visible_rects(bounds) {
             let n = active.session.columns_of(id); // newspaper column count (1 = normal)
             // Copy the pane's current grid (glyphs + resolved colours + cursor).
             if let Some(pane) = active.session.pane(id) {
@@ -1293,6 +1303,15 @@ impl App {
                 active.renderer.fill_rect(0.0, h - t, w, t, col); // bottom
                 active.renderer.fill_rect(0.0, 0.0, t, h, col); // left
                 active.renderer.fill_rect(w - t, 0.0, t, h, col); // right
+            }
+        }
+
+        // Visible bell: a brief translucent white flash over the whole window.
+        if let Some(exp) = active.bell_flash {
+            if Instant::now() < exp {
+                active.renderer.fill_rect(0.0, 0.0, bounds.w, bounds.h, Color::rgb(0xff, 0xff, 0xff).with_alpha(0.25));
+            } else {
+                active.bell_flash = None; // flash elapsed
             }
         }
 

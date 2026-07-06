@@ -43,6 +43,7 @@ impl Menu {
             Item::Action("Split Horizontally", Action::SplitHoriz),
             Item::Action("Split Vertically", Action::SplitVert),
             Item::Action("New Tab", Action::NewTab),
+            Item::Action("Maximise / Restore Pane", Action::ToggleZoom),
             Item::Separator,
             Item::Action("Close Terminal", Action::CloseTerm),
             Item::Separator,

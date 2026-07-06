@@ -105,6 +105,7 @@ pub struct Session<B: Backend, F: FnMut(usize, usize) -> B> {
     groups: HashMap<PaneId, u32>,      // pane -> group id (for Broadcast::Group)
     columns: HashMap<PaneId, u16>,     // pane -> newspaper column count (absent = 1)
     titles: HashMap<PaneId, String>,   // pane -> latest OSC/shell title (for tab + window titles)
+    zoomed: Option<PaneId>,            // if set, this pane is maximised to fill the window
     focus: PaneId,                     // the currently focused pane
     broadcast: Broadcast,              // current input fan-out mode
     bounds: Rect,                      // window content rectangle in pixels
@@ -130,6 +131,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             groups: HashMap::new(), // no groups assigned initially
             columns: HashMap::new(), // every pane starts single-column
             titles: HashMap::new(),  // no titles until the shell sets one
+            zoomed: None,            // no pane maximised initially
             focus: first,           // focus starts on the only pane
             broadcast: Broadcast::Off,
             bounds,
@@ -152,6 +154,29 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     /// Immutable access to the layout tree (the renderer calls `.rects(...)`).
     pub fn tree(&self) -> &Tree {
         &self.tree
+    }
+
+    /// Whether a pane is currently maximised (zoomed to fill the window).
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed.is_some()
+    }
+
+    /// Toggle maximising the focused pane: when zoomed, that pane fills the
+    /// window and its siblings/dividers/tab-strips are hidden. Toggling again
+    /// restores the layout.
+    pub fn toggle_zoom(&mut self) {
+        self.zoomed = if self.zoomed.is_some() { None } else { Some(self.focus) };
+        self.relayout(self.bounds); // resize the (un)zoomed pane(s)
+    }
+
+    /// The panes to actually draw for `bounds`: just the zoomed pane (full
+    /// window) when zoomed, otherwise the normal layout. The renderer and mouse
+    /// hit-testing use this so zoom is respected everywhere.
+    pub fn visible_rects(&self, bounds: Rect) -> Vec<(PaneId, Rect)> {
+        match self.zoomed {
+            Some(z) if self.panes.contains_key(&z) => vec![(z, bounds)],
+            _ => self.tree.rects(bounds),
+        }
     }
 
     /// How many newspaper columns pane `id` is showing (1 = a normal pane).
@@ -202,19 +227,29 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.titles.get(&id).map(String::as_str)
     }
 
-    /// The tab strips to draw/hit-test for the current window `bounds`. Thin
-    /// pass-through to the layout tree.
+    /// The tab strips to draw/hit-test for the current window `bounds`. Hidden
+    /// while a pane is zoomed.
     pub fn tab_bars(&self, bounds: Rect) -> Vec<TabBar> {
+        if self.zoomed.is_some() {
+            return Vec::new();
+        }
         self.tree.tab_bars(bounds)
     }
 
-    /// The divider gutter rectangles between panes, for drawing pane dividers.
+    /// The divider gutter rectangles between panes. Hidden while zoomed.
     pub fn dividers(&self, bounds: Rect) -> Vec<Rect> {
+        if self.zoomed.is_some() {
+            return Vec::new();
+        }
         self.tree.dividers(bounds)
     }
 
-    /// A draggable divider at `(px, py)`, if any (for drag-to-resize).
+    /// A draggable divider at `(px, py)`, if any. None while zoomed (no
+    /// dividers are shown).
     pub fn divider_at(&self, px: f32, py: f32, bounds: Rect) -> Option<rt_core::DragHandle> {
+        if self.zoomed.is_some() {
+            return None;
+        }
         self.tree.divider_at(px, py, bounds)
     }
 
@@ -260,7 +295,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     /// position. Only visible panes are considered (inactive tab pages have no
     /// rectangle), which is exactly right — you can't click what you can't see.
     pub fn focus_at(&mut self, px: f32, py: f32) -> bool {
-        for (id, rect) in self.tree.rects(self.bounds) {
+        for (id, rect) in self.visible_rects(self.bounds) {
             if rect.contains(px, py) {
                 self.focus = id; // adopt the clicked pane as the focus
                 return true;
@@ -300,6 +335,11 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             // the newly-active tab.
             Action::NextTab => self.cycle_tab_focus(1),
             Action::PrevTab => self.cycle_tab_focus(-1),
+            // Maximise/restore the focused pane.
+            Action::ToggleZoom => {
+                self.toggle_zoom();
+                Some(SessionEvent::Redraw)
+            }
             // Broadcast mode changes: update state, ask for a redraw so any
             // indicator refreshes.
             Action::BroadcastOff => {
@@ -412,6 +452,14 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     /// last size until shown.
     pub fn relayout(&mut self, bounds: Rect) {
         self.bounds = bounds; // remember the new window size
+        // When zoomed, only the maximised pane is sized (to the full window).
+        if let Some(z) = self.zoomed {
+            let layout = self.column_layout(z, bounds);
+            if let Some(p) = self.panes.get_mut(&z) {
+                p.resize(layout.col_cells, (layout.rows * layout.count as usize).max(1));
+            }
+            return;
+        }
         for (id, rect) in self.tree.rects(bounds) {
             // Column mode makes the PTY ONE column WIDE and `count` columns
             // TALL (count*rows), so the app underneath just sees a single tall,
@@ -470,6 +518,9 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.groups.remove(&closing); // forget any group membership
         self.columns.remove(&closing); // forget its column count
         self.titles.remove(&closing); // forget its title
+        if self.zoomed == Some(closing) {
+            self.zoomed = None; // un-zoom if we closed the maximised pane
+        }
         if self.tree.is_empty() {
             return Some(SessionEvent::CloseWindow); // no panes left → close window
         }
