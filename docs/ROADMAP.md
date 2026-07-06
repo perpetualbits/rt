@@ -64,8 +64,11 @@ Where the widget toolkit pays off.
     Implemented as a plain cell-accurate search (not RegexSearch) so highlights
     line up exactly with the grid. (cat. §9)
 14. **Bell** ✅ — visible flash (translucent white overlay, 150ms). (cat. §2)
-15. **Per-pane titlebar** with editable title + size text (optional, config
-    `show_titlebar`). (cat. §4)
+15. **Per-pane titlebar** ✅ — a header strip per pane (config `show_titlebar`,
+    on by default) with a group swatch, the pane title, and its `COLSxROWS` size;
+    focused pane's strip is highlighted. Content routes through a central
+    `Session::content_rect` so the grid, hit-testing, selection and search stay in
+    sync. Remaining polish: click-to-edit title, drag-to-group. (cat. §4)
 16. **Scrollbar UI** + scrollback config (position, infinite). (cat. §2)
 
 ## Phase 3 — Tabs, layouts, grouping polish

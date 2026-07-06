@@ -438,6 +438,10 @@ impl ApplicationHandler for App {
             pane
         });
         let mut session = Session::new(bounds, cell, spawn);
+        // Reserve a per-pane titlebar strip if the settings ask for it, then
+        // relayout so the first pane is sized to its content (minus the header).
+        session.set_show_titlebar(settings.show_titlebar);
+        session.relayout(bounds);
 
         // Dev/demo startup layout (seed of the future saved-layouts feature):
         //   RT_SPLIT=h|v    → perform one split at startup
@@ -1113,8 +1117,15 @@ impl App {
                 if active.session.columns_of(id) > 1 {
                     return None; // skip newspaper-column panes for now
                 }
-                let col = ((mx - rect.x) / cw).max(0.0) as usize; // cell column
-                let row = ((my - rect.y) / ch).max(0.0) as usize; // cell row
+                // Map against the content rect (grid area minus the titlebar); a
+                // click in the titlebar strip is above the content and yields no
+                // cell.
+                let content = active.session.content_rect(rect);
+                if my < content.y {
+                    return None; // in the titlebar, not the grid
+                }
+                let col = ((mx - content.x) / cw).max(0.0) as usize; // cell column
+                let row = ((my - content.y) / ch).max(0.0) as usize; // cell row
                 return Some((id, col, row));
             }
         }
@@ -1328,6 +1339,14 @@ impl App {
         // clear above already is the background.)
         for (id, rect) in active.session.visible_rects(bounds) {
             let n = active.session.columns_of(id); // newspaper column count (1 = normal)
+            // Reserve the titlebar strip at the top: `content` is where the grid
+            // draws; `full` keeps the whole pane rectangle for the strip, border
+            // and markers. Shadowing `rect` with the content rect means every
+            // `rect.*` below (cells, cursor, scrollbar, separators) refers to the
+            // content area automatically — the grid can never overlap the header.
+            let full = rect; // the pane's whole rectangle (incl. titlebar)
+            let rect = active.session.content_rect(rect); // grid area (minus header)
+            let bar_h = active.session.titlebar_h(); // header height (0 when disabled)
             // Copy the pane's current grid (glyphs + resolved colours + cursor).
             if let Some(pane) = active.session.pane(id) {
                 let snap = pane.snapshot(); // in column mode this is a count*rows-tall screen
@@ -1480,28 +1499,61 @@ impl App {
                     active.renderer.fill_rect(bx, thumb_y, bw, thumb_h, thumb_col);
                 }
             }
-            // Group marker: a small colour-coded square in the pane's top-right
-            // corner when it belongs to an input group, so Broadcast::Group
-            // membership is visible without a per-pane titlebar. Each group id
-            // gets a distinct hue.
-            if let Some(g) = active.session.group_of(id) {
-                let col = match g {
-                    1 => Color::rgb(0xe0, 0x6c, 0x40), // orange
-                    2 => Color::rgb(0x4c, 0xa0, 0xe0), // blue
-                    3 => Color::rgb(0x6c, 0xc0, 0x50), // green
-                    _ => Color::rgb(0xc0, 0x60, 0xd0), // purple (group 4+)
-                };
+            // Per-pane titlebar strip (Terminator-style), drawn in the reserved
+            // header above the grid: focus-tinted background, an optional group
+            // swatch, the pane title on the left and its cell size on the right.
+            let group_hue = |g: u32| match g {
+                1 => Color::rgb(0xe0, 0x6c, 0x40), // orange
+                2 => Color::rgb(0x4c, 0xa0, 0xe0), // blue
+                3 => Color::rgb(0x6c, 0xc0, 0x50), // green
+                _ => Color::rgb(0xc0, 0x60, 0xd0), // purple (group 4+)
+            };
+            if bar_h > 0.0 {
+                let focused = id == focus;
+                // Strip background + a dark hairline separating it from the grid.
+                let bar_bg = if focused { Color::rgb(0x35, 0x3b, 0x4a) } else { Color::rgb(0x24, 0x26, 0x2e) };
+                active.renderer.fill_rect(full.x, full.y, full.w, bar_h, bar_bg);
+                active.renderer.fill_rect(full.x, full.y + bar_h - 1.0, full.w, 1.0, Color::rgb(0x12, 0x12, 0x18));
+                let text_col = if focused { Color::rgb(0xe6, 0xe6, 0xf0) } else { Color::rgb(0x9a, 0x9a, 0xa6) };
+                let pad = 6.0; // horizontal inset inside the strip
+                let text_top = full.y + (bar_h - cell_h) * 0.5; // vertically centre the glyph line
+                let mut left_x = full.x + pad; // running left cursor (px)
+                // Group swatch, if this pane is in an input group.
+                if let Some(g) = active.session.group_of(id) {
+                    let s = cell_h * 0.6; // swatch side length
+                    active.renderer.fill_rect(left_x, full.y + (bar_h - s) * 0.5, s, s, group_hue(g));
+                    left_x += s + 5.0; // leave a gap before the title
+                }
+                // Size text ("COLSxROWS") pinned to the right edge.
+                let cols = (rect.w / cell_w).max(0.0) as usize; // content columns
+                let rows = (rect.h / cell_h).max(0.0) as usize; // content rows
+                let size_str = format!("{cols}x{rows}");
+                let size_w = size_str.chars().count() as f32 * cell_w;
+                let size_x = (full.right() - pad - size_w).max(left_x);
+                for (i, ch) in size_str.chars().enumerate() {
+                    active.renderer.draw_char(size_x, text_top, i, 0, ch, text_col, false, false);
+                }
+                // Title on the left, truncated so it never runs into the size.
+                let title = active.session.title_of(id).filter(|t| !t.is_empty()).unwrap_or("Terminal");
+                let avail = ((size_x - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
+                for (i, ch) in title.chars().take(avail).enumerate() {
+                    active.renderer.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
+                }
+            } else if let Some(g) = active.session.group_of(id) {
+                // No titlebar: fall back to a small colour-coded corner square so
+                // group membership is still visible.
                 let m = 10.0; // marker size in pixels
-                let pad = 4.0; // inset from the corner
-                active.renderer.fill_rect(rect.right() - m - pad, rect.y + pad, m, m, col);
+                let p = 4.0; // inset from the corner
+                active.renderer.fill_rect(full.right() - m - p, full.y + p, m, m, group_hue(g));
             }
-            // Outline the focused pane with a thin border (four thin rects).
+            // Outline the focused pane with a thin border (four thin rects),
+            // around the whole pane including its titlebar (`full`, not content).
             if id == focus {
                 let t = 2.0; // border thickness in pixels
-                active.renderer.fill_rect(rect.x, rect.y, rect.w, t, focus_border); // top
-                active.renderer.fill_rect(rect.x, rect.bottom() - t, rect.w, t, focus_border); // bottom
-                active.renderer.fill_rect(rect.x, rect.y, t, rect.h, focus_border); // left
-                active.renderer.fill_rect(rect.right() - t, rect.y, t, rect.h, focus_border); // right
+                active.renderer.fill_rect(full.x, full.y, full.w, t, focus_border); // top
+                active.renderer.fill_rect(full.x, full.bottom() - t, full.w, t, focus_border); // bottom
+                active.renderer.fill_rect(full.x, full.y, t, full.h, focus_border); // left
+                active.renderer.fill_rect(full.right() - t, full.y, t, full.h, focus_border); // right
             }
         }
 
@@ -1629,8 +1681,16 @@ impl App {
                 || settings.palette != active.settings.palette;
             let family_changed = settings.font_family != active.settings.font_family;
             let fonts_changed = family_changed || settings.font_size != active.settings.font_size;
+            let titlebar_changed = settings.show_titlebar != active.settings.show_titlebar;
             active.settings = settings; // commit
             Self::persist(&active.settings);
+            // Titlebar toggle changes every pane's content height → re-reserve and
+            // resize all PTYs.
+            if titlebar_changed {
+                active.session.set_show_titlebar(active.settings.show_titlebar);
+                let size = active.window.inner_size();
+                active.session.relayout(Rect::new(0.0, 0.0, size.width as f32, size.height as f32));
+            }
             // Colours: rebuild the palette and apply it live to every pane.
             if colours_changed {
                 let pal = rt_engine::Palette::new(

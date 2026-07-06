@@ -110,8 +110,12 @@ pub struct Session<B: Backend, F: FnMut(usize, usize) -> B> {
     broadcast: Broadcast,              // current input fan-out mode
     bounds: Rect,                      // window content rectangle in pixels
     cell: (f32, f32),                  // (width, height) of one character cell in px
+    show_titlebar: bool,               // reserve a header strip atop each pane
     spawn: F,                          // factory that creates a new backend
 }
+
+/// Vertical padding added to the cell height to size a per-pane titlebar strip.
+const TITLEBAR_PAD: f32 = 4.0;
 
 impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     /// Create a session with a single initial pane filling `bounds`.
@@ -136,6 +140,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             broadcast: Broadcast::Off,
             bounds,
             cell,
+            show_titlebar: false, // off until the GUI enables it from settings
             spawn,
         }
     }
@@ -484,6 +489,33 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.groups.insert(self.focus, group); // record membership for the focus
     }
 
+    /// Enable or disable the per-pane titlebar strip. Reserving (or freeing) the
+    /// header changes every pane's content height, so the caller should
+    /// [`relayout`](Session::relayout) afterwards to resize the PTYs.
+    pub fn set_show_titlebar(&mut self, on: bool) {
+        self.show_titlebar = on;
+    }
+
+    /// Height of the per-pane titlebar strip in pixels (0 when disabled). One
+    /// text line plus a little padding, so it scales with the font size.
+    pub fn titlebar_h(&self) -> f32 {
+        if self.show_titlebar {
+            self.cell.1 + TITLEBAR_PAD
+        } else {
+            0.0
+        }
+    }
+
+    /// The content rectangle of a pane whose full rectangle is `rect`: the same
+    /// box minus the titlebar strip reserved at its top. This is the single
+    /// definition of "where a pane's terminal grid lives"; both the layout
+    /// (PTY sizing) and the renderer (drawing/hit-testing) route through it so a
+    /// titlebar can never desync the grid from what the mouse hits.
+    pub fn content_rect(&self, rect: Rect) -> Rect {
+        let h = self.titlebar_h(); // reserved header height (0 if disabled)
+        Rect::new(rect.x, rect.y + h, rect.w, (rect.h - h).max(0.0))
+    }
+
     /// Update the character-cell pixel size (after a font change) so subsequent
     /// [`Session::relayout`] converts pane rectangles to (cols, rows) correctly.
     pub fn set_cell(&mut self, cell: (f32, f32)) {
@@ -496,9 +528,10 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     /// last size until shown.
     pub fn relayout(&mut self, bounds: Rect) {
         self.bounds = bounds; // remember the new window size
-        // When zoomed, only the maximised pane is sized (to the full window).
+        // When zoomed, only the maximised pane is sized (to the full window,
+        // minus its titlebar strip).
         if let Some(z) = self.zoomed {
-            let layout = self.column_layout(z, bounds);
+            let layout = self.column_layout(z, self.content_rect(bounds));
             if let Some(p) = self.panes.get_mut(&z) {
                 p.resize(layout.col_cells, (layout.rows * layout.count as usize).max(1));
             }
@@ -510,7 +543,8 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             // narrow screen; we re-tile those rows into columns at display time.
             // This is why full-screen apps (vim/vi/neovim) columnize
             // transparently — they never know the screen is being re-tiled.
-            let layout = self.column_layout(id, rect); // count/col_cells/rows(=one column's height)
+            // Size from the content rect so the titlebar strip is excluded.
+            let layout = self.column_layout(id, self.content_rect(rect)); // count/col_cells/rows(=one column's height)
             if let Some(p) = self.panes.get_mut(&id) {
                 let pty_rows = layout.rows * layout.count as usize; // total screen height fed to the app
                 p.resize(layout.col_cells, pty_rows.max(1)); // narrow + tall
@@ -643,10 +677,10 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     fn pane_cells(&self, id: PaneId) -> (usize, usize) {
         for (pid, rect) in self.tree.rects(self.bounds) {
             if pid == id {
-                return cells_in(rect, self.cell); // found its rectangle
+                return cells_in(self.content_rect(rect), self.cell); // minus the titlebar strip
             }
         }
-        cells_in(self.bounds, self.cell) // fallback: full-window sizing
+        cells_in(self.content_rect(self.bounds), self.cell) // fallback: full-window sizing
     }
 }
 

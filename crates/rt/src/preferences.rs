@@ -82,6 +82,8 @@ pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool, famili
             ui.heading("Behaviour");
             // Focus mode: click-to-focus vs focus-follows-mouse (sloppy).
             ui.checkbox(&mut settings.focus_follows_mouse, "Focus follows mouse");
+            // Per-pane titlebars (title + size + group) vs the borderless look.
+            ui.checkbox(&mut settings.show_titlebar, "Show per-pane titlebars");
 
             ui.separator();
             // The dialog is dismissed by this button or the Escape key.

@@ -115,6 +115,10 @@ pub struct Settings {
     /// pointer-focus coincide, since a pane is always focused (over a gutter the
     /// previous focus simply sticks).
     pub focus_follows_mouse: bool,
+    /// When true, each pane shows a header strip with its title, size and group
+    /// (Terminator's per-terminal titlebar). When false, panes are borderless
+    /// (rt's cleaner default) and group membership shows as a corner marker.
+    pub show_titlebar: bool,
     /// Default text colour (RGB). Cells that don't set an explicit foreground
     /// use this.
     pub foreground: [u8; 3],
@@ -158,6 +162,7 @@ impl Default for Settings {
             background_opacity: 1.0,       // opaque until the user dials it down
             scrim_strength: 0.0,           // no scrim until the user enables it
             focus_follows_mouse: false,    // click-to-focus by default
+            show_titlebar: true,           // Terminator-style per-pane titlebars on by default
             foreground: [0xd0, 0xd0, 0xd8], // light grey text
             background: [0x10, 0x10, 0x14], // near-black background
             palette: DEFAULT_PALETTE,      // classic xterm 16-colour palette
