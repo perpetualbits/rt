@@ -1368,6 +1368,25 @@ fn ctrl_byte(c: char) -> Option<u8> {
 fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let area = term.backend().size()?; // initial screen rectangle
     let mut mux = Mux::new(area)?;
+    // Debug/demo hook: build a small live scene so the whole feature set is
+    // visible in one shot (floating panes, all three instruments, a live wire).
+    if std::env::var("RT_MUX_DEMO").is_ok() {
+        mux.split(Orientation::Horizontal); // → pane 2 (right)
+        mux.split(Orientation::Vertical); // → pane 3 (right-bottom)
+        mux.connect_wire(1, Stream::Stdout, 2); // wire pane1.stdout → pane2.stdin
+        // pane 1: steady output (green flow) that also feeds the wire via tee.
+        if let Some(p) = mux.panes.get(&1) {
+            p.write(b"while true; do echo tick $(date +%T); sleep 0.6; done | tee $RT_OUT\n");
+        }
+        // pane 2: read the wire.
+        if let Some(p) = mux.panes.get(&2) {
+            p.write(b"cat $RT_IN\n");
+        }
+        // pane 3: burn a core (heat → white-hot border), no output.
+        if let Some(p) = mux.panes.get(&3) {
+            p.write(b"yes >/dev/null\n");
+        }
+    }
     let input = EventReader::new(); // background input thread (never blocked by a slow draw)
 
     // Idle cadence: slow enough to stay cheap, fast enough for the latency frame
