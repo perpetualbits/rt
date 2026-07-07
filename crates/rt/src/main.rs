@@ -2237,6 +2237,9 @@ impl App {
         let ctx = active.egui_ctx.clone();
         ctx.begin_pass(raw);
         let ppp = ctx.pixels_per_point().max(0.5); // physical px → egui points
+        // Which instruments the settings enable (patch-bay wires always draw).
+        let (inst_output, inst_heat, inst_latency) =
+            (active.settings.inst_output, active.settings.inst_heat, active.settings.inst_latency);
         {
             let painter =
                 ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("rt_instr")));
@@ -2246,14 +2249,16 @@ impl App {
                 let (x, y, w, h) = (rect.x / ppp, rect.y / ppp, rect.w / ppp, rect.h / ppp);
                 // Heat: a blackbody-tinted border stroke (the pane's temperature),
                 // drawn under the green output packets so one ring shows both.
-                let load = active.heat.get(id).copied().unwrap_or(0.0);
-                painter.rect_stroke(
-                    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
-                    egui::CornerRadius::ZERO,
-                    egui::Stroke::new(2.4, heat_color32(load)),
-                    egui::StrokeKind::Inside,
-                );
-                for k in 0..FLOW_PACKETS {
+                if inst_heat {
+                    let load = active.heat.get(id).copied().unwrap_or(0.0);
+                    painter.rect_stroke(
+                        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+                        egui::CornerRadius::ZERO,
+                        egui::Stroke::new(2.4, heat_color32(load)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                for k in (0..FLOW_PACKETS).take_while(|_| inst_output) {
                     let t = (m.phase + k as f32 / FLOW_PACKETS as f32).fract();
                     let p = flow_point(x, y, w, h, t);
                     let a = 0.30 + 0.70 * act; // dim when idle, vivid when busy
@@ -2310,7 +2315,7 @@ impl App {
                 }
             }
             // Jack dots on every pane (filled ● when a wire uses them).
-            for (id, r) in &rects {
+            for (id, r) in rects.iter().take_while(|_| active.settings.show_jacks) {
                 let has_in = active.wires.iter().any(|w| w.dst == *id);
                 let has_out = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
                 let has_err = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
@@ -2353,7 +2358,7 @@ impl App {
             // fast bright flare travelling round when a deadline was missed.
             let (ww, wh) = (size.width as f32 / ppp, size.height as f32 / ppp);
             const LAT_SEGS: u32 = 96;
-            for i in 0..LAT_SEGS {
+            for i in (0..LAT_SEGS).take_while(|_| inst_latency) {
                 let t0 = i as f32 / LAT_SEGS as f32;
                 let t1 = (i + 1) as f32 / LAT_SEGS as f32;
                 let p0 = flow_point(1.0, 1.0, ww - 2.0, wh - 2.0, t0);

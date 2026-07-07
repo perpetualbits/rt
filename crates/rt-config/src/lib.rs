@@ -127,6 +127,14 @@ pub struct Settings {
     /// (Terminator's per-terminal titlebar). When false, panes are borderless
     /// (rt's cleaner default) and group membership shows as a corner marker.
     pub show_titlebar: bool,
+    /// Border instrument: the green output-activity flow around each pane.
+    pub inst_output: bool,
+    /// Border instrument: the blackbody CPU-heat tint of each pane's border.
+    pub inst_heat: bool,
+    /// Border instrument: the violet latency frame around the window.
+    pub inst_latency: bool,
+    /// Show the patch-bay jack dots on each pane (existing wires draw regardless).
+    pub show_jacks: bool,
     /// Default text colour (RGB). Cells that don't set an explicit foreground
     /// use this.
     pub foreground: [u8; 3],
@@ -171,6 +179,10 @@ impl Default for Settings {
             scrim_strength: 0.0,           // no scrim until the user enables it
             focus_follows_mouse: false,    // click-to-focus by default
             show_titlebar: true,           // Terminator-style per-pane titlebars on by default
+            inst_output: true,             // border instruments on by default
+            inst_heat: true,
+            inst_latency: true,
+            show_jacks: true,              // patch-bay jacks visible by default
             foreground: [0xd0, 0xd0, 0xd8], // light grey text
             background: [0x10, 0x10, 0x14], // near-black background
             palette: DEFAULT_PALETTE,      // classic xterm 16-colour palette

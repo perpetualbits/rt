@@ -85,6 +85,13 @@ pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool, famili
             // Per-pane titlebars (title + size + group) vs the borderless look.
             ui.checkbox(&mut settings.show_titlebar, "Show per-pane titlebars");
 
+            ui.add_space(6.0);
+            ui.heading("Border instruments");
+            ui.checkbox(&mut settings.inst_output, "Output activity (green flow)");
+            ui.checkbox(&mut settings.inst_heat, "CPU heat (blackbody border)");
+            ui.checkbox(&mut settings.inst_latency, "Latency (violet window frame)");
+            ui.checkbox(&mut settings.show_jacks, "Patch-bay jacks");
+
             ui.separator();
             // The dialog is dismissed by this button or the Escape key.
             ui.horizontal(|ui| {
