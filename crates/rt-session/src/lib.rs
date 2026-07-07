@@ -437,7 +437,8 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
             | Action::WireStdout
             | Action::WireStderr
             | Action::Unwire
-            | Action::PipeInto => None,
+            | Action::PipeInto
+            | Action::Manual => None,
         }
     }
 

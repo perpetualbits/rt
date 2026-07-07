@@ -65,6 +65,7 @@ impl Menu {
             Item::Separator,
             Item::Action("Toggle Focus-Follows-Mouse", Action::ToggleFocusFollowsMouse),
             Item::Action("Preferences…", Action::Preferences),
+            Item::Action("Manual (F1)", Action::Manual),
         ];
         Menu { items, x, y, hovered: None }
     }

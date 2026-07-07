@@ -99,6 +99,8 @@ pub enum Action {
     Unwire,
     /// Patch-bay: split and wire the focused pane's stdout into the new pane.
     PipeInto,
+    /// Open/close the built-in manual overlay.
+    Manual,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -388,6 +390,7 @@ impl Keymap {
             ("<Shift><Control>u", Action::WireStderr),   // wire stderr jack
             ("<Shift><Control>k", Action::Unwire),       // disconnect focused pane
             ("<Shift><Control>p", Action::PipeInto),     // split + pipe stdout in
+            ("F1", Action::Manual),                      // built-in manual
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {

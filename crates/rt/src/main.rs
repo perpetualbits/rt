@@ -12,6 +12,7 @@
 
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
+mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
 mod preferences; // egui preferences dialog
 mod render; // the GL glyph-atlas renderer
@@ -199,6 +200,7 @@ struct Active {
     egui_state: egui_winit::State,        // egui-winit input bridge
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
     prefs_open: bool,                     // whether the preferences dialog is showing
+    manual_open: bool,                    // whether the built-in manual overlay is showing
     search_open: bool,                    // whether the scrollback-search bar is showing
     search_query: String,                 // the current search text
     search_matches: Vec<rt_engine::SearchMatch>, // hits for search_query in search_pane
@@ -689,6 +691,7 @@ impl ApplicationHandler for App {
             egui_state,
             egui_painter,
             prefs_open: false,
+            manual_open: false,
             search_open: false,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -704,6 +707,12 @@ impl ApplicationHandler for App {
         if std::env::var("RT_PREFS").is_ok() {
             if let Some(active) = self.active.as_mut() {
                 active.prefs_open = true;
+            }
+        }
+        // Debug/verification hook: RT_MANUAL opens the manual overlay at startup.
+        if std::env::var("RT_MANUAL").is_ok() {
+            if let Some(active) = self.active.as_mut() {
+                active.manual_open = true;
             }
         }
         // Debug/verification hook: RT_MENU opens the context menu at startup so
@@ -784,6 +793,35 @@ impl ApplicationHandler for App {
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
                 // Close / resize / redraw fall through to the normal handling.
+                _ => {}
+            }
+        }
+
+        // The manual overlay behaves like the preferences dialog: egui gets events
+        // (for scrolling), Esc or F1 closes it, and terminal input is suspended.
+        if active.manual_open {
+            let r = active.egui_state.on_window_event(&active.window, &event);
+            if r.repaint {
+                active.window.request_redraw();
+            }
+            match event {
+                WindowEvent::KeyboardInput { event: ref ke, .. }
+                    if ke.state == ElementState::Pressed
+                        && matches!(
+                            ke.logical_key,
+                            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F1)
+                        ) =>
+                {
+                    active.manual_open = false;
+                    active.window.request_redraw();
+                    return;
+                }
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::ModifiersChanged(_) => return,
                 _ => {}
             }
         }
@@ -1351,6 +1389,10 @@ impl App {
             Action::Unwire => {
                 let f = active.session.focus();
                 active.wires.retain(|w| w.src != f && w.dst != f);
+                active.window.request_redraw();
+            }
+            Action::Manual => {
+                active.manual_open = !active.manual_open; // toggle the manual overlay
                 active.window.request_redraw();
             }
             Action::PipeInto => {
@@ -1974,10 +2016,12 @@ impl App {
 
         active.renderer.end_frame(); // upload + draw call
 
-        // One egui pass per frame: the preferences dialog, or the search bar, or
-        // (when no dialog is up) the always-on border instruments.
+        // One egui pass per frame: the preferences dialog, the manual, the search
+        // bar, or (when none is up) the always-on border instruments.
         if active.prefs_open {
             Self::paint_egui(active);
+        } else if active.manual_open {
+            Self::paint_manual(active);
         } else if active.search_open {
             Self::paint_search(active);
         } else {
@@ -2201,6 +2245,29 @@ impl App {
             *e = *e * 0.5 + load * 0.5; // smooth
         }
         true
+    }
+
+    /// Run the built-in manual overlay for this frame and paint it.
+    fn paint_manual(active: &mut Active) {
+        let raw_input = active.egui_state.take_egui_input(&active.window);
+        let ctx = active.egui_ctx.clone();
+        let mut close = false;
+        ctx.begin_pass(raw_input);
+        manual::ui(&ctx, &mut close);
+        let output = ctx.end_pass();
+        if close {
+            active.manual_open = false;
+        }
+        active.egui_state.handle_platform_output(&active.window, output.platform_output);
+        let ppp = output.pixels_per_point;
+        let primitives = ctx.tessellate(output.shapes, ppp);
+        let size = active.window.inner_size();
+        active.egui_painter.paint_and_update_textures(
+            [size.width, size.height],
+            ppp,
+            &primitives,
+            &output.textures_delta,
+        );
     }
 
     /// Draw the per-pane output-activity instrument as an egui overlay: glowing
