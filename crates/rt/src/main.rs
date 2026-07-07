@@ -81,6 +81,9 @@ struct Active {
     bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
     meters: std::collections::HashMap<rt_core::PaneId, Meter>, // per-pane output-activity instrument
     last_meter_tick: Instant,             // wall-clock of the last instrument advance
+    heat: std::collections::HashMap<rt_core::PaneId, f32>, // per-pane CPU load (heat instrument)
+    heat_ticks: std::collections::HashMap<rt_core::PaneId, u64>, // last session CPU ticks per pane
+    heat_last: Instant,                   // wall-clock of the last /proc heat sample
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
@@ -546,6 +549,9 @@ impl ApplicationHandler for App {
             bell_flash: None,
             meters: std::collections::HashMap::new(),
             last_meter_tick: Instant::now(),
+            heat: std::collections::HashMap::new(),
+            heat_ticks: std::collections::HashMap::new(),
+            heat_last: Instant::now(),
             last_click: None,
             click_count: 0,
             egui_ctx,
@@ -973,6 +979,14 @@ impl ApplicationHandler for App {
                 _ => dirty = true, // a pane closed; repaint the survivors
             }
             active.meters.remove(&id); // forget the closed pane's instrument state
+            active.heat.remove(&id);
+            active.heat_ticks.remove(&id);
+        }
+        // Refresh the CPU-heat readings (~2 Hz); repaint if a fresh sample lands
+        // and any pane is warm, so the temperature border stays live even for a
+        // CPU-busy-but-silent pane.
+        if Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02) {
+            dirty = true;
         }
         // Keep repainting while any border flow is still moving, so it eases to a
         // stop (and decays) instead of freezing mid-orbit when output pauses.
@@ -1820,6 +1834,51 @@ impl App {
         );
     }
 
+    /// Sample `/proc` (~2 Hz) to update each pane's CPU load — the heat
+    /// instrument. Load is summed over the pane's session (shell + children), so
+    /// whatever it's running counts. Returns whether it actually sampled this
+    /// call (self-throttled); ported from rt-mux.
+    fn sample_heat(active: &mut Active) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(active.heat_last).as_secs_f32();
+        if dt < 0.4 {
+            return false; // throttle to ~2 Hz
+        }
+        active.heat_last = now;
+        // Sum cumulative CPU ticks per session in one /proc scan.
+        let mut by_session: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        if let Ok(rd) = std::fs::read_dir("/proc") {
+            for ent in rd.flatten() {
+                let name = ent.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                    continue; // only numeric pid dirs
+                }
+                let Ok(content) = std::fs::read_to_string(ent.path().join("stat")) else { continue };
+                // comm (field 2) is parenthesised; parse fixed fields after the last ')'.
+                let Some(rp) = content.rfind(')') else { continue };
+                let toks: Vec<&str> = content[rp + 1..].split_whitespace().collect();
+                if toks.len() < 13 {
+                    continue; // [3]=session(6) [11]=utime(14) [12]=stime(15)
+                }
+                let session: u32 = toks[3].parse().unwrap_or(0);
+                let utime: u64 = toks[11].parse().unwrap_or(0);
+                let stime: u64 = toks[12].parse().unwrap_or(0);
+                *by_session.entry(session).or_default() += utime + stime;
+            }
+        }
+        const HZ: f32 = 100.0; // _SC_CLK_TCK on Linux
+        for id in active.session.tree().all_panes() {
+            let Some(pid) = active.session.pane(id).and_then(|p| p.pid()) else { continue };
+            let ticks = by_session.get(&pid).copied().unwrap_or(0);
+            let prev = active.heat_ticks.insert(id, ticks).unwrap_or(ticks);
+            let load = ticks.saturating_sub(prev) as f32 / (dt * HZ); // fraction of one core
+            let e = active.heat.entry(id).or_insert(0.0);
+            *e = *e * 0.5 + load * 0.5; // smooth
+        }
+        true
+    }
+
     /// Draw the per-pane output-activity instrument as an egui overlay: glowing
     /// green packets orbiting each pane's border, their speed and brightness
     /// scaled by that pane's live output rate (ported from rt-mux). Runs its own
@@ -1853,6 +1912,15 @@ impl App {
                 let m = active.meters.get(id).copied().unwrap_or_default();
                 let act = (m.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
                 let (x, y, w, h) = (rect.x / ppp, rect.y / ppp, rect.w / ppp, rect.h / ppp);
+                // Heat: a blackbody-tinted border stroke (the pane's temperature),
+                // drawn under the green output packets so one ring shows both.
+                let load = active.heat.get(id).copied().unwrap_or(0.0);
+                painter.rect_stroke(
+                    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(2.4, heat_color32(load)),
+                    egui::StrokeKind::Inside,
+                );
                 for k in 0..FLOW_PACKETS {
                     let t = (m.phase + k as f32 / FLOW_PACKETS as f32).fract();
                     let p = flow_point(x, y, w, h, t);
@@ -1932,6 +2000,38 @@ impl App {
         active.search_pane = None;
         active.window.request_redraw();
     }
+}
+
+/// Planck/blackbody colour for a CPU load (fraction of one core): idle glows a
+/// dim deep red, a busy core runs up through orange and yellow to white-hot, a
+/// pathological load goes blue-white — load *is* temperature. Ported from rt-mux.
+fn heat_color32(load: f32) -> egui::Color32 {
+    let n = (load / 1.5).clamp(0.0, 1.0); // normalise (≥1.5 cores = max heat)
+    let s = n * n * (3.0 - 2.0 * n); // smoothstep
+    let kelvin = 1200.0 + s * 9000.0; // 1200K (dim red) .. 10200K (blue-white)
+    let (r, g, b) = blackbody(kelvin);
+    let bright = 0.30 + 0.70 * n; // idle dim, busy vivid
+    egui::Color32::from_rgb((r * bright) as u8, (g * bright) as u8, (b * bright) as u8)
+}
+
+/// Approximate blackbody RGB (0..255) for a colour temperature in kelvin
+/// (Tanner Helland's fit).
+fn blackbody(kelvin: f32) -> (f32, f32, f32) {
+    let t = (kelvin / 100.0).clamp(10.0, 400.0);
+    let r = if t <= 66.0 { 255.0 } else { (329.698_73 * (t - 60.0).powf(-0.133_204_76)).clamp(0.0, 255.0) };
+    let g = if t <= 66.0 {
+        (99.470_8 * t.ln() - 161.119_57).clamp(0.0, 255.0)
+    } else {
+        (288.122_16 * (t - 60.0).powf(-0.075_514_85)).clamp(0.0, 255.0)
+    };
+    let b = if t >= 66.0 {
+        255.0
+    } else if t <= 19.0 {
+        0.0
+    } else {
+        (138.517_73 * (t - 10.0).ln() - 305.044_8).clamp(0.0, 255.0)
+    };
+    (r, g, b)
 }
 
 /// The point at normalised position `t` (0..1, clockwise from the top-left)
