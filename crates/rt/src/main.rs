@@ -542,7 +542,7 @@ impl ApplicationHandler for App {
         let cell = renderer.cell_size(); // (cell_w, cell_h) in pixels
 
         // --- build the session with real PTY panes -----------------------
-        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let bounds = content_bounds(size);
         // RT_EXEC runs a command in every new pane before dropping to an
         // interactive shell (handy for screenshots / demos).
         let exec = std::env::var("RT_EXEC").ok();
@@ -904,7 +904,7 @@ impl ApplicationHandler for App {
                 }
                 active.renderer.resize(size.width as f32, size.height as f32); // viewport
                 // Recompute pane sizes from the new window bounds.
-                let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+                let bounds = content_bounds(size);
                 active.session.relayout(bounds); // push new sizes to PTYs
                 active.window.request_redraw(); // repaint at the new size
             }
@@ -1016,7 +1016,7 @@ impl ApplicationHandler for App {
                         }
                     } else {
                         let size = active.window.inner_size();
-                        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+                        let bounds = content_bounds(size);
                         let (mx, my) = active.mouse;
                         // A press on an output jack starts a drag-to-wire. Checked
                         // *before* the divider, since jacks sit on the pane edge
@@ -1280,7 +1280,7 @@ impl App {
     /// stdout jack sits at the right edge upper third, the stderr jack lower third.
     fn jack_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, Stream)> {
         let size = active.window.inner_size();
-        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let bounds = content_bounds(size);
         const R: f32 = 12.0; // grab radius in px
         for (id, r) in active.session.visible_rects(bounds) {
             let (ox, oy) = (r.x + r.w, r.y + r.h / 3.0);
@@ -1298,7 +1298,7 @@ impl App {
     /// The pane whose rectangle contains the physical-pixel point `(mx, my)`.
     fn pane_at(active: &Active, mx: f32, my: f32) -> Option<rt_core::PaneId> {
         let size = active.window.inner_size();
-        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let bounds = content_bounds(size);
         active
             .session
             .visible_rects(bounds)
@@ -1479,7 +1479,7 @@ impl App {
     /// outside any pane.
     fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
         let size = active.window.inner_size();
-        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let bounds = content_bounds(size);
         let (cw, ch) = active.renderer.cell_size();
         for (id, rect) in active.session.visible_rects(bounds) {
             if rect.contains(mx, my) {
@@ -1608,7 +1608,7 @@ impl App {
                 let cell = active.renderer.cell_size(); // new cell metrics
                 active.session.set_cell(cell);
                 let size = active.window.inner_size();
-                active.session.relayout(Rect::new(0.0, 0.0, size.width as f32, size.height as f32));
+                active.session.relayout(content_bounds(size));
             }
             Err(e) => log::warn!("font reload failed: {e}"),
         }
@@ -1684,7 +1684,7 @@ impl App {
         let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline (opaque)
 
         let size = active.window.inner_size(); // physical pixels
-        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let bounds = content_bounds(size);
         // Clear to the (possibly translucent) background. This IS the pane
         // background — we no longer draw an opaque per-pane fill, which under
         // translucency would double-blend and darken the see-through areas.
@@ -2061,7 +2061,7 @@ impl App {
             if titlebar_changed {
                 active.session.set_show_titlebar(active.settings.show_titlebar);
                 let size = active.window.inner_size();
-                active.session.relayout(Rect::new(0.0, 0.0, size.width as f32, size.height as f32));
+                active.session.relayout(content_bounds(size));
             }
             // Colours: rebuild the palette and apply it live to every pane.
             if colours_changed {
@@ -2296,7 +2296,7 @@ impl App {
         }
         // Pane rectangles in physical pixels.
         let size = active.window.inner_size();
-        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let bounds = content_bounds(size);
         let rects = active.session.visible_rects(bounds);
 
         // egui pass: a background painter drawing the orbiting packets.
@@ -2423,13 +2423,17 @@ impl App {
             // Latency: the whole-window frame, drawn last so it wins the outer
             // ring. Short violet segments each coloured by the undulation, with a
             // fast bright flare travelling round when a deadline was missed.
-            let (ww, wh) = (size.width as f32 / ppp, size.height as f32 / ppp);
+            // Trace the content region's perimeter (inset by the standoff), not
+            // the raw window edge, so the frame is fully visible.
+            let cb = content_bounds(size);
+            let (fx, fy) = (cb.x / ppp, cb.y / ppp);
+            let (fw, fh) = (cb.w / ppp, cb.h / ppp);
             const LAT_SEGS: u32 = 96;
             for i in (0..LAT_SEGS).take_while(|_| inst_latency) {
                 let t0 = i as f32 / LAT_SEGS as f32;
                 let t1 = (i + 1) as f32 / LAT_SEGS as f32;
-                let p0 = flow_point(1.0, 1.0, ww - 2.0, wh - 2.0, t0);
-                let p1 = flow_point(1.0, 1.0, ww - 2.0, wh - 2.0, t1);
+                let p0 = flow_point(fx, fy, fw, fh, t0);
+                let p1 = flow_point(fx, fy, fw, fh, t1);
                 let col = latency_color(t0, active.lat_phase, active.stall);
                 painter.line_segment([p0, p1], egui::Stroke::new(2.0, col));
             }
@@ -2558,6 +2562,24 @@ fn blackbody(kelvin: f32) -> (f32, f32, f32) {
         (138.517_73 * (t - 10.0).ln() - 305.044_8).clamp(0.0, 255.0)
     };
     (r, g, b)
+}
+
+/// Standoff (physical px) between the window edge and the terminal content, so
+/// the edge-living features — heat border, patch-bay jacks, latency frame, and
+/// the outermost text cells — have room and aren't clipped by the window edge.
+const WINDOW_MARGIN: f32 = 16.0;
+
+/// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
+/// All layout (panes, instruments, jacks, hit-testing) uses this; the background
+/// clear/scrim still fill the whole window, so the margin shows the background.
+fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
+    let m = WINDOW_MARGIN;
+    Rect::new(
+        m,
+        m,
+        (size.width as f32 - 2.0 * m).max(1.0),
+        (size.height as f32 - 2.0 * m).max(1.0),
+    )
 }
 
 /// A point on the cubic Bézier `p0→p3` (control points `p1`, `p2`) at `t` in
