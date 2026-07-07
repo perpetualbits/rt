@@ -59,7 +59,7 @@ const MISS_FULL: f32 = 0.05;
 /// Slop below which an overrun is just normal scheduling jitter, not a miss.
 const MISS_SLOP: f32 = 0.010;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers}; // input events (mullion's crossterm)
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind}; // input events
 
 use mullion::backend::{Backend, CrosstermBackend}; // Backend trait (size) + the real terminal backend
 use mullion::border::{draw_box, render_rim, Borders, BorderStyle, CornerStyle, LineWeight}; // borders + rim animation
@@ -107,18 +107,22 @@ struct Meter {
 /// holds both ends open `O_RDWR|O_NONBLOCK` for the pane's whole life so a
 /// program never blocks opening or writing even when nothing is wired yet.
 struct Jacks {
-    out_path: PathBuf, // $RT_OUT — program writes, rt-mux reads
+    out_path: PathBuf, // $RT_OUT — program writes stdout, rt-mux reads
+    err_path: PathBuf, // $RT_ERR — program writes stderr, rt-mux reads
     in_path: PathBuf,  // $RT_IN  — rt-mux writes, program reads
-    out_read: File,    // rt-mux's persistent handle on out_path (reads program output)
+    out_read: File,    // rt-mux's persistent handle on out_path
+    err_read: File,    // rt-mux's persistent handle on err_path
     in_write: File,    // rt-mux's persistent handle on in_path (feeds the program)
 }
 
 impl Jacks {
-    /// Create the two fifos for pane `id` under `dir` and open rt-mux's ends.
+    /// Create the three fifos for pane `id` under `dir` and open rt-mux's ends.
     fn new(dir: &Path, id: TileId) -> io::Result<Jacks> {
         let out_path = dir.join(format!("{id}.out"));
+        let err_path = dir.join(format!("{id}.err"));
         let in_path = dir.join(format!("{id}.in"));
         mkfifo(&out_path)?;
+        mkfifo(&err_path)?;
         mkfifo(&in_path)?;
         // O_RDWR keeps a peer present so the fifo never hits EOF and the program's
         // open/write never blocks; O_NONBLOCK keeps rt-mux's own I/O async.
@@ -126,14 +130,16 @@ impl Jacks {
             OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(p)
         };
         let out_read = open(&out_path)?;
+        let err_read = open(&err_path)?;
         let in_write = open(&in_path)?;
-        Ok(Jacks { out_path, in_path, out_read, in_write })
+        Ok(Jacks { out_path, err_path, in_path, out_read, err_read, in_write })
     }
 
     /// The environment variables advertising these jacks to the pane's shell.
     fn env(&self) -> Vec<(String, String)> {
         vec![
             ("RT_OUT".to_string(), self.out_path.to_string_lossy().into_owned()),
+            ("RT_ERR".to_string(), self.err_path.to_string_lossy().into_owned()),
             ("RT_IN".to_string(), self.in_path.to_string_lossy().into_owned()),
         ]
     }
@@ -143,6 +149,7 @@ impl Drop for Jacks {
     /// Remove the fifos when the pane closes (the open handles drop with us).
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.out_path);
+        let _ = std::fs::remove_file(&self.err_path);
         let _ = std::fs::remove_file(&self.in_path);
     }
 }
@@ -162,15 +169,23 @@ fn mkfifo(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// One live patch-bay connection: bytes read from `src`'s output jack are written
-/// to `dst`'s input jack. Throughput drives the wire's flow animation, so the
-/// packets you see crossing the wire are the literal bytes on the pipe.
+/// Which of a pane's output streams a wire draws from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Stdout, // $RT_OUT — green
+    Stderr, // $RT_ERR — red
+}
+
+/// One live patch-bay connection: bytes read from `src`'s output stream jack are
+/// written to `dst`'s input jack. Throughput drives the wire's flow animation, so
+/// the packets you see crossing the wire are the literal bytes on the pipe.
 struct Wire {
-    src: TileId, // read from src's $RT_OUT
-    dst: TileId, // write to dst's $RT_IN
-    rate: f32,   // smoothed bytes/second across the wire
-    phase: f32,  // flow position along the wire (laps)
-    moved: u32,  // bytes carried since the last tick (reset each tick)
+    src: TileId,     // source pane
+    stream: Stream,  // which of its output streams (stdout / stderr)
+    dst: TileId,     // write to dst's $RT_IN
+    rate: f32,       // smoothed bytes/second across the wire
+    phase: f32,      // flow position along the wire (laps)
+    moved: u32,      // bytes carried since the last tick (reset each tick)
 }
 
 /// The whole multiplexer: the mullion layout tree, one engine pane per leaf, the
@@ -187,8 +202,12 @@ struct Mux {
     jacks: HashMap<TileId, Jacks>,
     /// Active patch-bay wires (src.out -> dst.in).
     wires: Vec<Wire>,
-    /// When wiring: the source pane whose output jack we're dragging from.
-    wiring_from: Option<TileId>,
+    /// When wiring: the source pane + stream whose jack we're dragging from.
+    wiring_from: Option<(TileId, Stream)>,
+    /// Pane box rectangles from the last frame, for mouse hit-testing.
+    last_boxes: Vec<(TileId, Rect)>,
+    /// Live cursor cell while dragging a wire with the mouse (rubber-band).
+    drag_cursor: Option<(u16, u16)>,
     /// Session temp directory holding all the fifos.
     dir: PathBuf,
     /// Per-pane border instrument state (output-activity flow).
@@ -231,6 +250,8 @@ impl Mux {
             jacks: HashMap::new(),
             wires: Vec::new(),
             wiring_from: None,
+            last_boxes: Vec::new(),
+            drag_cursor: None,
             dir,
             meters: HashMap::new(),
             last_frame: Instant::now(),
@@ -328,7 +349,7 @@ impl Mux {
         self.heat_ticks.remove(&id);
         self.jacks.remove(&id); // Drop -> remove its fifos
         self.wires.retain(|w| w.src != id && w.dst != id); // unplug any wires on it
-        if self.wiring_from == Some(id) {
+        if matches!(self.wiring_from, Some((s, _)) if s == id) {
             self.wiring_from = None; // a pending wire lost its source
         }
         self.tree.ensure_focus_valid(); // reseat focus onto a survivor
@@ -379,25 +400,11 @@ impl Mux {
                 }
                 // Rotate: flip the focused tile's parent split H<->V.
                 KeyCode::Char('r') => self.tree.flip_focused_parent(),
-                // Wire: first 'w' arms from the focused pane's output jack; a
-                // second 'w' (after moving focus to the target) completes the
-                // wire src.out -> dst.in. Re-arming on the same pane cancels.
-                KeyCode::Char('w') => {
-                    let focus = self.tree.focus();
-                    match self.wiring_from.take() {
-                        None => self.wiring_from = focus, // start dragging from here
-                        Some(src) => {
-                            if let Some(dst) = focus {
-                                if src != dst
-                                    && self.jacks.contains_key(&src)
-                                    && self.jacks.contains_key(&dst)
-                                {
-                                    self.wires.push(Wire { src, dst, rate: 0.0, phase: 0.0, moved: 0 });
-                                }
-                            }
-                        }
-                    }
-                }
+                // Wire: 'w' arms from the focused pane's stdout jack, 'e' from its
+                // stderr jack; the next 'w'/'e' (after moving focus to the target)
+                // completes the wire src -> dst.in. Re-firing on the same pane cancels.
+                KeyCode::Char('w') => self.wire_gesture(Stream::Stdout),
+                KeyCode::Char('e') => self.wire_gesture(Stream::Stderr),
                 // Quit the whole multiplexer.
                 KeyCode::Char('q') => return false,
                 _ => {} // unknown command: ignore
@@ -410,8 +417,100 @@ impl Mux {
             return true;
         }
 
+        // Esc cancels a pending wire rather than reaching the shell.
+        if self.wiring_from.is_some() && matches!(key.code, KeyCode::Esc) {
+            self.wiring_from = None;
+            self.drag_cursor = None;
+            return true;
+        }
+
         self.forward_key(key); // ordinary key → the focused shell
         true
+    }
+
+    /// Keyboard wire gesture: with nothing armed, arm from the focused pane's
+    /// `stream` jack; with something armed, complete to the focused pane's input.
+    fn wire_gesture(&mut self, stream: Stream) {
+        let focus = self.tree.focus();
+        match self.wiring_from.take() {
+            None => self.wiring_from = focus.map(|f| (f, stream)), // arm
+            Some((src, s)) => {
+                if let Some(dst) = focus {
+                    self.connect_wire(src, s, dst); // complete (uses the armed stream)
+                }
+            }
+        }
+    }
+
+    /// Add a wire `src`.`stream` → `dst`.stdin, if both panes have jacks and it's
+    /// not a self-loop. Shared by the keyboard and mouse gestures.
+    fn connect_wire(&mut self, src: TileId, stream: Stream, dst: TileId) {
+        if src != dst && self.jacks.contains_key(&src) && self.jacks.contains_key(&dst) {
+            self.wires.push(Wire { src, stream, dst, rate: 0.0, phase: 0.0, moved: 0 });
+        }
+    }
+
+    /// Mouse: left-press on an output jack starts a drag-wire (rubber-band
+    /// follows the cursor); release over a pane connects to its input jack.
+    /// Left-press elsewhere focuses the pane under the cursor; right-press
+    /// cancels a pending wire.
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        let (mx, my) = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((src, stream)) = self.jack_at(mx, my) {
+                    self.wiring_from = Some((src, stream)); // begin a drag from this jack
+                    self.drag_cursor = Some((mx, my));
+                } else if let Some(id) = self.pane_at(mx, my) {
+                    self.tree.focus_set(id); // click-to-focus
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.wiring_from.is_some() {
+                    self.drag_cursor = Some((mx, my)); // rubber-band the wire
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((src, stream)) = self.wiring_from.take() {
+                    if let Some(dst) = self.pane_at(mx, my) {
+                        self.connect_wire(src, stream, dst); // drop on a pane → connect
+                    }
+                    self.drag_cursor = None;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.wiring_from = None; // cancel a pending wire
+                self.drag_cursor = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Which output jack (if any) the point `(mx, my)` hits: the right edge of a
+    /// pane box carries the stdout jack (upper third) and stderr jack (lower
+    /// third). Accepts the border column and the cell just outside it.
+    fn jack_at(&self, mx: u16, my: u16) -> Option<(TileId, Stream)> {
+        for &(id, bx) in &self.last_boxes {
+            if bx.width < 2 || bx.height < 2 {
+                continue;
+            }
+            if mx + 1 >= bx.right() && mx <= bx.right() {
+                let so_row = bx.y + (bx.height / 3).max(1);
+                let se_row = bx.y + (2 * bx.height / 3).max(2);
+                if my.abs_diff(so_row) <= 1 {
+                    return Some((id, Stream::Stdout));
+                }
+                if my.abs_diff(se_row) <= 1 {
+                    return Some((id, Stream::Stderr));
+                }
+            }
+        }
+        None
+    }
+
+    /// The pane box containing `(mx, my)`, if any.
+    fn pane_at(&self, mx: u16, my: u16) -> Option<TileId> {
+        self.last_boxes.iter().find(|&&(_, bx)| bx.contains(mx, my)).map(|&(id, _)| id)
     }
 
     /// Encode a key event and write it to the focused pane's PTY. The pane's
@@ -465,29 +564,44 @@ impl Mux {
     /// never blocks. Returns whether any bytes moved (to keep the loop lively).
     fn pump(&mut self) -> bool {
         let mut moved = false;
-        let mut buf = [0u8; 8192];
         let srcs: Vec<TileId> = self.jacks.keys().copied().collect();
+        // Drain both output streams of every pane, tagging which stream.
         for src in srcs {
-            loop {
-                // Read one chunk from this pane's output jack (non-blocking).
-                let n = match self.jacks.get_mut(&src) {
-                    Some(j) => match j.out_read.read(&mut buf) {
+            moved |= self.pump_stream(src, Stream::Stdout);
+            moved |= self.pump_stream(src, Stream::Stderr);
+        }
+        moved
+    }
+
+    /// Drain one pane's given output stream jack and fan it to matching wires.
+    fn pump_stream(&mut self, src: TileId, stream: Stream) -> bool {
+        let mut moved = false;
+        let mut buf = [0u8; 8192];
+        loop {
+            // Read one chunk from the chosen jack (non-blocking).
+            let n = match self.jacks.get_mut(&src) {
+                Some(j) => {
+                    let fd = match stream {
+                        Stream::Stdout => &mut j.out_read,
+                        Stream::Stderr => &mut j.err_read,
+                    };
+                    match fd.read(&mut buf) {
                         Ok(0) => break, // (O_RDWR means no EOF; treat as "nothing")
                         Ok(n) => n,
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(_) => break,
-                    },
-                    None => break,
-                };
-                moved = true;
-                // Fan the chunk out to every wire leaving this pane. (Own the bytes
-                // so the src-jack borrow above is released before we touch dsts.)
-                let chunk = buf[..n].to_vec();
-                for w in self.wires.iter_mut().filter(|w| w.src == src) {
-                    if let Some(dj) = self.jacks.get_mut(&w.dst) {
-                        let _ = dj.in_write.write_all(&chunk); // best-effort; drops if the reader is behind
-                        w.moved = w.moved.saturating_add(n as u32);
                     }
+                }
+                None => break,
+            };
+            moved = true;
+            // Fan the chunk to every wire leaving this pane on this stream. (Own
+            // the bytes so the src-jack borrow is released before touching dsts.)
+            let chunk = buf[..n].to_vec();
+            for w in self.wires.iter_mut().filter(|w| w.src == src && w.stream == stream) {
+                if let Some(dj) = self.jacks.get_mut(&w.dst) {
+                    let _ = dj.in_write.write_all(&chunk); // best-effort; drops if the reader is behind
+                    w.moved = w.moved.saturating_add(n as u32);
                 }
             }
         }
@@ -662,7 +776,7 @@ impl Mux {
     /// base glyphs), scaled by the wire's live throughput. Packets travel
     /// source→destination: an idle wire stays dim, a busy one shows bright green
     /// packets marching across — the literal bytes on the pipe.
-    fn draw_wire_flow(buf: &mut Buffer, path: &[(u16, u16)], phase: f32, rate: f32) {
+    fn draw_wire_flow(buf: &mut Buffer, path: &[(u16, u16)], phase: f32, rate: f32, hue: (u8, u8, u8)) {
         if path.len() < 2 {
             return;
         }
@@ -688,11 +802,28 @@ impl Mux {
             if i <= 0.06 {
                 continue; // leave the dim base wire colour between packets
             }
-            let r = (0x18 as f32 + 0x34 as f32 * i) as u8;
-            let g = (0x44 as f32 + 0xb8 as f32 * i) as u8;
-            let b = (0x24 as f32 + 0x34 as f32 * i) as u8;
+            // Interpolate the stream hue from a dim base up to full brightness.
+            let mix = |c: u8| ((c as f32) * (0.28 + 0.72 * i)) as u8;
             let cell = buf.get_mut(x, y);
-            cell.style = cell.style.fg(Color::Rgb(r, g, b)); // recolour, keep the glyph
+            cell.style = cell.style.fg(Color::Rgb(mix(hue.0), mix(hue.1), mix(hue.2))); // recolour, keep glyph
+        }
+    }
+
+    /// Draw a straight dotted rubber-band line from a wire's source jack to the
+    /// mouse cursor while a drag-to-wire is in progress.
+    fn draw_rubber_band(buf: &mut Buffer, from: (u16, u16), to: (u16, u16), hue: (u8, u8, u8)) {
+        let (x0, y0) = (from.0 as i32, from.1 as i32);
+        let (x1, y1) = (to.0 as i32, to.1 as i32);
+        let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
+        let (bw, bh) = (buf.area.width as i32, buf.area.height as i32);
+        for s in 0..=steps {
+            let t = s as f32 / steps as f32;
+            let x = (x0 as f32 + (x1 - x0) as f32 * t).round() as i32;
+            let y = (y0 as f32 + (y1 - y0) as f32 * t).round() as i32;
+            if x < 0 || y < 0 || x >= bw || y >= bh {
+                continue;
+            }
+            buf.set_char(x as u16, y as u16, '·', Style::default().fg(Color::Rgb(hue.0, hue.1, hue.2)));
         }
     }
 
@@ -741,22 +872,32 @@ impl Mux {
             let mut active: Vec<usize> = Vec::new();
             for (wi, w) in self.wires.iter().enumerate() {
                 let (Some(sb), Some(db)) = (box_of(w.src), box_of(w.dst)) else { continue };
-                let (so, di) = (out_socket(sb.height), in_socket(db.height));
+                let (so, di) = (out_socket(sb.height, w.stream), in_socket(db.height));
                 let (Some(start), Some(goal)) = (so.attach(sb), di.attach(db)) else { continue };
                 reqs.push(RouteRequest::new(start, goal, so.outward().opposite(), di.outward().opposite()));
                 active.push(wi);
             }
             // Route them together (nudges parallels apart, biases away crossings).
             let conns = route_all(&free, &reqs, 4, 8);
+            // Base wire glyphs, dim-tinted by each wire's stream (green/red).
             let connectors: Vec<Connector> = conns.iter().flatten().cloned().collect();
-            let base = vec![Style::default().fg(Color::Rgb(0x18, 0x44, 0x24)); connectors.len()]; // dim green
+            let base: Vec<Style> = conns
+                .iter()
+                .enumerate()
+                .filter_map(|(j, c)| {
+                    c.as_ref().map(|_| {
+                        let (r, g, b) = stream_hue(self.wires[active[j]].stream);
+                        Style::default().fg(Color::Rgb(r / 4, g / 4, b / 4)) // dim base
+                    })
+                })
+                .collect();
             let canvas = Rect::new(0, 0, full.width, full.height);
             render_connectors(buf, canvas, (0, 0), &connectors, &base, &obstacles, LineWeight::Light);
-            // Green flow along each routed wire, scaled by its live throughput.
+            // Flow along each routed wire (stream-coloured), scaled by throughput.
             for (j, c) in conns.iter().enumerate() {
                 if let Some(conn) = c {
                     let w = &self.wires[active[j]];
-                    Self::draw_wire_flow(buf, &conn.path, w.phase, w.rate);
+                    Self::draw_wire_flow(buf, &conn.path, w.phase, w.rate, stream_hue(w.stream));
                 }
             }
         }
@@ -774,16 +915,17 @@ impl Mux {
             };
             draw_box(buf, bx, Borders::ALL, &bstyle);
             self.draw_output_flow(buf, id, bx); // green output-activity ring
-            // Jack notches: input on the left edge, output on the right.
-            let connected = |kind: Flow| {
-                self.wires.iter().any(|w| match kind {
-                    Flow::Out => w.src == id,
-                    _ => w.dst == id,
-                })
-            };
-            let sock = Style::default().fg(Color::Rgb(0x40, 0xa8, 0x54));
-            draw_socket(buf, bx, &in_socket(bx.height), connected(Flow::In), sock);
-            draw_socket(buf, bx, &out_socket(bx.height), connected(Flow::Out), sock);
+            // Jacks: stdin (left, grey), stdout (right upper, green), stderr
+            // (right lower, red). A jack is "connected" (filled ●) when a wire
+            // uses it.
+            let has_in = self.wires.iter().any(|w| w.dst == id);
+            let has_out = self.wires.iter().any(|w| w.src == id && w.stream == Stream::Stdout);
+            let has_err = self.wires.iter().any(|w| w.src == id && w.stream == Stream::Stderr);
+            let (og, og2, ob) = stream_hue(Stream::Stdout);
+            let (eg, eg2, eb) = stream_hue(Stream::Stderr);
+            draw_socket(buf, bx, &in_socket(bx.height), has_in, Style::default().fg(Color::Rgb(0x88, 0x88, 0x98)));
+            draw_socket(buf, bx, &stdout_socket(bx.height), has_out, Style::default().fg(Color::Rgb(og, og2, ob)));
+            draw_socket(buf, bx, &stderr_socket(bx.height), has_err, Style::default().fg(Color::Rgb(eg, eg2, eb)));
 
             // Blit the pane's grid into the box interior.
             let cw = bx.width.saturating_sub(2);
@@ -835,17 +977,36 @@ impl Mux {
             buf.set_string(bx.x + 2, bx.y, &label, tstyle);
         }
 
+        // Remember the boxes for the next frame's mouse hit-testing.
+        self.last_boxes = boxes;
+
+        // Rubber-band the in-progress mouse wire from its source jack to the cursor.
+        if let (Some((src, stream)), Some(cur)) = (self.wiring_from, self.drag_cursor) {
+            let anchor = self
+                .last_boxes
+                .iter()
+                .find(|&&(i, _)| i == src)
+                .and_then(|&(_, sb)| out_socket(sb.height, stream).anchor(sb));
+            if let Some(a) = anchor {
+                Self::draw_rubber_band(buf, a, cur, stream_hue(stream));
+            }
+        }
+
         // Bottom status line: the command cheatsheet, or the wiring prompt.
         let owned;
         let (hint, status) = match self.wiring_from {
-            Some(src) => {
+            Some((src, stream)) => {
+                let s = match stream {
+                    Stream::Stdout => "stdout",
+                    Stream::Stderr => "stderr",
+                };
                 owned = format!(
-                    " WIRING from shell {src} → move focus to the target, then C-a w to connect (C-a w here to cancel) "
+                    " WIRING {s} from shell {src} → click a pane (or focus it + C-a w/e) to connect · Esc/right-click cancels "
                 );
                 (owned.as_str(), Style::default().fg(Color::Rgb(0x20, 0x2a, 0x20)).bg(Color::Rgb(0x60, 0xc0, 0x60)))
             }
             None => (
-                " C-a  %/\" split · o/←→ focus · z zoom · r rotate · w wire · x close · q quit ",
+                " C-a  %/\" split · o/←→ focus · z zoom · r rotate · w/e wire out/err · x close · q quit · drag jacks to wire ",
                 Style::default().fg(Color::Rgb(0xc8, 0xc8, 0xd4)).bg(Color::Rgb(0x22, 0x22, 0x2c)),
             ),
         };
@@ -900,14 +1061,35 @@ fn inset(r: Rect, n: u16) -> Rect {
     Rect::new(r.x + n, r.y + n, r.width.saturating_sub(2 * n), r.height.saturating_sub(2 * n))
 }
 
-/// The output jack: a socket at mid-height on the box's right edge.
-fn out_socket(h: u16) -> Socket {
-    Socket::new(Side::Right, h / 2, Flow::Out, 0)
+/// The stdout jack: upper-third of the box's right edge.
+fn stdout_socket(h: u16) -> Socket {
+    Socket::new(Side::Right, (h / 3).max(1), Flow::Out, 0)
 }
 
-/// The input jack: a socket at mid-height on the box's left edge.
+/// The stderr jack: lower-third of the box's right edge.
+fn stderr_socket(h: u16) -> Socket {
+    Socket::new(Side::Right, (2 * h / 3).max(2), Flow::Out, 1)
+}
+
+/// The output socket for a given stream.
+fn out_socket(h: u16, stream: Stream) -> Socket {
+    match stream {
+        Stream::Stdout => stdout_socket(h),
+        Stream::Stderr => stderr_socket(h),
+    }
+}
+
+/// The input (stdin) jack: mid-height on the box's left edge.
 fn in_socket(h: u16) -> Socket {
     Socket::new(Side::Left, h / 2, Flow::In, 0)
+}
+
+/// The display colour of a stream: stdout green, stderr red.
+fn stream_hue(stream: Stream) -> (u8, u8, u8) {
+    match stream {
+        Stream::Stdout => (0x40, 0xc0, 0x54),
+        Stream::Stderr => (0xd0, 0x54, 0x30),
+    }
 }
 
 /// Translate one engine cell (`char` + `Rgb` fg/bg + attribute flags) into a
@@ -1116,11 +1298,17 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     loop {
         let start = Instant::now();
         // Handle every queued input event this frame (a burst collapses into one frame).
+        let mut interacted = false;
         for ev in input.drain() {
-            if let Event::Key(k) = ev {
-                if !mux.handle_key(k) {
-                    return Ok(()); // a command asked to quit
+            interacted = true; // any input → keep the frame lively (e.g. rubber-band)
+            match ev {
+                Event::Key(k) => {
+                    if !mux.handle_key(k) {
+                        return Ok(()); // a command asked to quit
+                    }
                 }
+                Event::Mouse(m) => mux.handle_mouse(m),
+                _ => {}
             }
         }
         // Titles / child exits. If every shell exited, we're done.
@@ -1145,7 +1333,7 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         term.draw(|buf| mux.render(buf))?;
 
         let flowing = mux.wires.iter().any(|w| w.rate > 1.0);
-        let busy = piped || flowing || mux.meters.values().any(|m| m.wakeups > 0 || m.rate > 0.5);
+        let busy = interacted || piped || flowing || mux.meters.values().any(|m| m.wakeups > 0 || m.rate > 0.5);
         let budget = if busy { FRAME } else { idle_budget };
         mux.last_budget = budget; // so next frame's overrun is measured correctly
         std::thread::sleep(budget.saturating_sub(start.elapsed()));
@@ -1157,7 +1345,7 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let mut backend = CrosstermBackend::new(io::stdout());
     backend.apply_capabilities(&Capabilities::detect()); // truecolor/unicode probe
-    backend.set_mouse_capture(false); // leave native mouse/selection to the outer terminal
+    backend.set_mouse_capture(true); // rt-mux uses the mouse for focus + drag-to-wire
     let mut term = Terminal::new(backend)?;
     term.enter()?; // raw mode, alternate screen, hidden cursor
 
