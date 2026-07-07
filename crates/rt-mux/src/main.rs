@@ -38,10 +38,20 @@ const BUSY_WAKEUPS: f32 = 60.0;
 /// Laps-per-second the flow travels at full activity (visually calm, not dizzy).
 const MAX_LAPS_PER_SEC: f32 = 0.6;
 
+/// Speed of the latency frame's calm undulation, in laps/second (slow breath).
+const LAT_SPEED: f32 = 0.12;
+/// Time constant for a latency spike to fade back to calm.
+const STALL_TAU: f32 = 0.6;
+/// Frame overrun (seconds) beyond the intended budget that reads as a full-height
+/// spike. A ~50ms hitch pins the spike; smaller hitches scale down.
+const MISS_FULL: f32 = 0.05;
+/// Slop below which an overrun is just normal scheduling jitter, not a miss.
+const MISS_SLOP: f32 = 0.010;
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers}; // input events (mullion's crossterm)
 
 use mullion::backend::{Backend, CrosstermBackend}; // Backend trait (size) + the real terminal backend
-use mullion::border::{render_rim, render_shared, BorderStyle, CornerStyle, LineWeight}; // shared-seam borders + rim animation
+use mullion::border::{draw_box, render_rim, render_shared, Borders, BorderStyle, CornerStyle, LineWeight}; // borders + rim animation
 use mullion::buffer::Buffer; // the cell buffer we paint into
 use mullion::capabilities::Capabilities; // terminal feature probe (colour depth, unicode…)
 use mullion::ease::gaussian; // bump shape for the flowing packets
@@ -90,6 +100,13 @@ struct Mux {
     meters: HashMap<TileId, Meter>,
     /// Timestamp of the previous frame, for the animation's wall-clock `dt`.
     last_frame: Instant,
+    /// The frame budget we slept for last iteration, so an overrun can be told
+    /// apart from an intentionally-lazy idle tick.
+    last_budget: Duration,
+    /// Phase of the latency frame's calm undulation (laps).
+    lat_phase: f32,
+    /// Current latency-spike severity (0 = calm, 1 = a bad deadline miss); decays.
+    stall: f32,
     /// Monotonic id allocator for new tiles (never reused, so stale ids are inert).
     next_id: TileId,
     /// True while we are between the prefix key and its command key.
@@ -109,6 +126,9 @@ impl Mux {
             titles: HashMap::new(),
             meters: HashMap::new(),
             last_frame: Instant::now(),
+            last_budget: FRAME,
+            lat_phase: 0.0,
+            stall: 0.0,
             next_id: 2, // 1 is taken by the first pane
             prefix_armed: false,
             area,
@@ -301,6 +321,58 @@ impl Mux {
             let activity = (meter.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
             meter.phase = (meter.phase + activity * MAX_LAPS_PER_SEC * dt).fract();
         }
+        // Latency frame: undulation always breathes; the spike decays toward calm.
+        self.lat_phase = (self.lat_phase + LAT_SPEED * dt).fract();
+        self.stall *= (-dt / STALL_TAU).exp();
+    }
+
+    /// Register that a frame took `dt` seconds against an intended `budget`. An
+    /// overrun beyond normal jitter raises the latency spike proportionally — this
+    /// is what makes an external CPU hogger visible as a violet flare on the frame.
+    fn note_latency(&mut self, dt: f32, budget: f32) {
+        let overrun = dt - budget; // how much longer than we asked for
+        if overrun > MISS_SLOP {
+            let severity = (overrun / MISS_FULL).clamp(0.0, 1.0);
+            self.stall = self.stall.max(severity); // keep the worst recent hitch
+        }
+    }
+
+    /// Draw the latency instrument on the window frame `outer`: a calm
+    /// purple-blue-violet undulation, with a bright fast-moving flare when the
+    /// render loop missed its deadline (a hogger stole the frame).
+    fn draw_latency_frame(&self, buf: &mut Buffer, outer: Rect) {
+        // Base structural frame to recolour (dim violet).
+        let base = BorderStyle {
+            weight: LineWeight::Light,
+            corners: CornerStyle::Rounded,
+            style: Style::default().fg(Color::Rgb(0x3a, 0x2c, 0x50)),
+        };
+        draw_box(buf, outer, Borders::ALL, &base);
+        let phase = self.lat_phase;
+        let stall = self.stall;
+        render_rim(buf, outer, &[], |pos, cur| {
+            // Calm undulation: two slow lobes drifting around the ring.
+            use std::f32::consts::TAU;
+            let wave = 0.5 + 0.5 * (TAU * (pos * 2.0 + phase)).sin(); // 0..1
+            let base_v = 0.20 + 0.30 * wave; // gentle brightness band
+            // Spike: a sharp bright bump that laps fast while a stall is active.
+            let spike = if stall > 0.01 {
+                let sp = (phase * 4.0).fract(); // moves faster than the calm wave
+                let mut d = (pos - sp).abs();
+                if d > 0.5 {
+                    d = 1.0 - d;
+                }
+                stall * gaussian(d, 0.06)
+            } else {
+                0.0
+            };
+            let v = (base_v + spike).clamp(0.0, 1.0);
+            // Purple-blue-violet: red & blue lead, green trails; a spike whitens it.
+            let r = (56.0 + 128.0 * v + spike * 120.0).min(255.0) as u8;
+            let g = (32.0 + 80.0 * v + spike * 110.0).min(255.0) as u8;
+            let b = (88.0 + 152.0 * v + spike * 40.0).min(255.0) as u8;
+            Some(cur.fg(Color::Rgb(r, g, b)))
+        });
     }
 
     /// Draw the flowing green output instrument onto pane `id`'s border ring
@@ -344,8 +416,20 @@ impl Mux {
     /// pane's cursor. Finally draw a one-line command hint at the very bottom.
     fn render(&mut self, buf: &mut Buffer) {
         let full = buf.area; // the whole screen this frame
-        // Reserve the bottom row for a status line; tiles get everything above.
-        let tiling = Rect::new(full.x, full.y, full.width, full.height.saturating_sub(1));
+        // Reserve the bottom row for a status line; the window frame is everything
+        // above it, and it belongs to the latency instrument.
+        let outer = Rect::new(full.x, full.y, full.width, full.height.saturating_sub(1));
+        if outer.width >= 4 && outer.height >= 4 {
+            self.draw_latency_frame(buf, outer); // the breathing violet window frame
+        }
+        // Panes live one cell inside the frame — a moat that keeps the per-pane
+        // green rings from ever touching the violet latency ring.
+        let tiling = Rect::new(
+            outer.x + 1,
+            outer.y + 1,
+            outer.width.saturating_sub(2),
+            outer.height.saturating_sub(2),
+        );
         self.area = tiling; // remember for next frame's directional focus
 
         // A calm rounded frame; the focused tile is thickened via `focus_override`.
@@ -638,14 +722,13 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let mut mux = Mux::new(area)?;
     let input = EventReader::new(); // background input thread (never blocked by a slow draw)
 
-    let mut first = true; // force the very first paint
+    // Idle cadence: slow enough to stay cheap, fast enough for the latency frame
+    // to visibly breathe at rest (~8 fps).
+    let idle_budget = Duration::from_millis(120);
     loop {
         let start = Instant::now();
-        // Handle every queued input event this frame (a burst collapses into one
-        // frame). Any input means we must repaint.
-        let mut dirty = first;
+        // Handle every queued input event this frame (a burst collapses into one frame).
         for ev in input.drain() {
-            dirty = true; // a key, a resize, anything → repaint
             if let Event::Key(k) = ev {
                 if !mux.handle_key(k) {
                     return Ok(()); // a command asked to quit
@@ -656,27 +739,23 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         if mux.poll_panes() {
             return Ok(());
         }
-        // Advance the instruments by real wall-clock time (framerate-independent).
+        // Advance the instruments by real wall-clock time (framerate-independent),
+        // and register any deadline overrun as a latency spike.
         let now = Instant::now();
-        let dt = now.duration_since(mux.last_frame).as_secs_f32().min(0.1); // clamp a stall
+        let dt = now.duration_since(mux.last_frame).as_secs_f32().min(0.5); // clamp a long stall
         mux.last_frame = now;
+        mux.note_latency(dt, mux.last_budget.as_secs_f32());
         mux.tick(dt);
-        // "Busy" = fresh output this frame, or the flow still visibly moving. An
-        // idle multiplexer has frozen borders, so it need not repaint at all —
-        // which is what keeps its own CPU (and thus latency) near zero.
+
+        // Always repaint (the frame breathes even at rest); mullion diffs and
+        // flushes only the changed cells, so a static screen costs almost nothing
+        // downstream. A busy pane paces at 60 fps, an idle mux at ~8 fps.
+        term.draw(|buf| mux.render(buf))?;
+
         let busy = mux.meters.values().any(|m| m.wakeups > 0 || m.rate > 0.5);
-        dirty = dirty || busy;
-
-        if dirty {
-            // Repaint; mullion diffs and flushes only the changed cells.
-            term.draw(|buf| mux.render(buf))?;
-        }
-
-        // Pace: a tight frame while anything is animating, a lazy tick when idle
-        // (still responsive to the next keypress or burst of output).
-        let budget = if busy { FRAME } else { Duration::from_millis(33) };
+        let budget = if busy { FRAME } else { idle_budget };
+        mux.last_budget = budget; // so next frame's overrun is measured correctly
         std::thread::sleep(budget.saturating_sub(start.elapsed()));
-        first = false;
     }
 }
 
