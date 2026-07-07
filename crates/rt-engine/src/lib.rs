@@ -261,6 +261,9 @@ pub struct TermPane {
     rows: usize,
     // The 256-colour palette used to resolve cell colours to RGB. Built once.
     palette: palette::Palette,
+    // The child shell's process id, captured at spawn. rt-mux uses it (as the
+    // pane's session leader) to attribute CPU/memory to the pane.
+    pid: Option<u32>,
 }
 
 impl TermPane {
@@ -336,6 +339,10 @@ impl TermPane {
         // Open the PTY and fork the shell. window_id 0: rt is single-window per
         // engine pane at this layer, so a constant id is fine.
         let pty = tty::new(&pty_opts, window_size, 0)?;
+        // Grab the child shell's pid before the event loop takes ownership of the
+        // PTY. It is the pane's session leader, so summing over its session gives
+        // the pane's whole process tree (shell + whatever it runs).
+        let pid = Some(pty.child().id());
 
         // The event loop owns the PTY and drives the Term. drain_on_exit=true so
         // a fast-exiting child's final output (e.g. `printf x` that exits
@@ -367,7 +374,14 @@ impl TermPane {
             cols,
             rows,
             palette: palette::Palette::xterm(), // standard xterm 256-colour table
+            pid,
         })
+    }
+
+    /// The child shell's process id (the pane's session leader), or `None` if it
+    /// could not be determined. Used to attribute CPU/memory to the pane.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// Feed raw input bytes (already encoded keystrokes / pasted text) to the

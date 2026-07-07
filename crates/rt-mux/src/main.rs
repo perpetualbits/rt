@@ -65,7 +65,7 @@ use mullion::backend::{Backend, CrosstermBackend}; // Backend trait (size) + the
 use mullion::border::{draw_box, render_rim, Borders, BorderStyle, CornerStyle, LineWeight}; // borders + rim animation
 use mullion::buffer::Buffer; // the cell buffer we paint into
 use mullion::capabilities::Capabilities; // terminal feature probe (colour depth, unicode…)
-use mullion::ease::gaussian; // bump shape for the flowing packets
+use mullion::ease::{gaussian, smoothstep}; // bump shape + eased heat ramp
 use mullion::float::free_cells_in_window; // routable cells between panes
 use mullion::geometry::Rect; // tile rectangles
 use mullion::label::Side; // socket edges
@@ -202,6 +202,12 @@ struct Mux {
     lat_phase: f32,
     /// Current latency-spike severity (0 = calm, 1 = a bad deadline miss); decays.
     stall: f32,
+    /// Per-pane CPU load (fraction of one core), smoothed — the heat instrument.
+    heat: HashMap<TileId, f32>,
+    /// Per-pane cumulative session CPU ticks at the last heat sample.
+    heat_ticks: HashMap<TileId, u64>,
+    /// When the heat instrument last sampled `/proc`.
+    heat_last: Instant,
     /// Monotonic id allocator for new tiles (never reused, so stale ids are inert).
     next_id: TileId,
     /// True while we are between the prefix key and its command key.
@@ -231,6 +237,9 @@ impl Mux {
             last_budget: FRAME,
             lat_phase: 0.0,
             stall: 0.0,
+            heat: HashMap::new(),
+            heat_ticks: HashMap::new(),
+            heat_last: Instant::now(),
             next_id: 2, // 1 is taken by the first pane
             prefix_armed: false,
             area,
@@ -315,6 +324,8 @@ impl Mux {
         self.panes.remove(&id); // Drop -> PTY shutdown + thread join
         self.titles.remove(&id);
         self.meters.remove(&id); // forget its instrument state
+        self.heat.remove(&id); // forget its heat reading
+        self.heat_ticks.remove(&id);
         self.jacks.remove(&id); // Drop -> remove its fifos
         self.wires.retain(|w| w.src != id && w.dst != id); // unplug any wires on it
         if self.wiring_from == Some(id) {
@@ -481,6 +492,53 @@ impl Mux {
             }
         }
         moved
+    }
+
+    /// Sample `/proc` (about twice a second) to update each pane's CPU load — the
+    /// heat instrument. A pane's load is summed over its whole session (the shell
+    /// plus whatever it's running), so `make`/`vim`/etc. count. Cheap: one pass
+    /// over `/proc`, ~2 Hz.
+    fn sample_heat(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.heat_last).as_secs_f32();
+        if dt < 0.4 {
+            return; // throttle to ~2 Hz
+        }
+        self.heat_last = now;
+        // Sum cumulative CPU ticks per session in a single /proc scan.
+        let mut by_session: HashMap<u32, u64> = HashMap::new();
+        if let Ok(rd) = std::fs::read_dir("/proc") {
+            for ent in rd.flatten() {
+                let name = ent.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                    continue; // only numeric pid dirs
+                }
+                let Ok(content) = std::fs::read_to_string(ent.path().join("stat")) else { continue };
+                // comm (field 2) is parenthesised and may contain spaces/`)`, so
+                // parse the fixed fields after the final ')'.
+                let Some(rp) = content.rfind(')') else { continue };
+                let toks: Vec<&str> = content[rp + 1..].split_whitespace().collect();
+                // After ')': [0]=state(3) [3]=session(6) [11]=utime(14) [12]=stime(15)
+                if toks.len() < 13 {
+                    continue;
+                }
+                let session: u32 = toks[3].parse().unwrap_or(0);
+                let utime: u64 = toks[11].parse().unwrap_or(0);
+                let stime: u64 = toks[12].parse().unwrap_or(0);
+                *by_session.entry(session).or_default() += utime + stime;
+            }
+        }
+        const HZ: f32 = 100.0; // _SC_CLK_TCK on Linux
+        let ids: Vec<TileId> = self.panes.keys().copied().collect();
+        for id in ids {
+            let Some(pid) = self.panes.get(&id).and_then(|p| p.pid()) else { continue };
+            let ticks = by_session.get(&pid).copied().unwrap_or(0);
+            let prev = self.heat_ticks.insert(id, ticks).unwrap_or(ticks);
+            let load = ticks.saturating_sub(prev) as f32 / (dt * HZ); // fraction of one core
+            let e = self.heat.entry(id).or_insert(0.0);
+            *e = *e * 0.5 + load * 0.5; // smooth
+        }
     }
 
     /// Advance the border instruments by `dt` seconds: convert each pane's
@@ -706,15 +764,13 @@ impl Mux {
         // ── Panes on top ────────────────────────────────────────────────────
         for &(id, bx) in &boxes {
             let focused = Some(id) == focus;
-            // Focused pane: heavier, brighter box.
+            // The border base colour is the pane's blackbody heat (CPU load);
+            // the green output flow rides over it, so one ring shows both at once.
+            let load = self.heat.get(&id).copied().unwrap_or(0.0);
             let bstyle = BorderStyle {
                 weight: if focused { LineWeight::Heavy } else { LineWeight::Light },
                 corners: CornerStyle::Rounded,
-                style: Style::default().fg(if focused {
-                    Color::Rgb(0x74, 0x78, 0x95)
-                } else {
-                    Color::Rgb(0x44, 0x46, 0x58)
-                }),
+                style: Style::default().fg(heat_color(load)),
             };
             draw_box(buf, bx, Borders::ALL, &bstyle);
             self.draw_output_flow(buf, id, bx); // green output-activity ring
@@ -801,6 +857,42 @@ impl Mux {
         let line: String = line.chars().take(full.width as usize).collect();
         buf.set_string(full.x, full.bottom() - 1, &line, status);
     }
+}
+
+/// Planck/blackbody colour for a CPU load: an idle process glows a dim deep red,
+/// a busy one runs up through orange and yellow to white-hot, and a pathological
+/// one goes blue-white — load *is* temperature. `load` is fraction of one core.
+fn heat_color(load: f32) -> Color {
+    let n = (load / 1.5).clamp(0.0, 1.0); // normalise (≥1.5 cores = max heat)
+    let s = smoothstep(n); // ease the ramp
+    let kelvin = 1200.0 + s * 9000.0; // 1200K (dim red) .. 10200K (blue-white)
+    let (r, g, b) = blackbody(kelvin);
+    let bright = 0.28 + 0.72 * n; // idle is dim; busy is vivid
+    Color::Rgb((r * bright) as u8, (g * bright) as u8, (b * bright) as u8)
+}
+
+/// Approximate blackbody RGB (0..255) for a colour temperature in kelvin
+/// (Tanner Helland's fit). Red/green/blue each follow the Planck locus.
+fn blackbody(kelvin: f32) -> (f32, f32, f32) {
+    let t = (kelvin / 100.0).clamp(10.0, 400.0);
+    let r = if t <= 66.0 {
+        255.0
+    } else {
+        (329.698_73 * (t - 60.0).powf(-0.133_204_76)).clamp(0.0, 255.0)
+    };
+    let g = if t <= 66.0 {
+        (99.470_8 * t.ln() - 161.119_57).clamp(0.0, 255.0)
+    } else {
+        (288.122_16 * (t - 60.0).powf(-0.075_514_85)).clamp(0.0, 255.0)
+    };
+    let b = if t >= 66.0 {
+        255.0
+    } else if t <= 19.0 {
+        0.0
+    } else {
+        (138.517_73 * (t - 10.0).ln() - 305.044_8).clamp(0.0, 255.0)
+    };
+    (r, g, b)
 }
 
 /// Shrink a rect by `n` cells on every side (saturating).
@@ -1037,6 +1129,8 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
         // Move bytes across the patch-bay wires this iteration.
         let piped = mux.pump();
+        // Refresh the CPU-heat readings (self-throttled to ~2 Hz).
+        mux.sample_heat();
         // Advance the instruments by real wall-clock time (framerate-independent),
         // and register any deadline overrun as a latency spike.
         let now = Instant::now();
