@@ -280,6 +280,20 @@ impl TermPane {
         cols: usize,
         rows: usize,
     ) -> std::io::Result<Self> {
+        Self::spawn_env(shell, working_directory, cols, rows, &[]) // no extra env
+    }
+
+    /// Like [`spawn`](Self::spawn) but with extra environment variables exported
+    /// into the child shell (each `(name, value)`). rt-mux uses this to advertise
+    /// a pane's side-channel pipe endpoints (`$RT_OUT` / `$RT_IN`) so programs can
+    /// opt into inter-pane wiring.
+    pub fn spawn_env(
+        shell: Option<(String, Vec<String>)>,
+        working_directory: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+        env: &[(String, String)], // extra environment variables for the child
+    ) -> std::io::Result<Self> {
         // Shared state between this struct and the proxy/I/O thread.
         let events = Arc::new(Mutex::new(VecDeque::new())); // event FIFO
         let sender_slot = Arc::new(Mutex::new(None)); // filled in below
@@ -304,6 +318,10 @@ impl TermPane {
         // like `mc` inherit whatever TERM launched rt and mis-decode our keys.
         pty_opts.env.insert("TERM".to_string(), "xterm-256color".to_string());
         pty_opts.env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        // Caller-supplied extras (e.g. rt-mux's $RT_OUT / $RT_IN pipe jacks).
+        for (k, v) in env {
+            pty_opts.env.insert(k.clone(), v.clone());
+        }
 
         // Cell pixel size is only advisory to the kernel's winsize; the parser
         // cares about cols/rows. 8×16 is a reasonable placeholder until the

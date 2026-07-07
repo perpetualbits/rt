@@ -19,3 +19,5 @@ rt-engine = { path = "../rt-engine" }
 mullion = { path = "../../../mullion" }
 # Matches mullion's crossterm so Event/KeyCode types line up across the seam.
 crossterm = "0.28"
+# For the side-channel pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).
+libc = "0.2"

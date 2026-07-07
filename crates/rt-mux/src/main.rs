@@ -24,7 +24,12 @@
 //! seam between them.
 
 use std::collections::HashMap; // tile id -> pane, and tile id -> title
-use std::io::{self, Stdout}; // stdout backend + Result
+use std::ffi::CString; // mkfifo path
+use std::fs::{File, OpenOptions}; // the fifo endpoints
+use std::io::{self, Read, Stdout, Write}; // stdout backend + Result + pipe I/O
+use std::os::unix::ffi::OsStrExt; // OsStr -> bytes for CString
+use std::os::unix::fs::OpenOptionsExt; // custom_flags for O_NONBLOCK
+use std::path::{Path, PathBuf}; // fifo paths
 use std::time::{Duration, Instant}; // frame pacing
 
 /// Number of green "packets" spaced evenly around each pane's border ring. They
@@ -38,6 +43,8 @@ const BUSY_WAKEUPS: f32 = 60.0;
 /// Laps-per-second the flow travels at full activity (visually calm, not dizzy).
 const MAX_LAPS_PER_SEC: f32 = 0.6;
 
+/// Bytes/second across a wire that reads as "fully busy" for its flow animation.
+const WIRE_BUSY_BYTES: f32 = 4096.0;
 /// Speed of the latency frame's calm undulation, in laps/second (slow breath).
 const LAT_SPEED: f32 = 0.12;
 /// Time constant for a latency spike to fade back to calm.
@@ -86,6 +93,78 @@ struct Meter {
     phase: f32,
 }
 
+/// A pane's side-channel pipe endpoints — its patch-bay jacks, kept separate
+/// from the interactive tty. `$RT_OUT` is a fifo a program *writes* to (rt-mux
+/// reads it); `$RT_IN` is a fifo rt-mux *writes* to (a program reads it). rt-mux
+/// holds both ends open `O_RDWR|O_NONBLOCK` for the pane's whole life so a
+/// program never blocks opening or writing even when nothing is wired yet.
+struct Jacks {
+    out_path: PathBuf, // $RT_OUT — program writes, rt-mux reads
+    in_path: PathBuf,  // $RT_IN  — rt-mux writes, program reads
+    out_read: File,    // rt-mux's persistent handle on out_path (reads program output)
+    in_write: File,    // rt-mux's persistent handle on in_path (feeds the program)
+}
+
+impl Jacks {
+    /// Create the two fifos for pane `id` under `dir` and open rt-mux's ends.
+    fn new(dir: &Path, id: TileId) -> io::Result<Jacks> {
+        let out_path = dir.join(format!("{id}.out"));
+        let in_path = dir.join(format!("{id}.in"));
+        mkfifo(&out_path)?;
+        mkfifo(&in_path)?;
+        // O_RDWR keeps a peer present so the fifo never hits EOF and the program's
+        // open/write never blocks; O_NONBLOCK keeps rt-mux's own I/O async.
+        let open = |p: &Path| {
+            OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(p)
+        };
+        let out_read = open(&out_path)?;
+        let in_write = open(&in_path)?;
+        Ok(Jacks { out_path, in_path, out_read, in_write })
+    }
+
+    /// The environment variables advertising these jacks to the pane's shell.
+    fn env(&self) -> Vec<(String, String)> {
+        vec![
+            ("RT_OUT".to_string(), self.out_path.to_string_lossy().into_owned()),
+            ("RT_IN".to_string(), self.in_path.to_string_lossy().into_owned()),
+        ]
+    }
+}
+
+impl Drop for Jacks {
+    /// Remove the fifos when the pane closes (the open handles drop with us).
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.out_path);
+        let _ = std::fs::remove_file(&self.in_path);
+    }
+}
+
+/// Create a fifo at `path` (mode 0600); an existing fifo is fine.
+fn mkfifo(path: &Path) -> io::Result<()> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "fifo path has a NUL byte"))?;
+    // SAFETY: `c` is a valid NUL-terminated C string for the duration of the call.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::AlreadyExists {
+            return Err(err); // a real failure (permissions, missing dir, …)
+        }
+    }
+    Ok(())
+}
+
+/// One live patch-bay connection: bytes read from `src`'s output jack are written
+/// to `dst`'s input jack. Throughput drives the wire's flow animation, so the
+/// packets you see crossing the wire are the literal bytes on the pipe.
+struct Wire {
+    src: TileId, // read from src's $RT_OUT
+    dst: TileId, // write to dst's $RT_IN
+    rate: f32,   // smoothed bytes/second across the wire
+    phase: f32,  // flow position along the wire (laps)
+    moved: u32,  // bytes carried since the last tick (reset each tick)
+}
+
 /// The whole multiplexer: the mullion layout tree, one engine pane per leaf, the
 /// per-pane titles, and the small amount of interaction state.
 struct Mux {
@@ -96,6 +175,14 @@ struct Mux {
     panes: HashMap<TileId, TermPane>,
     /// Latest OSC/shell title per pane, shown in its titlebar.
     titles: HashMap<TileId, String>,
+    /// Per-pane side-channel pipe jacks ($RT_OUT / $RT_IN).
+    jacks: HashMap<TileId, Jacks>,
+    /// Active patch-bay wires (src.out -> dst.in).
+    wires: Vec<Wire>,
+    /// When wiring: the source pane whose output jack we're dragging from.
+    wiring_from: Option<TileId>,
+    /// Session temp directory holding all the fifos.
+    dir: PathBuf,
     /// Per-pane border instrument state (output-activity flow).
     meters: HashMap<TileId, Meter>,
     /// Timestamp of the previous frame, for the animation's wall-clock `dt`.
@@ -120,10 +207,17 @@ impl Mux {
     /// Build the multiplexer with a single pane filling `area` (minus the outer
     /// border). Fails only if the first PTY cannot be spawned.
     fn new(area: Rect) -> io::Result<Self> {
+        // A per-session temp directory holds every pane's fifos.
+        let dir = std::env::temp_dir().join(format!("rt-mux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
         let mut mux = Mux {
             tree: Tree::new(Node::Tile(1)), // start with one leaf, id 1
             panes: HashMap::new(),
             titles: HashMap::new(),
+            jacks: HashMap::new(),
+            wires: Vec::new(),
+            wiring_from: None,
+            dir,
             meters: HashMap::new(),
             last_frame: Instant::now(),
             last_budget: FRAME,
@@ -136,25 +230,44 @@ impl Mux {
         // Size the first pane to the content area (screen minus the 1-cell frame).
         let cols = area.width.saturating_sub(2).max(1) as usize;
         let rows = area.height.saturating_sub(2).max(1) as usize;
-        let pane = TermPane::spawn(None, None, cols, rows)?; // None = default login shell
+        let env = mux.make_jacks(1); // its $RT_OUT / $RT_IN
+        let pane = TermPane::spawn_env(None, None, cols, rows, &env)?; // None = default login shell
         mux.panes.insert(1, pane);
         mux.tree.focus_set(1); // focus the only pane
         Ok(mux)
     }
 
+    /// Create the pipe jacks for pane `id` and return the env vars to export.
+    /// Best-effort: if the fifos can't be made the pane still runs, just without
+    /// wiring (it simply has no jacks entry).
+    fn make_jacks(&mut self, id: TileId) -> Vec<(String, String)> {
+        match Jacks::new(&self.dir, id) {
+            Ok(j) => {
+                let env = j.env();
+                self.jacks.insert(id, j);
+                env
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Spawn a fresh engine pane at a placeholder size (the next frame resizes it
-    /// to its real rectangle) and register it under a new id. Returns the id, or
-    /// `None` if the PTY could not be created.
+    /// to its real rectangle) and register it under a new id, with its own jacks.
+    /// Returns the id, or `None` if the PTY could not be created.
     fn spawn_pane(&mut self) -> Option<TileId> {
+        let id = self.next_id; // candidate id (committed only on success)
+        let env = self.make_jacks(id);
         // 80x24 is only a seed; `render` resizes every pane to its tile each frame.
-        match TermPane::spawn(None, None, 80, 24) {
+        match TermPane::spawn_env(None, None, 80, 24, &env) {
             Ok(pane) => {
-                let id = self.next_id; // allocate a never-reused id
                 self.next_id += 1;
                 self.panes.insert(id, pane);
                 Some(id)
             }
-            Err(_) => None, // out of ptys/fds: refuse the split rather than crash
+            Err(_) => {
+                self.jacks.remove(&id); // reap the jacks we just made
+                None
+            }
         }
     }
 
@@ -194,6 +307,11 @@ impl Mux {
         self.panes.remove(&id); // Drop -> PTY shutdown + thread join
         self.titles.remove(&id);
         self.meters.remove(&id); // forget its instrument state
+        self.jacks.remove(&id); // Drop -> remove its fifos
+        self.wires.retain(|w| w.src != id && w.dst != id); // unplug any wires on it
+        if self.wiring_from == Some(id) {
+            self.wiring_from = None; // a pending wire lost its source
+        }
         self.tree.ensure_focus_valid(); // reseat focus onto a survivor
         self.tree.ensure_zoom_valid();
         root_was_target || self.panes.is_empty()
@@ -242,6 +360,25 @@ impl Mux {
                 }
                 // Rotate: flip the focused tile's parent split H<->V.
                 KeyCode::Char('r') => self.tree.flip_focused_parent(),
+                // Wire: first 'w' arms from the focused pane's output jack; a
+                // second 'w' (after moving focus to the target) completes the
+                // wire src.out -> dst.in. Re-arming on the same pane cancels.
+                KeyCode::Char('w') => {
+                    let focus = self.tree.focus();
+                    match self.wiring_from.take() {
+                        None => self.wiring_from = focus, // start dragging from here
+                        Some(src) => {
+                            if let Some(dst) = focus {
+                                if src != dst
+                                    && self.jacks.contains_key(&src)
+                                    && self.jacks.contains_key(&dst)
+                                {
+                                    self.wires.push(Wire { src, dst, rate: 0.0, phase: 0.0, moved: 0 });
+                                }
+                            }
+                        }
+                    }
+                }
                 // Quit the whole multiplexer.
                 KeyCode::Char('q') => return false,
                 _ => {} // unknown command: ignore
@@ -303,6 +440,41 @@ impl Mux {
         false
     }
 
+    /// Move bytes across every wire: read whatever each pane wrote to its output
+    /// jack and forward it to the input jack of every pane wired downstream.
+    /// Reading always happens (even unwired) so a program writing to `$RT_OUT`
+    /// never blocks. Returns whether any bytes moved (to keep the loop lively).
+    fn pump(&mut self) -> bool {
+        let mut moved = false;
+        let mut buf = [0u8; 8192];
+        let srcs: Vec<TileId> = self.jacks.keys().copied().collect();
+        for src in srcs {
+            loop {
+                // Read one chunk from this pane's output jack (non-blocking).
+                let n = match self.jacks.get_mut(&src) {
+                    Some(j) => match j.out_read.read(&mut buf) {
+                        Ok(0) => break, // (O_RDWR means no EOF; treat as "nothing")
+                        Ok(n) => n,
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    },
+                    None => break,
+                };
+                moved = true;
+                // Fan the chunk out to every wire leaving this pane. (Own the bytes
+                // so the src-jack borrow above is released before we touch dsts.)
+                let chunk = buf[..n].to_vec();
+                for w in self.wires.iter_mut().filter(|w| w.src == src) {
+                    if let Some(dj) = self.jacks.get_mut(&w.dst) {
+                        let _ = dj.in_write.write_all(&chunk); // best-effort; drops if the reader is behind
+                        w.moved = w.moved.saturating_add(n as u32);
+                    }
+                }
+            }
+        }
+        moved
+    }
+
     /// Advance the border instruments by `dt` seconds: convert each pane's
     /// wakeup count into a smoothed rate and march its flow phase by that rate.
     /// A silent pane's phase does not move (idle borders are frozen); a busy
@@ -320,6 +492,15 @@ impl Mux {
             // Map activity (0..=BUSY) to a lap speed, and advance the phase.
             let activity = (meter.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
             meter.phase = (meter.phase + activity * MAX_LAPS_PER_SEC * dt).fract();
+        }
+        // Wires: smooth each wire's byte-rate and march its flow by that rate, so
+        // the packets crossing a wire are the literal bytes on the pipe.
+        for w in self.wires.iter_mut() {
+            let instant = w.moved as f32 / dt;
+            w.moved = 0;
+            w.rate = w.rate * 0.75 + instant * 0.25;
+            let activity = (w.rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
+            w.phase = (w.phase + activity * MAX_LAPS_PER_SEC * dt).fract();
         }
         // Latency frame: undulation always breathes; the spike decays toward calm.
         self.lat_phase = (self.lat_phase + LAT_SPEED * dt).fract();
@@ -509,9 +690,20 @@ impl Mux {
             }
         }
 
-        // Bottom status line: the command cheatsheet.
-        let hint = " C-a  %/\" split · o/←→ focus · z zoom · r rotate · x close · q quit ";
-        let status = Style::default().fg(Color::Rgb(0xc8, 0xc8, 0xd4)).bg(Color::Rgb(0x22, 0x22, 0x2c));
+        // Bottom status line: the command cheatsheet, or the wiring prompt.
+        let owned;
+        let (hint, status) = match self.wiring_from {
+            Some(src) => {
+                owned = format!(
+                    " WIRING from shell {src} → move focus to the target, then C-a w to connect (C-a w here to cancel) "
+                );
+                (owned.as_str(), Style::default().fg(Color::Rgb(0x20, 0x2a, 0x20)).bg(Color::Rgb(0x60, 0xc0, 0x60)))
+            }
+            None => (
+                " C-a  %/\" split · o/←→ focus · z zoom · r rotate · w wire · x close · q quit ",
+                Style::default().fg(Color::Rgb(0xc8, 0xc8, 0xd4)).bg(Color::Rgb(0x22, 0x22, 0x2c)),
+            ),
+        };
         // Pad the row so the background spans the full width.
         let mut line = String::from(hint);
         while (line.chars().count() as u16) < full.width {
@@ -739,6 +931,8 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         if mux.poll_panes() {
             return Ok(());
         }
+        // Move bytes across the patch-bay wires this iteration.
+        let piped = mux.pump();
         // Advance the instruments by real wall-clock time (framerate-independent),
         // and register any deadline overrun as a latency spike.
         let now = Instant::now();
@@ -752,7 +946,8 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         // downstream. A busy pane paces at 60 fps, an idle mux at ~8 fps.
         term.draw(|buf| mux.render(buf))?;
 
-        let busy = mux.meters.values().any(|m| m.wakeups > 0 || m.rate > 0.5);
+        let flowing = mux.wires.iter().any(|w| w.rate > 1.0);
+        let busy = piped || flowing || mux.meters.values().any(|m| m.wakeups > 0 || m.rate > 0.5);
         let budget = if busy { FRAME } else { idle_budget };
         mux.last_budget = budget; // so next frame's overrun is measured correctly
         std::thread::sleep(budget.saturating_sub(start.elapsed()));
