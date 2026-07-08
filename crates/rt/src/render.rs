@@ -104,6 +104,24 @@ fn measure_cell(font: &Font, font_px: f32) -> (f32, f32, f32) {
     }
 }
 
+/// Measure the `(cell_w, cell_h)` a font family + size produces, WITHOUT a GL
+/// context. `main` calls this before the window exists so it can pre-size the
+/// window to an exact cols×rows grid (the `--cols`/`--rows` flags). It mirrors
+/// exactly what `Renderer::new` measures internally, so the grid comes out
+/// identical once the real renderer is built.
+pub fn cell_size_for(blobs: &FontBlobs, font_px: f32) -> (f32, f32) {
+    // Only the primary regular font (index 0) defines the monospace cell.
+    match parse_chain(&blobs.regular, true) {
+        Ok(fonts) if !fonts.is_empty() => {
+            let (w, h, _) = measure_cell(&fonts[0], font_px); // drop the ascent
+            (w, h)
+        }
+        // Unparseable/empty: a rough estimate keeps the window sane. The real
+        // renderer will fail later with a clearer message if the font is broken.
+        _ => (font_px * 0.6, (font_px * 1.2).ceil()),
+    }
+}
+
 /// The renderer owns the GL objects, the font, the atlas, and the per-frame
 /// vertex scratch buffer.
 pub struct Renderer {

@@ -121,6 +121,17 @@ const TITLEBAR_PAD: f32 = 4.0;
 /// border / heat tint / latency frame never overlap the first characters.
 const PANE_PAD: f32 = 5.0;
 
+/// The pixel overhead `(horizontal, vertical)` that [`Session::content_rect`]
+/// removes from a pane's rectangle: twice the inner padding across, and the same
+/// plus the titlebar strip down. Inverting it lets the GUI pre-size a window so a
+/// single full-window pane comes out to an exact cols×rows grid (the `--cols` /
+/// `--rows` startup flags). Context-free on purpose — `main` calls it before any
+/// `Session` exists. Must stay in lockstep with `content_rect`/`titlebar_h`.
+pub fn pane_chrome(cell: (f32, f32), show_titlebar: bool) -> (f32, f32) {
+    let titlebar = if show_titlebar { cell.1 + TITLEBAR_PAD } else { 0.0 };
+    (2.0 * PANE_PAD, 2.0 * PANE_PAD + titlebar)
+}
+
 impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
     /// Create a session with a single initial pane filling `bounds`.
     ///

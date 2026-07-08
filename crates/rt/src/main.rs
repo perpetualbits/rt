@@ -406,11 +406,46 @@ impl ApplicationHandler for App {
             return; // already initialised; nothing to do on re-resume
         }
 
+        // Load persisted settings (before the renderer, so fonts/colours come
+        // from the config). Env vars override for demos/screenshots. Loaded here
+        // — ahead of the window — so `--cols`/`--rows` can pre-size it from the
+        // configured font metrics and titlebar setting.
+        let mut settings = rt_config::Config::load().settings;
+        if let Ok(v) = std::env::var("RT_OPACITY") {
+            if let Ok(o) = v.parse::<f32>() {
+                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0);
+            }
+        }
+        if let Ok(v) = std::env::var("RT_SCRIM") {
+            if let Ok(s) = v.parse::<f32>() {
+                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM);
+            }
+        }
+        if let Ok(v) = std::env::var("RT_FOCUS") {
+            settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
+        }
+
+        // Font chains for the configured family (system fonts via fontdb). Kept
+        // in `Active` so a live font change can reload them.
+        let font_blobs = font_blobs(&self.font_db, &settings.font_family);
+
         // --- create the window and choose a GL config --------------------
+        // With `--cols`/`--rows`, pre-size the window so the initial (single,
+        // full-window) pane lands on that exact grid — for apples-to-apples
+        // benchmarking against terminals launched with `--geometry=COLSxROWS`.
+        // Without the flags, keep a sensible default. `cell_size_for` measures
+        // the cell without a GL context (the renderer doesn't exist yet).
+        let initial_size: winit::dpi::Size = match parse_grid_flags() {
+            Some((cols, rows)) => {
+                let cell = render::cell_size_for(&font_blobs, settings.font_size);
+                window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
+            }
+            None => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
+        };
         let window_attrs = Window::default_attributes()
             .with_title("rt") // window title; per-pane titles update it later
             .with_transparent(true) // REQUIRED for the compositor to honour our alpha
-            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0)); // sensible default
+            .with_inner_size(initial_size);
         let template = ConfigTemplateBuilder::new().with_alpha_size(8); // want an alpha channel
         // DisplayBuilder creates the window AND enumerates GL configs together,
         // which is the supported winit-0.30/glutin-0.32 pattern.
@@ -487,27 +522,6 @@ impl ApplicationHandler for App {
         let gl = std::sync::Arc::new(unsafe {
             glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
         });
-
-        // Load persisted settings (before the renderer, so fonts/colours come
-        // from the config). Env vars override for demos/screenshots.
-        let mut settings = rt_config::Config::load().settings;
-        if let Ok(v) = std::env::var("RT_OPACITY") {
-            if let Ok(o) = v.parse::<f32>() {
-                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0);
-            }
-        }
-        if let Ok(v) = std::env::var("RT_SCRIM") {
-            if let Ok(s) = v.parse::<f32>() {
-                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM);
-            }
-        }
-        if let Ok(v) = std::env::var("RT_FOCUS") {
-            settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
-        }
-
-        // Font chains for the configured family (system fonts via fontdb). Kept
-        // in `Active` so a live font change can reload them.
-        let font_blobs = font_blobs(&self.font_db, &settings.font_family);
 
         // --- build the renderer ------------------------------------------
         let mut renderer = match Renderer::new(gl.clone(), &font_blobs, settings.font_size) {
@@ -2600,6 +2614,54 @@ fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
         (size.width as f32 - 2.0 * m).max(1.0),
         (size.height as f32 - 2.0 * m).max(1.0),
     )
+}
+
+/// Parse the optional `--cols N` / `--rows N` startup flags (both `--cols 80` and
+/// `--cols=80` accepted). Returns `Some((cols, rows))` only when BOTH are given
+/// and positive — a partial grid is ignored (falls back to the default size).
+/// Used to pin `rt` to an exact grid so its output-throughput numbers line up
+/// with other terminals launched via `--geometry=COLSxROWS` (see the bench).
+fn parse_grid_flags() -> Option<(usize, usize)> {
+    let mut cols: Option<usize> = None;
+    let mut rows: Option<usize> = None;
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        // Accept either "--cols=80" (one token) or "--cols 80" (two tokens).
+        let mut take = |flag: &str| -> Option<usize> {
+            if let Some(v) = a.strip_prefix(flag).and_then(|s| s.strip_prefix('=')) {
+                v.parse().ok() // --cols=80
+            } else if a == flag {
+                i += 1; // consume the value token
+                args.get(i).and_then(|v| v.parse().ok()) // --cols 80
+            } else {
+                None
+            }
+        };
+        if let Some(c) = take("--cols") {
+            cols = Some(c);
+        } else if let Some(r) = take("--rows") {
+            rows = Some(r);
+        }
+        i += 1;
+    }
+    match (cols, rows) {
+        (Some(c), Some(r)) if c > 0 && r > 0 => Some((c, r)),
+        _ => None,
+    }
+}
+
+/// Physical window size that makes a single full-window pane come out to exactly
+/// `cols`×`rows` cells, given the measured `cell` size and whether a per-pane
+/// titlebar strip is reserved. Inverts [`content_bounds`] (the window margin) and
+/// [`rt_session::pane_chrome`] (the pane's inner padding + titlebar). A half-cell
+/// slack keeps floating-point rounding from dropping the last row/column.
+fn window_size_for_grid(cols: usize, rows: usize, cell: (f32, f32), show_titlebar: bool) -> winit::dpi::PhysicalSize<u32> {
+    let (pad_w, pad_h) = rt_session::pane_chrome(cell, show_titlebar);
+    let w = cols as f32 * cell.0 + cell.0 * 0.5 + pad_w + 2.0 * WINDOW_MARGIN;
+    let h = rows as f32 * cell.1 + cell.1 * 0.5 + pad_h + 2.0 * WINDOW_MARGIN;
+    winit::dpi::PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
 }
 
 /// A point on the cubic Bézier `p0→p3` (control points `p1`, `p2`) at `t` in
