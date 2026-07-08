@@ -1865,6 +1865,7 @@ dependencies = [
  "rt-session",
  "smithay-clipboard",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-plasma",
  "winit",
 ]

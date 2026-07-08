@@ -61,6 +61,10 @@ egui_glow = { version = "0.35", default-features = false }
 # versions must match winit's so the shared wl_surface object is compatible.
 wayland-client = "0.31"
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+# Standard staging blur protocol (ext-background-effect-v1): KDE 6.7+, COSMIC,
+# niri. Already in the tree via winit; the `staging` feature exposes the binding.
+# The KWin dep above is kept for older Plasma; this is the cross-compositor path.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Clipboard + PRIMARY selection over the Wayland connection. Chosen over arboard
 # because arboard pulls X11 crates on Linux, which would break Wayland-native;
 # smithay-clipboard is pure Wayland and ties into the window's wl_display.

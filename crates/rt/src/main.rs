@@ -11,6 +11,7 @@
 //! `encode_key` fed to `Session::feed_input` (respecting broadcast mode).
 
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
+mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
@@ -178,6 +179,7 @@ struct Active {
     menu: Option<menu::Menu>,             // the open right-click context menu, if any
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<smithay_clipboard::Clipboard>, // Wayland clipboard + PRIMARY (None on x11 dev builds)
+    bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
@@ -535,6 +537,11 @@ impl ApplicationHandler for App {
         // Ask KWin to blur behind us (true background blur on KDE). No-op on
         // COSMIC/GNOME/sway, where the portable scrim does the job instead.
         blur::try_enable_kwin_blur(&window);
+        // Cross-compositor blur via the ext-background-effect-v1 staging protocol
+        // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
+        // translucent — blur behind an opaque surface is wasted compositor work.
+        // None on compositors without the protocol; the scrim carries on there.
+        let bg_effect = bg_effect::BackgroundEffect::try_init(&window, want_blur(&settings));
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
         // IMEs work: composed text arrives via WindowEvent::Ime(Commit).
@@ -683,6 +690,7 @@ impl ApplicationHandler for App {
             menu: None,
             ime_preedit: false,
             clipboard,
+            bg_effect,
             selection: None,
             selecting: false,
             dragging_divider: None,
@@ -917,6 +925,10 @@ impl ApplicationHandler for App {
                     active.surface.resize(&active.context, w, h); // resize GL surface
                 }
                 active.renderer.resize(size.width as f32, size.height as f32); // viewport
+                // Keep the blur region covering the whole surface at its new size.
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.on_resize(size.width, size.height);
+                }
                 // Recompute pane sizes from the new window bounds.
                 let bounds = content_bounds(size);
                 active.session.relayout(bounds); // push new sizes to PTYs
@@ -1338,12 +1350,20 @@ impl App {
                 let v = active.settings.adjust_opacity(0.05); // +5% opaque
                 log::info!("background opacity = {v:.2}");
                 Self::persist(&active.settings); // remember across restarts
+                // Blur is pointless once fully opaque; drop it as we cross 1.0.
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.set_enabled(want_blur(&active.settings));
+                }
                 active.window.request_redraw();
             }
             Action::OpacityDown => {
                 let v = active.settings.adjust_opacity(-0.05); // more see-through
                 log::info!("background opacity = {v:.2}");
                 Self::persist(&active.settings);
+                // Now translucent → (re)enable blur if the config allows it.
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.set_enabled(want_blur(&active.settings));
+                }
                 active.window.request_redraw();
             }
             Action::ScrimUp => {
@@ -2068,8 +2088,16 @@ impl App {
             let family_changed = settings.font_family != active.settings.font_family;
             let fonts_changed = family_changed || settings.font_size != active.settings.font_size;
             let titlebar_changed = settings.show_titlebar != active.settings.show_titlebar;
+            // The blur decision depends on both the toggle and the opacity slider.
+            let blur_changed = want_blur(&settings) != want_blur(&active.settings);
             active.settings = settings; // commit
             Self::persist(&active.settings);
+            // Background blur: toggle live if the config or opacity moved it.
+            if blur_changed {
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.set_enabled(want_blur(&active.settings));
+                }
+            }
             // Titlebar toggle changes every pane's content height → re-reserve and
             // resize all PTYs.
             if titlebar_changed {
@@ -2606,6 +2634,14 @@ const WINDOW_MARGIN: f32 = 8.0;
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background
 /// clear/scrim still fill the whole window, so the margin shows the background.
+/// Whether to ask the compositor for background blur: only when the user has it
+/// enabled AND the background is translucent (blur behind a fully opaque surface
+/// is invisible and wasted compositor work). The single source of truth for the
+/// blur decision, shared by startup and every runtime opacity/config change.
+fn want_blur(settings: &rt_config::Settings) -> bool {
+    settings.background_blur && settings.background_opacity < 1.0
+}
+
 fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
     let m = WINDOW_MARGIN;
     Rect::new(
