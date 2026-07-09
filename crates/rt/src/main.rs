@@ -12,6 +12,7 @@
 
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
+mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
@@ -35,7 +36,7 @@ use glutin::display::GetGlDisplay;
 use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, …)
 use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -178,7 +179,7 @@ struct Active {
     mouse: (f32, f32),                    // last cursor position in physical pixels
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
-    clipboard: Option<smithay_clipboard::Clipboard>, // Wayland clipboard + PRIMARY (None on x11 dev builds)
+    clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
@@ -634,15 +635,13 @@ impl ApplicationHandler for App {
         // IMEs work: composed text arrives via WindowEvent::Ime(Commit).
         window.set_ime_allowed(true);
 
-        // Wayland clipboard (+ PRIMARY selection), tied to the window's display.
-        // None on an x11 dev build (smithay-clipboard is Wayland-only).
-        // SAFETY: the display pointer comes from winit's live Wayland display.
-        let clipboard = match window.display_handle().map(|h| h.as_raw()) {
-            Ok(RawDisplayHandle::Wayland(d)) => {
-                Some(unsafe { smithay_clipboard::Clipboard::new(d.display.as_ptr()) })
-            }
-            _ => None, // not Wayland (x11 dev build): clipboard unavailable
-        };
+        // Clipboard (+ PRIMARY selection), tied to the window's display. Picks the
+        // Wayland (smithay) or X11 (arboard, `x11` feature) backend from the raw
+        // display handle; None on a backend we don't support.
+        let clipboard = window
+            .display_handle()
+            .ok()
+            .and_then(|h| clipboard::Clipboard::from_display(h.as_raw()));
 
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.inner_size(); // physical pixel size

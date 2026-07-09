@@ -19,11 +19,13 @@ path = "src/main.rs"
 
 [features]
 default = []
-# DEV-ONLY: adds the X11/XWayland backends so the window can be captured with
-# `xwd` on compositors that lack wlr-screencopy (grim). Release packages are
-# built WITHOUT this feature, so shipped binaries stay Wayland-native (the
-# dependency tree keeps zero x11 crates). For screenshots: cargo run -p rt --features x11
-x11 = ["winit/x11", "glutin/glx", "glutin/x11", "glutin-winit/glx", "glutin-winit/x11"]
+# First-class X11 support: adds the X11/XWayland backends (winit/glutin) AND an
+# X11 clipboard (arboard) so copy/paste + PRIMARY work, not just rendering. The
+# same code runs on either backend — winit auto-selects from WAYLAND_DISPLAY /
+# DISPLAY at runtime, so `--features x11` is a universal binary. The DEFAULT
+# build omits this feature, keeping the dependency tree Wayland-only (zero X11
+# crates). Build/install universal: cargo install --path crates/rt --features x11
+x11 = ["winit/x11", "glutin/glx", "glutin/x11", "glutin-winit/glx", "glutin-winit/x11", "dep:arboard"]
 
 [dependencies]
 rt-core = { path = "../rt-core" }
@@ -65,9 +67,14 @@ wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 # niri. Already in the tree via winit; the `staging` feature exposes the binding.
 # The KWin dep above is kept for older Plasma; this is the cross-compositor path.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
-# Clipboard + PRIMARY selection over the Wayland connection. Chosen over arboard
-# because arboard pulls X11 crates on Linux, which would break Wayland-native;
-# smithay-clipboard is pure Wayland and ties into the window's wl_display.
+# Clipboard + PRIMARY selection over the Wayland connection: pure Wayland, ties
+# into the window's wl_display, keeps the default tree free of X11 crates. The
+# X11 build pairs this with arboard (below) via the cross-backend `clipboard`
+# module — arboard is only pulled in by the `x11` feature.
 smithay-clipboard = "0.7"
+# X11 clipboard (CLIPBOARD + PRIMARY), only under the `x11` feature. default-
+# features off so it's x11-only (no image-data, no wayland-data-control) — the
+# X11 crates it pulls are exactly what that feature is opting into.
+arboard = { version = "3", default-features = false, optional = true }
 # For the patch-bay pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).
 libc = "0.2"
