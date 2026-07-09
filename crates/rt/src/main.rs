@@ -184,6 +184,7 @@ struct Active {
     selecting: bool,                      // true while the left button is held for a drag-select
     mouse_report: Option<(rt_core::PaneId, u16)>, // pane + xterm button code we're forwarding a press to
     hover_cell: Option<(rt_core::PaneId, usize, usize)>, // last cell reported to a 1003 (any-motion) app
+    scroll_drag: Option<(rt_core::PaneId, f32, Rect)>, // dragging the scrollbar: (pane, grab-offset in thumb, grid rect)
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
     bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
     meters: std::collections::HashMap<rt_core::PaneId, Meter>, // per-pane output-activity instrument
@@ -783,6 +784,7 @@ impl ApplicationHandler for App {
             selecting: false,
             mouse_report: None,
             hover_cell: None,
+            scroll_drag: None,
             dragging_divider: None,
             bell_flash: None,
             meters: std::collections::HashMap::new(),
@@ -1098,7 +1100,10 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
-                if let Some((_, btn)) = active.mouse_report {
+                if active.scroll_drag.is_some() {
+                    // Dragging the scrollbar thumb: scroll to track the pointer.
+                    Self::apply_scroll_drag(active, active.mouse.1);
+                } else if let Some((_, btn)) = active.mouse_report {
                     // A forwarded button is held: report motion to the app as a
                     // drag (Shift still suspends forwarding, e.g. to select).
                     if !active.mods.shift_key() {
@@ -1194,6 +1199,21 @@ impl ApplicationHandler for App {
                             active.dragging_divider = Some(handle);
                             return;
                         }
+                        // A press on the scrollbar starts a thumb-drag. Grabbing
+                        // the thumb keeps the pointer's offset within it; clicking
+                        // the track jumps the thumb's centre to the pointer.
+                        if let Some((pid, srect, thumb_y, thumb_h)) = Self::scrollbar_at(active, mx, my) {
+                            let grab = if my >= thumb_y && my <= thumb_y + thumb_h {
+                                my - thumb_y // grabbed the thumb: preserve the offset
+                            } else {
+                                thumb_h * 0.5 // clicked the track: centre the thumb here
+                            };
+                            active.scroll_drag = Some((pid, grab, srect));
+                            active.session.focus_at(mx, my); // focus the pane we're scrolling
+                            Self::apply_scroll_drag(active, my); // jump immediately
+                            active.window.request_redraw();
+                            return;
+                        }
                         // A tab label click switches tabs; else focus the pane and
                         // begin a text selection at the clicked cell.
                         let clicked_tab = active
@@ -1284,6 +1304,7 @@ impl ApplicationHandler for App {
                         return;
                     }
                     active.dragging_divider = None; // end any divider resize
+                    active.scroll_drag = None; // end any scrollbar drag
                     active.selecting = false; // drag finished
                     // A zero-length selection was just a click: discard it, and
                     // (copy-on-select) copy a real selection to PRIMARY.
@@ -1789,6 +1810,56 @@ impl App {
         true
     }
 
+    /// If `(mx, my)` falls on a pane's scrollbar (track or thumb), return that
+    /// pane, its grid rect, and the current thumb's `(y, height)`. `None` when
+    /// the pointer isn't on a scrollbar or the pane has no scrollback.
+    fn scrollbar_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, Rect, f32, f32)> {
+        let size = active.window.inner_size();
+        let bounds = content_bounds(size);
+        for (id, full) in active.session.visible_rects(bounds) {
+            if !full.contains(mx, my) {
+                continue; // not this pane
+            }
+            let rect = active.session.content_rect(full); // grid area (minus titlebar)
+            let (offset, history, screen) = active.session.pane(id)?.scroll_info();
+            if history == 0 {
+                return None; // no scrollback → no scrollbar to grab
+            }
+            let (bx, bw, thumb_y, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
+            // Within the scrollbar's x-band (a little slop for easy grabbing) and
+            // the grid's vertical extent?
+            if mx >= bx - 2.0 && mx <= bx + bw + 2.0 && my >= rect.y && my <= rect.bottom() {
+                return Some((id, rect, thumb_y, thumb_h));
+            }
+            return None; // in this pane but not on its scrollbar
+        }
+        None
+    }
+
+    /// Scroll the pane being scrollbar-dragged so its thumb tracks the pointer's
+    /// `my`. Inverts [`scrollbar_metrics`] to turn the desired thumb position into
+    /// a display offset, then scrolls by the difference. No-op if not dragging.
+    fn apply_scroll_drag(active: &mut Active, my: f32) {
+        let Some((pid, grab, rect)) = active.scroll_drag else { return };
+        let Some(pane) = active.session.pane(pid) else { return };
+        let (offset, history, screen) = pane.scroll_info();
+        if history == 0 || rect.h <= 0.0 {
+            return;
+        }
+        let total = (history + screen) as f32;
+        let (_bx, _bw, _ty, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
+        // Desired thumb top from the cursor (minus where we grabbed it), clamped
+        // to the track. Then invert thumb_y = rect.y + (history-offset)/total*rect.h.
+        let want_y = (my - grab).clamp(rect.y, rect.bottom() - thumb_h);
+        let frac = (want_y - rect.y) / rect.h; // 0 at top, →1 at bottom
+        let target = (history as f32 - frac * total).round().clamp(0.0, history as f32) as isize;
+        let delta = target - offset as isize;
+        if delta != 0 {
+            pane.scroll(delta); // move the view; the next frame redraws the thumb
+            active.window.request_redraw();
+        }
+    }
+
     /// Word boundaries around `(col, row)` for double-click selection: expand
     /// left and right over "word" characters (alphanumerics plus the punctuation
     /// that usually belongs to paths/URLs). Returns the inclusive `(start, end)`
@@ -2132,16 +2203,9 @@ impl App {
                 // Scrollbar on the right edge, shown when the pane has scrollback.
                 let (offset, history, screen) = pane.scroll_info();
                 if history > 0 {
-                    let total = (history + screen) as f32; // whole buffer height in lines
-                    let bw = 6.0; // scrollbar width
-                    let bx = rect.right() - bw - 1.0; // inset slightly from the edge
-                    // Track + thumb; thumb sized/placed by the visible fraction and
-                    // how far we're scrolled up. Brighter when scrolled off bottom.
+                    // Track + thumb; geometry shared with the drag hit-test.
+                    let (bx, bw, thumb_y, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
                     active.renderer.fill_rect(bx, rect.y, bw, rect.h, Color::rgb(0x22, 0x22, 0x2c));
-                    let thumb_h = (screen as f32 / total * rect.h).max(24.0); // min grabbable size
-                    let thumb_y = (rect.y + (history - offset) as f32 / total * rect.h)
-                        .min(rect.bottom() - thumb_h) // keep inside the pane
-                        .max(rect.y);
                     let thumb_col = if offset > 0 {
                         Color::rgb(0x88, 0x88, 0x9a) // scrolled up: highlight
                     } else {
@@ -2942,6 +3006,22 @@ fn window_size_for_grid(cols: usize, rows: usize, cell: (f32, f32), show_titleba
     let w = cols as f32 * cell.0 + cell.0 * 0.5 + pad_w + 2.0 * WINDOW_MARGIN;
     let h = rows as f32 * cell.1 + cell.1 * 0.5 + pad_h + 2.0 * WINDOW_MARGIN;
     winit::dpi::PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
+}
+
+/// Scrollbar geometry for a pane whose grid area is `rect` and whose scroll
+/// state is `(offset, history, screen)` — returns `(bx, width, thumb_y,
+/// thumb_h)` in pixels. Shared by the renderer (which draws the thumb) and the
+/// drag hit-test (which grabs it), so the visible thumb and the grabbable region
+/// are always the same rectangle. Only meaningful when `history > 0`.
+fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -> (f32, f32, f32, f32) {
+    let total = (history + screen) as f32; // whole buffer height in lines
+    let bw = 6.0; // scrollbar width
+    let bx = rect.right() - bw - 1.0; // inset slightly from the grid's right edge
+    let thumb_h = (screen as f32 / total * rect.h).max(24.0); // visible fraction, min grabbable
+    let thumb_y = (rect.y + history.saturating_sub(offset) as f32 / total * rect.h)
+        .min(rect.bottom() - thumb_h) // keep inside the pane
+        .max(rect.y);
+    (bx, bw, thumb_y, thumb_h)
 }
 
 /// A pointer action to report to the application running inside a pane.
