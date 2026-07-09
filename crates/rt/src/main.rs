@@ -195,6 +195,8 @@ struct Active {
     lat_phase: f32,                       // phase of the latency frame's undulation
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
+    active_until: Instant,                // poll fast (animate) until here; set on input/output, else idle-throttle
+    poll_ms: u64,                         // the wake interval set last tick, so latency is judged against it
     scrollback: Rc<std::cell::Cell<usize>>, // live scrollback size for newly spawned panes
     jacks: SharedJacks,                   // per-pane patch-bay pipe jacks (shared with the spawn closure)
     wires: Vec<Wire>,                     // active patch-bay connections
@@ -795,6 +797,8 @@ impl ApplicationHandler for App {
             lat_phase: 0.0,
             stall: 0.0,
             last_wake: Instant::now(),
+            active_until: Instant::now(),
+            poll_ms: 16,
             scrollback,
             jacks,
             wires: Vec::new(),
@@ -878,6 +882,11 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Everything here needs the active state; ignore events before resume.
         let Some(active) = self.active.as_mut() else { return };
+        // Any real interaction (not our own repaint) keeps the loop in the fast,
+        // animating poll for a moment; when nothing happens it idle-throttles.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            active.active_until = Instant::now() + ACTIVE_TAIL;
+        }
 
         // While the preferences dialog is open, egui gets first look at events
         // and terminal input is suspended (window lifecycle still flows through).
@@ -1372,8 +1381,13 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         let wake_dt = now.duration_since(active.last_wake).as_secs_f32().min(0.5);
         active.last_wake = now;
-        let overrun = wake_dt - 0.016; // vs the 16ms WaitUntil budget
-        if overrun > 0.010 {
+        // Compare against the interval we actually scheduled last tick, not a
+        // fixed 16ms — otherwise an intentional idle wake (100ms apart) would be
+        // misread as a stolen frame and flare the latency instrument forever,
+        // which would in turn force repaints and defeat the throttle.
+        let budget = active.poll_ms as f32 / 1000.0;
+        let overrun = wake_dt - budget;
+        if active.poll_ms <= 16 && overrun > 0.010 {
             active.stall = active.stall.max((overrun / 0.05).clamp(0.0, 1.0)); // keep the worst recent hitch
         }
         active.lat_phase = (active.lat_phase + 0.12 * wake_dt).fract(); // calm breath
@@ -1400,8 +1414,9 @@ impl ApplicationHandler for App {
                         }
                         _ => {
                             // Wakeup → new output; count it for the pane's border
-                            // flow instrument and schedule a redraw.
+                            // flow instrument, keep the fast poll, and schedule a redraw.
                             active.meters.entry(id).or_default().wakeups += 1;
+                            active.active_until = now + ACTIVE_TAIL;
                             dirty = true;
                         }
                     }
@@ -1467,9 +1482,14 @@ impl ApplicationHandler for App {
         if dirty {
             active.window.request_redraw(); // schedule a paint
         }
-        // Re-check about every 16ms (~60fps) even when idle, so async output is
-        // picked up promptly without a hot busy-loop.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+        // Idle-throttle: animate at ~60fps only while there's recent input/output
+        // (so instruments move and interaction is crisp); otherwise fall back to a
+        // ~10Hz poll that still catches async output and heat but lets the CPU
+        // sleep. The chosen interval is remembered so the next tick judges latency
+        // against it (see the budget above).
+        let interval = if Instant::now() < active.active_until { ACTIVE_POLL } else { IDLE_POLL };
+        active.poll_ms = interval.as_millis() as u64;
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
     }
 }
 
@@ -2996,6 +3016,16 @@ fn blackbody(kelvin: f32) -> (f32, f32, f32) {
 /// the edge-living features — heat border, patch-bay jacks, latency frame, and
 /// the outermost text cells — have room and aren't clipped by the window edge.
 const WINDOW_MARGIN: f32 = 8.0;
+
+/// Fast wake interval while animating or interacting (~60fps).
+const ACTIVE_POLL: Duration = Duration::from_millis(16);
+/// Idle wake interval: when nothing is happening we still wake this often to
+/// notice async PTY output and heat changes, but at ~10Hz instead of 60 — a
+/// fraction of the cost, still prompt enough that output appears without lag.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+/// Stay in the fast poll for this long after the last input or output, so a
+/// burst eases to a stop smoothly and interaction never feels throttled.
+const ACTIVE_TAIL: Duration = Duration::from_millis(750);
 
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background
