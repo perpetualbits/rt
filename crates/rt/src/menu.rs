@@ -8,7 +8,7 @@
 //! Background opacity / blur live in Preferences (which has richer controls), so
 //! they are intentionally absent here.
 
-use rt_config::Action;
+use rt_config::{Action, Keymap};
 
 /// One row of the menu: a clickable action or a visual separator.
 enum Item {
@@ -42,15 +42,22 @@ fn items() -> Vec<Item> {
         Item::Separator,
         Item::Action("Toggle Focus-Follows-Mouse", Action::ToggleFocusFollowsMouse),
         Item::Action("Preferences…", Action::Preferences),
-        Item::Action("Manual (F1)", Action::Manual),
+        Item::Action("Manual", Action::Manual),
     ]
 }
 
 /// Build the context menu for this frame at window position `pos` (egui points).
+/// `keymap` supplies each action's accelerator, shown right-aligned on its row.
 /// Sets `*chosen` to the picked action and `*close` when the menu should be
 /// dismissed — a click on an item, or a press anywhere outside the panel.
 /// Call once per frame from the egui run closure while the menu is open.
-pub fn ui(ctx: &egui::Context, pos: (f32, f32), chosen: &mut Option<Action>, close: &mut bool) {
+pub fn ui(
+    ctx: &egui::Context,
+    pos: (f32, f32),
+    keymap: &Keymap,
+    chosen: &mut Option<Action>,
+    close: &mut bool,
+) {
     // A floating, screen-constrained panel anchored at the click point. Fore-
     // ground order so it sits above the terminal (and the border instruments).
     let area = egui::Area::new(egui::Id::new("rt_context_menu"))
@@ -59,14 +66,20 @@ pub fn ui(ctx: &egui::Context, pos: (f32, f32), chosen: &mut Option<Action>, clo
         .constrain(true) // keep the whole panel on-screen (replaces the old clamp)
         .show(ctx, |ui| {
             egui::Frame::menu(ui.style()).show(ui, |ui| {
-                ui.set_min_width(220.0);
+                ui.set_min_width(260.0); // room for the label plus its accelerator
                 // Justified layout: buttons stretch the full width and left-align
                 // their text, so the rows read as a menu rather than pills.
                 ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                     for it in items() {
                         match it {
                             Item::Action(label, action) => {
-                                if ui.button(label).clicked() {
+                                // A menu button, with the action's accelerator
+                                // right-aligned in a weak colour (egui draws it).
+                                let mut button = egui::Button::new(label);
+                                if let Some(sc) = keymap.shortcut_for(action) {
+                                    button = button.shortcut_text(sc);
+                                }
+                                if ui.add(button).clicked() {
                                     *chosen = Some(action);
                                     *close = true;
                                 }

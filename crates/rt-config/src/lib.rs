@@ -426,4 +426,13 @@ impl Keymap {
             .find(|(c, _)| c == chord) // first chord that matches exactly
             .map(|(_, a)| *a) // hand back just the action
     }
+
+    /// The first accelerator bound to `action`, formatted for display (e.g. the
+    /// right-click menu). `None` when the action has no binding.
+    pub fn shortcut_for(&self, action: Action) -> Option<String> {
+        self.bindings
+            .iter()
+            .find(|(_, a)| *a == action) // first binding for this action
+            .map(|(chord, _)| chord.to_string()) // via the Chord Display impl
+    }
 }

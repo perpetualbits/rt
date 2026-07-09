@@ -2359,7 +2359,7 @@ impl App {
         let mut chosen: Option<rt_config::Action> = None;
         let mut close = false;
         ctx.begin_pass(raw_input);
-        menu::ui(&ctx, (pos.0 / ppp, pos.1 / ppp), &mut chosen, &mut close);
+        menu::ui(&ctx, (pos.0 / ppp, pos.1 / ppp), &active.keymap, &mut chosen, &mut close);
         let output = ctx.end_pass();
         // Dismiss before applying, so an action that opens another overlay (e.g.
         // Preferences) isn't immediately re-covered by the menu.

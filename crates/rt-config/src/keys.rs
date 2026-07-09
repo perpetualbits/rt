@@ -145,3 +145,40 @@ impl Chord {
         Some(Key::Char(first.to_ascii_lowercase())) // normalise case
     }
 }
+
+impl std::fmt::Display for Key {
+    /// Human-readable key name for accelerator display (menus, tooltips).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Key::Char(c) => write!(f, "{}", c.to_ascii_uppercase()), // 'o' → "O", '.' → "."
+            Key::Up => write!(f, "Up"),
+            Key::Down => write!(f, "Down"),
+            Key::Left => write!(f, "Left"),
+            Key::Right => write!(f, "Right"),
+            Key::Tab => write!(f, "Tab"),
+            Key::Enter => write!(f, "Enter"),
+            Key::PageUp => write!(f, "PgUp"),
+            Key::PageDown => write!(f, "PgDn"),
+            Key::Function(n) => write!(f, "F{n}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Chord {
+    /// The chord as a conventional accelerator string, e.g. `Ctrl+Shift+O`,
+    /// `Ctrl+.`, `F1`. Modifiers are shown in the usual Ctrl, Shift, Alt, Super
+    /// order (independent of how they were written in the config).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (bit, name) in [
+            (Mods::CONTROL, "Ctrl"),
+            (Mods::SHIFT, "Shift"),
+            (Mods::ALT, "Alt"),
+            (Mods::SUPER, "Super"),
+        ] {
+            if self.mods.contains(bit) {
+                write!(f, "{name}+")?; // prefix each present modifier
+            }
+        }
+        write!(f, "{}", self.key) // then the key itself
+    }
+}
