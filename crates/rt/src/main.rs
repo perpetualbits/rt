@@ -12,6 +12,7 @@
 
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
+mod x11_blur; // X11 background blur via _KDE_NET_WM_BLUR_BEHIND_REGION (no-op elsewhere)
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
@@ -181,6 +182,7 @@ struct Active {
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
+    x11_blur: x11_blur::X11Blur,          // X11 background blur (inert on Wayland / no x11 feature)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
     mouse_report: Option<(rt_core::PaneId, u16)>, // pane + xterm button code we're forwarding a press to
@@ -630,6 +632,9 @@ impl ApplicationHandler for App {
         // translucent — blur behind an opaque surface is wasted compositor work.
         // None on compositors without the protocol (the window is just translucent).
         let bg_effect = bg_effect::BackgroundEffect::try_init(&window, want_blur(&settings));
+        // X11 counterpart: the _KDE_NET_WM_BLUR_BEHIND_REGION property (KWin-X11,
+        // picom). Inert on Wayland and on a no-x11 build.
+        let x11_blur = x11_blur::X11Blur::try_init(&window, want_blur(&settings));
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
         // IMEs work: composed text arrives via WindowEvent::Ime(Commit).
@@ -781,6 +786,7 @@ impl ApplicationHandler for App {
             ime_preedit: false,
             clipboard,
             bg_effect,
+            x11_blur,
             selection: None,
             selecting: false,
             mouse_report: None,
@@ -1560,9 +1566,7 @@ impl App {
                 log::info!("background opacity = {v:.2}");
                 Self::persist(&active.settings); // remember across restarts
                 // Blur is pointless once fully opaque; drop it as we cross 1.0.
-                if let Some(fx) = &mut active.bg_effect {
-                    fx.set_enabled(want_blur(&active.settings));
-                }
+                apply_blur(active);
                 active.window.request_redraw();
             }
             Action::OpacityDown => {
@@ -1570,9 +1574,7 @@ impl App {
                 log::info!("background opacity = {v:.2}");
                 Self::persist(&active.settings);
                 // Now translucent → (re)enable blur if the config allows it.
-                if let Some(fx) = &mut active.bg_effect {
-                    fx.set_enabled(want_blur(&active.settings));
-                }
+                apply_blur(active);
                 active.window.request_redraw();
             }
             Action::ToggleFocusFollowsMouse => {
@@ -2443,9 +2445,7 @@ impl App {
             active.scrollback.set(active.settings.scrollback);
             // Background blur: toggle live if the config or opacity moved it.
             if blur_changed {
-                if let Some(fx) = &mut active.bg_effect {
-                    fx.set_enabled(want_blur(&active.settings));
-                }
+                apply_blur(active);
             }
             // Titlebar toggle changes every pane's content height → re-reserve and
             // resize all PTYs.
@@ -3037,6 +3037,17 @@ fn want_blur(settings: &rt_config::Settings) -> bool {
     settings.background_blur && settings.background_opacity < 1.0
 }
 
+/// Push the current blur decision to whichever backend is live: the Wayland ext
+/// protocol and/or the X11 property. Both are no-ops when not applicable, so
+/// this is always safe to call after an opacity/blur change.
+fn apply_blur(active: &mut Active) {
+    let want = want_blur(&active.settings);
+    if let Some(fx) = &mut active.bg_effect {
+        fx.set_enabled(want);
+    }
+    active.x11_blur.set_enabled(want);
+}
+
 fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
     let m = WINDOW_MARGIN;
     Rect::new(
@@ -3184,6 +3195,30 @@ fn flow_point(x: f32, y: f32, w: f32, h: f32, t: f32) -> egui::Pos2 {
 }
 
 /// Program entry point: set up logging, load a font, and run the winit loop.
+/// Build the winit event loop, choosing the backend explicitly so a universal
+/// (`x11`-feature) binary uses **native Wayland** on a Wayland session and only
+/// falls back to X11 otherwise — never XWayland when Wayland is present. On a
+/// Wayland-only build there is nothing to disambiguate. A user-set
+/// `WINIT_UNIX_BACKEND` still wins (we don't override an explicit choice).
+fn build_event_loop() -> EventLoop<()> {
+    let mut builder = EventLoop::builder();
+    #[cfg(feature = "x11")]
+    {
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                builder.with_wayland(); // native Wayland, not XWayland
+                log::debug!("event loop: preferring native Wayland backend");
+            } else {
+                builder.with_x11();
+                log::debug!("event loop: using X11 backend");
+            }
+        }
+    }
+    builder.build().expect("failed to create event loop")
+}
+
 fn main() {
     env_logger::init(); // honour RUST_LOG for diagnostics
     // Scan system fonts up front (for the family picker + lookup). A monospace
@@ -3198,7 +3233,7 @@ fn main() {
         std::process::exit(1);
     }
     // Build the winit event loop and hand it our application.
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = build_event_loop();
     let mut app = App { font_db, mono_families, cli: parse_cli(), active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
