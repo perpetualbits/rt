@@ -562,8 +562,15 @@ impl Renderer {
             _ => return,               // blank or un-cacheable: skip
         };
         // Place the bitmap on the baseline: baseline y = cell top + ascent.
-        let gx = cell_x + g.left; // apply horizontal bearing
-        let gy = cell_y + self.ascent - g.top; // baseline minus glyph top
+        // SNAP to the integer pixel grid. The quad's UVs map its gw×gh texels
+        // one-to-one to pixels, but only if it lands on whole pixels; at a
+        // fractional position (a pane split gives a fractional origin `ox`, and
+        // `ascent` is a raw float) the NEAREST-filtered coverage atlas samples the
+        // neighbouring texel at the edge — the faint per-glyph outline. Rounding
+        // costs sub-pixel placement (irrelevant for a monospace grid) and makes
+        // the text pixel-exact regardless of pane geometry.
+        let gx = (cell_x + g.left).round(); // apply horizontal bearing, snapped
+        let gy = (cell_y + self.ascent - g.top).round(); // baseline minus glyph top, snapped
         self.push_quad(gx, gy, g.w, g.h, (g.u0, g.v0, g.u1, g.v1), fg); // emit glyph quad
     }
 
