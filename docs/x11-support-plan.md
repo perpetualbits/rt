@@ -135,8 +135,22 @@ Follow-ups remain as listed under **Out of scope** (X11 blur; default-enabling).
 - **arboard PRIMARY** must be exercised (some environments/WMs are finicky about
   PRIMARY ownership); covered by the round-trip test.
 
-## Out of scope (follow-ups)
+## Follow-ups — DONE (2026-07-09)
 
-- X11 background blur via `_KDE_NET_WM_BLUR_BEHIND_REGION`.
-- Making `x11` a default feature (universal single binary shipped by default) —
-  a packaging decision, easy to flip later if desired.
+- **X11 background blur** — `x11_blur.rs` sets `_KDE_NET_WM_BLUR_BEHIND_REGION`
+  (empty region = whole window) via x11rb, toggled by the same `want_blur`
+  decision as the Wayland paths (`apply_blur`). Inert on Wayland / no-x11 builds.
+  Verified under Xephyr that the property is set (`xprop`); actual rendering
+  needs a KWin-X11 / picom-with-blur compositor, which the headless env lacks.
+- **`x11` is now a default feature** — `default = ["x11"]`, so the shipped binary
+  is universal (build lean Wayland-only with `--no-default-features`).
+- **Backend preference (native Wayland, never XWayland)** — `build_event_loop`
+  explicitly calls `with_wayland()` when `WAYLAND_DISPLAY` is set, else
+  `with_x11()` (a user-set `WINIT_UNIX_BACKEND` still wins). Verified on the real
+  Wayland session: "preferring native Wayland backend" and rt does **not** appear
+  in `xlsclients` (i.e. it is not an XWayland client).
+
+## Still out of scope
+
+- Nothing outstanding for X11 parity. (X11 blur *rendering* is compositor-side;
+  rt sets the property correctly.)

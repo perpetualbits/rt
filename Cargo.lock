@@ -1926,6 +1926,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-plasma",
  "winit",
+ "x11rb",
 ]
 
 [[package]]
