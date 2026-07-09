@@ -253,11 +253,89 @@ impl Selection {
     }
 }
 
+/// Command-line overrides, parsed once in `main`. All optional: an unset field
+/// falls back to the persisted config (font) or the default window size (grid).
+/// The point is scriptability — pinning the grid/font from a benchmark harness
+/// the same way `alacritty -o window.dimensions.columns=…` does.
+#[derive(Clone, Default)]
+struct Cli {
+    cols: Option<usize>,   // --cols N : pin the initial grid width in cells
+    rows: Option<usize>,   // --rows N : pin the initial grid height in cells
+    font: Option<String>,  // --font "Family" : override the configured font family
+    font_size: Option<f32>, // --font-size PX : override the configured size (pixels)
+}
+
+/// Parse `Cli` from `std::env::args`. Hand-rolled (no clap dependency): accepts
+/// `--flag value` and `--flag=value`. On `-h`/`--help` it prints usage and
+/// exits 0; on a malformed/unknown flag it prints the error and exits 2.
+fn parse_cli() -> Cli {
+    let mut cli = Cli::default();
+    let mut args = std::env::args().skip(1); // skip argv[0]
+    // Pull the value for a flag, whether it came inline (`--k=v`) or split
+    // (`--k v`). Errors out with a clear message when a value is required.
+    while let Some(arg) = args.next() {
+        // Split a `--key=value` form into ("--key", Some("value")).
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+        // Fetch this flag's value from the inline part or the next argument.
+        let mut value = |flag: &str| -> String {
+            inline.clone().or_else(|| args.next()).unwrap_or_else(|| {
+                eprintln!("rt: {flag} needs a value");
+                std::process::exit(2);
+            })
+        };
+        match key.as_str() {
+            "--cols" => cli.cols = Some(parse_usize(&value("--cols"), "--cols")),
+            "--rows" => cli.rows = Some(parse_usize(&value("--rows"), "--rows")),
+            "--font" => cli.font = Some(value("--font")),
+            "--font-size" => cli.font_size = Some(parse_f32(&value("--font-size"), "--font-size")),
+            "-h" | "--help" => {
+                println!(
+                    "rt — Wayland-native terminal multiplexer\n\n\
+                     Usage: rt [OPTIONS]\n\n\
+                     Options:\n  \
+                     --cols N          pin the initial grid width (cells)\n  \
+                     --rows N          pin the initial grid height (cells)\n  \
+                     --font \"Family\"   override the configured font family\n  \
+                     --font-size PX    override the configured font size (pixels)\n  \
+                     -h, --help        show this message\n\n\
+                     Everything else is configured in Preferences / config.toml."
+                );
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("rt: unknown option '{other}' (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
+    cli
+}
+
+/// Parse a `usize` CLI value or exit(2) with a clear message.
+fn parse_usize(s: &str, flag: &str) -> usize {
+    s.parse().unwrap_or_else(|_| {
+        eprintln!("rt: {flag} expects a whole number, got '{s}'");
+        std::process::exit(2);
+    })
+}
+
+/// Parse an `f32` CLI value or exit(2) with a clear message.
+fn parse_f32(s: &str, flag: &str) -> f32 {
+    s.parse().unwrap_or_else(|_| {
+        eprintln!("rt: {flag} expects a number, got '{s}'");
+        std::process::exit(2);
+    })
+}
+
 /// The winit application object. Holds only the font bytes until `resumed`
 /// builds the `Active` state.
 struct App {
     font_db: std::sync::Arc<fontdb::Database>, // system fonts, for family lookup + the picker
     mono_families: Vec<String>,                // monospace family names for the preferences combo
+    cli: Cli,                                  // command-line overrides (grid/font)
     active: Option<Active>,                    // populated on first resume
 }
 
@@ -426,23 +504,31 @@ impl ApplicationHandler for App {
         if let Ok(v) = std::env::var("RT_FOCUS") {
             settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
         }
+        // CLI overrides win over the persisted config (and over the env knobs
+        // above), so a benchmark harness can pin the font without editing config.
+        if let Some(family) = &self.cli.font {
+            settings.font_family = family.clone();
+        }
+        if let Some(px) = self.cli.font_size {
+            settings.font_size = px.max(1.0); // guard against a zero/negative size
+        }
 
         // Font chains for the configured family (system fonts via fontdb). Kept
         // in `Active` so a live font change can reload them.
         let font_blobs = font_blobs(&self.font_db, &settings.font_family);
 
         // --- create the window and choose a GL config --------------------
-        // With `--cols`/`--rows`, pre-size the window so the initial (single,
-        // full-window) pane lands on that exact grid — for apples-to-apples
-        // benchmarking against terminals launched with `--geometry=COLSxROWS`.
-        // Without the flags, keep a sensible default. `cell_size_for` measures
-        // the cell without a GL context (the renderer doesn't exist yet).
-        let initial_size: winit::dpi::Size = match parse_grid_flags() {
-            Some((cols, rows)) => {
+        // With BOTH `--cols` and `--rows`, pre-size the window so the initial
+        // (single, full-window) pane lands on that exact grid — for apples-to-
+        // apples benchmarking against terminals launched with `--geometry=COLSxROWS`.
+        // Without them, keep a sensible default. `cell_size_for` measures the
+        // cell without a GL context (the renderer doesn't exist yet).
+        let initial_size: winit::dpi::Size = match (self.cli.cols, self.cli.rows) {
+            (Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
                 let cell = render::cell_size_for(&font_blobs, settings.font_size);
                 window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
             }
-            None => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
+            _ => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
         };
         let window_attrs = Window::default_attributes()
             .with_title("rt") // window title; per-pane titles update it later
@@ -2652,42 +2738,6 @@ fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
     )
 }
 
-/// Parse the optional `--cols N` / `--rows N` startup flags (both `--cols 80` and
-/// `--cols=80` accepted). Returns `Some((cols, rows))` only when BOTH are given
-/// and positive — a partial grid is ignored (falls back to the default size).
-/// Used to pin `rt` to an exact grid so its output-throughput numbers line up
-/// with other terminals launched via `--geometry=COLSxROWS` (see the bench).
-fn parse_grid_flags() -> Option<(usize, usize)> {
-    let mut cols: Option<usize> = None;
-    let mut rows: Option<usize> = None;
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        // Accept either "--cols=80" (one token) or "--cols 80" (two tokens).
-        let mut take = |flag: &str| -> Option<usize> {
-            if let Some(v) = a.strip_prefix(flag).and_then(|s| s.strip_prefix('=')) {
-                v.parse().ok() // --cols=80
-            } else if a == flag {
-                i += 1; // consume the value token
-                args.get(i).and_then(|v| v.parse().ok()) // --cols 80
-            } else {
-                None
-            }
-        };
-        if let Some(c) = take("--cols") {
-            cols = Some(c);
-        } else if let Some(r) = take("--rows") {
-            rows = Some(r);
-        }
-        i += 1;
-    }
-    match (cols, rows) {
-        (Some(c), Some(r)) if c > 0 && r > 0 => Some((c, r)),
-        _ => None,
-    }
-}
-
 /// Physical window size that makes a single full-window pane come out to exactly
 /// `cols`×`rows` cells, given the measured `cell` size and whether a per-pane
 /// titlebar strip is reserved. Inverts [`content_bounds`] (the window margin) and
@@ -2744,7 +2794,7 @@ fn main() {
     }
     // Build the winit event loop and hand it our application.
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App { font_db, mono_families, active: None };
+    let mut app = App { font_db, mono_families, cli: parse_cli(), active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);

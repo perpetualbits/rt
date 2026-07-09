@@ -24,11 +24,13 @@
 # and rt are pinned by the script. See the "FONT SETUP" note it prints.
 #
 # Usage:
-#   ./term-render-bench.sh                 # run all five
+#   ./term-render-bench.sh                 # cat mode, all five terminals
 #   TERMINALS="rt alacritty" ./term-render-bench.sh
 #   REPS=8 TARGET_LINES=300000 ./term-render-bench.sh
 #   RT_INSTRUMENTS=1 ./term-render-bench.sh # benchmark rt with its border gauges on
 #   REBUILD=1 ./term-render-bench.sh        # force-regenerate the payload
+#   MODE=vtebench ./term-render-bench.sh    # render-stress suite (needs vtebench)
+#   MODE=vtebench VTEBENCH_ARGS="-w 100 -H 30 scrolling dense-cells" ./term-render-bench.sh
 #
 set -uo pipefail
 
@@ -48,6 +50,15 @@ COOLDOWN=${COOLDOWN:-1}               # pause between terminals (seconds)
 RT_INSTRUMENTS=${RT_INSTRUMENTS:-0}   # 1 = leave rt's border gauges/jacks on
 TERMINALS=${TERMINALS:-"rt alacritty gnome-terminal terminator cosmic-term"}
 
+# MODE = cat      : replay a fixed text file (default; PTY-drain + parse proxy).
+# MODE = vtebench : run alacritty's vtebench render-stress suite (scrolling
+#                   regions, alt-screen, dense colored cells, unicode) — a far
+#                   better proxy for actual glyph drawing. Needs vtebench on PATH
+#                   (or point VTEBENCH at it). Both modes are timed identically.
+MODE=${MODE:-cat}
+VTEBENCH=${VTEBENCH:-$(command -v vtebench 2>/dev/null || echo "$HOME/.cargo/bin/vtebench")}
+VTEBENCH_ARGS=${VTEBENCH_ARGS:-"-w $COLS -H $ROWS"}  # size flags; append names to pick a subset
+
 PAYLOAD="$WORK/payload.txt"
 OUT="$WORK/out"
 
@@ -56,53 +67,83 @@ if [ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
   echo "error: no WAYLAND_DISPLAY/DISPLAY — run this inside your graphical session." >&2
   exit 1
 fi
-if [ "$COLS" -le "$FOLD" ]; then
-  echo "error: COLS ($COLS) must exceed FOLD ($FOLD) or lines will wrap." >&2
-  exit 1
-fi
+case "$MODE" in
+  cat|vtebench) ;;
+  *) echo "error: MODE must be 'cat' or 'vtebench' (got '$MODE')" >&2; exit 1 ;;
+esac
 
 mkdir -p "$WORK"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
-# ---- build the payload once (folded, replicated to TARGET_LINES) ----------
-if [ ! -s "$PAYLOAD" ] || [ "${REBUILD:-0}" = 1 ]; then
-  echo "building payload from 'ls -alR ~' folded to ${FOLD} cols ..."
-  base="$WORK/base.txt"
-  # LC_ALL=C keeps fold byte-oriented and fast; drop errors (unreadable dirs).
-  LC_ALL=C ls -alR "$HOME" 2>/dev/null | fold -w "$FOLD" > "$base"
-  bl=$(wc -l < "$base")
-  if [ "$bl" -eq 0 ]; then echo "error: empty listing" >&2; exit 1; fi
-  if [ "$bl" -ge "$TARGET_LINES" ]; then
-    head -n "$TARGET_LINES" "$base" > "$PAYLOAD"          # already big enough
-  else
-    n=$(( (TARGET_LINES + bl - 1) / bl ))                 # ceil(TARGET/bl) copies
-    : > "$PAYLOAD"
-    for ((i=0;i<n;i++)); do cat "$base"; done > "$PAYLOAD"
+if [ "$MODE" = vtebench ]; then
+  # ---- vtebench mode: verify the tool, skip the text payload --------------
+  if [ ! -x "$VTEBENCH" ]; then
+    cat >&2 <<MSG
+error: MODE=vtebench but no vtebench binary was found (looked at: $VTEBENCH).
+vtebench isn't packaged; build it from source, then re-run:
+    git clone https://github.com/alacritty/vtebench && cd vtebench
+    cargo build --release
+    VTEBENCH=\$(pwd)/target/release/vtebench MODE=vtebench $0
+(or 'cargo install --git https://github.com/alacritty/vtebench' to drop it in ~/.cargo/bin).
+MSG
+    exit 1
   fi
+  BYTES=0   # vtebench synthesizes its own stream; there is no single payload size
+  echo "mode: vtebench  ($VTEBENCH $VTEBENCH_ARGS)"
+  echo
+else
+  # ---- cat mode: build the payload once (folded, replicated) --------------
+  if [ "$COLS" -le "$FOLD" ]; then
+    echo "error: COLS ($COLS) must exceed FOLD ($FOLD) or lines will wrap." >&2
+    exit 1
+  fi
+  if [ ! -s "$PAYLOAD" ] || [ "${REBUILD:-0}" = 1 ]; then
+    echo "building payload from 'ls -alR ~' folded to ${FOLD} cols ..."
+    base="$WORK/base.txt"
+    # LC_ALL=C keeps fold byte-oriented and fast; drop errors (unreadable dirs).
+    LC_ALL=C ls -alR "$HOME" 2>/dev/null | fold -w "$FOLD" > "$base"
+    bl=$(wc -l < "$base")
+    if [ "$bl" -eq 0 ]; then echo "error: empty listing" >&2; exit 1; fi
+    if [ "$bl" -ge "$TARGET_LINES" ]; then
+      head -n "$TARGET_LINES" "$base" > "$PAYLOAD"          # already big enough
+    else
+      n=$(( (TARGET_LINES + bl - 1) / bl ))                 # ceil(TARGET/bl) copies
+      : > "$PAYLOAD"
+      for ((i=0;i<n;i++)); do cat "$base"; done > "$PAYLOAD"
+    fi
+  fi
+  LINES=$(wc -l < "$PAYLOAD"); BYTES=$(wc -c < "$PAYLOAD")
+  echo "mode: cat  (payload: $LINES lines, $BYTES bytes, $PAYLOAD)"
+  echo
 fi
-LINES=$(wc -l < "$PAYLOAD"); BYTES=$(wc -c < "$PAYLOAD")
-echo "payload: $LINES lines, $BYTES bytes  ($PAYLOAD)"
-echo
 
 # ---- the in-terminal benchmark (written to a file so no nested quoting) ----
-# args: <name> <payload> <outdir> <reps> <warmup>
+# args: <name> <outdir> <reps> <warmup> <cmd...>  — it times running <cmd...>,
+# whose stdout goes to the terminal (that's the workload being rendered).
 cat > "$WORK/bench.sh" <<'BENCH'
 #!/usr/bin/env bash
-name=$1; payload=$2; outdir=$3; reps=$4; warmup=$5
+name=$1; outdir=$2; reps=$3; warmup=$4; shift 4   # remaining args = command to time
 export LC_ALL=C
-for ((i=0;i<warmup;i++)); do cat "$payload"; done   # untimed warmup
+for ((i=0;i<warmup;i++)); do "$@"; done           # untimed warmup
 : > "$outdir/$name.times"
 for ((i=0;i<reps;i++)); do
-  s=$EPOCHREALTIME                                  # bash 5 microsecond clock
-  cat "$payload"
+  s=$EPOCHREALTIME                                 # bash 5 microsecond clock
+  "$@"
   e=$EPOCHREALTIME
   awk -v a="$s" -v b="$e" 'BEGIN{printf "%.6f\n", b-a}' >> "$outdir/$name.times"
 done
 sync
-touch "$outdir/$name.done"                          # signals the driver we're finished
+touch "$outdir/$name.done"                         # signals the driver we're finished
 BENCH
 chmod +x "$WORK/bench.sh"
-BENCH_ARGS() { echo "$WORK/bench.sh $1 $PAYLOAD $OUT $REPS $WARMUP"; }
+# The command each terminal times. cat mode replays the file; vtebench mode runs
+# the render-stress suite at the matched size. Both write to the terminal's tty.
+if [ "$MODE" = vtebench ]; then
+  RUNCMD="$VTEBENCH $VTEBENCH_ARGS"
+else
+  RUNCMD="cat $PAYLOAD"
+fi
+BENCH_ARGS() { echo "$WORK/bench.sh $1 $OUT $REPS $WARMUP $RUNCMD"; }
 
 # ---- rt config: pin font, optionally silence the border instruments -------
 if [ "$RT_INSTRUMENTS" = 1 ]; then inst=true; else inst=false; fi
@@ -207,9 +248,16 @@ for name in $TERMINALS; do
 done
 
 # ---- summary ---------------------------------------------------------------
+# MB/s is only meaningful in cat mode (a known payload size); vtebench mode
+# reports times only, since it synthesizes a variable-size stream.
 echo
-echo "================ results  (payload $BYTES bytes, best of $REPS) ================"
-printf "%-16s %9s %9s %9s %10s\n" terminal "min(s)" "median" "mean" "MB/s"
+if [ "$MODE" = vtebench ]; then
+  echo "============ results  (vtebench: $VTEBENCH_ARGS, best of $REPS) ============"
+  printf "%-16s %9s %9s %9s\n" terminal "min(s)" "median" "mean"
+else
+  echo "============ results  (cat: $BYTES bytes, best of $REPS) ============"
+  printf "%-16s %9s %9s %9s %10s\n" terminal "min(s)" "median" "mean" "MB/s"
+fi
 # Emit rows to a temp file so we can sort the table by best time.
 rows="$WORK/rows.txt"; : > "$rows"
 for name in $TERMINALS; do
@@ -223,13 +271,23 @@ for name in $TERMINALS; do
     END {
       n=NR; mn=a[1];
       med=(n%2 ? a[(n+1)/2] : (a[n/2]+a[n/2+1])/2);
-      printf "%s %.3f %.3f %.3f %.1f\n", name, mn, med, sum/n, bytes/mn/1e6;
+      mbps = (bytes > 0) ? sprintf("%.1f", bytes/mn/1e6) : "-";
+      printf "%s %.3f %.3f %.3f %s\n", name, mn, med, sum/n, mbps;
     }' >> "$rows"
 done
-# Print measured rows sorted fastest-first, then the "(no result)" note above.
+# Print measured rows sorted fastest-first (the "(no result)" note printed above).
 sort -k2 -n "$rows" | while read -r name mn md mean mbps; do
-  printf "%-16s %9s %9s %9s %10s\n" "$name" "$mn" "$md" "$mean" "$mbps"
+  if [ "$MODE" = vtebench ]; then
+    printf "%-16s %9s %9s %9s\n" "$name" "$mn" "$md" "$mean"
+  else
+    printf "%-16s %9s %9s %9s %10s\n" "$name" "$mn" "$md" "$mean" "$mbps"
+  fi
 done
 echo
-echo "note: 'cat' timing chiefly measures PTY-drain + parse; for a rendering-"
-echo "      specific figure run vtebench in each window at matched size."
+if [ "$MODE" = vtebench ]; then
+  echo "note: vtebench stresses scrolling/alt-screen/dense-cells/unicode — a much"
+  echo "      better rendering proxy than cat. Lower time = faster."
+else
+  echo "note: 'cat' timing chiefly measures PTY-drain + parse; for a rendering-"
+  echo "      specific figure re-run with MODE=vtebench."
+fi
