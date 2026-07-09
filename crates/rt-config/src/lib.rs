@@ -120,6 +120,13 @@ pub struct Settings {
     /// stand-in for background blur (see `docs/APPEARANCE.md`): a Wayland client
     /// can't blur what's behind it, but it can wash out its legibility.
     pub scrim_strength: f32,
+    /// When true, ask the compositor to blur whatever is behind the translucent
+    /// window (the `ext-background-effect-v1` staging protocol; KDE 6.7+, COSMIC,
+    /// niri). True background blur — unlike the `scrim`, which only washes out
+    /// contrast. A silent no-op on compositors without the protocol (GNOME, older
+    /// KWin, X11), and skipped entirely while the background is fully opaque
+    /// (`background_opacity == 1.0`), where blur would be wasted work.
+    pub background_blur: bool,
     /// When true, moving the mouse over a pane focuses it (sloppy focus). When
     /// false (default), focus changes only on click. In rt sloppy and strict
     /// pointer-focus coincide, since a pane is always focused (over a gutter the
@@ -179,6 +186,7 @@ impl Default for Settings {
         Settings {
             background_opacity: 1.0,       // opaque until the user dials it down
             scrim_strength: 0.0,           // no scrim until the user enables it
+            background_blur: true,         // request compositor blur when translucent (no-op if unsupported)
             focus_follows_mouse: false,    // click-to-focus by default
             show_titlebar: true,           // Terminator-style per-pane titlebars on by default
             inst_output: true,             // border instruments on by default

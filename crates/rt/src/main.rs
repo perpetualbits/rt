@@ -11,6 +11,7 @@
 //! `encode_key` fed to `Session::feed_input` (respecting broadcast mode).
 
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
+mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
@@ -178,6 +179,7 @@ struct Active {
     menu: Option<menu::Menu>,             // the open right-click context menu, if any
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<smithay_clipboard::Clipboard>, // Wayland clipboard + PRIMARY (None on x11 dev builds)
+    bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
@@ -251,11 +253,89 @@ impl Selection {
     }
 }
 
+/// Command-line overrides, parsed once in `main`. All optional: an unset field
+/// falls back to the persisted config (font) or the default window size (grid).
+/// The point is scriptability — pinning the grid/font from a benchmark harness
+/// the same way `alacritty -o window.dimensions.columns=…` does.
+#[derive(Clone, Default)]
+struct Cli {
+    cols: Option<usize>,   // --cols N : pin the initial grid width in cells
+    rows: Option<usize>,   // --rows N : pin the initial grid height in cells
+    font: Option<String>,  // --font "Family" : override the configured font family
+    font_size: Option<f32>, // --font-size PX : override the configured size (pixels)
+}
+
+/// Parse `Cli` from `std::env::args`. Hand-rolled (no clap dependency): accepts
+/// `--flag value` and `--flag=value`. On `-h`/`--help` it prints usage and
+/// exits 0; on a malformed/unknown flag it prints the error and exits 2.
+fn parse_cli() -> Cli {
+    let mut cli = Cli::default();
+    let mut args = std::env::args().skip(1); // skip argv[0]
+    // Pull the value for a flag, whether it came inline (`--k=v`) or split
+    // (`--k v`). Errors out with a clear message when a value is required.
+    while let Some(arg) = args.next() {
+        // Split a `--key=value` form into ("--key", Some("value")).
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+        // Fetch this flag's value from the inline part or the next argument.
+        let mut value = |flag: &str| -> String {
+            inline.clone().or_else(|| args.next()).unwrap_or_else(|| {
+                eprintln!("rt: {flag} needs a value");
+                std::process::exit(2);
+            })
+        };
+        match key.as_str() {
+            "--cols" => cli.cols = Some(parse_usize(&value("--cols"), "--cols")),
+            "--rows" => cli.rows = Some(parse_usize(&value("--rows"), "--rows")),
+            "--font" => cli.font = Some(value("--font")),
+            "--font-size" => cli.font_size = Some(parse_f32(&value("--font-size"), "--font-size")),
+            "-h" | "--help" => {
+                println!(
+                    "rt — Wayland-native terminal multiplexer\n\n\
+                     Usage: rt [OPTIONS]\n\n\
+                     Options:\n  \
+                     --cols N          pin the initial grid width (cells)\n  \
+                     --rows N          pin the initial grid height (cells)\n  \
+                     --font \"Family\"   override the configured font family\n  \
+                     --font-size PX    override the configured font size (pixels)\n  \
+                     -h, --help        show this message\n\n\
+                     Everything else is configured in Preferences / config.toml."
+                );
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("rt: unknown option '{other}' (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
+    cli
+}
+
+/// Parse a `usize` CLI value or exit(2) with a clear message.
+fn parse_usize(s: &str, flag: &str) -> usize {
+    s.parse().unwrap_or_else(|_| {
+        eprintln!("rt: {flag} expects a whole number, got '{s}'");
+        std::process::exit(2);
+    })
+}
+
+/// Parse an `f32` CLI value or exit(2) with a clear message.
+fn parse_f32(s: &str, flag: &str) -> f32 {
+    s.parse().unwrap_or_else(|_| {
+        eprintln!("rt: {flag} expects a number, got '{s}'");
+        std::process::exit(2);
+    })
+}
+
 /// The winit application object. Holds only the font bytes until `resumed`
 /// builds the `Active` state.
 struct App {
     font_db: std::sync::Arc<fontdb::Database>, // system fonts, for family lookup + the picker
     mono_families: Vec<String>,                // monospace family names for the preferences combo
+    cli: Cli,                                  // command-line overrides (grid/font)
     active: Option<Active>,                    // populated on first resume
 }
 
@@ -424,23 +504,31 @@ impl ApplicationHandler for App {
         if let Ok(v) = std::env::var("RT_FOCUS") {
             settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
         }
+        // CLI overrides win over the persisted config (and over the env knobs
+        // above), so a benchmark harness can pin the font without editing config.
+        if let Some(family) = &self.cli.font {
+            settings.font_family = family.clone();
+        }
+        if let Some(px) = self.cli.font_size {
+            settings.font_size = px.max(1.0); // guard against a zero/negative size
+        }
 
         // Font chains for the configured family (system fonts via fontdb). Kept
         // in `Active` so a live font change can reload them.
         let font_blobs = font_blobs(&self.font_db, &settings.font_family);
 
         // --- create the window and choose a GL config --------------------
-        // With `--cols`/`--rows`, pre-size the window so the initial (single,
-        // full-window) pane lands on that exact grid — for apples-to-apples
-        // benchmarking against terminals launched with `--geometry=COLSxROWS`.
-        // Without the flags, keep a sensible default. `cell_size_for` measures
-        // the cell without a GL context (the renderer doesn't exist yet).
-        let initial_size: winit::dpi::Size = match parse_grid_flags() {
-            Some((cols, rows)) => {
+        // With BOTH `--cols` and `--rows`, pre-size the window so the initial
+        // (single, full-window) pane lands on that exact grid — for apples-to-
+        // apples benchmarking against terminals launched with `--geometry=COLSxROWS`.
+        // Without them, keep a sensible default. `cell_size_for` measures the
+        // cell without a GL context (the renderer doesn't exist yet).
+        let initial_size: winit::dpi::Size = match (self.cli.cols, self.cli.rows) {
+            (Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
                 let cell = render::cell_size_for(&font_blobs, settings.font_size);
                 window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
             }
-            None => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
+            _ => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
         };
         let window_attrs = Window::default_attributes()
             .with_title("rt") // window title; per-pane titles update it later
@@ -535,6 +623,11 @@ impl ApplicationHandler for App {
         // Ask KWin to blur behind us (true background blur on KDE). No-op on
         // COSMIC/GNOME/sway, where the portable scrim does the job instead.
         blur::try_enable_kwin_blur(&window);
+        // Cross-compositor blur via the ext-background-effect-v1 staging protocol
+        // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
+        // translucent — blur behind an opaque surface is wasted compositor work.
+        // None on compositors without the protocol; the scrim carries on there.
+        let bg_effect = bg_effect::BackgroundEffect::try_init(&window, want_blur(&settings));
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
         // IMEs work: composed text arrives via WindowEvent::Ime(Commit).
@@ -683,6 +776,7 @@ impl ApplicationHandler for App {
             menu: None,
             ime_preedit: false,
             clipboard,
+            bg_effect,
             selection: None,
             selecting: false,
             dragging_divider: None,
@@ -917,6 +1011,10 @@ impl ApplicationHandler for App {
                     active.surface.resize(&active.context, w, h); // resize GL surface
                 }
                 active.renderer.resize(size.width as f32, size.height as f32); // viewport
+                // Keep the blur region covering the whole surface at its new size.
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.on_resize(size.width, size.height);
+                }
                 // Recompute pane sizes from the new window bounds.
                 let bounds = content_bounds(size);
                 active.session.relayout(bounds); // push new sizes to PTYs
@@ -1338,12 +1436,20 @@ impl App {
                 let v = active.settings.adjust_opacity(0.05); // +5% opaque
                 log::info!("background opacity = {v:.2}");
                 Self::persist(&active.settings); // remember across restarts
+                // Blur is pointless once fully opaque; drop it as we cross 1.0.
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.set_enabled(want_blur(&active.settings));
+                }
                 active.window.request_redraw();
             }
             Action::OpacityDown => {
                 let v = active.settings.adjust_opacity(-0.05); // more see-through
                 log::info!("background opacity = {v:.2}");
                 Self::persist(&active.settings);
+                // Now translucent → (re)enable blur if the config allows it.
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.set_enabled(want_blur(&active.settings));
+                }
                 active.window.request_redraw();
             }
             Action::ScrimUp => {
@@ -2068,8 +2174,16 @@ impl App {
             let family_changed = settings.font_family != active.settings.font_family;
             let fonts_changed = family_changed || settings.font_size != active.settings.font_size;
             let titlebar_changed = settings.show_titlebar != active.settings.show_titlebar;
+            // The blur decision depends on both the toggle and the opacity slider.
+            let blur_changed = want_blur(&settings) != want_blur(&active.settings);
             active.settings = settings; // commit
             Self::persist(&active.settings);
+            // Background blur: toggle live if the config or opacity moved it.
+            if blur_changed {
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.set_enabled(want_blur(&active.settings));
+                }
+            }
             // Titlebar toggle changes every pane's content height → re-reserve and
             // resize all PTYs.
             if titlebar_changed {
@@ -2606,6 +2720,14 @@ const WINDOW_MARGIN: f32 = 8.0;
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background
 /// clear/scrim still fill the whole window, so the margin shows the background.
+/// Whether to ask the compositor for background blur: only when the user has it
+/// enabled AND the background is translucent (blur behind a fully opaque surface
+/// is invisible and wasted compositor work). The single source of truth for the
+/// blur decision, shared by startup and every runtime opacity/config change.
+fn want_blur(settings: &rt_config::Settings) -> bool {
+    settings.background_blur && settings.background_opacity < 1.0
+}
+
 fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
     let m = WINDOW_MARGIN;
     Rect::new(
@@ -2614,42 +2736,6 @@ fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
         (size.width as f32 - 2.0 * m).max(1.0),
         (size.height as f32 - 2.0 * m).max(1.0),
     )
-}
-
-/// Parse the optional `--cols N` / `--rows N` startup flags (both `--cols 80` and
-/// `--cols=80` accepted). Returns `Some((cols, rows))` only when BOTH are given
-/// and positive — a partial grid is ignored (falls back to the default size).
-/// Used to pin `rt` to an exact grid so its output-throughput numbers line up
-/// with other terminals launched via `--geometry=COLSxROWS` (see the bench).
-fn parse_grid_flags() -> Option<(usize, usize)> {
-    let mut cols: Option<usize> = None;
-    let mut rows: Option<usize> = None;
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        // Accept either "--cols=80" (one token) or "--cols 80" (two tokens).
-        let mut take = |flag: &str| -> Option<usize> {
-            if let Some(v) = a.strip_prefix(flag).and_then(|s| s.strip_prefix('=')) {
-                v.parse().ok() // --cols=80
-            } else if a == flag {
-                i += 1; // consume the value token
-                args.get(i).and_then(|v| v.parse().ok()) // --cols 80
-            } else {
-                None
-            }
-        };
-        if let Some(c) = take("--cols") {
-            cols = Some(c);
-        } else if let Some(r) = take("--rows") {
-            rows = Some(r);
-        }
-        i += 1;
-    }
-    match (cols, rows) {
-        (Some(c), Some(r)) if c > 0 && r > 0 => Some((c, r)),
-        _ => None,
-    }
 }
 
 /// Physical window size that makes a single full-window pane come out to exactly
@@ -2708,7 +2794,7 @@ fn main() {
     }
     // Build the winit event loop and hand it our application.
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App { font_db, mono_families, active: None };
+    let mut app = App { font_db, mono_families, cli: parse_cli(), active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);

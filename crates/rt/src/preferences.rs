@@ -43,6 +43,10 @@ pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool, famili
                 egui::Slider::new(&mut settings.scrim_strength, 0.0..=Settings::MAX_SCRIM)
                     .text("Background scrim"),
             );
+            // True compositor blur where the protocol exists (KDE 6.7+, COSMIC,
+            // niri). Only takes effect while the background is translucent; a
+            // silent no-op elsewhere.
+            ui.checkbox(&mut settings.background_blur, "Background blur (if supported)");
 
             ui.separator();
             ui.heading("Colours");
