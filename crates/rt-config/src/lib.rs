@@ -214,9 +214,11 @@ impl Settings {
     /// The strongest scrim we allow; above this almost nothing shows through, at
     /// which point the user may as well raise opacity instead.
     pub const MAX_SCRIM: f32 = 0.95;
-    /// Upper bound for the scrollback slider. 1M lines is already ~1 GB for an
-    /// 80-column pane; beyond that, redirect to a file or pager instead.
-    pub const MAX_SCROLLBACK: usize = 1_000_000;
+    /// Upper bound for the scrollback slider. 20M lines suits listing/searching a
+    /// whole filesystem, but a *full* buffer is heavy — very roughly ~1.5 GB per
+    /// million 80-column lines — so the titlebar shows a used/max meter to watch
+    /// it. The grid only allocates as it fills, so an unused ceiling is cheap.
+    pub const MAX_SCROLLBACK: usize = 20_000_000;
 
     /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
     /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.

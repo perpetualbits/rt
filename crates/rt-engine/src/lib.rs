@@ -268,6 +268,10 @@ pub struct TermPane {
     // The child shell's process id, captured at spawn. rt-mux uses it (as the
     // pane's session leader) to attribute CPU/memory to the pane.
     pid: Option<u32>,
+    // The configured maximum scrollback (lines) this pane was built with, so the
+    // GUI can show a "used / max" buffer meter. `scroll_info().1` is the current
+    // fill against this ceiling.
+    scrollback_limit: usize,
 }
 
 impl TermPane {
@@ -382,7 +386,14 @@ impl TermPane {
             rows,
             palette: palette::Palette::xterm(), // standard xterm 256-colour table
             pid,
+            scrollback_limit: scrollback,
         })
+    }
+
+    /// The pane's configured scrollback ceiling in lines (what it was spawned
+    /// with). Pair with `scroll_info().1` for a "used / max" buffer meter.
+    pub fn scrollback_limit(&self) -> usize {
+        self.scrollback_limit
     }
 
     /// The child shell's process id (the pane's session leader), or `None` if it

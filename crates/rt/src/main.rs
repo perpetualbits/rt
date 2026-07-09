@@ -880,7 +880,7 @@ impl ApplicationHandler for App {
     }
 
     /// Handle a window event: close, resize, key input, redraw.
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Everything here needs the active state; ignore events before resume.
         let Some(active) = self.active.as_mut() else { return };
 
@@ -1013,8 +1013,14 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            // The user closed the window.
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // The user closed the window (title-bar button / compositor). Exit
+            // the same way the last-pane-closed path does — `process::exit`,
+            // NOT `event_loop.exit()`. The latter unwinds and Drops the GL
+            // context, egui_glow painter and Wayland blur objects, whose teardown
+            // ordering faults (a segfault on Wayland, an X11 GetGeometry panic on
+            // the x11 dev build). The OS reclaims everything; the PTY children get
+            // SIGHUP. This matches SessionEvent::CloseWindow below.
+            WindowEvent::CloseRequested => std::process::exit(0),
 
             // Track modifier state so key events can build correct chords.
             WindowEvent::ModifiersChanged(new_mods) => {
@@ -2259,9 +2265,36 @@ impl App {
                 for (i, ch) in size_str.chars().enumerate() {
                     active.renderer.draw_char(size_x, text_top, i, 0, ch, text_col, false, false);
                 }
-                // Title on the left, truncated so it never runs into the size.
+                // Scrollback meter ("buf USED/MAX") just left of the size, warming
+                // grey → amber → red as the buffer fills so a runaway listing is
+                // visible before it eats memory.
+                let mut left_of = size_x; // right boundary the title must clear
+                if let Some(pane) = active.session.pane(id) {
+                    let (_, used, _) = pane.scroll_info(); // history lines currently held
+                    let max = pane.scrollback_limit();
+                    if max > 0 {
+                        let meter = format!("buf {}/{}", fmt_lines(used), fmt_lines(max));
+                        let mw = meter.chars().count() as f32 * cell_w;
+                        let mx = (size_x - 2.0 * cell_w - mw).max(left_x); // a 2-cell gap before the size
+                        let frac = used as f32 / max as f32;
+                        let mcol = if frac > 0.85 {
+                            Color::rgb(0xe0, 0x60, 0x50) // nearly full: red warning
+                        } else if frac > 0.6 {
+                            Color::rgb(0xe0, 0xc0, 0x50) // getting full: amber
+                        } else if focused {
+                            Color::rgb(0xa2, 0xac, 0xba) // idle: muted grey-blue
+                        } else {
+                            Color::rgb(0x7c, 0x80, 0x8c)
+                        };
+                        for (i, ch) in meter.chars().enumerate() {
+                            active.renderer.draw_char(mx, text_top, i, 0, ch, mcol, false, false);
+                        }
+                        left_of = mx; // title truncates before the meter
+                    }
+                }
+                // Title on the left, truncated so it never runs into the meter/size.
                 let title = active.session.title_of(id).filter(|t| !t.is_empty()).unwrap_or("Terminal");
-                let avail = ((size_x - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
+                let avail = ((left_of - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
                 for (i, ch) in title.chars().take(avail).enumerate() {
                     active.renderer.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
                 }
@@ -3019,6 +3052,20 @@ fn window_size_for_grid(cols: usize, rows: usize, cell: (f32, f32), show_titleba
     let w = cols as f32 * cell.0 + cell.0 * 0.5 + pad_w + 2.0 * WINDOW_MARGIN;
     let h = rows as f32 * cell.1 + cell.1 * 0.5 + pad_h + 2.0 * WINDOW_MARGIN;
     winit::dpi::PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
+}
+
+/// Format a line count compactly for the titlebar buffer meter: `950`, `12k`,
+/// `1.2M`, `20M`. Whole thousands/millions drop the decimal.
+fn fmt_lines(n: usize) -> String {
+    if n >= 1_000_000 {
+        let m = n as f64 / 1_000_000.0;
+        if (m.fract()).abs() < 0.05 { format!("{}M", m.round() as u64) } else { format!("{m:.1}M") }
+    } else if n >= 1_000 {
+        let k = n as f64 / 1_000.0;
+        if (k.fract()).abs() < 0.05 { format!("{}k", k.round() as u64) } else { format!("{k:.1}k") }
+    } else {
+        format!("{n}")
+    }
 }
 
 /// Scrollbar geometry for a pane whose grid area is `rect` and whose scroll
