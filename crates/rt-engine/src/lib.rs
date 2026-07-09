@@ -618,6 +618,16 @@ impl TermPane {
         term.mode().intersects(TermMode::MOUSE_MODE) // click | motion | drag
     }
 
+    /// Whether the program requested *any-motion* mouse tracking (mode 1003): it
+    /// wants pointer motion reported even with no button held, e.g. to highlight
+    /// whatever the pointer hovers over. Distinct from the click/drag modes so the
+    /// GUI can avoid spamming bare motion at apps that only asked for clicks.
+    pub fn wants_motion(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        let term = self.term.lock();
+        term.mode().contains(TermMode::MOUSE_MOTION) // DECSET 1003
+    }
+
     /// Whether the program requested SGR mouse encoding (mode 1006). Selects the
     /// `ESC [ < … M/m` form over the legacy `ESC [ M` byte form.
     pub fn mouse_sgr(&self) -> bool {
