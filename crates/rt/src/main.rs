@@ -183,6 +183,7 @@ struct Active {
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
     mouse_report: Option<(rt_core::PaneId, u16)>, // pane + xterm button code we're forwarding a press to
+    hover_cell: Option<(rt_core::PaneId, usize, usize)>, // last cell reported to a 1003 (any-motion) app
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
     bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
     meters: std::collections::HashMap<rt_core::PaneId, Meter>, // per-pane output-activity instrument
@@ -781,6 +782,7 @@ impl ApplicationHandler for App {
             selection: None,
             selecting: false,
             mouse_report: None,
+            hover_cell: None,
             dragging_divider: None,
             bell_flash: None,
             meters: std::collections::HashMap::new(),
@@ -1124,6 +1126,9 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                } else if !active.mods.shift_key() && Self::forward_hover(active) {
+                    // The app under the pointer wants bare motion (mode 1003): it
+                    // owns the hover (Shift suspends forwarding). Nothing else here.
                 } else if active.settings.focus_follows_mouse {
                     // Sloppy focus: focus the pane under the pointer. Only redraw
                     // when focus actually changes (not on every motion), and only
@@ -1750,6 +1755,36 @@ impl App {
                 }
             }
         }
+        active.window.request_redraw();
+        true
+    }
+
+    /// Report bare pointer motion (no button) to the app under the cursor, but
+    /// only if it enabled any-motion tracking (mode 1003, e.g. to light up
+    /// whatever is hovered). Deduplicated to cell changes so we send one report
+    /// per cell entered, not one per pixel. Returns `true` when the app owns the
+    /// hover (so the caller skips focus-follows for this move).
+    fn forward_hover(active: &mut Active) -> bool {
+        // The pane + cell under the pointer (None over gutters/titlebars).
+        let Some((pane_id, col, row)) = Self::cell_at(active, active.mouse.0, active.mouse.1) else {
+            active.hover_cell = None; // left the grid: forget the last cell
+            return false;
+        };
+        // Does that pane's app want bare motion? (1003, not just clicks.)
+        let wants = active
+            .session
+            .pane(pane_id)
+            .is_some_and(|p| p.wants_motion());
+        if !wants {
+            active.hover_cell = None;
+            return false;
+        }
+        // Same cell as last time → nothing new to send, but the app still owns it.
+        if active.hover_cell == Some((pane_id, col, row)) {
+            return true;
+        }
+        active.hover_cell = Some((pane_id, col, row));
+        Self::forward_mouse(active, MouseReport::Move, active.mouse.0, active.mouse.1);
         active.window.request_redraw();
         true
     }
@@ -2915,6 +2950,7 @@ enum MouseReport {
     Press(u16),   // button pressed; the u16 is the base xterm button code (0=L,1=M,2=R)
     Release(u16), // button released
     Drag(u16),    // pointer motion while a button is held
+    Move,         // pointer motion with NO button held (any-motion / hover, mode 1003)
     Scroll(bool), // wheel notch: true = up, false = down
 }
 
@@ -2929,6 +2965,7 @@ fn encode_mouse(report: MouseReport, col: u16, row: u16, mods: &ModifiersState, 
         MouseReport::Press(b) => (b, false),
         MouseReport::Release(b) => (b, true),
         MouseReport::Drag(b) => (b + 32, false),               // xterm motion flag
+        MouseReport::Move => (3 + 32, false),                  // no button (3) + motion (32) = 35
         MouseReport::Scroll(up) => (if up { 64 } else { 65 }, false), // wheel codes
     };
     if mods.alt_key() {
