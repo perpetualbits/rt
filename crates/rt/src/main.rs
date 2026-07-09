@@ -176,7 +176,7 @@ struct Active {
     mods: ModifiersState,                 // live modifier state (updated on change)
     settings: rt_config::Settings,        // window appearance (background opacity, …)
     mouse: (f32, f32),                    // last cursor position in physical pixels
-    menu: Option<menu::Menu>,             // the open right-click context menu, if any
+    menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<smithay_clipboard::Clipboard>, // Wayland clipboard + PRIMARY (None on x11 dev builds)
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
@@ -829,11 +829,7 @@ impl ApplicationHandler for App {
         // its rendering can be screenshotted without synthetic mouse input.
         if std::env::var("RT_MENU").is_ok() {
             if let Some(active) = self.active.as_mut() {
-                let (cw, ch) = active.renderer.cell_size();
-                let size = active.window.inner_size();
-                let mut m = menu::Menu::new(200.0, 150.0); // fixed, visible spot
-                m.clamp(size.width as f32, size.height as f32, cw, ch);
-                active.menu = Some(m);
+                active.menu = Some((200.0, 150.0)); // fixed, visible spot
             }
         }
         // Debug/verification hook: RT_SEARCH opens the search bar at startup with
@@ -923,6 +919,33 @@ impl ApplicationHandler for App {
                         ) =>
                 {
                     active.manual_open = false;
+                    active.window.request_redraw();
+                    return;
+                }
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::ModifiersChanged(_) => return,
+                _ => {}
+            }
+        }
+
+        // The context menu is an egui overlay too: egui gets first look (for
+        // hover/click), Escape or a click outside closes it, and terminal input is
+        // suspended while it is up.
+        if active.menu.is_some() {
+            let r = active.egui_state.on_window_event(&active.window, &event);
+            if r.repaint {
+                active.window.request_redraw();
+            }
+            match event {
+                WindowEvent::KeyboardInput { event: ref ke, .. }
+                    if ke.state == ElementState::Pressed
+                        && matches!(ke.logical_key, Key::Named(NamedKey::Escape)) =>
+                {
+                    active.menu = None;
                     active.window.request_redraw();
                     return;
                 }
@@ -1101,11 +1124,6 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                } else if let Some(m) = active.menu.as_mut() {
-                    let (cw, ch) = active.renderer.cell_size(); // cell metrics for hit layout
-                    if m.set_hover(active.mouse.0, active.mouse.1, cw, ch) {
-                        active.window.request_redraw(); // hovered row changed
-                    }
                 } else if active.settings.focus_follows_mouse {
                     // Sloppy focus: focus the pane under the pointer. Only redraw
                     // when focus actually changes (not on every motion), and only
@@ -1145,25 +1163,14 @@ impl ApplicationHandler for App {
                     }
                     log::debug!("right-click at {:?} → open menu", active.mouse);
                     // Focus the pane under the cursor first, so the menu's
-                    // actions apply to the pane you right-clicked.
+                    // actions apply to the pane you right-clicked. The menu itself
+                    // is an egui overlay anchored here; egui clamps it on-screen.
                     active.session.focus_at(active.mouse.0, active.mouse.1);
-                    let (cw, ch) = active.renderer.cell_size();
-                    let size = active.window.inner_size();
-                    let mut m = menu::Menu::new(active.mouse.0, active.mouse.1);
-                    m.clamp(size.width as f32, size.height as f32, cw, ch);
-                    active.menu = Some(m);
+                    active.menu = Some(active.mouse);
                     active.window.request_redraw();
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
-                    if let Some(m) = active.menu.take() {
-                        // Menu open: click activates the hovered item (or closes).
-                        let (cw, ch) = active.renderer.cell_size();
-                        let action = m.hit(active.mouse.0, active.mouse.1, cw, ch).and_then(|i| m.action_at(i));
-                        active.window.request_redraw();
-                        if let Some(a) = action {
-                            Self::apply_action(active, a); // may exit on the last pane
-                        }
-                    } else {
+                    {
                         let size = active.window.inner_size();
                         let bounds = content_bounds(size);
                         let (mx, my) = active.mouse;
@@ -1874,12 +1881,6 @@ impl App {
     /// focused PTY(s).
     fn on_key_press(&mut self, key_event: winit::event::KeyEvent) {
         let Some(active) = self.active.as_mut() else { return };
-        // Escape dismisses an open context menu (and is then consumed).
-        if active.menu.is_some() && matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
-            active.menu = None;
-            active.window.request_redraw();
-            return;
-        }
         // While an IME/dead-key composition is in progress, swallow key presses:
         // the composed result arrives via WindowEvent::Ime(Commit) instead. This
         // is what prevents the dead key (´) and its result (ó) both being sent.
@@ -2254,18 +2255,14 @@ impl App {
             }
         }
 
-        // The context menu draws last so it sits above the terminal content.
-        if let Some(m) = active.menu.as_ref() {
-            let (cw, ch) = active.renderer.cell_size(); // cell metrics for menu layout
-            m.draw(&mut active.renderer, cw, ch); // panel + rows + hover highlight
-        }
-
         active.renderer.end_frame(); // upload + draw call
 
-        // One egui pass per frame: the preferences dialog, the manual, the search
-        // bar, or (when none is up) the always-on border instruments.
+        // One egui pass per frame: the preferences dialog, the context menu, the
+        // manual, the search bar, or (when none is up) the border instruments.
         if active.prefs_open {
             Self::paint_egui(active);
+        } else if active.menu.is_some() {
+            Self::paint_menu(active);
         } else if active.manual_open {
             Self::paint_manual(active);
         } else if active.search_open {
@@ -2349,6 +2346,42 @@ impl App {
             &primitives,
             &output.textures_delta,
         );
+    }
+
+    /// Run the egui context menu for this frame and paint it. Applies the picked
+    /// action and closes the menu on a selection, an outside click, or Escape.
+    fn paint_menu(active: &mut Active) {
+        let Some(pos) = active.menu else { return };
+        let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
+        let ctx = active.egui_ctx.clone(); // cheap Arc clone (avoids borrowing active in the closure)
+        // The menu was anchored in physical pixels; egui positions in points.
+        let ppp = active.window.scale_factor() as f32;
+        let mut chosen: Option<rt_config::Action> = None;
+        let mut close = false;
+        ctx.begin_pass(raw_input);
+        menu::ui(&ctx, (pos.0 / ppp, pos.1 / ppp), &mut chosen, &mut close);
+        let output = ctx.end_pass();
+        // Dismiss before applying, so an action that opens another overlay (e.g.
+        // Preferences) isn't immediately re-covered by the menu.
+        if chosen.is_some() || close {
+            active.menu = None;
+        }
+        active.egui_state.handle_platform_output(&active.window, output.platform_output);
+        let out_ppp = output.pixels_per_point;
+        let primitives = ctx.tessellate(output.shapes, out_ppp);
+        let size = active.window.inner_size();
+        active.egui_painter.paint_and_update_textures(
+            [size.width, size.height],
+            out_ppp,
+            &primitives,
+            &output.textures_delta,
+        );
+        // Apply after painting/committing state so it runs the same path as a key
+        // binding (may relayout, open a dialog, or close the last pane and exit).
+        if let Some(action) = chosen {
+            Self::apply_action(active, action);
+            active.window.request_redraw();
+        }
     }
 
     /// Run the scrollback-search bar UI for this frame and paint it. Draws a slim
