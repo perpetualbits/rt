@@ -195,6 +195,7 @@ struct Active {
     lat_phase: f32,                       // phase of the latency frame's undulation
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
+    scrollback: Rc<std::cell::Cell<usize>>, // live scrollback size for newly spawned panes
     jacks: SharedJacks,                   // per-pane patch-bay pipe jacks (shared with the spawn closure)
     wires: Vec<Wire>,                     // active patch-bay connections
     wiring_from: Option<(rt_core::PaneId, Stream)>, // the armed wire source, mid-gesture
@@ -671,6 +672,10 @@ impl ApplicationHandler for App {
         let _ = std::fs::create_dir_all(&jacks_dir);
         let jacks: SharedJacks = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let jacks_spawn = jacks.clone();
+        // Live scrollback size shared with the spawn factory, so changing it in
+        // Preferences takes effect for the next terminal without a restart.
+        let scrollback = Rc::new(std::cell::Cell::new(settings.scrollback));
+        let scrollback_spawn = scrollback.clone();
         // The factory spawns a shell-backed pane at the requested cell size. A
         // spawn failure here is fatal (no PTY available) — we surface it by
         // panicking with a clear message rather than rendering a broken pane.
@@ -688,7 +693,7 @@ impl ApplicationHandler for App {
                 }
                 Err(_) => Vec::new(), // no jacks: the pane still runs, just unwireable
             };
-            let mut pane = TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env)
+            let mut pane = TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get())
                 .expect("failed to spawn a PTY/shell for a pane");
             if let Ok(p) = palette_spawn.lock() {
                 pane.set_palette(p.clone()); // apply the current colours
@@ -795,6 +800,7 @@ impl ApplicationHandler for App {
             lat_phase: 0.0,
             stall: 0.0,
             last_wake: Instant::now(),
+            scrollback,
             jacks,
             wires: Vec::new(),
             wiring_from: None,
@@ -1846,13 +1852,18 @@ impl App {
         if history == 0 || rect.h <= 0.0 {
             return;
         }
-        let total = (history + screen) as f32;
         let (_bx, _bw, _ty, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
+        // Invert scrollbar_metrics: the thumb travels `rect.h - thumb_h`, and its
+        // position maps linearly onto the offset range `history..0` (top..bottom).
+        let travel = (rect.h - thumb_h).max(0.0);
+        if travel <= 0.0 {
+            return; // thumb fills the track: nothing to drag
+        }
         // Desired thumb top from the cursor (minus where we grabbed it), clamped
-        // to the track. Then invert thumb_y = rect.y + (history-offset)/total*rect.h.
-        let want_y = (my - grab).clamp(rect.y, rect.bottom() - thumb_h);
-        let frac = (want_y - rect.y) / rect.h; // 0 at top, →1 at bottom
-        let target = (history as f32 - frac * total).round().clamp(0.0, history as f32) as isize;
+        // to the travel range so both ends are exactly reachable.
+        let want_y = (my - grab).clamp(rect.y, rect.y + travel);
+        let down = (want_y - rect.y) / travel; // 1 at bottom, 0 at top
+        let target = (history as f32 * (1.0 - down)).round().clamp(0.0, history as f32) as isize;
         let delta = target - offset as isize;
         if delta != 0 {
             pane.scroll(delta); // move the view; the next frame redraws the thumb
@@ -2400,6 +2411,8 @@ impl App {
             let blur_changed = want_blur(&settings) != want_blur(&active.settings);
             active.settings = settings; // commit
             Self::persist(&active.settings);
+            // Scrollback: newly spawned panes read this live cell.
+            active.scrollback.set(active.settings.scrollback);
             // Background blur: toggle live if the config or opacity moved it.
             if blur_changed {
                 if let Some(fx) = &mut active.bg_effect {
@@ -3017,10 +3030,16 @@ fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -
     let total = (history + screen) as f32; // whole buffer height in lines
     let bw = 6.0; // scrollbar width
     let bx = rect.right() - bw - 1.0; // inset slightly from the grid's right edge
-    let thumb_h = (screen as f32 / total * rect.h).max(24.0); // visible fraction, min grabbable
-    let thumb_y = (rect.y + history.saturating_sub(offset) as f32 / total * rect.h)
-        .min(rect.bottom() - thumb_h) // keep inside the pane
-        .max(rect.y);
+    // Thumb size = the visible fraction of the buffer, floored so it stays
+    // grabbable even for a huge history, and capped at the track height.
+    let thumb_h = (screen as f32 / total * rect.h).max(24.0).min(rect.h);
+    // Thumb position: it slides over the track region ABOVE its own height as
+    // the offset runs 0 (bottom) → history (top). Mapping across this reduced
+    // *travel* (not the whole track) — and against `history`, not `total` — is
+    // what keeps BOTH ends reachable once the thumb is floored to its minimum.
+    let travel = (rect.h - thumb_h).max(0.0); // distance the thumb can move
+    let down = history.saturating_sub(offset) as f32 / history.max(1) as f32; // 1 at bottom, 0 at top
+    let thumb_y = rect.y + down * travel;
     (bx, bw, thumb_y, thumb_h)
 }
 

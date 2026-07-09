@@ -88,6 +88,13 @@ pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool, famili
             ui.checkbox(&mut settings.focus_follows_mouse, "Focus follows mouse");
             // Per-pane titlebars (title + size + group) vs the borderless look.
             ui.checkbox(&mut settings.show_titlebar, "Show per-pane titlebars");
+            // Scrollback buffer size (lines kept above the screen). Logarithmic
+            // so the slider spans 1k…1M usefully. Applies to new terminals.
+            ui.add(
+                egui::Slider::new(&mut settings.scrollback, 1000..=Settings::MAX_SCROLLBACK)
+                    .logarithmic(true)
+                    .text("Scrollback (lines, new terminals)"),
+            );
 
             ui.add_space(6.0);
             ui.heading("Border instruments");

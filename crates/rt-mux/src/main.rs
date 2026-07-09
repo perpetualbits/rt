@@ -335,7 +335,7 @@ impl Mux {
         let cols = area.width.saturating_sub(2).max(1) as usize;
         let rows = area.height.saturating_sub(2).max(1) as usize;
         let env = mux.make_jacks(1); // its $RT_OUT / $RT_IN
-        let pane = TermPane::spawn_env(None, None, cols, rows, &env)?; // None = default login shell
+        let pane = TermPane::spawn_env(None, None, cols, rows, &env, rt_engine::DEFAULT_SCROLLBACK)?; // None = default login shell
         mux.panes.insert(1, pane);
         mux.tree.focus_set(1); // focus the only pane
         Ok(mux)
@@ -362,7 +362,7 @@ impl Mux {
         let id = self.next_id; // candidate id (committed only on success)
         let env = self.make_jacks(id);
         // 80x24 is only a seed; `render` resizes every pane to its tile each frame.
-        match TermPane::spawn_env(None, None, 80, 24, &env) {
+        match TermPane::spawn_env(None, None, 80, 24, &env, rt_engine::DEFAULT_SCROLLBACK) {
             Ok(pane) => {
                 self.next_id += 1;
                 self.panes.insert(id, pane);

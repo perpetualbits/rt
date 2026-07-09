@@ -158,6 +158,11 @@ pub struct Settings {
     pub font_family: String,
     /// Font size in pixels.
     pub font_size: f32,
+    /// Maximum scrollback lines retained per pane, above the visible screen.
+    /// Larger keeps more history to scroll and search through, at the cost of
+    /// memory (~tens of bytes per column per line). Applies to terminals opened
+    /// after the change.
+    pub scrollback: usize,
 }
 
 /// The default 16-colour ANSI palette (classic xterm values).
@@ -198,6 +203,7 @@ impl Default for Settings {
             palette: DEFAULT_PALETTE,      // classic xterm 16-colour palette
             font_family: "DejaVu Sans Mono".to_string(), // ubiquitous monospace default
             font_size: 18.0,               // pixels
+            scrollback: 10_000,            // matches rt_engine::DEFAULT_SCROLLBACK
         }
     }
 }
@@ -208,6 +214,9 @@ impl Settings {
     /// The strongest scrim we allow; above this almost nothing shows through, at
     /// which point the user may as well raise opacity instead.
     pub const MAX_SCRIM: f32 = 0.95;
+    /// Upper bound for the scrollback slider. 1M lines is already ~1 GB for an
+    /// 80-column pane; beyond that, redirect to a file or pager instead.
+    pub const MAX_SCROLLBACK: usize = 1_000_000;
 
     /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
     /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.

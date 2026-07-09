@@ -29,6 +29,10 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 
+/// Default scrollback lines retained above the screen (matches alacritty's own
+/// default). rt's front-end overrides this from the user's Preferences.
+pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
 /// High-level events a pane can surface to the GUI, distilled from
 /// `alacritty_terminal`'s richer event enum down to what rt's UI actually acts
 /// on. Draining these (via [`TermPane::drain_events`]) replaces Terminator's
@@ -283,7 +287,8 @@ impl TermPane {
         cols: usize,
         rows: usize,
     ) -> std::io::Result<Self> {
-        Self::spawn_env(shell, working_directory, cols, rows, &[]) // no extra env
+        // Default scrollback; callers that expose a setting use `spawn_env`.
+        Self::spawn_env(shell, working_directory, cols, rows, &[], DEFAULT_SCROLLBACK)
     }
 
     /// Like [`spawn`](Self::spawn) but with extra environment variables exported
@@ -296,14 +301,16 @@ impl TermPane {
         cols: usize,
         rows: usize,
         env: &[(String, String)], // extra environment variables for the child
+        scrollback: usize,        // max scrollback lines to retain above the screen
     ) -> std::io::Result<Self> {
         // Shared state between this struct and the proxy/I/O thread.
         let events = Arc::new(Mutex::new(VecDeque::new())); // event FIFO
         let sender_slot = Arc::new(Mutex::new(None)); // filled in below
         let proxy = Proxy { queue: events.clone(), sender: sender_slot.clone() };
 
-        // Build the terminal grid + parser with default behaviour.
-        let config = Config::default(); // 10k scrollback, standard cursor, etc.
+        // Build the terminal grid + parser. `scrolling_history` is the buffer the
+        // user can grow for long-running output (see rt's Preferences).
+        let config = Config { scrolling_history: scrollback, ..Config::default() };
         let size = Size { cols, screen_lines: rows }; // initial dimensions
         // Term is shared behind alacritty's FairMutex so the I/O thread and the
         // renderer can both reach it without starving each other.
