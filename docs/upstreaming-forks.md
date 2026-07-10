@@ -1,6 +1,21 @@
 # Upstreaming the throughput forks
 
-rt's ASCII-throughput win (~1.5× in the engine, ~1.4× end-to-end) currently rides
+## Status (live)
+
+- **Track B — vendored: DONE.** rt builds the win from `vendor/vte` + `vendor/alacritty_terminal`
+  on a clean checkout; no external forks needed. See [`vendored-engine.md`](vendored-engine.md).
+- **Track A — vte PR: OPEN → https://github.com/alacritty/vte/pull/154**
+  (`perpetualbits:batched-print-str → alacritty:master`, +81/−3, tests green).
+- **Track A — alacritty_terminal PR: NOT YET.** Blocked on a *published* vte 0.16; patch +
+  PR text staged in [`upstreaming/`](upstreaming/), fire once vte lands on crates.io.
+
+---
+
+> **Historical note:** the description below was written while rt still rode on two
+> *uncommitted local* forks. That state is superseded by Track B (vendored). Kept for the
+> upstreaming plan, which is still current.
+
+rt's ASCII-throughput win (~1.5× in the engine, ~1.4× end-to-end) originally rode
 on **two uncommitted local forks**:
 
 | Fork | Path | Upstream repo | Change |
