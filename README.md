@@ -13,7 +13,7 @@ session is present (never XWayland), falling back to X11 otherwise.
 ## Features
 
 - **Panes & tabs** — split any way, keyboard- or mouse-driven, Terminator keybindings.
-- **Newspaper columns** — flow long output into side-by-side columns (`Ctrl+.` / `Ctrl+,`).
+- **Newspaper columns** — flow one pane's output into side-by-side columns so a wide screen shows *more rows at once*, newspaper-style (`Ctrl+.` / `Ctrl+,`). See below.
 - **Scrollback search** — `Ctrl+Shift+F`; configurable buffer up to 20M lines, with a live memory meter.
 - **Broadcast** — type once, reach a pane group or every pane.
 - **Border instruments** — live gauges on each pane's edge: output flow, CPU heat (blackbody), render latency. Idle-throttled, so they cost nothing when nothing's happening.
@@ -23,6 +23,20 @@ session is present (never XWayland), falling back to X11 otherwise.
 - **Scheme-aware chrome** — per-pane headers derived from your own foreground/background colours.
 
 Press **F1** in rt for the full built-in manual.
+
+### Newspaper columns — use that wide screen
+
+Modern displays are wide, but a terminal only fills them with *columns*, not
+*rows* — so `less`, a build log, or `git log` leaves the bottom two-thirds of a
+27-inch screen blank. rt's **newspaper columns** flow a single pane's output into
+two, three, or more side-by-side columns: text runs down the first column, then
+continues at the top of the next, exactly like a newspaper. One `Ctrl+.` doubles
+how much scrollback you see at a glance; `Ctrl+,` folds it back.
+
+![A single pane split into newspaper columns, showing far more of a long listing at once](docs/screenshots/newspaper-columns.png)
+
+It's transparent to the program underneath — it just sees an ordinary scrollback
+scroll — so it works with anything: `man` pages, `cat` of a long file, logs, `vim`.
 
 ## Build & install
 

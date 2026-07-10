@@ -244,7 +244,7 @@ struct Active {
     hover_cell: Option<(rt_core::PaneId, usize, usize)>, // last cell reported to a 1003 (any-motion) app
     scroll_drag: Option<(rt_core::PaneId, f32, Rect)>, // dragging the scrollbar: (pane, grab-offset in thumb, grid rect)
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
-    bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
+    bell_flash: std::collections::HashMap<rt_core::PaneId, Instant>, // per-pane visible-bell expiry
     meters: std::collections::HashMap<rt_core::PaneId, Meter>, // per-pane output-activity instrument
     last_meter_tick: Instant,             // wall-clock of the last instrument advance
     heat: std::collections::HashMap<rt_core::PaneId, f32>, // per-pane CPU load (heat instrument)
@@ -254,6 +254,7 @@ struct Active {
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
     active_until: Instant,                // poll fast (animate) until here; set on input/output, else idle-throttle
+    last_input: Instant,                  // last keystroke; the cursor soft-blinks for a bounded window after it
     poll_ms: u64,                         // the wake interval set last tick, so latency is judged against it
     scrollback: Rc<std::cell::Cell<usize>>, // live scrollback size for newly spawned panes
     jacks: SharedJacks,                   // per-pane patch-bay pipe jacks (shared with the spawn closure)
@@ -871,7 +872,7 @@ impl ApplicationHandler for App {
             hover_cell: None,
             scroll_drag: None,
             dragging_divider: None,
-            bell_flash: None,
+            bell_flash: std::collections::HashMap::new(),
             meters: std::collections::HashMap::new(),
             last_meter_tick: Instant::now(),
             heat: std::collections::HashMap::new(),
@@ -881,6 +882,7 @@ impl ApplicationHandler for App {
             stall: 0.0,
             last_wake: Instant::now(),
             active_until: Instant::now(),
+            last_input: Instant::now(),
             poll_ms: 16,
             scrollback,
             jacks,
@@ -1491,8 +1493,9 @@ impl ApplicationHandler for App {
                             dirty = true;
                         }
                         rt_engine::PaneEvent::Bell => {
-                            // Visible bell: flash the window briefly.
-                            active.bell_flash = Some(Instant::now() + Duration::from_millis(150));
+                            // Visible bell: briefly stripe the border of just this pane.
+                            active.bell_flash.insert(id, now + Duration::from_millis(80));
+                            active.active_until = now + Duration::from_millis(120); // repaint to show then clear it
                             dirty = true;
                         }
                         _ => {
@@ -1562,15 +1565,27 @@ impl ApplicationHandler for App {
         if dirty && active.search_open && !active.search_query.is_empty() {
             Self::run_search(active, false); // live refresh; keep position + view
         }
+        // The focused cursor soft-blinks for a bounded window after the last
+        // keystroke; keep repainting (cheaply) so the fade animates, then stop.
+        let blinking = active.last_input.elapsed() < Duration::from_secs_f32(CURSOR_BLINK_PERIOD * CURSOR_BLINK_CYCLES);
+        if blinking {
+            dirty = true;
+        }
         if dirty {
             active.window.request_redraw(); // schedule a paint
         }
         // Idle-throttle: animate at ~60fps only while there's recent input/output
-        // (so instruments move and interaction is crisp); otherwise fall back to a
-        // ~10Hz poll that still catches async output and heat but lets the CPU
-        // sleep. The chosen interval is remembered so the next tick judges latency
-        // against it (see the budget above).
-        let interval = if Instant::now() < active.active_until { ACTIVE_POLL } else { IDLE_POLL };
+        // (so instruments move and interaction is crisp); a pulsing cursor uses a
+        // cheaper ~20Hz; otherwise fall back to a ~10Hz poll that still catches
+        // async output and heat but lets the CPU sleep. The chosen interval is
+        // remembered so the next tick judges latency against it (see the budget).
+        let interval = if Instant::now() < active.active_until {
+            ACTIVE_POLL
+        } else if blinking {
+            BLINK_POLL
+        } else {
+            IDLE_POLL
+        };
         active.poll_ms = interval.as_millis() as u64;
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
     }
@@ -2120,6 +2135,12 @@ impl App {
         };
         if let Some(bytes) = bytes {
             active.session.feed_input(&bytes); // send to the shell(s)
+            active.last_input = Instant::now(); // restart the cursor blink window
+            // Typing returns you to the live prompt: if the focused pane was
+            // scrolled up in history, snap it back to the bottom.
+            if let Some(pane) = active.session.pane(active.session.focus()) {
+                pane.scroll_to_bottom();
+            }
         }
     }
 
@@ -2257,23 +2278,29 @@ impl App {
                         let ccol = Color::rgb(cc[0], cc[1], cc[2]);
                         let focused = id == focus; // is this the focused pane?
                         if !focused {
-                            // Unfocused: hollow outline regardless of shape.
+                            // Unfocused: hollow outline regardless of shape, steady (no blink).
                             active.renderer.cursor_hollow(ox, rect.y, cur.col, sub, ccol);
                         } else {
+                            // Soft-blink: fade the focused cursor's alpha so the glyph
+                            // beneath shows through, pulsing for a bounded window after
+                            // the last keystroke, then holding steady.
+                            let blink = cursor_blink_alpha(active.last_input.elapsed().as_secs_f32());
+                            let cur_col = ccol.with_alpha(blink);
                             match cur.shape {
                                 CursorShape::Block => {
-                                    // Solid block + inverse glyph for contrast.
-                                    active.renderer.fill_cell(ox, rect.y, cur.col, sub, ccol);
+                                    // Solid block + inverse glyph for contrast; both fade
+                                    // together so the underlying glyph re-emerges on the dip.
+                                    active.renderer.fill_cell(ox, rect.y, cur.col, sub, cur_col);
                                     if let Some(u) = snap.rows.get(cur.line).and_then(|rw| rw.get(cur.col)) {
                                         if u.c != ' ' {
                                             let ub = u.bg;
-                                            active.renderer.draw_char(ox, rect.y, cur.col, sub, u.c, Color::rgb(ub[0], ub[1], ub[2]), u.attrs.bold, u.attrs.italic);
+                                            active.renderer.draw_char(ox, rect.y, cur.col, sub, u.c, Color::rgb(ub[0], ub[1], ub[2]).with_alpha(blink), u.attrs.bold, u.attrs.italic);
                                         }
                                     }
                                 }
-                                CursorShape::HollowBlock => active.renderer.cursor_hollow(ox, rect.y, cur.col, sub, ccol),
-                                CursorShape::Underline => active.renderer.cursor_underline(ox, rect.y, cur.col, sub, ccol),
-                                CursorShape::Beam => active.renderer.cursor_beam(ox, rect.y, cur.col, sub, ccol),
+                                CursorShape::HollowBlock => active.renderer.cursor_hollow(ox, rect.y, cur.col, sub, cur_col),
+                                CursorShape::Underline => active.renderer.cursor_underline(ox, rect.y, cur.col, sub, cur_col),
+                                CursorShape::Beam => active.renderer.cursor_beam(ox, rect.y, cur.col, sub, cur_col),
                                 CursorShape::Hidden => {} // nothing (snapshot already filters, but be safe)
                             }
                         }
@@ -2473,12 +2500,16 @@ impl App {
             }
         }
 
-        // Visible bell: a brief translucent white flash over the whole window.
-        if let Some(exp) = active.bell_flash {
-            if Instant::now() < exp {
-                active.renderer.fill_rect(0.0, 0.0, bounds.w, bounds.h, Color::rgb(0xff, 0xff, 0xff).with_alpha(0.25));
-            } else {
-                active.bell_flash = None; // flash elapsed
+        // Visible bell: a brief yellow/black hazard stripe on the border of just
+        // the pane that rang — never a whole-window flash.
+        if !active.bell_flash.is_empty() {
+            let now = Instant::now();
+            active.bell_flash.retain(|_, exp| now < *exp); // drop elapsed flashes
+            let rects: Vec<_> = active.session.visible_rects(bounds);
+            for (id, r) in rects {
+                if active.bell_flash.contains_key(&id) {
+                    active.renderer.bell_stripe(r.x, r.y, r.w, r.h);
+                }
             }
         }
 
@@ -2583,14 +2614,20 @@ impl App {
     /// action and closes the menu on a selection, an outside click, or Escape.
     fn paint_menu(active: &mut Active) {
         let Some(pos) = active.menu else { return };
+        // Menu context, computed fresh each frame: the URL under the right-click
+        // (if any) drives the Open Link / Copy Address rows; a live selection
+        // enables Copy.
+        let url = Self::cell_at(active, pos.0, pos.1)
+            .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
+        let has_sel = Self::selected_text(active).is_some();
         let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
         let ctx = active.egui_ctx.clone(); // cheap Arc clone (avoids borrowing active in the closure)
         // The menu was anchored in physical pixels; egui positions in points.
         let ppp = active.window.scale_factor() as f32;
-        let mut chosen: Option<rt_config::Action> = None;
+        let mut chosen: Option<menu::MenuPick> = None;
         let mut close = false;
         ctx.begin_pass(raw_input);
-        menu::ui(&ctx, (pos.0 / ppp, pos.1 / ppp), &active.keymap, &mut chosen, &mut close);
+        menu::ui(&ctx, (pos.0 / ppp, pos.1 / ppp), &active.keymap, has_sel, url.as_deref(), &mut chosen, &mut close);
         let output = ctx.end_pass();
         // Dismiss before applying, so an action that opens another overlay (e.g.
         // Preferences) isn't immediately re-covered by the menu.
@@ -2609,9 +2646,22 @@ impl App {
         );
         // Apply after painting/committing state so it runs the same path as a key
         // binding (may relayout, open a dialog, or close the last pane and exit).
-        if let Some(action) = chosen {
-            Self::apply_action(active, action);
-            active.window.request_redraw();
+        match chosen {
+            Some(menu::MenuPick::Do(action)) => {
+                Self::apply_action(active, action);
+                active.window.request_redraw();
+            }
+            Some(menu::MenuPick::OpenUrl(u)) => {
+                Self::open_url(&u);
+                active.window.request_redraw();
+            }
+            Some(menu::MenuPick::CopyUrl(u)) => {
+                if let Some(cb) = &active.clipboard {
+                    cb.store(u); // put the address on the CLIPBOARD selection
+                }
+                active.window.request_redraw();
+            }
+            None => {}
         }
     }
 
@@ -3116,6 +3166,30 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 /// Stay in the fast poll for this long after the last input or output, so a
 /// burst eases to a stop smoothly and interaction never feels throttled.
 const ACTIVE_TAIL: Duration = Duration::from_millis(750);
+
+/// Cursor soft-blink: after you stop typing, the focused cursor pulses gently
+/// (a soft fade, not a hard on/off) for [`CURSOR_BLINK_CYCLES`] cycles of
+/// [`CURSOR_BLINK_PERIOD`], then holds steady — mirroring Terminator, which
+/// blinks a handful of times then stops. Bounding it keeps idle CPU near zero:
+/// we only repaint (at [`BLINK_POLL`]) during that window.
+const CURSOR_BLINK_PERIOD: f32 = 1.0; // seconds per pulse (Terminator ≈ 1s)
+const CURSOR_BLINK_CYCLES: f32 = 9.0; // pulses after last keystroke, then steady
+const CURSOR_BLINK_MIN: f32 = 0.25; // dimmest alpha — soft, never fully off
+/// Repaint cadence while the cursor is pulsing: ~20fps is smooth for a 1s fade
+/// and far cheaper than the 60fps active poll.
+const BLINK_POLL: Duration = Duration::from_millis(50);
+
+/// The focused cursor's alpha `seconds` after the last keystroke: a raised-cosine
+/// pulse between [`CURSOR_BLINK_MIN`] and 1.0, settling to a steady 1.0 once the
+/// blink window elapses. 1.0 right after a keystroke (cursor solid), dipping and
+/// returning each period.
+fn cursor_blink_alpha(seconds: f32) -> f32 {
+    if seconds >= CURSOR_BLINK_PERIOD * CURSOR_BLINK_CYCLES {
+        return 1.0; // window over: hold steady
+    }
+    let s = 0.5 + 0.5 * (seconds / CURSOR_BLINK_PERIOD * std::f32::consts::TAU).cos();
+    CURSOR_BLINK_MIN + (1.0 - CURSOR_BLINK_MIN) * s
+}
 
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background

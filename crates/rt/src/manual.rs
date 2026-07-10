@@ -64,9 +64,12 @@ SCROLLBACK  SEARCH
 
 
 GROUPS  &  BROADCAST   (type once, reach many panes)
-  Ctrl+Shift+G    cycle the focused pane's input group (colour-coded marker)
+  Make a group: press Ctrl+Shift+G on each pane until they show the SAME
+  corner colour. Panes sharing a colour are one group -- that's all a group is.
+  Ctrl+Shift+G    cycle THIS pane's group colour (none -> 1 -> 2 -> 3 -> 4)
   right-click menu Broadcast: Off / All / Group
-                  Off = focused pane; All = every pane; Group = same-group panes
+                  Off = focused pane only;  All = every pane;
+                  Group = every pane sharing the focused pane's colour
 
 
 MOUSE

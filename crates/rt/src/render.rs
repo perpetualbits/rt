@@ -548,6 +548,38 @@ impl Renderer {
         self.fill_rect(x, y, bw, self.cell_h, color);
     }
 
+    /// Paint a yellow/black hazard-stripe frame just inside the rect `(x,y,w,h)` —
+    /// rt's visible bell, shown briefly on the border of the pane that rang (so a
+    /// bell flags its own pane instead of flashing the whole window).
+    pub fn bell_stripe(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        const T: f32 = 5.0; // band thickness
+        self.striped_edge(x, y, w, T, true); // top
+        self.striped_edge(x, y + h - T, w, T, true); // bottom
+        self.striped_edge(x, y, T, h, false); // left
+        self.striped_edge(x + w - T, y, T, h, false); // right
+    }
+
+    /// One edge of [`bell_stripe`]: alternating yellow/black segments along the
+    /// band, giving the classic caution-tape look.
+    fn striped_edge(&mut self, x: f32, y: f32, w: f32, h: f32, horizontal: bool) {
+        const SEG: f32 = 12.0; // stripe segment length
+        let yellow = Color::rgb(0xf2, 0xc9, 0x4c);
+        let black = Color::rgb(0x14, 0x14, 0x14);
+        let len = if horizontal { w } else { h };
+        let (mut o, mut i) = (0.0f32, 0u32);
+        while o < len {
+            let seg = SEG.min(len - o);
+            let c = if i % 2 == 0 { yellow } else { black };
+            if horizontal {
+                self.fill_rect(x + o, y, seg, h, c);
+            } else {
+                self.fill_rect(x, y + o, w, seg, c);
+            }
+            o += seg;
+            i += 1;
+        }
+    }
+
     /// Draw a 1-cell character at cell column/row within a pane whose top-left
     /// pixel is `(ox, oy)`. Skips blanks. `fg` is the glyph colour; `bold`/
     /// `italic` select the heavier / oblique faces (each falling back to the
