@@ -33,6 +33,8 @@ depends:
   - libxcb1
 
 contents:
+  # Native jobs build here directly; the riscv64 cross job copies its
+  # target/riscv64gc-unknown-linux-gnu/release/rt to this path before packaging.
   - src: ./target/release/rt
     dst: /usr/bin/rt
     file_info:

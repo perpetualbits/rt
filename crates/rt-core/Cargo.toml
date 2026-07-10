@@ -1,6 +1,6 @@
 [package]
 name = "rt-core"                     # the pure model layer: layout tree + pane identity
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"                     # 2021 is enough here; the GUI crates may move to 2024 later
 license = "GPL-3.0-or-later"         # see docs/REFERENCES.md for the licensing rationale
 description = "rt layout tree and session model (headless, no I/O)"

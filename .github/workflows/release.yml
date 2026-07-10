@@ -62,3 +62,51 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+
+  riscv64:
+    name: riscv64 (deb/rpm/arch)
+    runs-on: ubuntu-24.04 # no native riscv64 runner — cross-compile in a container
+    steps:
+      - uses: actions/checkout@v4
+
+      # Debian-trixie image carrying a riscv64 multiarch sysroot (Wayland/GL/font
+      # dev libs) + the riscv64 GCC toolchain. See packaging/riscv64/Dockerfile.
+      - name: Build the riscv64 cross image
+        run: docker build -f packaging/riscv64/Dockerfile -t rt-riscv64-cross packaging/riscv64
+
+      - name: Cross-compile rt for riscv64
+        run: |
+          docker run --rm -v "$PWD":/work -e CARGO_TARGET_DIR=/work/target \
+            rt-riscv64-cross \
+            cargo build -p rt --release --target riscv64gc-unknown-linux-gnu --locked
+
+      # The container writes target/ as root; take ownership, then stage the
+      # cross binary where nfpm.yaml expects it.
+      - name: Stage the riscv64 binary
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" target
+          mkdir -p target/release
+          cp target/riscv64gc-unknown-linux-gnu/release/rt target/release/rt
+          file target/release/rt
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build packages
+        env:
+          PKG_ARCH: riscv64
+        run: |
+          set -euo pipefail
+          export PKG_VERSION="${GITHUB_REF_NAME#v}"
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          mkdir -p dist
+          for pkgr in deb rpm archlinux; do
+            nfpm package --config packaging/nfpm.yaml --packager "$pkgr" --target dist/
+          done
+          echo "built:"; ls -l dist
+
+      - name: Attach packages to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
