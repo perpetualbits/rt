@@ -1909,7 +1909,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rt"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "arboard",
  "egui",
@@ -1938,7 +1938,7 @@ dependencies = [
 
 [[package]]
 name = "rt-config"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "toml",
@@ -1946,18 +1946,18 @@ dependencies = [
 
 [[package]]
 name = "rt-core"
-version = "0.2.3"
+version = "0.2.4"
 
 [[package]]
 name = "rt-engine"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "alacritty_terminal",
 ]
 
 [[package]]
 name = "rt-mux"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "crossterm",
  "libc",
@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "rt-session"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rt-config",
  "rt-core",

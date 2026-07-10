@@ -1,6 +1,6 @@
 [package]
 name = "rt-session"                  # the controller: turns Actions into tree+engine changes
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "rt session controller: layout tree + pane backends + focus + broadcast"
