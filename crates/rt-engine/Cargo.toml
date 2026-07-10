@@ -10,4 +10,4 @@ description = "rt terminal engine: PTY + alacritty_terminal Term, exposing a ren
 # alacritty's battle-tested, damage-tracked terminal engine (PTY, grid, VTE/ANSI
 # parser) instead of reimplementing it. 0.26.0 is the published version matching
 # the source we studied in reference/alacritty.
-alacritty_terminal = "0.26.0"
+alacritty_terminal = { path = "../../vendor/alacritty_terminal" }  # vendored throughput fork (see docs/upstreaming-forks.md)

@@ -1,0 +1,200 @@
+diff --git a/alacritty_terminal/CHANGELOG.md b/alacritty_terminal/CHANGELOG.md
+index 3d5cac7d..c232a632 100644
+--- a/alacritty_terminal/CHANGELOG.md
++++ b/alacritty_terminal/CHANGELOG.md
+@@ -10,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ 
+ ## 0.26.1-dev
+ 
++### Added
++
++- `Handler::input_run` for writing a whole run of printable characters at once,
++  used by the parser to speed up throughput of printable text
++
+ ### Fixed
+ 
+ - Panic when the PTY could not be set to non-blocking
+diff --git a/alacritty_terminal/src/term/mod.rs b/alacritty_terminal/src/term/mod.rs
+index 8eb67975..39e9d154 100644
+--- a/alacritty_terminal/src/term/mod.rs
++++ b/alacritty_terminal/src/term/mod.rs
+@@ -1057,6 +1057,116 @@ impl<T> Dimensions for Term<T> {
+ }
+ 
+ impl<T: EventListener> Handler for Term<T> {
++    /// Batched fast-path for a run of printable characters from the parser.
++    ///
++    /// The parser hands ground text one character at a time to [`Self::input`],
++    /// which re-derives the target cell from the cursor position on every call
++    /// (two bounds-checked grid indexes plus a row-occupancy update) and is
++    /// deliberately not inlined. For the overwhelmingly common case of narrow
++    /// single-width ASCII, this method instead writes a whole run into the
++    /// current row through one mutable slice, updating occupancy once and
++    /// advancing the cursor once per row segment.
++    ///
++    /// Anything the fast path does not model is delegated to per-character
++    /// [`Self::input`], so the observable result is identical to feeding the run
++    /// one character at a time:
++    /// - INSERT mode, a non-ASCII active charset, or an active cell-template
++    ///   `extra` (hyperlink / underline color) bail out for the whole run;
++    /// - non-printable-ASCII bytes (UTF-8 lead bytes, DEL, controls) are emitted
++    ///   individually;
++    /// - a row segment that would overwrite existing wide characters falls back
++    ///   to `input` so its spacer cleanup runs.
++    #[inline]
++    fn input_run(&mut self, text: &str) {
++        // Short runs cannot amortize the batch setup below, and escape- or
++        // newline-heavy output produces many of them (e.g. `"y\n"` repeated
++        // yields single-character runs). Route them straight to per-character
++        // `input`, which is where they end up anyway.
++        const MIN_BATCH: usize = 4;
++
++        // These conditions cannot change within a ground run (no control
++        // sequence is processed between its characters), so check them once.
++        if text.len() < MIN_BATCH
++            || self.mode.contains(TermMode::INSERT)
++            || self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
++            || self.grid.cursor.template.extra.is_some()
++        {
++            for c in text.chars() {
++                self.input(c);
++            }
++            return;
++        }
++
++        let columns = self.columns();
++        let fg = self.grid.cursor.template.fg;
++        let bg = self.grid.cursor.template.bg;
++        let flags = self.grid.cursor.template.flags;
++        // Cells whose spacer bookkeeping the fast path must not silently break.
++        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
++
++        let mut data = text.as_bytes();
++        while !data.is_empty() {
++            // Resolve a wrap deferred by the previous character or segment.
++            if self.grid.cursor.input_needs_wrap {
++                self.wrapline();
++                if self.grid.cursor.input_needs_wrap {
++                    // LINE_WRAP disabled: wrapline is a no-op. Emit exactly one
++                    // character through the slow path (which overwrites the last
++                    // column with correct semantics) and continue.
++                    let c = unsafe { std::str::from_utf8_unchecked(data) }.chars().next().unwrap();
++                    self.input(c);
++                    data = &data[c.len_utf8()..];
++                    continue;
++                }
++            }
++
++            let start = self.grid.cursor.point.column.0;
++            let avail = columns - start;
++
++            // Longest prefix of printable ASCII that fits in the current row.
++            let mut n = 0;
++            while n < avail && n < data.len() && matches!(data[n], 0x20..=0x7e) {
++                n += 1;
++            }
++
++            if n == 0 {
++                // Not fast-path eligible (non-ASCII or control): one slow char.
++                let c = unsafe { std::str::from_utf8_unchecked(data) }.chars().next().unwrap();
++                self.input(c);
++                data = &data[c.len_utf8()..];
++                continue;
++            }
++
++            let line = self.grid.cursor.point.line;
++            let cells = &mut self.grid[line][Column(start)..Column(start + n)];
++
++            // If the segment would overwrite wide-char cells, defer to `input`
++            // so its spacer cleanup runs; this never happens for fresh ASCII.
++            if cells.iter().any(|c| c.flags.intersects(wide)) {
++                for &byte in &data[..n] {
++                    self.input(byte as char);
++                }
++            } else {
++                for (cell, &byte) in cells.iter_mut().zip(&data[..n]) {
++                    cell.c = byte as char;
++                    cell.fg = fg;
++                    cell.bg = bg;
++                    cell.flags = flags;
++                    cell.extra = None;
++                }
++                // Advance the cursor exactly as `input` would after the last cell.
++                let last = start + n - 1;
++                if last + 1 < columns {
++                    self.grid.cursor.point.column = Column(last + 1);
++                } else {
++                    self.grid.cursor.point.column = Column(columns - 1);
++                    self.grid.cursor.input_needs_wrap = true;
++                }
++            }
++            data = &data[n..];
++        }
++    }
++
+     /// A character to be displayed.
+     #[inline(never)]
+     fn input(&mut self, c: char) {
+@@ -2518,6 +2628,62 @@ mod tests {
+     use crate::term::test::TermSize;
+     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+ 
++    /// `input_run` must produce grid and cursor state identical to feeding the
++    /// same characters one at a time through `input`.
++    fn assert_input_run_matches(cols: usize, lines: usize, insert: bool, wrap: bool, text: &str) {
++        let size = TermSize::new(cols, lines);
++        let mut per_char = Term::new(Config::default(), &size, VoidListener);
++        let mut batched = Term::new(Config::default(), &size, VoidListener);
++        for term in [&mut per_char, &mut batched] {
++            term.mode.set(TermMode::INSERT, insert);
++            term.mode.set(TermMode::LINE_WRAP, wrap);
++        }
++
++        for c in text.chars() {
++            per_char.input(c);
++        }
++        batched.input_run(text);
++
++        // Compare cell-by-cell through the grid index (which handles the ring
++        // buffer's rotation) rather than `Grid`'s `PartialEq`, whose `Storage`
++        // comparison asserts a non-rotated buffer and cannot compare scrollback.
++        let ctx = format!("cols={cols}, lines={lines}, insert={insert}, wrap={wrap}, text={text:?}");
++        for line in (per_char.grid.topmost_line().0..=per_char.grid.bottommost_line().0).map(Line) {
++            for col in (0..cols).map(Column) {
++                assert_eq!(
++                    per_char.grid[line][col], batched.grid[line][col],
++                    "cell mismatch at {line:?} {col:?} ({ctx})"
++                );
++            }
++        }
++        assert_eq!(
++            per_char.grid.cursor.point, batched.grid.cursor.point,
++            "cursor point mismatch ({ctx})"
++        );
++        assert_eq!(
++            per_char.grid.cursor.input_needs_wrap, batched.grid.cursor.input_needs_wrap,
++            "input_needs_wrap mismatch ({ctx})"
++        );
++    }
++
++    #[test]
++    fn input_run_matches_input() {
++        // Pure ASCII long enough to wrap and scroll several times.
++        let long_ascii: String = (0..500).map(|i| (b'!' + (i % 90) as u8) as char).collect();
++        // ASCII interleaved with wide CJK, exercising the wide fallback + boundaries.
++        let mixed = "abc你好def世界ghijklmnop你q";
++        // Content sized to land exactly on a row boundary for the small width.
++        let exact = "0123456789";
++
++        for &(cols, lines) in &[(10usize, 5usize), (7, 3), (20, 8), (2, 4)] {
++            for text in [long_ascii.as_str(), mixed, exact, "x", ""] {
++                assert_input_run_matches(cols, lines, false, true, text);
++                assert_input_run_matches(cols, lines, false, false, text);
++                assert_input_run_matches(cols, lines, true, true, text);
++            }
++        }
++    }
++
+     #[test]
+     fn scroll_display_page_up() {
+         let size = TermSize::new(5, 10);

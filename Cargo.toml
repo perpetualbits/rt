@@ -22,3 +22,9 @@ lto = "thin"                         # cross-crate inlining without full-LTO's l
 codegen-units = 1                    # let the optimiser see whole crates (slower build, faster binary)
 panic = "abort"                      # smaller binary; a terminal has no useful unwind recovery
 strip = true                         # drop symbols from release artifacts shipped in packages
+
+# Vendored throughput fork: the vendored alacritty_terminal (path dep in
+# rt-engine) needs the forked vte that adds the batched input_run/print_str hook.
+# Both live in vendor/; see docs/upstreaming-forks.md for provenance + de-vendor plan.
+[patch.crates-io]
+vte = { path = "vendor/vte" }
