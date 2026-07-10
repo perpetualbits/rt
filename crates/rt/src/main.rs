@@ -356,8 +356,15 @@ fn parse_cli() -> Cli {
             "--font" => cli.font = Some(value("--font")),
             "--font-size" => cli.font_size = Some(parse_f32(&value("--font-size"), "--font-size")),
             "-V" | "--version" => {
-                // Tracks the crate version automatically, so releases stay in sync.
-                println!("rt {}", env!("CARGO_PKG_VERSION"));
+                // Crate version, plus the git commit stamped in by build.rs on a
+                // from-source build (e.g. "rt 0.2.1 (a1b2c3d)") so a dev build is
+                // never mistaken for the release it sits ahead of. option_env!
+                // keeps this compiling even if the build script didn't run.
+                let v = env!("CARGO_PKG_VERSION");
+                match option_env!("RT_GIT_DESC") {
+                    Some(g) if !g.is_empty() => println!("rt {v} ({g})"),
+                    _ => println!("rt {v}"),
+                }
                 std::process::exit(0);
             }
             "-h" | "--help" => {
