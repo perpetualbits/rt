@@ -355,6 +355,11 @@ fn parse_cli() -> Cli {
             "--rows" => cli.rows = Some(parse_usize(&value("--rows"), "--rows")),
             "--font" => cli.font = Some(value("--font")),
             "--font-size" => cli.font_size = Some(parse_f32(&value("--font-size"), "--font-size")),
+            "-V" | "--version" => {
+                // Tracks the crate version automatically, so releases stay in sync.
+                println!("rt {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 println!(
                     "rt — Wayland-native terminal multiplexer\n\n\
@@ -364,6 +369,7 @@ fn parse_cli() -> Cli {
                      --rows N          pin the initial grid height (cells)\n  \
                      --font \"Family\"   override the configured font family\n  \
                      --font-size PX    override the configured font size (pixels)\n  \
+                     -V, --version     print version and exit\n  \
                      -h, --help        show this message\n\n\
                      Everything else is configured in Preferences / config.toml."
                 );
