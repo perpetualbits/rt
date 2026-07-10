@@ -16,7 +16,12 @@ path = "src/main.rs"
 rt-engine = { path = "../rt-engine" }
 # The tiling/render engine: a ratatui-shaped TUI cell-buffer library. We host
 # rt-engine panes inside its tiles (cells-into-cells) and let it do the chrome.
-mullion = { path = "../../../mullion" }
+# Pinned to the exact upstream commit rt-mux builds against (mullion's
+# 'videoplayer' tip, which is ahead of tag v0.3.0). A git dep — not a path —
+# so a clean checkout / CI builds without mullion sitting next to the repo.
+# For local co-development against ~/git/mullion, an (uncommitted, gitignored)
+# .cargo/config.toml `paths` override redirects this back to the working copy.
+mullion = { git = "https://github.com/perpetualbits/mullion.git", rev = "f5bc146aeb48046e3d6654d7c8e488eea38825da" }
 # Matches mullion's crossterm so Event/KeyCode types line up across the seam.
 crossterm = "0.28"
 # For the side-channel pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).

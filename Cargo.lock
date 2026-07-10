@@ -1263,6 +1263,7 @@ dependencies = [
 [[package]]
 name = "mullion"
 version = "0.3.0"
+source = "git+https://github.com/perpetualbits/mullion.git?rev=f5bc146aeb48046e3d6654d7c8e488eea38825da#f5bc146aeb48046e3d6654d7c8e488eea38825da"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm",

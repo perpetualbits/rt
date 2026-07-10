@@ -22,3 +22,4 @@ Cargo.lock.orig
 # would otherwise sweep in. See the 201MB file-1 incident.
 /1
 /2
+/.cargo
