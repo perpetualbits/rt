@@ -1,0 +1,64 @@
+# nfpm config → one source of truth for the deb / rpm / arch packages.
+# Built per-arch in CI (see .github/workflows/release.yml): PKG_ARCH is the
+# nfpm arch (amd64 | arm64) and PKG_VERSION the tag without its leading "v".
+# nfpm translates `arch` to each packager's convention (deb amd64/arm64,
+# rpm x86_64/aarch64, arch x86_64/aarch64).
+name: rt
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: none
+maintainer: "perpetualbits <perpetualbits@gmail.com>"
+description: |
+  Wayland-native tiling terminal multiplexer.
+  A loose port of Terminator's ideas onto the alacritty_terminal engine, with a
+  custom OpenGL glyph renderer, an egui chrome layer, and a per-pane fd patch-bay.
+  Runs native on Wayland (preferred) and on X11.
+vendor: perpetualbits
+homepage: https://github.com/perpetualbits/rt
+license: GPL-3.0-or-later
+section: utils
+priority: optional
+
+# Shared runtime libraries (Debian/Ubuntu names). rpm/arch names differ and are
+# overridden below. rt links wayland + xkbcommon + GL/EGL + fontconfig, and the
+# xcb/x11 stack for the X11 backend.
+depends:
+  - libwayland-client0
+  - libxkbcommon0
+  - libgl1
+  - libegl1
+  - libfontconfig1
+  - libx11-6
+  - libxcb1
+
+contents:
+  - src: ./target/release/rt
+    dst: /usr/bin/rt
+    file_info:
+      mode: 0755
+  - src: ./extra/linux/io.github.perpetualbits.rt.desktop
+    dst: /usr/share/applications/io.github.perpetualbits.rt.desktop
+  - src: ./extra/logo/rt.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/io.github.perpetualbits.rt.svg
+  - src: ./COPYING
+    dst: /usr/share/doc/rt/copyright
+
+overrides:
+  rpm:
+    depends:
+      - wayland
+      - libxkbcommon
+      - mesa-libGL
+      - mesa-libEGL
+      - fontconfig
+      - libX11
+      - libxcb
+  archlinux:
+    depends:
+      - wayland
+      - libxkbcommon
+      - libglvnd
+      - fontconfig
+      - libx11
+      - libxcb

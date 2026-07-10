@@ -1,0 +1,64 @@
+name: release
+
+# Build distro packages on every version tag and attach them to that tag's
+# GitHub Release, so people can grab a .deb / .rpm / .pkg.tar.zst and run rt
+# without a Rust toolchain.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # upload assets to the Release
+
+jobs:
+  packages:
+    name: ${{ matrix.arch }} (deb/rpm/arch)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for each arch — no cross-compilation. The riscv64
+          # column and snap are separate follow-up jobs (harder toolchains).
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same dev libraries the GUI/GL/font stack needs to compile.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libxcb1-dev libx11-dev \
+            libgl1-mesa-dev libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build rt (release)
+        run: cargo build -p rt --release --locked
+
+      # nfpm turns one config into deb + rpm + arch packages. `go install` keeps
+      # it arch-agnostic (Go is preinstalled on the runners).
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build packages
+        env:
+          PKG_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          export PKG_VERSION="${GITHUB_REF_NAME#v}"   # tag v0.2.2 -> 0.2.2
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          mkdir -p dist
+          for pkgr in deb rpm archlinux; do
+            nfpm package --config packaging/nfpm.yaml --packager "$pkgr" --target dist/
+          done
+          echo "built:"; ls -l dist
+
+      - name: Attach packages to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
