@@ -110,3 +110,26 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+
+  snap:
+    name: ${{ matrix.arch }} snap
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # snapcraft has no riscv64 target, so the snap column is amd64 + arm64.
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      # The official action provisions LXD and runs snapcraft from snap/snapcraft.yaml.
+      - uses: snapcore/action-build@v1
+        id: build
+
+      - name: Attach snap to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.build.outputs.snap }}
+          fail_on_unmatched_files: true

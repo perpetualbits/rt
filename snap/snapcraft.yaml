@@ -1,0 +1,62 @@
+name: rt
+base: core24
+adopt-info: rt
+summary: Wayland-native tiling terminal multiplexer
+description: |
+  rt is a Wayland-native (and X11-capable) tiling terminal multiplexer — a loose
+  port of Terminator's ideas onto the alacritty_terminal engine, with a custom
+  OpenGL glyph renderer, an egui chrome layer, and a per-pane fd patch-bay.
+license: GPL-3.0-or-later
+grade: stable
+
+# A terminal spawns the user's real shell and reaches their files, so it needs
+# classic (unconfined) access. Classic snaps require manual Snap Store review to
+# publish; until then the .snap is attached to GitHub Releases and installed with
+# `snap install ./rt_*.snap --dangerous --classic`.
+confinement: classic
+
+apps:
+  rt:
+    command: bin/rt
+    desktop: usr/share/applications/io.github.perpetualbits.rt.desktop
+
+parts:
+  rt:
+    plugin: rust
+    source: .
+    rust-channel: stable
+    # Build only the GUI binary from the workspace (its vendored path deps and
+    # the root [patch] resolve from the repo root, exactly like
+    # `cargo install --path crates/rt`).
+    rust-path: [crates/rt]
+    build-packages:
+      - libwayland-dev
+      - libxkbcommon-dev
+      - libxcb1-dev
+      - libx11-dev
+      - libgl1-mesa-dev
+      - libfontconfig1-dev
+      - pkg-config
+    stage-packages:
+      - libwayland-client0
+      - libwayland-cursor0
+      - libxkbcommon0
+      - libgl1
+      - libegl1
+      - libfontconfig1
+      - libx11-6
+      - libxcb1
+    override-pull: |
+      craftctl default
+      craftctl set version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/rt/Cargo.toml | head -1)"
+
+  assets:
+    # Desktop entry + icon, so launchers and the store show rt properly.
+    plugin: dump
+    source: extra
+    organize:
+      linux/io.github.perpetualbits.rt.desktop: usr/share/applications/io.github.perpetualbits.rt.desktop
+      logo/rt.svg: usr/share/icons/hicolor/scalable/apps/io.github.perpetualbits.rt.svg
+    stage:
+      - usr/share/applications/io.github.perpetualbits.rt.desktop
+      - usr/share/icons/hicolor/scalable/apps/io.github.perpetualbits.rt.svg
