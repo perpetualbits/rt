@@ -135,6 +135,13 @@ EXAMPLES   (type these in the panes; wire them as noted)
        pane B:   cat $RT_IN            (waits for input)
        wire A.stdout -> B, then in A:  echo hello > $RT_OUT
 
+  6. Collatz orbit (3x+1) looping around a two-pane ring
+       pane B:   while read n; do echo $n; [ $n -eq 1 ]&&break; echo $((n%2?3*n+1:n/2))>$RT_OUT; done<$RT_IN
+       pane A:   the same line, prefixed with   echo 27>$RT_OUT;   to seed it
+       wire A.stdout -> B  and  B.stdout -> A   (close the ring)
+       the seed hops A,B,A,B..., halved or 3x+1'd each step, until it
+       reaches 1 -- the live number you watch is the packet riding the wire.
+
 
 APPEARANCE   (Preferences: right-click menu -> Preferences...)
   font family & size (Ctrl+= / Ctrl+- / Ctrl+0 to zoom), colours & schemes,
