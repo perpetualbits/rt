@@ -45,6 +45,22 @@ There's also a text-mode multiplexer that hosts the same panes inside any termin
 cargo install --path crates/rt-mux
 ```
 
+## Desktop integration
+
+`cargo install` only places the binary. To get a launcher entry and icon (so rt
+shows up in your application menu and the compositor binds its icon to the window):
+
+```sh
+extra/linux/install.sh              # user-local, ~/.local/share
+extra/linux/install.sh --system     # system-wide, /usr/share (run with sudo)
+extra/linux/install.sh --uninstall  # remove it again
+```
+
+This installs the [icon](extra/logo/rt.svg) into the hicolor theme and the
+`io.github.perpetualbits.rt.desktop` entry, pinning `Exec` to your resolved `rt`
+path. rt sets its Wayland `app_id` / X11 `WM_CLASS` to `io.github.perpetualbits.rt`,
+which is what lets the compositor match the window to that icon.
+
 ## Configuration
 
 Settings live in `$XDG_CONFIG_HOME/rt/config.toml` (or `~/.config/rt/config.toml`).

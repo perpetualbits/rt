@@ -589,8 +589,18 @@ impl ApplicationHandler for App {
             }
             _ => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
         };
+        // Wayland app_id / X11 WM_CLASS. This MUST equal the installed desktop
+        // entry's basename (io.github.perpetualbits.rt.desktop) so the compositor
+        // can bind our icon to the window — without it, no icon shows on Wayland
+        // no matter what's installed. Both winit ext traits write the same
+        // `platform_specific.name` field, so one call covers both backends
+        // (Wayland uses `general` as the app_id; X11 uses it as the WM_CLASS
+        // class). See extra/linux/ for the desktop entry + icon.
+        use winit::platform::wayland::WindowAttributesExtWayland;
+        const APP_ID: &str = "io.github.perpetualbits.rt";
         let window_attrs = Window::default_attributes()
             .with_title("rt") // window title; per-pane titles update it later
+            .with_name(APP_ID, "rt") // app_id (Wayland) / WM_CLASS (X11) → icon binding
             .with_transparent(true) // REQUIRED for the compositor to honour our alpha
             .with_inner_size(initial_size);
         let template = ConfigTemplateBuilder::new().with_alpha_size(8); // want an alpha channel

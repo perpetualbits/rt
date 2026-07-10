@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=rt
+GenericName=Terminal Multiplexer
+Comment=Wayland-native tiling terminal multiplexer
+TryExec=rt
+Exec=rt
+Icon=io.github.perpetualbits.rt
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;multiplexer;tiling;tabs;panes;
+StartupNotify=true
+StartupWMClass=io.github.perpetualbits.rt
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=rt

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="rt terminal">
+  <defs>
+    <linearGradient id="wire" x1="52" y1="200" x2="200" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#bb9af7"/>
+      <stop offset="1" stop-color="#ff9e64"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="8" x2="0" y2="248" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1b1c26"/>
+      <stop offset="1" stop-color="#101014"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- terminal tile -->
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#tile)"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="53.5" fill="none" stroke="#2a2b3a" stroke-width="1"/>
+
+  <!-- patch-bay wire (rt's signature): glow, stroke, then the two jacks.
+       Bowed low so it passes below the prompt; gradient runs purple->amber so
+       each jack contrasts with the glyph beside it. -->
+  <path d="M52 200 C 110 172, 152 150, 200 60" fill="none" stroke="url(#wire)" stroke-width="16" stroke-linecap="round" opacity="0.32" filter="url(#glow)"/>
+  <path d="M52 200 C 110 172, 152 150, 200 60" fill="none" stroke="url(#wire)" stroke-width="8" stroke-linecap="round" opacity="0.92"/>
+  <circle cx="52" cy="200" r="11" fill="#bb9af7"/>
+  <circle cx="52" cy="200" r="4.5" fill="#101014"/>
+  <circle cx="200" cy="60" r="11" fill="#ff9e64"/>
+  <circle cx="200" cy="60" r="4.5" fill="#101014"/>
+
+  <!-- prompt: amber chevron + purple cursor block -->
+  <path d="M82 94 L126 128 L82 162" fill="none" stroke="#ff9e64" stroke-width="19" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="144" y="111" width="46" height="34" rx="7" fill="#bb9af7"/>
+</svg>
