@@ -1809,9 +1809,6 @@ impl App {
         let (cw, ch) = active.renderer.cell_size();
         for (id, rect) in active.session.visible_rects(bounds) {
             if rect.contains(mx, my) {
-                if active.session.columns_of(id) > 1 {
-                    return None; // skip newspaper-column panes for now
-                }
                 // Map against the content rect (grid area minus the titlebar); a
                 // click in the titlebar strip is above the content and yields no
                 // cell.
@@ -1819,8 +1816,17 @@ impl App {
                 if my < content.y {
                     return None; // in the titlebar, not the grid
                 }
-                let col = ((mx - content.x) / cw).max(0.0) as usize; // cell column
-                let row = ((my - content.y) / ch).max(0.0) as usize; // cell row
+                let dx = (mx - content.x) / cw; // offset in cells from the content origin
+                let dy = (my - content.y) / ch;
+                if active.session.columns_of(id) > 1 {
+                    // Newspaper columns: invert the renderer's tiling to the cell
+                    // in the tall count*rows viewport the app actually sees, so
+                    // mouse reports (wheel, clicks) reach the app in column mode.
+                    let (col, row) = active.session.column_layout(id, rect).cell_at(dx, dy);
+                    return Some((id, col, row));
+                }
+                let col = dx.max(0.0) as usize; // cell column
+                let row = dy.max(0.0) as usize; // cell row
                 return Some((id, col, row));
             }
         }

@@ -66,6 +66,24 @@ pub struct ColumnLayout {
     pub gap: usize,
 }
 
+impl ColumnLayout {
+    /// Inverse of the renderer's column tiling: map a point `(dx, dy)` in cells,
+    /// measured from the pane's content top-left, to the `(col, row)` cell in the
+    /// tall `count * rows` viewport the app actually sees. The renderer places
+    /// grid line `r` at column `r / rows`, sub-row `r % rows`, with each column
+    /// `col_cells` wide followed by a `gap`; this reverses that. Clamps into
+    /// range (a point in a gap snaps to the adjacent column's edge), so mouse
+    /// forwarding into a newspaper-column pane always yields a valid cell.
+    pub fn cell_at(&self, dx: f32, dy: f32) -> (usize, usize) {
+        let step = (self.col_cells + self.gap) as f32; // cells between column origins
+        let dx = dx.max(0.0);
+        let k = ((dx / step) as usize).min(self.count.saturating_sub(1) as usize); // which column
+        let col = ((dx - k as f32 * step) as usize).min(self.col_cells.saturating_sub(1));
+        let sub = (dy.max(0.0) as usize).min(self.rows.saturating_sub(1)); // row within the column
+        (col, k * self.rows + sub)
+    }
+}
+
 /// How typed input fans out to other panes — rt's port of Terminator's
 /// input broadcast / grouping feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -719,4 +737,39 @@ fn cells_in(rect: Rect, cell: (f32, f32)) -> (usize, usize) {
     let cols = (rect.w / cw).floor() as usize; // whole columns that fit
     let rows = (rect.h / ch).floor() as usize; // whole rows that fit
     (cols.max(1), rows.max(1)) // clamp to a minimum 1x1 grid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ColumnLayout::cell_at` must invert the renderer's tiling: a point at the
+    /// centre of the cell the renderer drew for grid line `k*rows + s`, char
+    /// column `c`, maps back to exactly `(c, k*rows + s)`.
+    #[test]
+    fn column_cell_at_inverts_the_renderer_tiling() {
+        let g = ColumnLayout { count: 3, col_cells: 20, rows: 10, gap: 2 };
+        let step = g.col_cells + g.gap; // cells between column origins
+        for k in 0..g.count as usize {
+            for s in 0..g.rows {
+                for c in [0usize, 5, g.col_cells - 1] {
+                    let dx = (k * step + c) as f32 + 0.5; // centre of the cell
+                    let dy = s as f32 + 0.5;
+                    assert_eq!(g.cell_at(dx, dy), (c, k * g.rows + s), "k={k} s={s} c={c}");
+                }
+            }
+        }
+    }
+
+    /// A point in a gap, or past the last column/row, clamps into range — mouse
+    /// forwarding must always yield a valid cell, never an out-of-bounds one.
+    #[test]
+    fn column_cell_at_clamps_gaps_and_edges() {
+        let g = ColumnLayout { count: 2, col_cells: 10, rows: 5, gap: 2 };
+        // Just past column 0's text (into the gap) → column 0's last cell.
+        assert_eq!(g.cell_at(g.col_cells as f32 + 0.5, 0.5), (g.col_cells - 1, 0));
+        // Far right / far down clamps, never out of bounds.
+        let (col, row) = g.cell_at((g.col_cells + g.gap) as f32 * 9.0, 999.0);
+        assert!(col < g.col_cells && row < g.count as usize * g.rows);
+    }
 }
