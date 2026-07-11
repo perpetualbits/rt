@@ -12,20 +12,20 @@ permissions:
 
 jobs:
   packages:
-    name: ${{ matrix.arch }} (deb/rpm/arch)
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Native runners for each arch — no cross-compilation. The riscv64
-          # column and snap are separate follow-up jobs (harder toolchains).
-          - { runner: ubuntu-24.04, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    name: deb/rpm/arch (x86_64 + aarch64 + riscv64)
+    runs-on: ubuntu-24.04
+    env:
+      # Cap the glibc version each binary needs, so the packages run on older
+      # distros (Debian bookworm 2.36, Ubuntu 22.04 2.35, …) and not only on the
+      # build host's glibc. rt dlopens the GUI/GL/font libraries (they're never
+      # hard-linked — only libc/libm/libgcc_s are), so cross-building needs no
+      # target sysroot: cargo-zigbuild + zig cross-compile every arch right here.
+      ZIG_VERSION: "0.14.1"
     steps:
       - uses: actions/checkout@v4
 
-      # Same dev libraries the GUI/GL/font stack needs to compile.
+      # Host dev libraries satisfy build-script pkg-config; the libraries
+      # themselves are dlopened at runtime (declared as package deps), not linked.
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -34,75 +34,39 @@ jobs:
             libgl1-mesa-dev libfontconfig1-dev
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, riscv64gc-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build rt (release)
-        run: cargo build -p rt --release --locked
-
-      # nfpm turns one config into deb + rpm + arch packages. `go install` keeps
-      # it arch-agnostic (Go is preinstalled on the runners).
-      - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
-
-      - name: Build packages
-        env:
-          PKG_ARCH: ${{ matrix.arch }}
+      - name: Install zig + cargo-zigbuild
         run: |
-          set -euo pipefail
-          export PKG_VERSION="${GITHUB_REF_NAME#v}"   # tag v0.2.2 -> 0.2.2
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          mkdir -p dist
-          for pkgr in deb rpm archlinux; do
-            nfpm package --config packaging/nfpm.yaml --packager "$pkgr" --target dist/
-          done
-          echo "built:"; ls -l dist
-
-      - name: Attach packages to the Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          fail_on_unmatched_files: true
-
-  riscv64:
-    name: riscv64 (deb/rpm/arch)
-    runs-on: ubuntu-24.04 # no native riscv64 runner — cross-compile in a container
-    steps:
-      - uses: actions/checkout@v4
-
-      # Debian-trixie image carrying a riscv64 multiarch sysroot (Wayland/GL/font
-      # dev libs) + the riscv64 GCC toolchain. See packaging/riscv64/Dockerfile.
-      - name: Build the riscv64 cross image
-        run: docker build -f packaging/riscv64/Dockerfile -t rt-riscv64-cross packaging/riscv64
-
-      - name: Cross-compile rt for riscv64
-        run: |
-          docker run --rm -v "$PWD":/work -e CARGO_TARGET_DIR=/work/target \
-            rt-riscv64-cross \
-            cargo build -p rt --release --target riscv64gc-unknown-linux-gnu --locked
-
-      # The container writes target/ as root; take ownership, then stage the
-      # cross binary where nfpm.yaml expects it.
-      - name: Stage the riscv64 binary
-        run: |
-          sudo chown -R "$(id -u):$(id -g)" target
-          mkdir -p target/release
-          cp target/riscv64gc-unknown-linux-gnu/release/rt target/release/rt
-          file target/release/rt
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
 
       - name: Install nfpm
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 
-      - name: Build packages
-        env:
-          PKG_ARCH: riscv64
+      - name: Build + package every arch
         run: |
           set -euo pipefail
-          export PKG_VERSION="${GITHUB_REF_NAME#v}"
+          export PKG_VERSION="${GITHUB_REF_NAME#v}" # tag v0.2.6 -> 0.2.6
           export PATH="$PATH:$(go env GOPATH)/bin"
-          mkdir -p dist
-          for pkgr in deb rpm archlinux; do
-            nfpm package --config packaging/nfpm.yaml --packager "$pkgr" --target dist/
-          done
+          mkdir -p dist target/release
+
+          # zig-target (with glibc floor) : rustc target dir : nfpm arch
+          build() {
+            local zt="$1" dir="$2" arch="$3"
+            echo "=== building $arch ($zt) ==="
+            cargo zigbuild --release -p rt --locked --target "$zt"
+            cp "target/$dir/release/rt" target/release/rt # where nfpm.yaml looks
+            for pkgr in deb rpm archlinux; do
+              PKG_ARCH="$arch" nfpm package --config packaging/nfpm.yaml --packager "$pkgr" --target dist/
+            done
+          }
+          build x86_64-unknown-linux-gnu.2.28    x86_64-unknown-linux-gnu    amd64
+          build aarch64-unknown-linux-gnu.2.28   aarch64-unknown-linux-gnu   arm64
+          build riscv64gc-unknown-linux-gnu.2.35 riscv64gc-unknown-linux-gnu riscv64
           echo "built:"; ls -l dist
 
       - name: Attach packages to the Release
@@ -118,7 +82,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # snapcraft has no riscv64 target, so the snap column is amd64 + arm64.
+          # A snap ships its own base runtime, so it isn't affected by the host
+          # glibc; snapcraft has no riscv64 target, so the snap column is amd64 + arm64.
           - { runner: ubuntu-24.04, arch: amd64 }
           - { runner: ubuntu-24.04-arm, arch: arm64 }
     steps:

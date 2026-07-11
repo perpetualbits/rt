@@ -1,6 +1,6 @@
 [package]
 name = "rt-engine"                   # thin, well-commented wrapper over alacritty_terminal
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "rt terminal engine: PTY + alacritty_terminal Term, exposing a render snapshot"

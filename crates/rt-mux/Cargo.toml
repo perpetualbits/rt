@@ -1,6 +1,6 @@
 [package]
 name = "rt-mux"                      # rt's text-mode sibling: a tmux-style multiplexer
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "rt-mux: a text-mode terminal multiplexer — rt-engine panes hosted in mullion tiles"
