@@ -25,6 +25,6 @@ strip = true                         # drop symbols from release artifacts shipp
 
 # Vendored throughput fork: the vendored alacritty_terminal (path dep in
 # rt-engine) needs the forked vte that adds the batched input_run/print_str hook.
-# Both live in vendor/; see docs/upstreaming-forks.md for provenance + de-vendor plan.
+# Both live in vendor/; see docs/vendored-engine.md for provenance.
 [patch.crates-io]
 vte = { path = "vendor/vte" }

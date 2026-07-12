@@ -8,10 +8,10 @@ escape-heavy, wide-char, and short-run output.
 
 ## Why these are vendored, not crates.io deps
 
-The optimization is not yet released upstream. Rather than depend on two forks existing
-on a developer's disk (the previous state: absolute path-deps to `~/git/vte` and
-`~/git/alacritty`), the crates are vendored in-tree so **a clean checkout builds the fast
-path with no external setup**.
+The optimization is not in any upstream release, and none is coming (see "Permanent"
+below). Rather than depend on two forks existing on a developer's disk (the previous
+state: absolute path-deps to `~/git/vte` and `~/git/alacritty`), the crates are vendored
+in-tree so **a clean checkout builds the fast path with no external setup**.
 
 Wiring:
 - `Cargo.toml` (root): `[patch.crates-io] vte = { path = "vendor/vte" }`
@@ -29,17 +29,19 @@ Wiring:
 The `alacritty_terminal` Cargo.toml had `edition`/`rust-version` inlined from the
 alacritty workspace root (they were `.workspace = true` in the monorepo).
 
-## De-vendor plan
+## Permanent: this fork is not going upstream
 
-The upstreaming path and ready-to-apply patches live in
-[`upstreaming-forks.md`](upstreaming-forks.md) and [`upstreaming/`](upstreaming/).
-Once vte 0.16 (with the batch hook) and an `alacritty_terminal` release (with
-`input_run`) are published to crates.io:
+Upstreaming was attempted and declined. The batching was offered to `alacritty/vte`
+as PR #154 and, after that was closed, issue #155 asked whether any form of it would be
+in scope. Both were closed under the Alacritty project's contribution policy, which
+prohibits LLM/AI-generated contributions — code, pull requests, issues, and comments:
+<https://github.com/alacritty/alacritty/blob/master/CONTRIBUTING.md#llmai-contributions>
 
-1. Delete `vendor/`.
-2. `crates/rt-engine/Cargo.toml`: `alacritty_terminal = "<release>"`.
-3. Root `Cargo.toml`: remove the `[patch.crates-io] vte` block.
-4. `cargo update`, rebuild `--locked` on a clean clone, re-run `bench/term-render-bench.sh`.
+There is therefore no route to land this in `vte` / `alacritty_terminal`, and rt stays
+on the vendored fork **permanently**.
 
-Until then, pulling upstream `alacritty_terminal` fixes means re-applying the `input_run`
-patch onto a fresh crate copy.
+Practical upkeep: to pull an upstream `alacritty_terminal` fix, re-apply the change onto
+a fresh copy of the crate. The diff is small — `Term::input_run` plus its
+`input_run_matches_input` differential test, and the additive `print_str` / `input_run`
+hook in `vte` — and can be regenerated any time with `git diff` against the upstream tag
+the vendored copy was cut from (`alacritty_terminal` 0.26.1-dev, `vte` v0.15.0).

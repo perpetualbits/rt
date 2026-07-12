@@ -8,7 +8,7 @@ homepage = "https://alacritty.org"
 repository = "https://github.com/alacritty/alacritty"
 # Vendored into rt: fields inlined from the alacritty workspace root (they were
 # `edition.workspace`/`rust-version.workspace` in the monorepo). See
-# rt/docs/upstreaming-forks.md for provenance and the de-vendor plan.
+# rt/docs/vendored-engine.md for provenance.
 edition = "2024"
 rust-version = "1.85.0"
 
