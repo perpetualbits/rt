@@ -2269,9 +2269,10 @@ impl App {
             // hardware GL / overlays / re-armed → full frame; also, wires are
             // animated chrome spanning arbitrary inter-pane regions outside
             // `border_bands`, so the partial path can't bound their damage —
-            // fall back to Full whenever any wire exists. Partial present is
-            // EGL-only (buffer-age-preserved swap); a non-EGL surface (GLX/…)
-            // would draw scissored AND full every other frame, so → full path.
+            // fall back to Full whenever any wire exists. A partial present
+            // needs either an EGL surface (mechanism A, buffer-age swap) or an
+            // X11 present handle (Route 1, readback+XPutImage) — see
+            // `partial_present_available`; otherwise → full path.
             active.damage.mark_full();
         }
         for (id, rect) in active.session.visible_rects(bounds) {
