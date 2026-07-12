@@ -13,6 +13,8 @@
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
 mod x11_blur; // X11 background blur via _KDE_NET_WM_BLUR_BEHIND_REGION (no-op elsewhere)
+#[cfg(feature = "x11")]
+mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
 mod damage; // pure pixel-rect damage accumulator
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
