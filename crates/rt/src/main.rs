@@ -2290,7 +2290,24 @@ impl App {
         // Chrome egui blends every frame (focus outline, border instruments)
         // lives on the pane borders; force those bands into the damage set so the
         // scissored clear+redraw always precedes egui's blend (no double-blend).
-        if !active.damage.is_full() {
+        //
+        // NOT on the X11 present path: there the X window preserves the border
+        // pixels server-side, so folding the perimeter bands in would coalesce a
+        // single-pane frame's damage to the WHOLE window and make every keystroke
+        // XPutImage ~2-3MB over ssh (~1s). Chrome persists in the window and is
+        // re-sent only when it actually changes (via force_full). This is the
+        // whole point of Route 1: send only the changed cells, like Terminator.
+        let x11_present_active = {
+            #[cfg(feature = "x11")]
+            {
+                active.x11_present.is_some()
+            }
+            #[cfg(not(feature = "x11"))]
+            {
+                false
+            }
+        };
+        if !active.damage.is_full() && !x11_present_active {
             for (_id, (rect, _)) in &snapshots {
                 for band in border_bands(*rect, active.session.titlebar_h() as i32) {
                     active.damage.add_rect(band);
@@ -2299,6 +2316,14 @@ impl App {
         }
 
         let frame_damage = active.damage.finish();
+        // TEMP diagnostic (remove before ship): log the present rect the X11 path
+        // will read back + XPutImage, to confirm it's cell-sized not full-window.
+        #[cfg(feature = "x11")]
+        if x11_present_active {
+            if let Some(b) = frame_damage.bbox() {
+                log::info!("PRESENT bbox {}x{} at ({},{})", b.w, b.h, b.x, b.y);
+            }
+        }
         // Fold in recent frames' damage per the back-buffer age, and decide.
         let plan = Self::plan_frame(active, frame_damage);
 
