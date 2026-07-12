@@ -1,8 +1,38 @@
 # Damage-based rendering — mechanism B (buffer_age-independent preservation) — design
 
-Status: approved design, pre-implementation.
+Status: **spike run — both endpoints non-viable on the milkv (softpipe). See "Spike outcome" below.**
 Date: 2026-07-12.
 Builds on: `2026-07-11-damage-based-rendering-design.md` (Phase 1, mechanism A — merged to main at `e681478`).
+
+## Spike outcome (2026-07-12) — B cannot help the milkv
+
+The decision spike ran on the milkv (softpipe, headless weston). Both endpoints failed:
+
+- **Endpoint P (preserved-swap): unavailable.** `eglSurfaceAttrib(EGL_SWAP_BEHAVIOR,
+  EGL_BUFFER_PRESERVED)` returns **`EGL_BAD_MATCH`**; the query reads back
+  `EGL_BUFFER_DESTROYED`. glutin's chosen EGL config does not support preserved
+  swap on this stack. (Load-independent — a config capability fact.)
+- **Endpoint F (persistent FBO + blit): pathologically slow.** A single full-window
+  `glBlitFramebuffer` (FBO→window, 960×600) costs **~953 ms** (blit-bench, 20
+  samples, deferred rasterisation drained first). That is **~4× the ~248 ms
+  full-window shading it would replace** — F would make the board *slower*.
+
+Per the spec's own decision rule ("neither viable → B can't help this board"), **B is
+abandoned for softpipe.** The spike did its job: it prevented building a 4×-slower FBO path.
+
+**Deeper finding.** Softpipe makes *every* full-window GL operation expensive
+(shading ~248 ms, blit ~953 ms) and offers no cheap preservation. Partial
+*shading* is cheap (Phase 1 proved it), but every full-window *present*
+(unpreserved swap, blit, readback) is expensive. Only a backend that touches the
+**damage region for both render *and* present** — mechanism **C** (non-GL /
+XRender, Terminator-style) — can be fast on a GPU-less board. That is a separate,
+larger effort; this spec's mechanism (GL preservation) is a dead end on softpipe.
+
+Phase 1 (mechanism A, merged `e681478`) is unaffected: it helps stacks where
+`buffer_age` works and is a no-op on hardware GPUs.
+
+---
+
 
 ## Problem
 
