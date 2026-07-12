@@ -10,7 +10,7 @@ use glow::HasContext;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, CreateGCAux, Gcontext, ImageFormat};
+use x11rb::protocol::xproto::{ConnectionExt, CreateGCAux, Gcontext, ImageFormat, ImageOrder};
 use x11rb::rust_connection::RustConnection;
 
 /// Reverse the row order of a tightly-packed `w*h*4` buffer. `glReadPixels` is
@@ -36,7 +36,8 @@ pub struct X11Present {
 
 impl X11Present {
     /// Build from rt's window. `None` on Wayland, an unsupported depth (not 24/32),
-    /// or if X setup fails — the caller then keeps the normal `swap_buffers` path.
+    /// a non-LSBFirst (big-endian) server, or if X setup fails — the caller then keeps
+    /// the normal `swap_buffers` path. Requires little-endian + BGRX/TrueColor visual.
     pub fn try_new(window: &Window) -> Option<Self> {
         let win = match window.window_handle().ok()?.as_raw() {
             RawWindowHandle::Xlib(h) => h.window as u32,
@@ -52,6 +53,15 @@ impl X11Present {
             log::info!("x11_present: depth {depth} unsupported; using swap_buffers");
             return None; // unfamiliar visual → fall back
         }
+        // We read GL_BGRA bytes and XPutImage them as ZPixmap, which assumes a
+        // little-endian server + BGRX/TrueColor visual. On a big-endian server the
+        // bytes would be interpreted swapped (silent wrong colours, NOT caught by
+        // the present fallback since XPutImage still succeeds) — so require LSBFirst,
+        // else fall back to swap_buffers.
+        if conn.setup().image_byte_order != ImageOrder::LSB_FIRST {
+            log::info!("x11_present: non-LSBFirst server; using swap_buffers");
+            return None;
+        }
         let gc = conn.generate_id().ok()?;
         conn.create_gc(gc, win, &CreateGCAux::new()).ok()?;
         conn.flush().ok()?;
@@ -64,7 +74,7 @@ impl X11Present {
     /// the caller can fall back to a full present.
     pub fn present_rect(&self, gl: &glow::Context, x: i32, y: i32, w: i32, h: i32, screen_h: i32) -> bool {
         if w <= 0 || h <= 0 {
-            return false;
+            return true; // nothing to present is success, not a failure
         }
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let gl_y = screen_h - (y + h); // glReadPixels is bottom-left origin
