@@ -35,7 +35,8 @@ use std::time::{Duration, Instant}; // frame pacing for async PTY updates
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::ContextAttributesBuilder;
 use glutin::display::GetGlDisplay;
-use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, …)
+use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, buffer_age, …)
+use glutin::surface::Rect as GlRect; // EGL damage rect (bottom-left origin)
 use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -2556,6 +2557,45 @@ impl App {
         // Present the frame.
         if let Err(e) = active.surface.swap_buffers(&active.context) {
             log::error!("swap_buffers failed: {e}"); // non-fatal; log and continue
+        }
+    }
+
+    /// The age of the back buffer: how many swaps ago its contents were last drawn.
+    /// 0 means "unknown / brand new" — the whole buffer must be redrawn.
+    fn buffer_age(active: &Active) -> u32 {
+        active.surface.buffer_age()
+    }
+
+    /// Present a scissored frame, hinting the compositor with the damage rects.
+    /// Returns `true` on a successful partial-damage swap; `false` if the caller
+    /// must fall back to a full redraw + full `swap_buffers` (age 0, non-EGL
+    /// surface, or a swap error). `rects` are physical px, top-left origin; they are
+    /// converted to EGL's bottom-left-origin `Rect` here.
+    fn present_with_damage(active: &mut Active, rects: &[crate::damage::PxRect]) -> bool {
+        use glutin::context::PossiblyCurrentContext;
+        use glutin::surface::Surface;
+
+        let screen_h = active.window.inner_size().height as i32;
+        let egl_rects: Vec<GlRect> = rects
+            .iter()
+            .map(|r| {
+                let y = screen_h - (r.y + r.h); // flip to bottom-left origin
+                GlRect::new(r.x, y, r.w, r.h)
+            })
+            .collect();
+
+        // swap_buffers_with_damage is only on the concrete EGL surface/context.
+        match (&active.surface, &active.context) {
+            (Surface::Egl(egl_surface), PossiblyCurrentContext::Egl(egl_ctx)) => {
+                match egl_surface.swap_buffers_with_damage(egl_ctx, &egl_rects) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("swap_buffers_with_damage failed ({e}); full swap next frame");
+                        false
+                    }
+                }
+            }
+            _ => false, // GLX / other backend: Phase 2 territory
         }
     }
 
