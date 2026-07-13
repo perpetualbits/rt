@@ -17,6 +17,8 @@ mod gl_backend; // the default GL backend: wraps render.rs's Renderer + present 
 mod x11_blur; // X11 background blur via _KDE_NET_WM_BLUR_BEHIND_REGION (no-op elsewhere)
 #[cfg(feature = "x11")]
 mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
+#[cfg(feature = "x11")]
+mod xrender_backend; // mechanism C: XRender backend
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
 mod damage; // pure pixel-rect damage accumulator
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
@@ -892,8 +894,24 @@ impl ApplicationHandler for App {
         // the default backend. `&window` is borrowed here, before it moves into
         // `Active` below. XRender is not yet wired (Task 3): `GlBackend` is built
         // unconditionally, even when `backend_kind` is `XRender`.
-        let backend: Box<dyn backend::Backend> =
-            Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window));
+        let backend: Box<dyn backend::Backend> = {
+            // Mechanism C: on the XRender path, build the command-based backend
+            // that draws into this X11 window via x11rb (no GL used at render
+            // time). NOTE: for now the GL context above is still created even on
+            // this path (harmless for local Xvfb dev); skipping GL entirely on
+            // XRender (no GLX-over-ssh) lands with the chrome-degrade task.
+            #[cfg(feature = "x11")]
+            let xr: Option<Box<dyn backend::Backend>> =
+                if matches!(backend_kind, backend::BackendKind::XRender) {
+                    xrender_backend::XRenderBackend::try_new(&window, &font_blobs, settings.font_size)
+                        .map(|b| Box::new(b) as Box<dyn backend::Backend>)
+                } else {
+                    None
+                };
+            #[cfg(not(feature = "x11"))]
+            let xr: Option<Box<dyn backend::Backend>> = None;
+            xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window)))
+        };
         self.active = Some(Active {
             window,
             backend,
