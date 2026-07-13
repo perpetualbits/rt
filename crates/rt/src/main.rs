@@ -342,6 +342,7 @@ struct Cli {
     rows: Option<usize>,   // --rows N : pin the initial grid height in cells
     font: Option<String>,  // --font "Family" : override the configured font family
     font_size: Option<f32>, // --font-size PX : override the configured size (pixels)
+    backend: Option<String>, // --backend gl|xrender : override backend::choose_backend's pick
 }
 
 /// Parse `Cli` from `std::env::args`. Hand-rolled (no clap dependency): accepts
@@ -370,6 +371,14 @@ fn parse_cli() -> Cli {
             "--rows" => cli.rows = Some(parse_usize(&value("--rows"), "--rows")),
             "--font" => cli.font = Some(value("--font")),
             "--font-size" => cli.font_size = Some(parse_f32(&value("--font-size"), "--font-size")),
+            "--backend" => {
+                let v = value("--backend");
+                if !v.eq_ignore_ascii_case("gl") && !v.eq_ignore_ascii_case("xrender") {
+                    eprintln!("rt: --backend must be 'gl' or 'xrender', got '{v}'");
+                    std::process::exit(2);
+                }
+                cli.backend = Some(v);
+            }
             "-V" | "--version" => {
                 // Crate version, plus the git commit stamped in by build.rs on a
                 // from-source build (e.g. "rt 0.2.1 (a1b2c3d)") so a dev build is
@@ -391,6 +400,7 @@ fn parse_cli() -> Cli {
                      --rows N          pin the initial grid height (cells)\n  \
                      --font \"Family\"   override the configured font family\n  \
                      --font-size PX    override the configured font size (pixels)\n  \
+                     --backend gl|xrender  override the auto-selected rendering backend\n  \
                      -V, --version     print version and exit\n  \
                      -h, --help        show this message\n\n\
                      Everything else is configured in Preferences / config.toml."
@@ -866,9 +876,22 @@ impl ApplicationHandler for App {
 
         // Store the fully-initialised state and paint once.
         let low_power = renderer.is_software(); // read before `renderer` is moved in
+        // Decide which backend *would* be used: a local unix-socket $DISPLAY (or
+        // Wayland) keeps the existing GL path; a TCP/forwarded $DISPLAY (`ssh -X`
+        // → `localhost:10.x`) picks XRender for mechanism C — unless overridden by
+        // `--backend`/`RT_BACKEND`. XRenderBackend doesn't exist yet (arrives in a
+        // later mechanism-C task), so for now we log the decision but always build
+        // `GlBackend` below regardless of `kind`.
+        let display_env = std::env::var("DISPLAY").ok();
+        let is_x11 = display_env.is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none();
+        let backend_override = self.cli.backend.clone().or_else(|| std::env::var("RT_BACKEND").ok());
+        let backend_kind = backend::choose_backend(display_env.as_deref(), is_x11, backend_override.as_deref());
+        log::info!("backend: {backend_kind:?}");
+
         // Wrap the GL renderer + present resources (surface/context/X11 present) as
         // the default backend. `&window` is borrowed here, before it moves into
-        // `Active` below.
+        // `Active` below. XRender is not yet wired (Task 3): `GlBackend` is built
+        // unconditionally, even when `backend_kind` is `XRender`.
         let backend: Box<dyn backend::Backend> =
             Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window));
         self.active = Some(Active {

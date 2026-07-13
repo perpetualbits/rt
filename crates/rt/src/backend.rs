@@ -69,3 +69,55 @@ pub trait Backend {
     /// Whether the X11 Route-1 damage-rect present path is active.
     fn x11_present_active(&self) -> bool;
 }
+
+/// Which [`Backend`] implementation to use. `Gl` is the existing local-rendering
+/// path; `XRender` is the mechanism-C remote-friendly path (arrives in a later
+/// task — see [`choose_backend`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Gl,
+    XRender,
+}
+
+/// Pick the backend. Override wins; else Wayland/non-X11 → Gl; else a DISPLAY with
+/// a host part before `:` (TCP / ssh -X forward) → XRender; a bare `:N` (local unix
+/// socket) → Gl.
+///
+/// Pure and unit-tested: no env/CLI reads happen here — the caller (`main.rs`)
+/// gathers `display`/`is_x11`/`override_env` from `$DISPLAY`, the winit backend
+/// choice, `$RT_BACKEND`, and `--backend`, then calls this.
+pub fn choose_backend(display: Option<&str>, is_x11: bool, override_env: Option<&str>) -> BackendKind {
+    if let Some(o) = override_env {
+        return if o.eq_ignore_ascii_case("xrender") { BackendKind::XRender } else { BackendKind::Gl };
+    }
+    if !is_x11 { return BackendKind::Gl; } // Wayland etc.
+    match display {
+        // "host:N" (host non-empty) is TCP/forwarded; ":N" is a local unix socket.
+        Some(d) if d.split(':').next().map_or(false, |h| !h.is_empty()) => BackendKind::XRender,
+        _ => BackendKind::Gl,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unix_socket_selects_gl() {
+        assert!(matches!(choose_backend(Some(":0"), true, None), BackendKind::Gl));
+        assert!(matches!(choose_backend(Some(":1.0"), true, None), BackendKind::Gl));
+    }
+    #[test]
+    fn tcp_forwarded_selects_xrender() {
+        assert!(matches!(choose_backend(Some("localhost:10.0"), true, None), BackendKind::XRender));
+        assert!(matches!(choose_backend(Some("192.168.1.5:0"), true, None), BackendKind::XRender));
+    }
+    #[test]
+    fn wayland_selects_gl() {
+        assert!(matches!(choose_backend(None, false, None), BackendKind::Gl));
+    }
+    #[test]
+    fn override_wins() {
+        assert!(matches!(choose_backend(Some(":0"), true, Some("xrender")), BackendKind::XRender));
+        assert!(matches!(choose_backend(Some("localhost:10.0"), true, Some("gl")), BackendKind::Gl));
+    }
+}
