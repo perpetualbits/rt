@@ -10,8 +10,10 @@
 //! becomes an `Action` fed to `Session::apply`; a miss becomes PTY bytes via
 //! `encode_key` fed to `Session::feed_input` (respecting broadcast mode).
 
+mod backend; // rendering backend abstraction (GL today, XRender in mechanism C)
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
+mod gl_backend; // the default GL backend: wraps render.rs's Renderer + present resources
 mod x11_blur; // X11 background blur via _KDE_NET_WM_BLUR_BEHIND_REGION (no-op elsewhere)
 #[cfg(feature = "x11")]
 mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
@@ -38,8 +40,7 @@ use glutin::config::ConfigTemplateBuilder;
 use glutin::context::ContextAttributesBuilder;
 use glutin::display::GetGlDisplay;
 use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, buffer_age, …)
-use glutin::surface::Rect as GlRect; // EGL damage rect (bottom-left origin)
-use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
+use glutin::surface::SurfaceAttributesBuilder;
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
@@ -235,11 +236,7 @@ const WIRE_PACKETS: u32 = 3;
 /// build it lazily and tear it down on suspend.
 struct Active {
     window: Window,                       // the OS window
-    surface: Surface<WindowSurface>,      // the GL drawing surface
-    context: glutin::context::PossiblyCurrentContext, // the current GL context
-    #[cfg(feature = "x11")]
-    x11_present: Option<x11_present::X11Present>, // Route 1: X11 damage-rect present (None on Wayland)
-    renderer: Renderer,                   // our glyph-atlas renderer
+    backend: Box<dyn backend::Backend>,   // rendering backend (GL renderer + present resources)
     session: AppSession,                  // layout + panes + focus + broadcast
     keymap: Keymap,                       // Terminator-style bindings
     mods: ModifiersState,                 // live modifier state (updated on change)
@@ -869,13 +866,14 @@ impl ApplicationHandler for App {
 
         // Store the fully-initialised state and paint once.
         let low_power = renderer.is_software(); // read before `renderer` is moved in
+        // Wrap the GL renderer + present resources (surface/context/X11 present) as
+        // the default backend. `&window` is borrowed here, before it moves into
+        // `Active` below.
+        let backend: Box<dyn backend::Backend> =
+            Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window));
         self.active = Some(Active {
-            #[cfg(feature = "x11")]
-            x11_present: x11_present::X11Present::try_new(&window),
             window,
-            surface,
-            context,
-            renderer,
+            backend,
             session,
             keymap: Keymap::defaults(),
             mods: ModifiersState::empty(),
@@ -1163,9 +1161,9 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 // glutin needs non-zero dimensions to resize the surface.
                 if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
-                    active.surface.resize(&active.context, w, h); // resize GL surface
+                    active.backend.resize_surface(w, h); // resize GL surface
                 }
-                active.renderer.resize(size.width as f32, size.height as f32); // viewport
+                active.backend.resize(size.width as f32, size.height as f32); // viewport
                 // Keep the blur region covering the whole surface at its new size.
                 if let Some(fx) = &mut active.bg_effect {
                     fx.on_resize(size.width, size.height);
@@ -1883,7 +1881,7 @@ impl App {
     fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
         let size = active.window.inner_size();
         let bounds = content_bounds(size);
-        let (cw, ch) = active.renderer.cell_size();
+        let (cw, ch) = active.backend.cell_size();
         for (id, rect) in active.session.visible_rects(bounds) {
             if rect.contains(mx, my) {
                 // Map against the content rect (grid area minus the titlebar); a
@@ -2161,9 +2159,9 @@ impl App {
             active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
         }
         let px = active.settings.font_size;
-        match active.renderer.reload_fonts(&active.font_blobs, px) {
+        match active.backend.reload_fonts(&active.font_blobs, px) {
             Ok(()) => {
-                let cell = active.renderer.cell_size(); // new cell metrics
+                let cell = active.backend.cell_size(); // new cell metrics
                 active.session.set_cell(cell);
                 let size = active.window.inner_size();
                 active.session.relayout(content_bounds(size));
@@ -2252,7 +2250,7 @@ impl App {
         // preserved; everything else falls to the full redraw (today's path),
         // which is always correct.
         let overlay_open = active.prefs_open || active.menu.is_some() || active.manual_open || active.search_open;
-        let (cell_w, cell_h) = active.renderer.cell_size(); // px per cell
+        let (cell_w, cell_h) = active.backend.cell_size(); // px per cell
         let (cw, ch) = (cell_w as i32, cell_h as i32);
 
         // Build this frame's damage from the panes. This loop also fetches the
@@ -2262,9 +2260,9 @@ impl App {
         let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
         if active.force_full
             || overlay_open
-            || !active.renderer.is_software()
+            || !active.backend.is_software()
             || !active.wires.is_empty()
-            || !Self::partial_present_available(active)
+            || !active.backend.partial_present_available()
         {
             // hardware GL / overlays / re-armed → full frame; also, wires are
             // animated chrome spanning arbitrary inter-pane regions outside
@@ -2297,16 +2295,7 @@ impl App {
         // XPutImage ~2-3MB over ssh (~1s). Chrome persists in the window and is
         // re-sent only when it actually changes (via force_full). This is the
         // whole point of Route 1: send only the changed cells, like Terminator.
-        let x11_present_active = {
-            #[cfg(feature = "x11")]
-            {
-                active.x11_present.is_some()
-            }
-            #[cfg(not(feature = "x11"))]
-            {
-                false
-            }
-        };
+        let x11_present_active = active.backend.x11_present_active();
         if !active.damage.is_full() && !x11_present_active {
             for (_id, (rect, _)) in &snapshots {
                 for band in border_bands(*rect, active.session.titlebar_h() as i32) {
@@ -2316,14 +2305,6 @@ impl App {
         }
 
         let frame_damage = active.damage.finish();
-        // TEMP diagnostic (remove before ship): log the present rect the X11 path
-        // will read back + XPutImage, to confirm it's cell-sized not full-window.
-        #[cfg(feature = "x11")]
-        if x11_present_active {
-            if let Some(b) = frame_damage.bbox() {
-                log::info!("PRESENT bbox {}x{} at ({},{})", b.w, b.h, b.x, b.y);
-            }
-        }
         // Fold in recent frames' damage per the back-buffer age, and decide.
         let plan = Self::plan_frame(active, frame_damage);
 
@@ -2355,7 +2336,7 @@ impl App {
         let cfg_bg = active.settings.background; // configured background RGB (for the non-default cell-bg test)
 
         let focus = active.session.focus(); // which pane is focused
-        let (cell_w, cell_h) = active.renderer.cell_size(); // px per cell
+        let (cell_w, cell_h) = active.backend.cell_size(); // px per cell
         let sep = Color::rgb(0x2a, 0x2a, 0x33); // subtle inter-column separator colour
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.) Iterates the pre-fetched
@@ -2435,29 +2416,29 @@ impl App {
                         // Selection highlight wins over the cell's own background;
                         // otherwise draw an explicit (non-default) background.
                         if hl_cur.contains(&(r, col_idx)) {
-                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, cur_hl);
+                            active.backend.fill_cell(ox, rect.y, col_idx, sub, cur_hl);
                         } else if hl_other.contains(&(r, col_idx)) {
-                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, other_hl);
+                            active.backend.fill_cell(ox, rect.y, col_idx, sub, other_hl);
                         } else if pane_sel.map_or(false, |s| s.contains(col_idx, sub)) {
-                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, sel_bg);
+                            active.backend.fill_cell(ox, rect.y, col_idx, sub, sel_bg);
                         } else if cell.bg != cfg_bg {
                             // A non-default background: draw it opaque (default-bg
                             // cells stay translucent via the window clear).
                             let c = cell.bg;
-                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, Color::rgb(c[0], c[1], c[2]));
+                            active.backend.fill_cell(ox, rect.y, col_idx, sub, Color::rgb(c[0], c[1], c[2]));
                         }
                         let fg = Color::rgb(cell.fg[0], cell.fg[1], cell.fg[2]); // per-cell foreground
                         if cell.c != ' ' {
                             // Glyph, in the bold/oblique face per the cell's attributes.
-                            active.renderer.draw_char(ox, rect.y, col_idx, sub, cell.c, fg, cell.attrs.bold, cell.attrs.italic);
+                            active.backend.draw_char(ox, rect.y, col_idx, sub, cell.c, fg, cell.attrs.bold, cell.attrs.italic);
                         }
                         // Text-attribute lines (drawn even on blank cells so an
                         // underlined space still shows a rule).
                         if cell.attrs.underline {
-                            active.renderer.draw_underline(ox, rect.y, col_idx, sub, fg);
+                            active.backend.draw_underline(ox, rect.y, col_idx, sub, fg);
                         }
                         if cell.attrs.strikeout {
-                            active.renderer.draw_strikeout(ox, rect.y, col_idx, sub, fg);
+                            active.backend.draw_strikeout(ox, rect.y, col_idx, sub, fg);
                         }
                     }
                 }
@@ -2477,7 +2458,7 @@ impl App {
                         let focused = id == focus; // is this the focused pane?
                         if !focused {
                             // Unfocused: hollow outline regardless of shape, steady (no blink).
-                            active.renderer.cursor_hollow(ox, rect.y, cur.col, sub, ccol);
+                            active.backend.cursor_hollow(ox, rect.y, cur.col, sub, ccol);
                         } else {
                             // Soft-blink: fade the focused cursor's alpha so the glyph
                             // beneath shows through, pulsing for a bounded window after
@@ -2493,17 +2474,17 @@ impl App {
                                 CursorShape::Block => {
                                     // Solid block + inverse glyph for contrast; both fade
                                     // together so the underlying glyph re-emerges on the dip.
-                                    active.renderer.fill_cell(ox, rect.y, cur.col, sub, cur_col);
+                                    active.backend.fill_cell(ox, rect.y, cur.col, sub, cur_col);
                                     if let Some(u) = snap.rows.get(cur.line).and_then(|rw| rw.get(cur.col)) {
                                         if u.c != ' ' {
                                             let ub = u.bg;
-                                            active.renderer.draw_char(ox, rect.y, cur.col, sub, u.c, Color::rgb(ub[0], ub[1], ub[2]).with_alpha(blink), u.attrs.bold, u.attrs.italic);
+                                            active.backend.draw_char(ox, rect.y, cur.col, sub, u.c, Color::rgb(ub[0], ub[1], ub[2]).with_alpha(blink), u.attrs.bold, u.attrs.italic);
                                         }
                                     }
                                 }
-                                CursorShape::HollowBlock => active.renderer.cursor_hollow(ox, rect.y, cur.col, sub, cur_col),
-                                CursorShape::Underline => active.renderer.cursor_underline(ox, rect.y, cur.col, sub, cur_col),
-                                CursorShape::Beam => active.renderer.cursor_beam(ox, rect.y, cur.col, sub, cur_col),
+                                CursorShape::HollowBlock => active.backend.cursor_hollow(ox, rect.y, cur.col, sub, cur_col),
+                                CursorShape::Underline => active.backend.cursor_underline(ox, rect.y, cur.col, sub, cur_col),
+                                CursorShape::Beam => active.backend.cursor_beam(ox, rect.y, cur.col, sub, cur_col),
                                 CursorShape::Hidden => {} // nothing (snapshot already filters, but be safe)
                             }
                         }
@@ -2514,7 +2495,7 @@ impl App {
                 if n > 1 {
                     for nc in 1..geom.count as usize {
                         let x = rect.x + nc as f32 * step - (geom.gap as f32 * 0.5) * cell_w; // gap centre
-                        active.renderer.fill_rect(x, rect.y, 1.0, rect.h, sep); // 1px vertical rule
+                        active.backend.fill_rect(x, rect.y, 1.0, rect.h, sep); // 1px vertical rule
                     }
                 }
 
@@ -2523,13 +2504,13 @@ impl App {
                 if history > 0 {
                     // Track + thumb; geometry shared with the drag hit-test.
                     let (bx, bw, thumb_y, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
-                    active.renderer.fill_rect(bx, rect.y, bw, rect.h, Color::rgb(0x22, 0x22, 0x2c));
+                    active.backend.fill_rect(bx, rect.y, bw, rect.h, Color::rgb(0x22, 0x22, 0x2c));
                     let thumb_col = if offset > 0 {
                         Color::rgb(0x88, 0x88, 0x9a) // scrolled up: highlight
                     } else {
                         Color::rgb(0x55, 0x55, 0x66) // at the bottom: dimmer
                     };
-                    active.renderer.fill_rect(bx, thumb_y, bw, thumb_h, thumb_col);
+                    active.backend.fill_rect(bx, thumb_y, bw, thumb_h, thumb_col);
                 }
             }
             // Per-pane titlebar strip (Terminator-style), drawn in the reserved
@@ -2558,8 +2539,8 @@ impl App {
                 };
                 let bar_bg = mix(bg, fg, if focused { 0.20 } else { 0.10 });
                 let sep = mix(bg, fg, 0.40); // hairline: a touch more toward fg → a visible edge
-                active.renderer.fill_rect(full.x, full.y, full.w, bar_h, bar_bg);
-                active.renderer.fill_rect(full.x, full.y + bar_h - 1.0, full.w, 1.0, sep);
+                active.backend.fill_rect(full.x, full.y, full.w, bar_h, bar_bg);
+                active.backend.fill_rect(full.x, full.y + bar_h - 1.0, full.w, 1.0, sep);
                 let text_col = if focused { Color::rgb(fg[0], fg[1], fg[2]) } else { mix(fg, bg, 0.40) };
                 let pad = 6.0; // horizontal inset inside the strip
                 let text_top = full.y + (bar_h - cell_h) * 0.5; // vertically centre the glyph line
@@ -2567,7 +2548,7 @@ impl App {
                 // Group swatch, if this pane is in an input group.
                 if let Some(g) = active.session.group_of(id) {
                     let s = cell_h * 0.6; // swatch side length
-                    active.renderer.fill_rect(left_x, full.y + (bar_h - s) * 0.5, s, s, group_hue(g));
+                    active.backend.fill_rect(left_x, full.y + (bar_h - s) * 0.5, s, s, group_hue(g));
                     left_x += s + 5.0; // leave a gap before the title
                 }
                 // Size text ("COLSxROWS") pinned to the right edge.
@@ -2577,7 +2558,7 @@ impl App {
                 let size_w = size_str.chars().count() as f32 * cell_w;
                 let size_x = (full.right() - pad - size_w).max(left_x);
                 for (i, ch) in size_str.chars().enumerate() {
-                    active.renderer.draw_char(size_x, text_top, i, 0, ch, text_col, false, false);
+                    active.backend.draw_char(size_x, text_top, i, 0, ch, text_col, false, false);
                 }
                 // Scrollback meter ("buf USED/MAX") just left of the size, warming
                 // grey → amber → red as the buffer fills so a runaway listing is
@@ -2601,7 +2582,7 @@ impl App {
                             Color::rgb(0x7c, 0x80, 0x8c)
                         };
                         for (i, ch) in meter.chars().enumerate() {
-                            active.renderer.draw_char(mx, text_top, i, 0, ch, mcol, false, false);
+                            active.backend.draw_char(mx, text_top, i, 0, ch, mcol, false, false);
                         }
                         left_of = mx; // title truncates before the meter
                     }
@@ -2610,23 +2591,23 @@ impl App {
                 let title = active.session.title_of(id).filter(|t| !t.is_empty()).unwrap_or("Terminal");
                 let avail = ((left_of - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
                 for (i, ch) in title.chars().take(avail).enumerate() {
-                    active.renderer.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
+                    active.backend.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
                 }
             } else if let Some(g) = active.session.group_of(id) {
                 // No titlebar: fall back to a small colour-coded corner square so
                 // group membership is still visible.
                 let m = 10.0; // marker size in pixels
                 let p = 4.0; // inset from the corner
-                active.renderer.fill_rect(full.right() - m - p, full.y + p, m, m, group_hue(g));
+                active.backend.fill_rect(full.right() - m - p, full.y + p, m, m, group_hue(g));
             }
             // Outline the focused pane with a thin border (four thin rects),
             // around the whole pane including its titlebar (`full`, not content).
             if id == focus {
                 let t = 2.0; // border thickness in pixels
-                active.renderer.fill_rect(full.x, full.y, full.w, t, focus_border); // top
-                active.renderer.fill_rect(full.x, full.bottom() - t, full.w, t, focus_border); // bottom
-                active.renderer.fill_rect(full.x, full.y, t, full.h, focus_border); // left
-                active.renderer.fill_rect(full.right() - t, full.y, t, full.h, focus_border); // right
+                active.backend.fill_rect(full.x, full.y, full.w, t, focus_border); // top
+                active.backend.fill_rect(full.x, full.bottom() - t, full.w, t, focus_border); // bottom
+                active.backend.fill_rect(full.x, full.y, t, full.h, focus_border); // left
+                active.backend.fill_rect(full.right() - t, full.y, t, full.h, focus_border); // right
             }
         }
 
@@ -2637,10 +2618,10 @@ impl App {
         for d in active.session.dividers(bounds) {
             if d.w < d.h {
                 // Vertical gutter (left/right split): a vertical line.
-                active.renderer.fill_rect(d.x + d.w * 0.5 - 0.5, d.y, 1.0, d.h, divider_col);
+                active.backend.fill_rect(d.x + d.w * 0.5 - 0.5, d.y, 1.0, d.h, divider_col);
             } else {
                 // Horizontal gutter (top/bottom split): a horizontal line.
-                active.renderer.fill_rect(d.x, d.y + d.h * 0.5 - 0.5, d.w, 1.0, divider_col);
+                active.backend.fill_rect(d.x, d.y + d.h * 0.5 - 0.5, d.w, 1.0, divider_col);
             }
         }
 
@@ -2655,7 +2636,7 @@ impl App {
             for tab in &bar.tabs {
                 let r = tab.rect; // this tab's strip rectangle
                 // Segment background (active tab stands out).
-                active.renderer.fill_rect(r.x, r.y, r.w, r.h, if tab.active { tab_active } else { tab_bg });
+                active.backend.fill_rect(r.x, r.y, r.w, r.h, if tab.active { tab_active } else { tab_bg });
                 // Label: the pane's title if it has one, else the tab number.
                 // Truncate to what fits in the segment (leaving room for the
                 // number prefix and padding).
@@ -2676,10 +2657,10 @@ impl App {
                 let text_top = r.y + (r.h - cell_h) * 0.5; // centre the glyph line
                 let col = if tab.active { txt_on } else { txt_off };
                 for (i, ch) in label.chars().enumerate() {
-                    active.renderer.draw_char(r.x + 8.0, text_top, i, 0, ch, col, tab.active, false);
+                    active.backend.draw_char(r.x + 8.0, text_top, i, 0, ch, col, tab.active, false);
                 }
                 // Right separator between tabs.
-                active.renderer.fill_rect(r.right() - 1.0, r.y, 1.0, r.h, tab_line);
+                active.backend.fill_rect(r.right() - 1.0, r.y, 1.0, r.h, tab_line);
             }
         }
 
@@ -2696,10 +2677,10 @@ impl App {
                 };
                 let t = 3.0; // border thickness
                 let (w, h) = (bounds.w, bounds.h);
-                active.renderer.fill_rect(0.0, 0.0, w, t, col); // top
-                active.renderer.fill_rect(0.0, h - t, w, t, col); // bottom
-                active.renderer.fill_rect(0.0, 0.0, t, h, col); // left
-                active.renderer.fill_rect(w - t, 0.0, t, h, col); // right
+                active.backend.fill_rect(0.0, 0.0, w, t, col); // top
+                active.backend.fill_rect(0.0, h - t, w, t, col); // bottom
+                active.backend.fill_rect(0.0, 0.0, t, h, col); // left
+                active.backend.fill_rect(w - t, 0.0, t, h, col); // right
             }
         }
 
@@ -2711,7 +2692,7 @@ impl App {
             let rects: Vec<_> = active.session.visible_rects(bounds);
             for (id, r) in rects {
                 if active.bell_flash.contains_key(&id) {
-                    active.renderer.bell_stripe(r.x, r.y, r.w, r.h);
+                    active.backend.bell_stripe(r.x, r.y, r.w, r.h);
                 }
             }
         }
@@ -2736,20 +2717,6 @@ impl App {
         }
     }
 
-    /// Whether a partial (non-full-swap) present is available this build/surface:
-    /// an EGL surface (mechanism A) or an X11 present handle (Route 1). Otherwise
-    /// the frame must take the full path.
-    fn partial_present_available(active: &Active) -> bool {
-        if matches!(active.surface, Surface::Egl(_)) {
-            return true; // mechanism A (buffer_age partial swap)
-        }
-        #[cfg(feature = "x11")]
-        if active.x11_present.is_some() {
-            return true; // Route 1 (readback + XPutImage)
-        }
-        false
-    }
-
     /// Combine this frame's damage with recent frames' damage per the EGL buffer
     /// age and decide Full vs Partial. Records this frame into the history ring
     /// (newest front, capped at `HISTORY_DEPTH`) for future frames.
@@ -2761,11 +2728,11 @@ impl App {
         let age = {
             #[cfg(feature = "x11")]
             {
-                if active.x11_present.is_some() { 1 } else { Self::buffer_age(active) }
+                if active.backend.x11_present_active() { 1 } else { active.backend.buffer_age() }
             }
             #[cfg(not(feature = "x11"))]
             {
-                Self::buffer_age(active)
+                active.backend.buffer_age()
             }
         };
         let full_now = matches!(this, FrameDamage::Full);
@@ -2817,22 +2784,12 @@ impl App {
     /// egui, full swap. Byte-for-byte the pre-damage behaviour.
     fn redraw_full(&mut self, bg: Color, bounds: Rect, snapshots: Vec<(rt_core::PaneId, PxRectSnap)>) {
         let Some(active) = self.active.as_mut() else { return };
-        active.renderer.begin_frame(bg); // translucent clear
+        active.backend.begin_frame(bg); // translucent clear
         Self::draw_panes(active, bounds, &snapshots);
-        active.renderer.end_frame(); // upload + draw call
+        active.backend.end_frame(); // upload + draw call
         Self::paint_overlays_or_instruments(active);
-        #[cfg(feature = "x11")]
-        if let Some(p) = active.x11_present.as_ref() {
-            let sz = active.window.inner_size();
-            let (w, h) = (sz.width as i32, sz.height as i32);
-            if p.present_rect(active.renderer.gl_ctx(), 0, 0, w, h, h) {
-                return; // presented the full window via XPutImage; no swap
-            }
-            // present failed → fall through to swap_buffers
-        }
-        if let Err(e) = active.surface.swap_buffers(&active.context) {
-            log::error!("swap_buffers failed: {e}"); // non-fatal; log and continue
-        }
+        // Present the full window (X11 Route-1 full present, else swap_buffers).
+        active.backend.present(&active.window, None);
     }
 
     /// Partial path (software GL, EGL surface only): preserve the buffer,
@@ -2848,71 +2805,23 @@ impl App {
         hint_rects: &[crate::damage::PxRect],
     ) -> bool {
         let Some(active) = self.active.as_mut() else { return false };
-        active.renderer.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
+        active.backend.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
         Self::draw_panes(active, bounds, &snapshots);
-        active.renderer.end_frame();
+        active.backend.end_frame();
         Self::paint_overlays_or_instruments(active); // instruments blend inside the cleared bbox
-        active.renderer.clear_scissor(); // next frame starts with a clean scissor
-        #[cfg(feature = "x11")]
-        if let Some(p) = active.x11_present.as_ref() {
-            let sh = active.window.inner_size().height as i32;
-            if p.present_rect(active.renderer.gl_ctx(), bbox.x, bbox.y, bbox.w, bbox.h, sh) {
-                return false; // presented the damage rect via XPutImage; no swap, no re-arm
-            }
-            // present failed → fall through to the full-redraw fallback below
-        }
-        if !Self::present_with_damage(active, hint_rects) {
+        active.backend.clear_scissor(); // next frame starts with a clean scissor
+        // Present just the damage (X11 Route-1 bbox present, else EGL partial swap).
+        if active.backend.present(&active.window, Some((bbox, hint_rects))) {
             // EGL partial swap unavailable/failed → guarantee correctness with a
             // full redraw + full swap this frame, and force a full frame next time.
-            active.renderer.begin_frame(bg);
+            active.backend.begin_frame(bg);
             Self::draw_panes(active, bounds, &snapshots);
-            active.renderer.end_frame();
+            active.backend.end_frame();
             Self::paint_overlays_or_instruments(active);
-            if let Err(e) = active.surface.swap_buffers(&active.context) {
-                log::error!("swap_buffers failed: {e}");
-            }
+            active.backend.full_swap();
             return true;
         }
         false
-    }
-
-    /// The age of the back buffer: how many swaps ago its contents were last drawn.
-    /// 0 means "unknown / brand new" — the whole buffer must be redrawn.
-    fn buffer_age(active: &Active) -> u32 {
-        active.surface.buffer_age()
-    }
-
-    /// Present a scissored frame, hinting the compositor with the damage rects.
-    /// Returns `true` on a successful partial-damage swap; `false` if the caller
-    /// must fall back to a full redraw + full `swap_buffers` (age 0, non-EGL
-    /// surface, or a swap error). `rects` are physical px, top-left origin; they are
-    /// converted to EGL's bottom-left-origin `Rect` here.
-    fn present_with_damage(active: &mut Active, rects: &[crate::damage::PxRect]) -> bool {
-        use glutin::context::PossiblyCurrentContext;
-        use glutin::surface::Surface;
-
-        let screen_h = active.window.inner_size().height as i32;
-        let egl_rects: Vec<GlRect> = rects
-            .iter()
-            .map(|r| {
-                let y = screen_h - (r.y + r.h); // flip to bottom-left origin
-                GlRect::new(r.x, y, r.w, r.h)
-            })
-            .collect();
-
-        // swap_buffers_with_damage is only on the concrete EGL surface/context.
-        match (&active.surface, &active.context) {
-            (Surface::Egl(egl_surface), PossiblyCurrentContext::Egl(egl_ctx)) => {
-                match egl_surface.swap_buffers_with_damage(egl_ctx, &egl_rects) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log::warn!("swap_buffers_with_damage failed ({e}); full swap next frame");
-                        false
-                    }
-                }
-            }
-            _ => false, // GLX / other backend: Phase 2 territory
-        }
     }
 
     /// Run the egui preferences UI for this frame and paint it. Applies any
@@ -2926,7 +2835,7 @@ impl App {
         ctx.begin_pass(raw_input);
         // Estimate scrollback memory against a full-width pane at the current
         // font, so the dialog can warn before the slider picks an unrunnable size.
-        let cols = (content_bounds(active.window.inner_size()).w / active.renderer.cell_size().0).max(1.0) as usize;
+        let cols = (content_bounds(active.window.inner_size()).w / active.backend.cell_size().0).max(1.0) as usize;
         let ram = total_ram_bytes();
         preferences::ui(&ctx, &mut settings, &mut close, &active.mono_families, ram, cols); // build the dialog
         let output = ctx.end_pass();
