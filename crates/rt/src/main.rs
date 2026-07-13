@@ -3229,21 +3229,7 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
         active.last_meter_tick = now;
-        for m in active.meters.values_mut() {
-            let inst = m.wakeups as f32 / dt.max(1e-3);
-            m.wakeups = 0;
-            m.rate = m.rate * 0.75 + inst * 0.25;
-            let act = (m.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
-            m.phase = (m.phase + act * FLOW_MAX_LAPS * dt).fract();
-        }
-        // Advance each wire's byte-rate and flow phase (packets = the actual bytes).
-        for w in active.wires.iter_mut() {
-            let inst = w.moved as f32 / dt.max(1e-3);
-            w.moved = 0;
-            w.rate = w.rate * 0.75 + inst * 0.25;
-            let act = (w.rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
-            w.phase = (w.phase + act * FLOW_MAX_LAPS * dt).fract();
-        }
+        advance_instrument_state(&mut active.meters, &mut active.wires, dt);
         // Pane rectangles in physical pixels.
         let size = active.window.inner_size();
         let bounds = content_bounds(size);
@@ -3500,6 +3486,31 @@ fn latency_color(pos: f32, phase: f32, stall: f32) -> egui::Color32 {
     let g = (32.0 + 80.0 * v + spike * 110.0).min(255.0) as u8;
     let b = (88.0 + 152.0 * v + spike * 40.0).min(255.0) as u8;
     egui::Color32::from_rgb(r, g, b)
+}
+
+/// Advance every meter's and wire's exponential rate + flow phase by `dt`
+/// seconds of wall-clock, consuming the accumulated `wakeups`/`moved` counts.
+/// Shared by the GL (`paint_instruments`) and native (XRender) draw paths so
+/// the animation math is identical on both.
+fn advance_instrument_state(
+    meters: &mut std::collections::HashMap<rt_core::PaneId, Meter>,
+    wires: &mut [Wire],
+    dt: f32,
+) {
+    for m in meters.values_mut() {
+        let inst = m.wakeups as f32 / dt.max(1e-3);
+        m.wakeups = 0;
+        m.rate = m.rate * 0.75 + inst * 0.25;
+        let act = (m.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
+        m.phase = (m.phase + act * FLOW_MAX_LAPS * dt).fract();
+    }
+    for w in wires.iter_mut() {
+        let inst = w.moved as f32 / dt.max(1e-3);
+        w.moved = 0;
+        w.rate = w.rate * 0.75 + inst * 0.25;
+        let act = (w.rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
+        w.phase = (w.phase + act * FLOW_MAX_LAPS * dt).fract();
+    }
 }
 
 /// Planck/blackbody colour for a CPU load (fraction of one core): idle glows a
@@ -3787,5 +3798,44 @@ fn main() {
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod instr_tests {
+    use super::*;
+
+    /// `advance_instrument_state` must reset the wakeup/moved counters, raise
+    /// the smoothed rate from live activity, and keep the flow phase wrapped
+    /// into `[0.0, 1.0)` — for both a meter and a wire, via the real function
+    /// (not a re-derivation of the math).
+    #[test]
+    fn advance_decays_and_wraps_phase() {
+        let mut meters = std::collections::HashMap::new();
+        let mut m = Meter::default();
+        m.wakeups = BUSY_WAKEUPS as u32; // one core's worth of activity over 1s
+        m.rate = 0.0;
+        meters.insert(rt_core::PaneId(1), m);
+
+        let mut wires = vec![Wire {
+            src: rt_core::PaneId(1),
+            stream: Stream::Stdout,
+            dst: rt_core::PaneId(2),
+            rate: 0.0,
+            phase: 0.0,
+            moved: WIRE_BUSY_BYTES as u32,
+        }];
+
+        advance_instrument_state(&mut meters, &mut wires, 1.0);
+
+        let m = meters.get(&rt_core::PaneId(1)).unwrap();
+        assert_eq!(m.wakeups, 0, "wakeups counter is consumed");
+        assert!(m.rate > 0.0, "meter rate rises with activity");
+        assert!(m.phase >= 0.0 && m.phase < 1.0, "meter phase stays in [0,1)");
+
+        let w = &wires[0];
+        assert_eq!(w.moved, 0, "moved counter is consumed");
+        assert!(w.rate > 0.0, "wire rate rises with activity");
+        assert!(w.phase >= 0.0 && w.phase < 1.0, "wire phase stays in [0,1)");
     }
 }
