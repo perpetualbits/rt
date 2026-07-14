@@ -30,8 +30,19 @@ pub fn clamp_scroll(scroll: usize, g: &Geom) -> usize {
     scroll.min(max)
 }
 
+/// How many character columns fit inside the panel's padded interior. Lines are
+/// truncated to this so text stays within the grey box (the egui manual clipped
+/// inside a ScrollArea; the native draw must clip explicitly). Saturates at 0.
+pub fn visible_cols(panel_w: f32, cell_w: f32) -> usize {
+    let inner = panel_w - PAD * 2.0;
+    if inner <= 0.0 || cell_w <= 0.0 {
+        return 0;
+    }
+    (inner / cell_w).floor() as usize
+}
+
 /// Draw the panel, the visible line slice, and a scrollbar thumb.
-pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, _cell_w: f32, _cell_h: f32) {
+pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, cell_w: f32, _cell_h: f32) {
     let bg = Color::rgb(0x18, 0x1a, 0x1f);
     let border = Color::rgb(0x50, 0x54, 0x60);
     let fg = Color::rgb(0xd0, 0xd2, 0xda);
@@ -45,8 +56,11 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, _cell_w: f32, _cell_h
     let ox = p.x + PAD;
     let oy = p.y + PAD;
     let scroll = clamp_scroll(scroll, g);
+    // Clip each line to the panel's interior so long lines don't spill past the
+    // grey box (the visible manual text stays inside its panel).
+    let cols = visible_cols(p.w, cell_w);
     for (r, line) in MANUAL.lines().skip(scroll).take(g.rows).enumerate() {
-        for (c, ch) in line.chars().enumerate() {
+        for (c, ch) in line.chars().take(cols).enumerate() {
             be.draw_char(ox, oy, c, r, ch, fg, false, false);
         }
     }
@@ -70,5 +84,24 @@ mod tests {
         let max = g.total - g.rows;
         assert_eq!(clamp_scroll(usize::MAX, &g), max, "cannot scroll past the end");
         assert_eq!(clamp_scroll(0, &g), 0);
+    }
+
+    #[test]
+    fn visible_cols_fits_inside_the_padded_panel() {
+        // 640px panel, 8px cells, 12px padding each side → (640-24)/8 = 77 cols.
+        assert_eq!(visible_cols(640.0, 8.0), 77);
+        // Degenerate: a panel narrower than the padding yields 0, never underflows.
+        assert_eq!(visible_cols(10.0, 8.0), 0);
+    }
+
+    #[test]
+    fn manual_has_lines_wider_than_a_typical_panel() {
+        // Guards the bug this fixes: MANUAL genuinely contains lines longer than
+        // the visible width of an 80%-of-800px panel, so truncation must engage.
+        let cols = visible_cols((800.0f32 * 0.8).min(720.0), 8.0);
+        assert!(
+            MANUAL.lines().any(|l| l.chars().count() > cols),
+            "expected some manual line wider than {cols} cols to exercise clipping"
+        );
     }
 }
