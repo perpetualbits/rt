@@ -191,19 +191,30 @@ fn xrender_chrome_is_commands_not_pixels() {
     // With the manual open, the instruments animate continuously underneath it,
     // so this trace is far busier than the sibling test's idle-terminal one
     // (tens of MB vs hundreds of KB). Measured directly (owned processes,
-    // watched with `ps` mid-run): the inner `timeout 1.8` reliably kills `rt`
+    // watched with `ps` mid-run): the inner `timeout` reliably kills `rt`
     // right on schedule, and by then every byte of interest is already
     // written — but `xtrace` itself then does *not* exit on its own here (near
     // -zero CPU afterward), unlike the sibling test's low-volume case where it
     // does. So the outer `timeout` below isn't just a safety net for this
     // test: measured over repeated runs, it is the thing that actually ends
     // `xtrace`, every time, regardless of how large the outer bound is (5 s
-    // and 90 s runs produced the same fully-formed trace) — so keep it short
-    // and deliberate rather than generous. `-b` batches xtrace's writes
-    // instead of flushing every line, keeping that window's work cheap.
+    // and 90 s runs produced the same fully-formed trace) — so keep it
+    // deliberate rather than open-ended, just comfortably larger than the
+    // inner bound so xtrace is reliably reaped after rt exits. `-b` batches
+    // xtrace's writes instead of flushing every line, keeping that window's
+    // work cheap.
+    //
+    // The inner bound matches the sibling test's `timeout 3` headroom: rt's
+    // cold-start + first-render on llvmpipe is ~1.5 s, and under the default
+    // *parallel* `cargo test` invocation (both xrender_commands tests run
+    // their Xvfb+xtrace+rt chains concurrently, contending for CPU), that
+    // cold start can run measurably slower than in isolation. `1.8` s left
+    // only ~0.3 s margin and was observed to flip `triangles` to 0 or
+    // truncate the trace under contention; `3` s restores the ~1.5 s margin
+    // the sibling test relies on.
     let fake = disp + 50;
     let status = Command::new("timeout")
-        .arg("5") // ends xtrace deliberately; all trace data is already flushed well before this
+        .arg("7") // comfortably larger than the inner 3s bound; ends xtrace deliberately
         .arg("xtrace")
         .arg("-n")
         .arg("-b")
@@ -211,7 +222,7 @@ fn xrender_chrome_is_commands_not_pixels() {
         .args(["-D", &format!(":{fake}")])
         .args(["-o", trace.to_str().unwrap(), "--"])
         .arg("timeout")
-        .arg("1.8") // > rt's ~1.5s cold-start + first-render, short enough to keep the trace small
+        .arg("3") // > rt's cold-start + first-render even under parallel-test CPU contention
         .arg(rt_bin)
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
