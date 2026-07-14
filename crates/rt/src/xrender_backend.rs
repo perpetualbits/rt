@@ -110,6 +110,10 @@ pub struct XRenderBackend {
     // a full repaint never blanks the window (no flash) and still ships zero pixels.
     back_pixmap: xproto::Pixmap,
     back_pic: render::Picture,
+    // The Picture that drawing primitives (`fill`, `stamp_shape`, `draw_tris`)
+    // currently target. Normally `back_pic` (the content buffer); temporarily
+    // switched to the instrument layer between `begin/end_instrument_layer`.
+    dst_pic: render::Picture,
     gc: xproto::Gcontext,       // GC for the pixmap->window CopyArea
     depth: u8,                  // window/pixmap depth (for back-buffer recreation)
     win_format: Pictformat,     // the window's Pictformat (for back-buffer recreation)
@@ -216,6 +220,7 @@ impl XRenderBackend {
             win_pic,
             back_pixmap,
             back_pic,
+            dst_pic: back_pic, // starts as the content buffer
             gc,
             depth,
             win_format,
@@ -291,7 +296,7 @@ impl XRenderBackend {
             }
         }
         let rect = xproto::Rectangle { x: x as i16, y: y as i16, width: w.max(0.0) as u16, height: h.max(0.0) as u16 };
-        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, to_render_color(c), &[rect]);
+        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.dst_pic, to_render_color(c), &[rect]);
     }
 
     /// Set the 1x1 repeating ARGB source to `c` (straight alpha), premultiplied as
@@ -341,7 +346,7 @@ impl XRenderBackend {
         cmd.extend_from_slice(&dy.to_ne_bytes());
         cmd.extend_from_slice(&gid.to_ne_bytes());
         let _ = render::composite_glyphs32(
-            &self.conn, render::PictOp::OVER, self.src_pic_argb, self.back_pic,
+            &self.conn, render::PictOp::OVER, self.src_pic_argb, self.dst_pic,
             self.a8_format, self.shape_glyphset, 0, 0, &cmd,
         );
     }
@@ -363,7 +368,7 @@ impl XRenderBackend {
         let mk = |(x, y): (f32, f32)| Pointfix { x: fx(x), y: fx(y) };
         let hw: Vec<Triangle> = tris.iter().map(|t| Triangle { p1: mk(t[0]), p2: mk(t[1]), p3: mk(t[2]) }).collect();
         let _ = render::triangles(
-            &self.conn, render::PictOp::OVER, self.src_pic_argb, self.back_pic,
+            &self.conn, render::PictOp::OVER, self.src_pic_argb, self.dst_pic,
             self.a8_format, 0, 0, &hw,
         );
     }
