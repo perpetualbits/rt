@@ -1702,7 +1702,12 @@ impl ApplicationHandler for App {
                         return;
                     }
                     active.dragging_divider = None; // end any divider resize
-                    active.scroll_drag = None; // end any scrollbar drag
+                    if active.scroll_drag.take().is_some() {
+                        // The scrollbar drag skipped the instrument layer (kept the
+                        // drag cheap); repaint it now the drag has ended.
+                        active.force_full = true;
+                        active.window.request_redraw();
+                    }
                     active.selecting = false; // drag finished
                     // A zero-length selection was just a click: discard it, and
                     // (copy-on-select) copy a real selection to PRIMARY.
@@ -2102,7 +2107,17 @@ impl App {
                 Some(SessionEvent::CloseWindow) => exit_clean(), // last pane closed; clean up first
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
                 Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
-                Some(SessionEvent::Redraw) => active.window.request_redraw(),
+                Some(SessionEvent::Redraw) => {
+                    // A session action that changed what's on screen — a tab
+                    // switch, split, zoom, rotate, columns, etc. These change the
+                    // whole visible layout, but the newly-shown panes have no
+                    // per-cell engine damage (their content didn't change, they
+                    // were just hidden), so a partial frame would redraw nothing
+                    // and the XRender back buffer would keep the OLD tab's pixels.
+                    // Force a full redraw so the new layout actually paints.
+                    active.force_full = true;
+                    active.window.request_redraw();
+                }
                 None => {}
             },
         }
@@ -3024,30 +3039,38 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
         active.last_meter_tick = now;
-        advance_instrument_state(&mut active.meters, &mut active.wires, dt);
         let size = active.window.inner_size();
         let (cw, ch) = active.backend.cell_size();
-        // Instruments always draw under any open overlay. Build the borrowing
-        // context from DISJOINT fields so `&mut active.backend` coexists with the
-        // `&active.*` reads (a whole-struct `&active` alongside would not).
-        let bounds = content_bounds(size);
-        let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
-        let ctx = chrome::instruments::InstrCtx {
-            rects: &rects,
-            meters: &active.meters,
-            wires: &active.wires,
-            heat: &active.heat,
-            inst_output: active.settings.inst_output,
-            inst_heat: active.settings.inst_heat,
-            inst_latency: active.settings.inst_latency,
-            show_jacks: active.settings.show_jacks,
-            wiring_from: active.wiring_from,
-            drag_cursor: active.drag_cursor,
-            lat_phase: active.lat_phase,
-            stall: active.stall,
-            size,
-        };
-        chrome::instruments::draw(&mut *active.backend, &ctx);
+        // Skip the instrument layer while the user is dragging the scrollbar: the
+        // drag forces a full frame per motion event, and re-emitting the whole
+        // instrument layer on each would flood the ssh -X link and freeze the
+        // drag (each frame is grid + instruments over the wire). A grid-only drag
+        // frame is as cheap as running with instruments off; the instruments are
+        // repainted on drag-release (which arms a force_full). Same for other
+        // rapid full-frame gestures could be added here.
+        if active.scroll_drag.is_none() {
+            advance_instrument_state(&mut active.meters, &mut active.wires, dt);
+            // Build the borrowing context from DISJOINT fields so `&mut
+            // active.backend` coexists with the `&active.*` reads.
+            let bounds = content_bounds(size);
+            let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
+            let ctx = chrome::instruments::InstrCtx {
+                rects: &rects,
+                meters: &active.meters,
+                wires: &active.wires,
+                heat: &active.heat,
+                inst_output: active.settings.inst_output,
+                inst_heat: active.settings.inst_heat,
+                inst_latency: active.settings.inst_latency,
+                show_jacks: active.settings.show_jacks,
+                wiring_from: active.wiring_from,
+                drag_cursor: active.drag_cursor,
+                lat_phase: active.lat_phase,
+                stall: active.stall,
+                size,
+            };
+            chrome::instruments::draw(&mut *active.backend, &ctx);
+        }
         // Overlay draws: each reads a few `active.*` fields to build its inputs as
         // locals FIRST, then takes `&mut *active.backend` (disjoint field borrows).
         if let Some(pos) = active.menu {
