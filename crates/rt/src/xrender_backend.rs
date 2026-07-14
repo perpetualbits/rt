@@ -681,6 +681,18 @@ impl Backend for XRenderBackend {
         // changed cells — that is what keeps the *wire* small); only the present
         // is full. Still zero PutImage, so mechanism C's invariant holds.
         let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
+        // Instrument layer OVER the content, when visible this frame. `instr_pic`
+        // is premultiplied ARGB (see `premultiply` + `fill`'s OVER path), so a
+        // plain RENDER `Composite` with `PictOp::OVER` and no mask blends it
+        // straight onto the window Picture — still a server-side RENDER request,
+        // never a client-side pixel upload (PutImage stays 0).
+        if self.instr_visible {
+            let _ = render::composite(
+                &self.conn, render::PictOp::OVER,
+                self.instr_pic, 0u32 /* mask: Picture::NONE */, self.win_pic,
+                0, 0, 0, 0, 0, 0, self.win_w, self.win_h,
+            );
+        }
         let _ = self.conn.flush();
         false // never needs the GL fallback
     }
