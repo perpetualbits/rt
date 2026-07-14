@@ -17,9 +17,25 @@
 #![cfg(feature = "x11")]
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Write a private `$XDG_CONFIG_HOME/rt/config.toml` pinning `inst_remote =
+/// false`, so this guard measures CONTENT geometry only (CompositeGlyphs/
+/// FillRectangles from text/backgrounds), independent of the shipped default
+/// for `inst_remote`/`inst_animate`. Mirrors `instrument_compositing.rs`'s
+/// `write_config` helper. `#[serde(default)]` on `Settings` means this one
+/// line is enough — every other field falls back to `Default`.
+fn write_no_instruments_config(tag: &str) -> PathBuf {
+    let mut base = std::env::temp_dir();
+    base.push(format!("rt_xrender_xdg_{tag}_{}", std::process::id()));
+    let rt_dir = base.join("rt");
+    std::fs::create_dir_all(&rt_dir).expect("create private XDG_CONFIG_HOME/rt");
+    std::fs::write(rt_dir.join("config.toml"), "[settings]\ninst_remote = false\n")
+        .expect("write config.toml");
+    base
+}
 
 /// True if `prog` is runnable (resolves on PATH / is executable).
 fn have(prog: &str) -> bool {
@@ -92,6 +108,7 @@ fn xrender_emits_commands_not_pixels() {
 
     let trace = std::env::temp_dir().join(format!("rt_xrender_trace_{}.txt", std::process::id()));
     let rt_bin = env!("CARGO_BIN_EXE_rt");
+    let cfg_home = write_no_instruments_config("hello");
 
     // xtrace connects upstream to Xvfb (`-d :disp`), creates a proxy/fake display
     // (`-D :fake`) whose DISPLAY it hands the child, and dumps every request the
@@ -109,6 +126,9 @@ fn xrender_emits_commands_not_pixels() {
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
         .env("SHELL", &shell)
+        // Pin instruments OFF so this guard measures content geometry only,
+        // independent of the shipped default.
+        .env("XDG_CONFIG_HOME", &cfg_home) // a temp dir containing rt/config.toml: "inst_remote = false\n"
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -117,6 +137,7 @@ fn xrender_emits_commands_not_pixels() {
     let _ = xvfb.kill();
     let _ = xvfb.wait();
     let _ = std::fs::remove_file(&shell);
+    let _ = std::fs::remove_dir_all(&cfg_home);
 
     let status = status.expect("run xtrace");
     // timeout(1) kills rt with SIGTERM → exit 124; that's the normal path here.
@@ -156,9 +177,11 @@ fn xrender_emits_commands_not_pixels() {
 /// Chrome regression: with the manual overlay open (via the test-only
 /// `RT_OPEN_MANUAL=1` startup hook), the native XRender path must still render
 /// as glyph/fill COMMANDS and ship zero `PutImage` pixel blits — even when an
-/// overlay is showing, not just on the bare "hello world" frame. (Border
-/// instruments are off by default on the remote backend, so this frame has no
-/// RENDER Triangles; the commands-not-pixels invariant is `PutImage == 0`.)
+/// overlay is showing, not just on the bare "hello world" frame. (Instruments
+/// are pinned off via a private `XDG_CONFIG_HOME` — see `write_no_instruments_config`
+/// — so this guard measures content geometry only, independent of the shipped
+/// `inst_remote`/`inst_animate` defaults; the commands-not-pixels invariant is
+/// `PutImage == 0`.)
 #[test]
 #[ignore = "needs Xvfb + xtrace; run with --ignored"]
 fn xrender_chrome_is_commands_not_pixels() {
@@ -193,6 +216,7 @@ fn xrender_chrome_is_commands_not_pixels() {
     let trace =
         std::env::temp_dir().join(format!("rt_xrender_chrome_trace_{}.txt", std::process::id()));
     let rt_bin = env!("CARGO_BIN_EXE_rt");
+    let cfg_home = write_no_instruments_config("chrome");
 
     // With the manual open, the instruments animate continuously underneath it,
     // so this trace is far busier than the sibling test's idle-terminal one
@@ -234,6 +258,9 @@ fn xrender_chrome_is_commands_not_pixels() {
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
         .env("RT_OPEN_MANUAL", "1") // test-only hook: open the manual overlay at startup
         .env("SHELL", &shell)
+        // Pin instruments OFF so this guard measures content geometry only,
+        // independent of the shipped default.
+        .env("XDG_CONFIG_HOME", &cfg_home) // a temp dir containing rt/config.toml: "inst_remote = false\n"
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -242,6 +269,7 @@ fn xrender_chrome_is_commands_not_pixels() {
     let _ = xvfb.kill();
     let _ = xvfb.wait();
     let _ = std::fs::remove_file(&shell);
+    let _ = std::fs::remove_dir_all(&cfg_home);
 
     let status = status.expect("run xtrace");
     eprintln!("xtrace/rt (chrome) exited: {status:?}");
@@ -256,7 +284,7 @@ fn xrender_chrome_is_commands_not_pixels() {
     eprintln!("chrome wire profile: CompositeGlyphs={composite} PutImage={put_image} bytes={bytes}");
 
     // The manual overlay + grid render as glyph/fill COMMANDS, never pixel blits.
-    // (Border instruments are off by default on the remote backend — inst_remote
+    // (Border instruments are pinned off via the private config above — inst_remote
     // — so this frame legitimately has no RENDER Triangles; the invariant that
     // matters is zero PutImage.)
     assert!(composite > 0, "native chrome must emit CompositeGlyphs (text as commands), got 0");
