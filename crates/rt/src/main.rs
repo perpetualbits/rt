@@ -82,7 +82,7 @@ enum Stream {
 
 /// One live patch-bay connection: bytes from `src`'s output stream jack are
 /// written to `dst`'s input jack. Throughput drives the wire's flow animation.
-struct Wire {
+pub(crate) struct Wire {
     src: rt_core::PaneId,
     stream: Stream,
     dst: rt_core::PaneId,
@@ -217,7 +217,7 @@ fn sweep_stale_jacks() {
 /// output rate and an accumulated flow phase. The border flow's speed and
 /// brightness track real output — the motion *is* the measurement.
 #[derive(Default, Clone, Copy)]
-struct Meter {
+pub(crate) struct Meter {
     wakeups: u32, // output events counted since the last tick
     rate: f32,    // smoothed events/second
     phase: f32,   // accumulated flow position (laps; only the fraction matters)
