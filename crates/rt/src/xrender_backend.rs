@@ -420,6 +420,8 @@ impl XRenderBackend {
                 }
             }
         }
+        // keep the draw target pointing at the new back buffer (invalidated on resize)
+        self.dst_pic = self.back_pic;
         // Recreate the instrument layer at the new size, transparent.
         let _ = render::free_picture(&self.conn, self.instr_pic);
         let _ = self.conn.free_pixmap(self.instr_pixmap);
