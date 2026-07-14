@@ -1618,6 +1618,13 @@ impl ApplicationHandler for App {
                             .map(|t| t.first_pane);
                         if let Some(first_pane) = clicked_tab {
                             active.session.focus_tab(first_pane);
+                            // The visible pane set changes but the newly-shown
+                            // panes have no engine damage (their content didn't
+                            // change), so force a full redraw — otherwise the
+                            // XRender back buffer keeps the previous tab's pixels
+                            // (stale content, and re-switching to an already-drawn
+                            // tab shows nothing new). Matches the keyboard path.
+                            active.force_full = true;
                             active.window.request_redraw();
                         } else {
                             active.session.focus_at(mx, my); // click-to-focus

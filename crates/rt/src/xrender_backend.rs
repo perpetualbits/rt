@@ -587,17 +587,19 @@ impl Backend for XRenderBackend {
         self.win_h = h.get() as u16;
         self.recreate_back(); // back buffer must match the new window size
     }
-    fn present(&mut self, _window: &Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
-        // Copy the finished frame from the back buffer to the window in one
-        // server-side CopyArea (no wire pixels): the damage bbox if partial, else
-        // the whole window. This is what makes the update atomic — no flash.
-        let (sx, sy, w, h) = match damage {
-            Some((b, _)) => (b.x as i16, b.y as i16, b.w as u16, b.h as u16),
-            None => (0, 0, self.win_w, self.win_h),
-        };
-        if w > 0 && h > 0 {
-            let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, sx, sy, sx, sy, w, h);
-        }
+    fn present(&mut self, _window: &Window, _damage: Option<(PxRect, &[PxRect])>) -> bool {
+        // ALWAYS copy the whole back buffer to the window, ignoring the damage
+        // bbox. A CopyArea is server-side (zero wire pixels), so a full-window
+        // copy costs the same as a partial one — but it guarantees the complete,
+        // consistent back buffer is what's on screen. Presenting only the damage
+        // bbox was the source of the "half-drawn / grows-as-you-type" borders:
+        // `fill()` draws a whole rect (focus border, divider) into the back buffer
+        // whenever it merely intersects the bbox, but a bbox-only present showed
+        // just the sliver inside the bbox, revealing the rest only as later
+        // frames' bboxes swept over it. The DRAW stays minimal (scissored to the
+        // changed cells — that is what keeps the *wire* small); only the present
+        // is full. Still zero PutImage, so mechanism C's invariant holds.
+        let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
         let _ = self.conn.flush();
         false // never needs the GL fallback
     }
