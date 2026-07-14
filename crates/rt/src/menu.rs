@@ -54,6 +54,67 @@ pub enum MenuPick {
     CopyUrl(String),
 }
 
+/// A native-menu action (backend-agnostic). Maps to a [`MenuPick`] on click.
+pub enum RowAction {
+    Do(Action),
+    OpenUrl(String),
+    CopyUrl(String),
+    Copy,
+    Paste,
+}
+
+impl RowAction {
+    /// Turn a clicked row into the pick the caller applies.
+    pub fn into_pick(self) -> MenuPick {
+        match self {
+            RowAction::Do(a) => MenuPick::Do(a),
+            RowAction::Copy => MenuPick::Do(Action::Copy),
+            RowAction::Paste => MenuPick::Do(Action::Paste),
+            RowAction::OpenUrl(u) => MenuPick::OpenUrl(u),
+            RowAction::CopyUrl(u) => MenuPick::CopyUrl(u),
+        }
+    }
+}
+
+/// One built menu row. `action == None` is a separator (not clickable).
+pub struct Row {
+    pub label: String,
+    pub accel: Option<String>,
+    pub action: Option<RowAction>,
+    pub enabled: bool,
+}
+
+/// The full menu for this frame, top to bottom — the single source of truth for
+/// both the egui menu and the native (XRender) menu. `has_selection` gates Copy;
+/// `url` adds the link rows at the top; `keymap` supplies accelerators.
+pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>) -> Vec<Row> {
+    let mut out = Vec::new();
+    let sep = || Row { label: String::new(), accel: None, action: None, enabled: false };
+    // `shortcut_for` already renders the chord via `Chord`'s `Display` impl (the
+    // same string egui's `shortcut_text` shows), so no extra formatting here.
+    let accel = |a: Action| keymap.shortcut_for(a);
+    if let Some(u) = url {
+        out.push(Row { label: "Open Link".into(), accel: None, action: Some(RowAction::OpenUrl(u.to_string())), enabled: true });
+        out.push(Row { label: "Copy Address".into(), accel: None, action: Some(RowAction::CopyUrl(u.to_string())), enabled: true });
+        out.push(sep());
+    }
+    out.push(Row { label: "Copy".into(), accel: accel(Action::Copy), action: Some(RowAction::Copy), enabled: has_selection });
+    out.push(Row { label: "Paste".into(), accel: accel(Action::Paste), action: Some(RowAction::Paste), enabled: true });
+    out.push(sep());
+    for it in items() {
+        match it {
+            Item::Action(label, action) => out.push(Row {
+                label: label.to_string(),
+                accel: accel(action),
+                action: Some(RowAction::Do(action)),
+                enabled: true,
+            }),
+            Item::Separator => out.push(sep()),
+        }
+    }
+    out
+}
+
 /// Build the context menu for this frame at window position `pos` (egui points).
 /// `has_selection` enables **Copy**; `url` — the address under the right-click,
 /// if any — adds **Open Link** / **Copy Address** at the top (Terminator-style,
@@ -142,5 +203,36 @@ pub fn ui(
         if outside {
             *close = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt_config::Keymap;
+
+    #[test]
+    fn url_rows_present_only_with_a_url() {
+        let km = Keymap::default();
+        let without = rows(&km, false, None);
+        assert!(!without.iter().any(|r| r.label == "Open Link"));
+        let with = rows(&km, false, Some("https://x"));
+        assert!(with.iter().any(|r| r.label == "Open Link"));
+    }
+
+    #[test]
+    fn copy_disabled_without_selection() {
+        let km = Keymap::default();
+        let r = rows(&km, false, None);
+        let copy = r.iter().find(|r| r.label == "Copy").unwrap();
+        assert!(!copy.enabled, "Copy needs a selection");
+        let r2 = rows(&km, true, None);
+        assert!(r2.iter().find(|r| r.label == "Copy").unwrap().enabled);
+    }
+
+    #[test]
+    fn separators_have_no_action() {
+        let r = rows(&Keymap::default(), false, None);
+        assert!(r.iter().any(|r| r.action.is_none()), "at least one separator");
     }
 }

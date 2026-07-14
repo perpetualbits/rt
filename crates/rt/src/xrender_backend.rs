@@ -13,13 +13,76 @@ use fontdue::Font;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 use x11rb::connection::Connection;
-use x11rb::protocol::render::{self, ConnectionExt as _, PictType, Pictformat};
+use x11rb::protocol::render::{self, ConnectionExt as _, PictType, Pictformat, Pointfix, Triangle};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
 
 use crate::backend::Backend;
 use crate::damage::PxRect;
 use crate::render::{Color, FontBlobs};
+
+/// A triangle in f32 window pixels (converted to XRender 16.16 fixed point at draw).
+type TriF = [(f32, f32); 3];
+
+/// Rim subdivisions for a disc/ring of radius `r`: enough that the polygon reads
+/// as a circle at terminal sizes, capped so a big ring stays cheap.
+fn seg_count(r: f32) -> u32 {
+    ((r * 3.0) as u32).clamp(8, 64)
+}
+
+/// Filled disc as a triangle fan (apex = centre, rim = `seg_count(r)` points).
+fn disc_tris(cx: f32, cy: f32, r: f32) -> Vec<TriF> {
+    use std::f32::consts::TAU;
+    let n = seg_count(r);
+    let pt = |k: u32| {
+        let a = TAU * k as f32 / n as f32;
+        (cx + r * a.cos(), cy + r * a.sin())
+    };
+    (0..n).map(|k| [(cx, cy), pt(k), pt((k + 1) % n)]).collect()
+}
+
+/// Annulus (outer `r`, inner `r-width`) as a triangle strip of quads → 2 tris each.
+fn ring_tris(cx: f32, cy: f32, r: f32, width: f32) -> Vec<TriF> {
+    use std::f32::consts::TAU;
+    let ri = (r - width).max(0.0);
+    let n = seg_count(r);
+    let outer = |k: u32| { let a = TAU * k as f32 / n as f32; (cx + r * a.cos(), cy + r * a.sin()) };
+    let inner = |k: u32| { let a = TAU * k as f32 / n as f32; (cx + ri * a.cos(), cy + ri * a.sin()) };
+    let mut out = Vec::with_capacity(n as usize * 2);
+    for k in 0..n {
+        let (o0, o1) = (outer(k), outer((k + 1) % n));
+        let (i0, i1) = (inner(k), inner((k + 1) % n));
+        out.push([o0, o1, i1]);
+        out.push([o0, i1, i0]);
+    }
+    out
+}
+
+/// Thick segment as a quad (2 triangles), butt caps, `width` centred on the line.
+fn line_tris(x0: f32, y0: f32, x1: f32, y1: f32, width: f32) -> Vec<TriF> {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+    // Unit normal, scaled to the half-width.
+    let (nx, ny) = (-dy / len * width * 0.5, dx / len * width * 0.5);
+    let a = (x0 + nx, y0 + ny);
+    let b = (x1 + nx, y1 + ny);
+    let c = (x1 - nx, y1 - ny);
+    let d = (x0 - nx, y0 - ny);
+    vec![[a, b, c], [a, c, d]]
+}
+
+/// Axis-aligned bounds `(x, y, w, h)` of a triangle list (for clip rejection).
+fn tris_bbox(tris: &[TriF]) -> (f32, f32, f32, f32) {
+    let mut lo = (f32::MAX, f32::MAX);
+    let mut hi = (f32::MIN, f32::MIN);
+    for t in tris {
+        for &(x, y) in t {
+            lo = (lo.0.min(x), lo.1.min(y));
+            hi = (hi.0.max(x), hi.1.max(y));
+        }
+    }
+    (lo.0, lo.1, hi.0 - lo.0, hi.1 - lo.1)
+}
 
 /// Convert rt's 0..1 float colour to XRender's 16-bit-per-channel colour.
 fn to_render_color(c: Color) -> render::Color {
@@ -43,6 +106,9 @@ pub struct XRenderBackend {
     glyphset: render::Glyphset, // one shared glyph set (all styles)
     src_pixmap: xproto::Pixmap, // 1x1 repeating solid-colour source
     src_pic: render::Picture,   // the source Picture over `src_pixmap`
+    argb_format: Pictformat,        // 32-bit ARGB format for the alpha source
+    src_pixmap_argb: xproto::Pixmap,// 1x1 repeating alpha-capable source pixmap
+    src_pic_argb: render::Picture,  // the ARGB source Picture (AA primitives)
     cell_w: f32,
     cell_h: f32,
     ascent: f32,
@@ -81,6 +147,10 @@ impl XRenderBackend {
             Some(f) => f,
             None => { log::warn!("xrender: no A8 glyph format found; falling back to GL"); return None; }
         };
+        let argb_format = match argb32_format(&formats) {
+            Some(f) => f,
+            None => { log::warn!("xrender: no 32-bit ARGB format; falling back to GL"); return None; }
+        };
 
         // The window Picture.
         let win_pic = conn.generate_id().ok()?;
@@ -94,6 +164,13 @@ impl XRenderBackend {
         let src_pic = conn.generate_id().ok()?;
         let aux = render::CreatePictureAux::new().repeat(render::Repeat::NORMAL);
         render::create_picture(&conn, src_pic, src_pixmap, win_format, &aux).ok()?;
+
+        // A 1x1 repeating 32-bit ARGB source for the alpha-blended AA primitives.
+        let src_pixmap_argb = conn.generate_id().ok()?;
+        conn.create_pixmap(32, src_pixmap_argb, win, 1, 1).ok()?;
+        let src_pic_argb = conn.generate_id().ok()?;
+        let aux_argb = render::CreatePictureAux::new().repeat(render::Repeat::NORMAL);
+        render::create_picture(&conn, src_pic_argb, src_pixmap_argb, argb_format, &aux_argb).ok()?;
 
         let glyphset = conn.generate_id().ok()?;
         render::create_glyph_set(&conn, glyphset, a8_format).ok()?;
@@ -128,6 +205,9 @@ impl XRenderBackend {
             glyphset,
             src_pixmap,
             src_pic,
+            argb_format,
+            src_pixmap_argb,
+            src_pic_argb,
             cell_w,
             cell_h,
             ascent,
@@ -194,6 +274,32 @@ impl XRenderBackend {
         let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, to_render_color(c), &[rect]);
     }
 
+    /// Composite a triangle mesh in colour `c` (straight alpha) onto the back
+    /// buffer with anti-aliasing: fill the 1x1 ARGB source with the *premultiplied*
+    /// colour, then `render::triangles` OVER through the A8 mask format so the
+    /// per-edge coverage is antialiased. Server-side geometry — zero wire pixels.
+    fn draw_tris(&self, tris: &[TriF], c: Color) {
+        if tris.is_empty() { return; }
+        // Clip rejection: skip meshes wholly outside the damage clip.
+        if let Some(b) = self.clip {
+            let (x, y, w, h) = tris_bbox(tris);
+            if !rect_intersects(x, y, w, h, b) { return; }
+        }
+        // Premultiplied ARGB solid source (OVER expects premultiplied alpha).
+        let s = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
+        let premult = render::Color { red: s(c.0 * c.3), green: s(c.1 * c.3), blue: s(c.2 * c.3), alpha: s(c.3) };
+        let one = xproto::Rectangle { x: 0, y: 0, width: 1, height: 1 };
+        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.src_pic_argb, premult, &[one]);
+        // f32 window px → 16.16 fixed point.
+        let fx = |v: f32| (v * 65536.0).round() as i32;
+        let mk = |(x, y): (f32, f32)| Pointfix { x: fx(x), y: fx(y) };
+        let hw: Vec<Triangle> = tris.iter().map(|t| Triangle { p1: mk(t[0]), p2: mk(t[1]), p3: mk(t[2]) }).collect();
+        let _ = render::triangles(
+            &self.conn, render::PictOp::OVER, self.src_pic_argb, self.back_pic,
+            self.a8_format, 0, 0, &hw,
+        );
+    }
+
     /// Recreate the back buffer at the current window size (after a resize). The
     /// new pixmap's contents are undefined, but the resize path arms a full redraw,
     /// so `begin_frame` clears and repaints it before `present` copies it out.
@@ -239,6 +345,16 @@ fn a8_format(formats: &render::QueryPictFormatsReply) -> Option<Pictformat> {
         .formats
         .iter()
         .find(|f| f.type_ == PictType::DIRECT && f.depth == 8 && f.direct.alpha_mask == 0xff && f.direct.red_mask == 0)
+        .map(|f| f.id)
+}
+
+/// Find a 32-bit DIRECT ARGB format for the alpha-blended solid source (packet
+/// glow needs true alpha, unlike the opaque 24-bit `src_pic`).
+fn argb32_format(formats: &render::QueryPictFormatsReply) -> Option<Pictformat> {
+    formats
+        .formats
+        .iter()
+        .find(|f| f.type_ == PictType::DIRECT && f.depth == 32 && f.direct.alpha_mask == 0xff)
         .map(|f| f.id)
 }
 
@@ -374,6 +490,15 @@ impl Backend for XRenderBackend {
         self.fill(x, y, w, t, c);
         self.fill(x, y + h - t, w, t, c);
     }
+    fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: Color) {
+        self.draw_tris(&disc_tris(cx, cy, r), c);
+    }
+    fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
+        self.draw_tris(&ring_tris(cx, cy, r, width), c);
+    }
+    fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
+        self.draw_tris(&line_tris(x0, y0, x1, y1, width), c);
+    }
     fn end_frame(&mut self) {}
 
     fn resize_surface(&mut self, w: std::num::NonZeroU32, h: std::num::NonZeroU32) {
@@ -426,10 +551,57 @@ impl Drop for XRenderBackend {
         let _ = render::free_picture(&self.conn, self.win_pic);
         let _ = render::free_picture(&self.conn, self.back_pic);
         let _ = render::free_picture(&self.conn, self.src_pic);
+        let _ = render::free_picture(&self.conn, self.src_pic_argb);
+        let _ = xproto::free_pixmap(&self.conn, self.src_pixmap_argb);
         let _ = render::free_glyph_set(&self.conn, self.glyphset);
         let _ = xproto::free_pixmap(&self.conn, self.back_pixmap);
         let _ = xproto::free_pixmap(&self.conn, self.src_pixmap);
         let _ = xproto::free_gc(&self.conn, self.gc);
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod geom_tests {
+    use super::*;
+
+    #[test]
+    fn disc_is_a_fan_on_radius() {
+        let n = seg_count(9.0);
+        let tris = disc_tris(50.0, 40.0, 9.0);
+        assert_eq!(tris.len() as u32, n, "one triangle per rim segment");
+        // Every rim vertex is ~9px from the centre.
+        for t in &tris {
+            for &(x, y) in &[t[1], t[2]] {
+                let d = ((x - 50.0).powi(2) + (y - 40.0).powi(2)).sqrt();
+                assert!((d - 9.0).abs() < 0.01, "rim vertex off-circle: {d}");
+            }
+            assert_eq!(t[0], (50.0, 40.0), "fan apex is the centre");
+        }
+    }
+
+    #[test]
+    fn ring_has_inner_and_outer_radius() {
+        let tris = ring_tris(30.0, 30.0, 4.0, 1.4);
+        assert!(!tris.is_empty());
+        let mut saw_outer = false;
+        let mut saw_inner = false;
+        for t in &tris {
+            for &(x, y) in t {
+                let d = ((x - 30.0).powi(2) + (y - 30.0).powi(2)).sqrt();
+                if (d - 4.0).abs() < 0.02 { saw_outer = true; }
+                if (d - 2.6).abs() < 0.02 { saw_inner = true; } // 4.0 - 1.4
+            }
+        }
+        assert!(saw_outer && saw_inner, "ring must touch both radii");
+    }
+
+    #[test]
+    fn line_is_two_triangles_of_correct_width() {
+        // A horizontal segment, width 2 → a 10x2 quad centred on y=20.
+        let tris = line_tris(10.0, 20.0, 20.0, 20.0, 2.0);
+        assert_eq!(tris.len(), 2, "a quad is two triangles");
+        let (_, y, _, h) = tris_bbox(&tris);
+        assert!((y - 19.0).abs() < 0.01 && (h - 2.0).abs() < 0.01, "half-width each side");
     }
 }

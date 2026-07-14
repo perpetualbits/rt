@@ -38,6 +38,16 @@ pub trait Backend {
     fn bell_stripe(&mut self, x: f32, y: f32, w: f32, h: f32);
     fn end_frame(&mut self);
 
+    // --- anti-aliased chrome primitives (native XRender chrome, Slice 2) ---
+    // Default no-ops: the GL backend never draws native chrome (it uses egui),
+    // so only XRenderBackend overrides these. Coords are window pixels.
+    /// Filled anti-aliased disc, alpha-composited (OVER).
+    fn fill_circle(&mut self, _cx: f32, _cy: f32, _r: f32, _c: Color) {}
+    /// Anti-aliased ring of the given stroke width (outer radius `r`).
+    fn stroke_circle(&mut self, _cx: f32, _cy: f32, _r: f32, _width: f32, _c: Color) {}
+    /// Anti-aliased thick line segment (butt caps).
+    fn stroke_line(&mut self, _x0: f32, _y0: f32, _x1: f32, _y1: f32, _width: f32, _c: Color) {}
+
     // --- present + surface plumbing ---------------------------------------
     /// Resize the presentation surface (the GL window surface) to `w`×`h`.
     fn resize_surface(&mut self, w: NonZeroU32, h: NonZeroU32);
