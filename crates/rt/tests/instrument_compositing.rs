@@ -8,16 +8,14 @@
 //! (`PutImage == 0`) established by `xrender_commands.rs` must still hold.
 //!
 //! Full assertion (instrument-green pixels appear on screen when instruments
-//! are forced on, and are absent when they're off) needs Task 5: nothing yet
-//! *draws* onto the instrument layer (`begin_instrument_layer`/
-//! `end_instrument_layer` are not wired into the frame loop), so the layer
-//! stays fully transparent this task and green pixels legitimately can't show
-//! up yet regardless of config. That half of the test is written now as a
-//! separate `#[ignore]`d test (`instrument_green_appears_when_visible`) that
-//! is EXPECTED TO FAIL until Task 5 lands the drawing; see the TODO(task5) on
-//! it. Task 4's own gate — this file's first test — asserts only the
-//! mechanical invariants: both configurations render without error, and
-//! `PutImage == 0` in both traces.
+//! are forced on, and are absent when they're off) needs Task 5:
+//! `begin_instrument_layer`/`end_instrument_layer` are now wired into the
+//! frame loop (`main.rs`'s `paint_overlays_or_instruments`, on a 6fps tick
+//! decoupled from content frames), so real jack/wire/border geometry lands on
+//! the layer and this now passes for real — see
+//! `instrument_green_appears_when_visible` below. Task 4's own gate — this
+//! file's first test — asserts only the mechanical invariants: both
+//! configurations render without error, and `PutImage == 0` in both traces.
 //!
 //! Needs `Xvfb` + `xtrace` + ImageMagick's `convert` on PATH. Run explicitly:
 //!   cargo test -p rt --features x11 --test instrument_compositing -- --ignored --nocapture
@@ -122,14 +120,15 @@ fn run_and_capture(tag: &str, disp: u32, xdg_config_home: &Path) -> (String, Pat
     // xtrace connects upstream to Xvfb (`-d :disp`), creates a proxy display
     // (`-D :fake`) whose DISPLAY it hands the child, and dumps every request the
     // child sends. `-n` skips xauth copying (Xvfb here runs without auth). We
-    // bound rt with `timeout` so it exits on its own.
-    let status = Command::new("xtrace")
+    // bound rt with `timeout` as a backstop, but explicitly kill our own spawned
+    // child below well before it fires (see the screenshot-timing note).
+    let mut child = Command::new("xtrace")
         .arg("-n")
         .args(["-d", &format!(":{disp}")])
         .args(["-D", &format!(":{fake}")])
         .args(["-o", trace.to_str().unwrap(), "--"])
         .arg("timeout")
-        .arg("3") // > rt's cold-start + first-render, < the shell's 5 s idle
+        .arg("5")
         .arg(rt_bin)
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
@@ -138,12 +137,19 @@ fn run_and_capture(tag: &str, disp: u32, xdg_config_home: &Path) -> (String, Pat
         .env("SHELL", &shell)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+        .expect("spawn xtrace");
 
-    // Screenshot the real display (:disp, not the xtrace proxy) while rt was
-    // rendering would race the timeout; instead grab it right after: Xvfb keeps
-    // the last-drawn frame on its root window until torn down, so a post-hoc
-    // `xwd -root` against :disp still captures rt's final on-screen frame.
+    // Screenshot the real display (:disp, not the xtrace proxy) WHILE rt is
+    // still alive. A post-exit capture is unusable: an X server destroys all
+    // resources (including the window) owned by a client's connection the
+    // moment that connection closes, so the screen area it occupied reverts to
+    // the root background before a post-hoc `xwd -root` can see it (verified:
+    // capturing after `wait` on the child produces an all-black PNG). Sleeping
+    // past rt's cold-start + first-render (~1.5s) plus a couple of
+    // `INSTRUMENT_TICK`s (166ms each) before grabbing the shot guarantees the
+    // instrument layer has been drawn at least once.
+    std::thread::sleep(Duration::from_millis(2200));
     let xwd_status = Command::new("xwd")
         .args(["-root", "-display", &format!(":{disp}")])
         .stdout(Stdio::piped())
@@ -160,6 +166,10 @@ fn run_and_capture(tag: &str, disp: u32, xdg_config_home: &Path) -> (String, Pat
             let _ = xwd.wait();
             convert
         });
+
+    // Stop exactly the process we spawned (never by name/pattern), then reap it.
+    let _ = child.kill();
+    let status = child.wait();
 
     // Tear down the Xvfb we own, and the temp shell, regardless of outcome.
     let _ = xvfb.kill();
@@ -186,10 +196,19 @@ fn green_mean(png: &Path, hex: &str, fuzz_pct: u32) -> Option<f64> {
     if !png.exists() {
         return None;
     }
+    // NOTE: `-fuzz` stays in effect for every later color op until reset, so
+    // the second `+opaque white` (paint everything NOT white to black) must
+    // reset it to 0% first — otherwise near-white anti-aliased text survives
+    // as light grey ("close enough to white" under the still-active fuzz)
+    // instead of being blackened, contaminating the mean with non-green
+    // pixels. Verified against a real screenshot: without the reset, an
+    // instruments-OFF render (no green drawn at all) still read mean > 0
+    // purely from light-grey text edges; with the reset it reads exactly 0.
     let out = Command::new("convert")
         .arg(png)
         .args(["-fuzz", &format!("{fuzz_pct}%")])
         .args(["-fill", "white", "-opaque", hex])
+        .args(["-fuzz", "0%"])
         .args(["-fill", "black", "+opaque", "white"])
         .args(["-format", "%[fx:mean]"])
         .arg("info:")
@@ -255,28 +274,16 @@ fn instrument_layer_composites_without_pixel_upload() {
     std::fs::remove_dir_all(xdg_off.parent().unwrap_or(&xdg_off)).ok();
 }
 
-/// TODO(task5): this is the REAL end-to-end assertion for the instrument
-/// layer — instrument-green pixels appear on screen when `inst_remote` +
-/// `inst_animate` are forced on, and are absent when they're off — but it can
-/// only pass once Task 5 wires `begin_instrument_layer`/`end_instrument_layer`
-/// into the frame loop so something actually draws jacks/borders onto the
-/// layer. Right now the layer stays fully transparent regardless of config
-/// (Task 4 only makes `present()` composite it — see the sibling test above),
-/// so this would fail if run. Deliberately inert by default: it no-ops unless
-/// `RT_TEST_TASK5_GREEN=1` is set, so neither plain `cargo test` NOR
-/// `cargo test -- --ignored` (Task 4's own verification command) can trip it.
-/// Task 5's verification step should run it with that env var set and, once
-/// green, delete this opt-in guard.
+/// The REAL end-to-end assertion for the instrument layer — instrument-green
+/// pixels appear on screen when `inst_remote` + `inst_animate` are forced on,
+/// and are absent when they're off. Now that Task 5 wires
+/// `begin_instrument_layer`/`end_instrument_layer` into the frame loop (a
+/// 6fps tick in `paint_overlays_or_instruments`, decoupled from content
+/// frames), real jack/wire/border geometry lands on the layer and this
+/// passes for real.
 #[test]
-#[ignore = "needs Xvfb + xtrace + ImageMagick; TODO(task5) — set RT_TEST_TASK5_GREEN=1 to activate, expected to fail before Task 5 lands"]
+#[ignore = "needs Xvfb + xtrace + ImageMagick; run with --ignored"]
 fn instrument_green_appears_when_visible() {
-    if std::env::var("RT_TEST_TASK5_GREEN").as_deref() != Ok("1") {
-        eprintln!(
-            "SKIP instrument_green_appears_when_visible: inert until Task 5 wires the instrument draw path; \
-             set RT_TEST_TASK5_GREEN=1 to run it for real"
-        );
-        return;
-    }
     if !have("Xvfb") || !have("xtrace") || !have("convert") || !have("xwd") {
         eprintln!("SKIP instrument_green_appears_when_visible: needs Xvfb, xtrace, xwd and convert (ImageMagick) on PATH");
         return;
@@ -302,4 +309,156 @@ fn instrument_green_appears_when_visible() {
 
     assert!(mean_on > 0.0, "green mean: expected instrument-green pixels with inst_remote=true, found none (mean={mean_on})");
     assert_eq!(mean_off, 0.0, "green mean: expected NO instrument-green pixels with inst_remote=false, found some (mean={mean_off})");
+}
+
+/// A shell that keeps one CPU core spinning forever and prints NOTHING. Feeds
+/// the heat instrument (`/proc` CPU sampling, sampled independently of any
+/// pane output) without ever touching stdout, so the pane's on-screen text
+/// stays static while rt still has a reason to keep the instrument layer
+/// ticking (a live heat border). This is the "silent" side of the decoupling
+/// guard below: visually quiet, but not so inert that the animation state
+/// starves — see the big comment on `instrument_ticks_decoupled_from_output`
+/// for why literal silence (a `sleep`-only shell) doesn't exercise anything.
+fn write_busy_silent_shell(tag: &str) -> PathBuf {
+    let mut shell = std::env::temp_dir();
+    shell.push(format!("rt_instr_busy_{tag}_{}.sh", std::process::id()));
+    let mut f = std::fs::File::create(&shell).expect("create busy shell");
+    f.write_all(b"#!/bin/sh\ni=0\nwhile true; do i=$((i+1)); done\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    shell
+}
+
+/// A shell that floods stdout as fast as possible, forever: the "content
+/// frames" side of the decoupling guard below — the pane scrolls continuously,
+/// generating far more `CompositeGlyphs` than the busy-silent shell above.
+fn write_flood_shell(tag: &str) -> PathBuf {
+    let mut shell = std::env::temp_dir();
+    shell.push(format!("rt_instr_flood_{tag}_{}.sh", std::process::id()));
+    let mut f = std::fs::File::create(&shell).expect("create flood shell");
+    f.write_all(b"#!/bin/sh\nyes 'flood flood flood flood flood filler filler filler filler filler filler filler'\n")
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    shell
+}
+
+/// Run rt for exactly `run_secs` under Xvfb+xtrace with the given shell and
+/// instruments forced on, returning the raw trace dump. No screenshot here —
+/// this guard only counts wire requests, so it skips `xwd`/`convert` entirely.
+fn run_traced(tag: &str, disp: u32, xdg_config_home: &Path, shell: &Path, run_secs: u64) -> String {
+    let Some(mut xvfb) = start_xvfb(disp) else {
+        panic!("Xvfb :{disp} did not come up for run '{tag}'");
+    };
+
+    let trace = std::env::temp_dir().join(format!("rt_instr_decouple_trace_{tag}_{}.txt", std::process::id()));
+    let rt_bin = env!("CARGO_BIN_EXE_rt");
+    let fake = disp + 50;
+
+    let status = Command::new("xtrace")
+        .arg("-n")
+        .args(["-d", &format!(":{disp}")])
+        .args(["-D", &format!(":{fake}")])
+        .args(["-o", trace.to_str().unwrap(), "--"])
+        .arg("timeout")
+        .arg(run_secs.to_string()) // bounds rt; both runs use the same duration
+        .arg(rt_bin)
+        .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
+        .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
+        .env("RT_SPLIT", "v") // side-by-side split: more than one pane's borders/jacks to draw
+        .env("XDG_CONFIG_HOME", xdg_config_home) // private config: force inst_remote/inst_animate
+        .env("SHELL", shell)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let _ = xvfb.kill();
+    let _ = xvfb.wait();
+
+    let status = status.expect("run xtrace");
+    eprintln!("[{tag}] xtrace/rt exited: {status:?}");
+
+    let dump = std::fs::read_to_string(&trace).unwrap_or_default();
+    let _ = std::fs::remove_file(&trace);
+    assert!(!dump.is_empty(), "[{tag}] xtrace produced no output — did rt connect to :{disp}?");
+    dump
+}
+
+/// The falsifiable decoupling guard: instrument geometry volume tracks
+/// wall-clock ticks, not keystroke/output volume. Two equal-length traces,
+/// both with instruments forced on (`inst_remote` + `inst_animate`):
+///
+/// - "silent": a shell that burns CPU forever but prints nothing. The pane's
+///   text never changes, but the heat border still has a reason to animate
+///   (`/proc` CPU sampling — sampled independently of any pane output, see
+///   `sample_heat`), so the instrument layer keeps redrawing at rt's throttled
+///   animation cadence (`INSTRUMENT_TICK` = 166ms, further capped to ~2fps by
+///   `anim_min` under a software/llvmpipe GL context, which Xvfb always is —
+///   see `about_to_wait`). A truly inert shell (just `sleep`) was tried first
+///   and rejected: with zero CPU/output/focus/bell activity at all, `anim`
+///   never becomes true even once past the first frame (in EITHER the old or
+///   new code — this is a pre-existing, unrelated property of the animation
+///   gate, not something this task changes), so it only ever measures the
+///   single first-show draw and can't distinguish "ticking at a bounded rate"
+///   from "frozen" — not a useful baseline for THIS guard.
+/// - "flood": a shell that floods stdout as fast as possible forever (`yes`).
+///   Massive content-frame volume (`CompositeGlyphs`), on top of the same
+///   heat-driven ticking.
+///
+/// The claim under test: `Triangles` (the instrument-layer geometry — jack
+/// circles are glyph-stamped, but the wire/latency-frame strokes are RENDER
+/// `Triangles`, and nothing else in this codebase emits `Triangles` — see
+/// `chrome/instruments.rs`' `stroke_line`) stays within the same order of
+/// magnitude regardless of the output flood, because it is paced by
+/// `INSTRUMENT_TICK`'s wall-clock cadence, not by how much content flows.
+/// Meanwhile `CompositeGlyphs` (content text) scales hugely with the flood.
+/// Before Task 5, the native path redrew instruments on every content-forced
+/// full frame — so heavier output (more frequent `dirty`/full-frame activity)
+/// would have re-shipped instrument geometry more often, not at a fixed rate.
+#[test]
+#[ignore = "needs Xvfb + xtrace; run with --ignored"]
+fn instrument_ticks_decoupled_from_output() {
+    if !have("Xvfb") || !have("xtrace") {
+        eprintln!("SKIP instrument_ticks_decoupled_from_output: needs Xvfb and xtrace on PATH");
+        return;
+    }
+
+    let disp_silent: u32 = 331 + (std::process::id() % 20);
+    let disp_flood: u32 = 361 + (std::process::id() % 20);
+    const RUN_SECS: u64 = 4; // > cold-start + first-render (~1.5s), several ticks after
+
+    let xdg_silent = write_config("decouple_silent", true, true);
+    let xdg_flood = write_config("decouple_flood", true, true);
+    let silent_shell = write_busy_silent_shell("decouple");
+    let flood_shell = write_flood_shell("decouple");
+
+    let dump_silent = run_traced("decouple_silent", disp_silent, &xdg_silent, &silent_shell, RUN_SECS);
+    let dump_flood = run_traced("decouple_flood", disp_flood, &xdg_flood, &flood_shell, RUN_SECS);
+
+    std::fs::remove_file(&silent_shell).ok();
+    std::fs::remove_file(&flood_shell).ok();
+    std::fs::remove_dir_all(xdg_silent.parent().unwrap_or(&xdg_silent)).ok();
+    std::fs::remove_dir_all(xdg_flood.parent().unwrap_or(&xdg_flood)).ok();
+
+    let silent_triangles = dump_silent.matches("Triangles").count();
+    let flood_triangles = dump_flood.matches("Triangles").count();
+    let silent_glyphs = dump_silent.matches("CompositeGlyphs").count();
+    let flood_glyphs = dump_flood.matches("CompositeGlyphs").count();
+    eprintln!(
+        "decoupling counts: silent_triangles={silent_triangles} flood_triangles={flood_triangles} \
+         silent_glyphs={silent_glyphs} flood_glyphs={flood_glyphs}"
+    );
+
+    // silent_triangles ≈ flood_triangles (both ~ the same throttled tick rate
+    // over the same wall-clock duration), but flood_glyphs >> silent_glyphs.
+    assert!(flood_triangles as f64 <= 2.0 * silent_triangles as f64 + 50.0,
+        "instrument geometry rode on output: silent={silent_triangles} flood={flood_triangles}");
+    assert!(flood_glyphs > silent_glyphs * 3,
+        "expected far more text glyphs under output flood: silent={silent_glyphs} flood={flood_glyphs}");
 }

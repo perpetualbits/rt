@@ -297,6 +297,9 @@ struct Active {
     damage_history: std::collections::VecDeque<crate::damage::FrameDamage>, // recent frames' damage, for buffer-age
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
     last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
+    instr_tick: bool,                     // redraw the instrument layer this frame (6fps, native path)
+    last_instr_tick: Instant,             // when the instrument layer was last redrawn
+    instr_layer_drawn: bool,              // the instrument layer has been drawn at least once since last shown
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -977,6 +980,9 @@ impl ApplicationHandler for App {
             damage_history: std::collections::VecDeque::new(),
             force_full: true, // first frame is always a full redraw
             last_focus: init_focus,
+            instr_tick: false,
+            last_instr_tick: Instant::now(),
+            instr_layer_drawn: false,
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so its egui rendering can be screenshotted.
@@ -1904,14 +1910,17 @@ impl ApplicationHandler for App {
         if anim && now.duration_since(active.last_anim) >= anim_min {
             active.last_anim = now;
             dirty = true;
-            // Native (XRender): the perimeter chrome (instruments + wires) is
-            // drawn only on full frames — a partial frame can't redraw the
-            // perimeter without eroding the static border or trailing the moving
-            // packets. An animation repaint IS that full frame, throttled to
-            // ~2fps by `anim_min`, so keystrokes and output stay on the minimal
-            // scissored path between ticks (no whole-screen re-send under load).
-            if !active.backend.supports_egui() {
-                active.force_full = true;
+            if active.backend.supports_egui() {
+                // GL: egui redraws instruments inline every frame (target "A").
+            } else if active.settings.inst_remote
+                && active.settings.inst_animate
+                && now.duration_since(active.last_instr_tick) >= INSTRUMENT_TICK
+            {
+                // Native: redraw ONLY the instrument layer at 6fps; the content
+                // buffer stays on the scissored path. No content full frame.
+                active.instr_tick = true;
+                active.last_instr_tick = now;
+                dirty = true;
             }
         }
         // While the search bar is open, keep its results current as new output
@@ -2572,23 +2581,19 @@ impl App {
         // engine damage state — runs exactly once per pane per frame.
         active.damage.begin_frame();
         let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
-        // Native (XRender) chrome: the border instruments + patch-bay are drawn
-        // over a persistent back buffer and span the pane perimeters, so any
-        // frame that shows them must be FULL. A partial frame would (a) erode the
-        // static border/jacks — a scissored clear erases the pixels under its
-        // bbox and the instruments outside it are never redrawn — and (b) trail
-        // the moving packets (their previous position isn't cleared). XRender
-        // full frames are commands-only (~KB), so this stays cheap; a keystroke
-        // A partial (scissored) frame is correct only when it can bound ALL of
-        // this frame's damage. On the native (XRender) path the animated chrome —
-        // border instruments AND patch-bay wires — is drawn only on full
-        // ANIMATION frames (see `about_to_wait`, throttled to ~2fps), so partial
-        // content frames stay MINIMAL: a keystroke or a line of output re-sends
-        // only the changed cells, never the whole screen. That is the whole point
-        // of mechanism C, and forcing full frames here for instruments/wires
-        // (an earlier bug) saturated the ssh link under load. On the GL path the
-        // wires are egui chrome blended every frame across arbitrary inter-pane
-        // regions the partial path can't bound, so any wire still forces full there.
+        // Native (XRender) chrome: the border instruments + patch-bay now live on
+        // their OWN persistent ARGB layer (`instr_pic`), composited over content
+        // by `present()` independently of whether this frame's content damage is
+        // full or partial (Task 3/4/5). So content damage no longer needs to be
+        // marked full just because instruments are visible: the instrument layer
+        // is redrawn on its own 6fps `instr_tick` cadence (see `about_to_wait`
+        // and `paint_overlays_or_instruments`), decoupled from keystroke/output
+        // frames — a keystroke or a line of output re-sends only the changed
+        // cells, never the whole screen. That is the whole point of mechanism C;
+        // forcing full content frames for instruments/wires (an earlier bug)
+        // saturated the ssh link under load. On the GL path the wires are egui
+        // chrome blended every frame across arbitrary inter-pane regions the
+        // partial path can't bound, so any wire still forces full there.
         if active.force_full
             || overlay_open
             || active.session.focus() != active.last_focus // focus moved: the blue border shifts panes with no cell-damage → full
@@ -3047,32 +3052,39 @@ impl App {
             return;
         }
         // Native (XRender) path: preferences is egui-only (force-closed above), so
-        // it is never open here. Draw the instruments first (background layer),
-        // then whichever overlay is up on top of them — otherwise the overlay's
-        // text would be composited underneath the animated meters/wires.
-        //
-        // This dispatch runs on FULL frames only (redraw_scissored skips it on
-        // the native path; animation ticks force a full frame — see
-        // `about_to_wait`). So the scissor is clear and the instrument layer is
-        // redrawn whole over a freshly-cleared buffer: no eroded border, no
-        // packet trail. First advance the instrument flow by real wall-clock time.
-        let now = Instant::now();
-        let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
-        active.last_meter_tick = now;
+        // it is never open here. The instrument layer is a persistent, separate
+        // ARGB picture composited over content by `present()` (Task 3/4); it is
+        // redrawn only on a 6fps `instr_tick` (or the first time it's shown), NOT
+        // on every content frame — so a keystroke/output burst on the scissored
+        // path never re-ships instrument geometry (see `about_to_wait`). Whichever
+        // overlay is up (menu/manual/search) is drawn on top of it, unchanged.
         let size = active.window.inner_size();
         let (cw, ch) = active.backend.cell_size();
         // Over the remote (XRender) backend the instruments are OFF by default
-        // (`inst_remote`): the layer is redrawn on every full frame, and over a
-        // slow ssh -X link that makes tab/menu/scroll lag — so remotely rt is a
-        // plain, fast terminal unless the user opts in. Also skip the layer while
-        // dragging the scrollbar (each drag frame is forced-full; grid-only keeps
-        // it cheap — the instruments repaint on drag-release via force_full).
-        if active.settings.inst_remote && active.scroll_drag.is_none() {
+        // (`inst_remote`); the user opts in. Also hide the layer while an overlay
+        // (menu/manual/search) is up, or while dragging the scrollbar (the
+        // instruments repaint on drag-release via force_full).
+        let overlay_up = active.prefs_open || active.menu.is_some() || active.manual_open || active.search_open;
+        let show = active.settings.inst_remote && !overlay_up && active.scroll_drag.is_none();
+        if !show {
+            active.instr_layer_drawn = false; // next show redraws the layer fresh
+        }
+        active.backend.set_instrument_layer_visible(show);
+        // Redraw the layer's geometry only on a 6fps tick (or the first show), so
+        // typing/output never re-ships instrument geometry. Advance the flow by
+        // real wall-clock time elapsed since the LAST ADVANCE (this block only
+        // runs at tick cadence), so wire packets/meters move at the right speed
+        // regardless of how often content frames happen to run.
+        if show && (active.instr_tick || !active.instr_layer_drawn) {
+            let now = Instant::now();
+            let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
+            active.last_meter_tick = now;
             advance_instrument_state(&mut active.meters, &mut active.wires, dt);
             // Build the borrowing context from DISJOINT fields so `&mut
             // active.backend` coexists with the `&active.*` reads.
             let bounds = content_bounds(size);
             let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
+            active.backend.begin_instrument_layer();
             let ctx = chrome::instruments::InstrCtx {
                 rects: &rects,
                 meters: &active.meters,
@@ -3089,7 +3101,10 @@ impl App {
                 size,
             };
             chrome::instruments::draw(&mut *active.backend, &ctx);
+            active.backend.end_instrument_layer();
+            active.instr_layer_drawn = true;
         }
+        active.instr_tick = false; // consume the tick
         // Overlay draws: each reads a few `active.*` fields to build its inputs as
         // locals FIRST, then takes `&mut *active.backend` (disjoint field borrows).
         if let Some(pos) = active.menu {
@@ -3204,12 +3219,16 @@ impl App {
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame();
         // GL blends its egui instruments into the scissored region every frame.
-        // The native (XRender) path draws its perimeter chrome (instruments,
-        // wires) only on full ANIMATION frames (2fps), so a scissored native
-        // frame stays minimal — changed cells only — and leaves the persistent
-        // instrument layer untouched in the window (server-side). It is refreshed
-        // on the next animation tick.
-        if active.backend.supports_egui() {
+        // The native (XRender) path draws its instrument layer separately from
+        // the content back buffer (a persistent ARGB picture composited by
+        // `present()`), so a scissored content frame stays minimal — changed
+        // cells only. But a native instrument tick must still run here (not just
+        // on full frames): otherwise a tick that lands on a frame with no content
+        // damage (the common case — ticks are decoupled from typing) would never
+        // get its `paint_overlays_or_instruments` call and the layer would go
+        // stale. `instr_tick` gates that: set only at 6fps in `about_to_wait`, so
+        // this doesn't reintroduce coupling to keystroke/output frames.
+        if active.backend.supports_egui() || active.instr_tick {
             Self::paint_overlays_or_instruments(active);
         }
         active.backend.clear_scissor(); // next frame starts with a clean scissor
@@ -3880,6 +3899,8 @@ const WINDOW_MARGIN: f32 = 8.0;
 
 /// Fast wake interval while animating or interacting (~60fps).
 const ACTIVE_POLL: Duration = Duration::from_millis(16);
+/// Remote instrument layer redraw cadence: 6fps, decoupled from content frames.
+const INSTRUMENT_TICK: Duration = Duration::from_millis(166);
 /// Idle wake interval: when nothing is happening we still wake this often to
 /// notice async PTY output and heat changes, but at ~10Hz instead of 60 — a
 /// fraction of the cost, still prompt enough that output appears without lag.
