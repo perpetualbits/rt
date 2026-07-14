@@ -101,6 +101,13 @@ fn to_render_color(c: Color) -> render::Color {
     render::Color { red: s(c.0), green: s(c.1), blue: s(c.2), alpha: s(c.3) }
 }
 
+/// Premultiply a straight-alpha colour into the 16-bit RENDER colour that
+/// `Composite(OVER)` expects: each channel scaled by alpha, alpha preserved.
+fn premultiply(c: Color) -> render::Color {
+    let s = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
+    render::Color { red: s(c.0 * c.3), green: s(c.1 * c.3), blue: s(c.2 * c.3), alpha: s(c.3) }
+}
+
 pub struct XRenderBackend {
     conn: RustConnection,
     window: u32,                // X window id (CopyArea destination)
@@ -114,6 +121,8 @@ pub struct XRenderBackend {
     // currently target. Normally `back_pic` (the content buffer); temporarily
     // switched to the instrument layer between `begin/end_instrument_layer`.
     dst_pic: render::Picture,
+    drawing_instruments: bool, // true between begin/end_instrument_layer: fill() uses OVER+premultiplied
+    instr_visible: bool,       // whether present() composites the instrument layer this frame
     gc: xproto::Gcontext,       // GC for the pixmap->window CopyArea
     depth: u8,                  // window/pixmap depth (for back-buffer recreation)
     win_format: Pictformat,     // the window's Pictformat (for back-buffer recreation)
@@ -239,6 +248,8 @@ impl XRenderBackend {
             back_pixmap,
             back_pic,
             dst_pic: back_pic, // starts as the content buffer
+            drawing_instruments: false,
+            instr_visible: false,
             gc,
             depth,
             win_format,
@@ -327,14 +338,19 @@ impl XRenderBackend {
             }
         }
         let rect = xproto::Rectangle { x: x as i16, y: y as i16, width: w.max(0.0) as u16, height: h.max(0.0) as u16 };
-        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.dst_pic, to_render_color(c), &[rect]);
+        if self.drawing_instruments {
+            // ARGB layer: OVER with premultiplied colour so alpha blends correctly.
+            let _ = render::fill_rectangles(&self.conn, render::PictOp::OVER, self.dst_pic, premultiply(c), &[rect]);
+        } else {
+            // Content buffer: opaque SRC, exactly as before.
+            let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.dst_pic, to_render_color(c), &[rect]);
+        }
     }
 
     /// Set the 1x1 repeating ARGB source to `c` (straight alpha), premultiplied as
     /// OVER expects, ready to be modulated by a shape mask or a triangle mesh.
     fn set_argb_src(&self, c: Color) {
-        let s = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
-        let premult = render::Color { red: s(c.0 * c.3), green: s(c.1 * c.3), blue: s(c.2 * c.3), alpha: s(c.3) };
+        let premult = premultiply(c);
         let one = xproto::Rectangle { x: 0, y: 0, width: 1, height: 1 };
         let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.src_pic_argb, premult, &[one]);
     }
@@ -633,6 +649,20 @@ impl Backend for XRenderBackend {
     }
     fn end_frame(&mut self) {}
 
+    fn begin_instrument_layer(&mut self) {
+        self.clear_instr_layer();          // fresh transparent layer each tick
+        self.dst_pic = self.instr_pic;     // retarget drawing at the layer
+        self.clip = None;                  // the whole layer is in play (no scissor)
+        self.drawing_instruments = true;   // fill() switches to OVER + premultiplied
+    }
+    fn end_instrument_layer(&mut self) {
+        self.dst_pic = self.back_pic;      // back to the content buffer
+        self.drawing_instruments = false;
+    }
+    fn set_instrument_layer_visible(&mut self, visible: bool) {
+        self.instr_visible = visible;
+    }
+
     fn resize_surface(&mut self, w: std::num::NonZeroU32, h: std::num::NonZeroU32) {
         self.win_w = w.get() as u16;
         self.win_h = h.get() as u16;
@@ -693,6 +723,37 @@ impl Drop for XRenderBackend {
         let _ = xproto::free_pixmap(&self.conn, self.src_pixmap);
         let _ = xproto::free_gc(&self.conn, self.gc);
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod premult_tests {
+    use super::*;
+    use crate::render::Color;
+
+    #[test]
+    fn premultiply_scales_rgb_by_alpha_and_keeps_alpha() {
+        // Half-alpha pure red → premultiplied red = 0.5, alpha = 0.5.
+        let c = premultiply(Color(1.0, 0.0, 0.0, 0.5));
+        assert_eq!(c.alpha, 32767); // 0.5 * 65535, truncated
+        assert_eq!(c.red, 32767);   // 1.0 * 0.5 * 65535
+        assert_eq!(c.green, 0);
+        assert_eq!(c.blue, 0);
+    }
+
+    #[test]
+    fn premultiply_opaque_is_unchanged_rgb() {
+        let c = premultiply(Color(1.0, 0.5, 0.25, 1.0));
+        assert_eq!(c.alpha, 65535);
+        assert_eq!(c.red, 65535);
+        assert_eq!(c.green, 32767);
+        assert_eq!(c.blue, 16383);
+    }
+
+    #[test]
+    fn premultiply_fully_transparent_is_zero() {
+        let c = premultiply(Color(1.0, 1.0, 1.0, 0.0));
+        assert_eq!((c.red, c.green, c.blue, c.alpha), (0, 0, 0, 0));
     }
 }
 
