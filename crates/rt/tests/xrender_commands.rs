@@ -190,15 +190,20 @@ fn xrender_chrome_is_commands_not_pixels() {
 
     // With the manual open, the instruments animate continuously underneath it,
     // so this trace is far busier than the sibling test's idle-terminal one
-    // (tens of MB vs hundreds of KB). `-b` makes xtrace batch its writes
-    // instead of flushing every line, so it can keep up in real time. As a
-    // belt-and-braces bound (in case xtrace still lags flushing a big trace
-    // after its child exits), the *entire* xtrace invocation is itself wrapped
-    // in an outer `timeout`, so this test can never hang past a fixed wall
-    // clock budget even if the inner `timeout 3` isn't enough to end it.
+    // (tens of MB vs hundreds of KB). Measured directly (owned processes,
+    // watched with `ps` mid-run): the inner `timeout 1.8` reliably kills `rt`
+    // right on schedule, and by then every byte of interest is already
+    // written — but `xtrace` itself then does *not* exit on its own here (near
+    // -zero CPU afterward), unlike the sibling test's low-volume case where it
+    // does. So the outer `timeout` below isn't just a safety net for this
+    // test: measured over repeated runs, it is the thing that actually ends
+    // `xtrace`, every time, regardless of how large the outer bound is (5 s
+    // and 90 s runs produced the same fully-formed trace) — so keep it short
+    // and deliberate rather than generous. `-b` batches xtrace's writes
+    // instead of flushing every line, keeping that window's work cheap.
     let fake = disp + 50;
     let status = Command::new("timeout")
-        .arg("30") // outer bound on the whole xtrace run, incl. its own flush time
+        .arg("5") // ends xtrace deliberately; all trace data is already flushed well before this
         .arg("xtrace")
         .arg("-n")
         .arg("-b")
@@ -206,7 +211,7 @@ fn xrender_chrome_is_commands_not_pixels() {
         .args(["-D", &format!(":{fake}")])
         .args(["-o", trace.to_str().unwrap(), "--"])
         .arg("timeout")
-        .arg("3") // > rt's cold-start + first-render, < the shell's 5 s idle
+        .arg("1.8") // > rt's ~1.5s cold-start + first-render, short enough to keep the trace small
         .arg(rt_bin)
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
