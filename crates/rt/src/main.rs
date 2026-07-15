@@ -297,6 +297,7 @@ struct Active {
     damage_history: std::collections::VecDeque<crate::damage::FrameDamage>, // recent frames' damage, for buffer-age
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
     last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
+    resize_events: u64,                   // how many Resized events this session has paid for (diagnostics)
     instr_tick: bool,                     // redraw the instrument layer this frame (6fps, native path)
     last_instr_tick: Instant,             // when the instrument layer was last redrawn
     instr_layer_drawn: bool,              // the instrument layer has been drawn at least once since last shown
@@ -980,6 +981,7 @@ impl ApplicationHandler for App {
             damage_history: std::collections::VecDeque::new(),
             force_full: true, // first frame is always a full redraw
             last_focus: init_focus,
+            resize_events: 0,
             instr_tick: false,
             last_instr_tick: Instant::now(),
             instr_layer_drawn: false,
@@ -1429,21 +1431,44 @@ impl ApplicationHandler for App {
 
             // Window resized: resize the GL surface, viewport, and relayout PTYs.
             WindowEvent::Resized(size) => {
+                // Timing breakdown, reported under `RUST_LOG=rt=info`. An
+                // interactive edge-drag on a real WM has been seen to stall rt's
+                // whole window for 5-10s and then repaint at once; that is not
+                // reproducible headless (no WM, no compositor), so the resize path
+                // reports its own costs and lets the affected session say where the
+                // time goes. `relayout` is the prime suspect: it runs
+                // `Term::resize` per pane, which reflows the grid AND the whole
+                // scrollback (10k lines by default).
+                let t_evt = Instant::now();
                 // glutin needs non-zero dimensions to resize the surface.
                 if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
                     active.backend.resize_surface(w, h); // resize GL surface
                 }
                 active.backend.resize(size.width as f32, size.height as f32); // viewport
+                let t_surface = t_evt.elapsed();
                 // Keep the blur region covering the whole surface at its new size.
                 if let Some(fx) = &mut active.bg_effect {
                     fx.on_resize(size.width, size.height);
                 }
+                let t_fx = t_evt.elapsed() - t_surface;
                 // Recompute pane sizes from the new window bounds.
                 let bounds = content_bounds(size);
+                let t_relayout0 = Instant::now();
                 active.session.relayout(bounds); // push new sizes to PTYs
+                let t_relayout = t_relayout0.elapsed();
                 active.force_full = true; // whole surface changed: next frame is full
                 active.instr_layer_drawn = false; // layer pixmap was recreated+cleared on resize — redraw it next frame
                 active.window.request_redraw(); // repaint at the new size
+                // Count resize events too: a drag delivers a stream of them, and
+                // each one pays the full cost above.
+                active.resize_events += 1;
+                let total = t_evt.elapsed();
+                log::info!(
+                    "resize #{} to {}x{}: surface={:.1}ms fx={:.1}ms relayout={:.1}ms total={:.1}ms",
+                    active.resize_events, size.width, size.height,
+                    t_surface.as_secs_f32() * 1e3, t_fx.as_secs_f32() * 1e3,
+                    t_relayout.as_secs_f32() * 1e3, total.as_secs_f32() * 1e3,
+                );
             }
 
             // A key was pressed or released.
