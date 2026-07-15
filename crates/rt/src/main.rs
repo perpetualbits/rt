@@ -2659,9 +2659,27 @@ impl App {
         // saturated the ssh link under load. On the GL path the wires are egui
         // chrome blended every frame across arbitrary inter-pane regions the
         // partial path can't bound, so any wire still forces full there.
-        if active.force_full
+        // The instrument LAYER is persistent and is otherwise only redrawn on a
+        // 6fps tick — which never fires unless `inst_animate` is on. So anything
+        // that moves instrument geometry with no tick (a new pane, a rotate, a
+        // divider drag, a tab switch, a wire change) left the layer showing the
+        // PREVIOUS layout, composited over the new content: jack-less new panes,
+        // borders that ignore a rotate, and tab 1's instruments bleeding onto
+        // tabs with no split at all. Same class as the focus-border bug — a
+        // visual change with no engine cell-damage — so it gets the same cure: one
+        // CENTRAL rule instead of a `instr_layer_drawn = false` at every site.
+        //
+        // Keyed on `force_full` (layout/chrome changed), NOT on "damage is full":
+        // the engine reports Full damage on any clear/scroll, which under an
+        // output flood is most frames, and that would put instrument geometry back
+        // on content frames — the exact coupling `instrument_ticks_decoupled_from_output`
+        // guards against.
+        let chrome_moved = active.force_full || active.session.focus() != active.last_focus;
+        if chrome_moved {
+            active.instr_layer_drawn = false; // redraw the layer against the new layout
+        }
+        if chrome_moved
             || overlay_open
-            || active.session.focus() != active.last_focus // focus moved: the blue border shifts panes with no cell-damage → full
             || !active.bell_flash.is_empty() // bell stripes span the pane top+bottom, not the output's cell-damage → full (and the expired entry, still present here until draw_panes retains it, gives one full frame to clear the stripe)
             || !active.backend.is_software()
             || (active.backend.supports_egui() && !active.wires.is_empty())
