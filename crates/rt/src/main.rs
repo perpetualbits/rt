@@ -1528,33 +1528,7 @@ impl ApplicationHandler for App {
                 // owns the pointer, and only re-issued when the shape actually
                 // changes — set_cursor is an X round trip, and motion events
                 // arrive at pointer-sample rate.
-                if active.dragging_divider.is_none()
-                    && active.scroll_drag.is_none()
-                    && active.mouse_report.is_none()
-                    && active.wiring_from.is_none()
-                    && !active.selecting
-                {
-                    let bounds = content_bounds(active.window.inner_size());
-                    // Jacks sit ON the divider, and a press checks `jack_at` FIRST
-                    // (a jack wins over the divider there). The cursor has to agree:
-                    // showing "resize" over a jack advertises the wrong action on a
-                    // small target, which makes the jack hard to trust even though
-                    // the click works. Grab = "you can pull a wire out of this".
-                    let want = if Self::jack_at(active, active.mouse.0, active.mouse.1).is_some() {
-                        Some(CursorIcon::Grab)
-                    } else {
-                        active
-                            .session
-                            .divider_at(active.mouse.0, active.mouse.1, bounds)
-                            // `horizontal` = the split's axis runs left/right, so the
-                            // divider is vertical and drags along x.
-                            .map(|h| if h.horizontal { CursorIcon::ColResize } else { CursorIcon::RowResize })
-                    };
-                    if want != active.cursor_icon {
-                        active.window.set_cursor(want.unwrap_or(CursorIcon::Default));
-                        active.cursor_icon = want;
-                    }
-                }
+                Self::update_cursor(active);
                 if active.scroll_drag.is_some() {
                     // Dragging the scrollbar thumb: scroll to track the pointer.
                     Self::apply_scroll_drag(active, active.mouse.1);
@@ -1568,8 +1542,20 @@ impl ApplicationHandler for App {
                 } else if active.wiring_from.is_some() {
                     // Rubber-band the in-progress wire to the cursor.
                     active.drag_cursor = Some(active.mouse);
-                    active.force_full = true; // rubber-band spans arbitrary pixels: repaint fully
-                    active.window.request_redraw();
+                    // The rubber-band spans arbitrary pixels between panes, so it
+                    // cannot ride the partial path: every pointer sample costs a
+                    // FULL window repaint. Where a frame is cheap (hardware GL)
+                    // that is a nice animation. Where it is expensive (XRender over
+                    // ssh -X, software GL) it turned wiring into many seconds of
+                    // stepping — an animation too slow to follow, paid for with the
+                    // one operation this backend exists to avoid. Skip it there:
+                    // the release paints the COMPLETED wire in one frame, which is
+                    // the state worth seeing. Feedback meanwhile is the Grabbing
+                    // cursor set at press — free, no frame required.
+                    if !active.backend.is_software() {
+                        active.force_full = true; // rubber-band spans arbitrary pixels: repaint fully
+                        active.window.request_redraw();
+                    }
                 } else if let Some(handle) = active.dragging_divider.clone() {
                     // Resize the split: turn the mouse position along the split's
                     // axis into a first-child ratio.
@@ -1627,6 +1613,7 @@ impl ApplicationHandler for App {
                     // jack under the cursor (before falling through to the menu).
                     if active.wiring_from.take().is_some() {
                         active.drag_cursor = None;
+                        Self::update_cursor(active); // drop Grabbing; the wire is cancelled
                         active.force_full = true; // clear the cancelled rubber-band ghost (off the partial path)
                         active.window.request_redraw();
                         return;
@@ -1666,6 +1653,12 @@ impl ApplicationHandler for App {
                         if let Some((src, stream)) = Self::jack_at(active, mx, my) {
                             active.wiring_from = Some((src, stream));
                             active.drag_cursor = Some((mx, my));
+                            // Say "you are dragging a wire" without costing a frame.
+                            // On the expensive paths the rubber-band is suppressed
+                            // (see CursorMoved), so this cursor is the ONLY feedback
+                            // until the release paints the finished wire.
+                            active.window.set_cursor(CursorIcon::Grabbing);
+                            active.cursor_icon = Some(CursorIcon::Grabbing);
                             active.window.request_redraw();
                             return;
                         }
@@ -1784,6 +1777,7 @@ impl ApplicationHandler for App {
                             Self::connect_wire(active, src, stream, dst);
                         }
                         active.drag_cursor = None;
+                        Self::update_cursor(active); // drop Grabbing; wiring_from is now None
                         // The rubber-band was drawn last frame across arbitrary pixels; whether
                         // this release connected a wire or aborted (no pane / rejected self-loop),
                         // its old pixels must be cleared, so force a full frame off the partial path.
@@ -3381,6 +3375,42 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Point the cursor at whatever is under it: Grab over a jack, resize arrows
+    /// over a bare divider, default elsewhere.
+    ///
+    /// A no-op while something else owns the pointer — a drag in progress keeps
+    /// its own shape. Only re-issued when the shape actually changes: set_cursor
+    /// is an X round trip and motion arrives at pointer-sample rate.
+    fn update_cursor(active: &mut Active) {
+        if active.dragging_divider.is_some()
+            || active.scroll_drag.is_some()
+            || active.mouse_report.is_some()
+            || active.wiring_from.is_some()
+            || active.selecting
+        {
+            return;
+        }
+        let bounds = content_bounds(active.window.inner_size());
+        // Jacks sit ON the divider, and a press checks `jack_at` FIRST (a jack
+        // wins there). The cursor must agree: "resize" over a jack advertises the
+        // wrong action on a small target, which makes the jack hard to trust even
+        // though the click works. Grab = "you can pull a wire out of this".
+        let want = if Self::jack_at(active, active.mouse.0, active.mouse.1).is_some() {
+            Some(CursorIcon::Grab)
+        } else {
+            active
+                .session
+                .divider_at(active.mouse.0, active.mouse.1, bounds)
+                // `horizontal` = the split's axis runs left/right, so the divider
+                // is vertical and drags along x.
+                .map(|h| if h.horizontal { CursorIcon::ColResize } else { CursorIcon::RowResize })
+        };
+        if want != active.cursor_icon {
+            active.window.set_cursor(want.unwrap_or(CursorIcon::Default));
+            active.cursor_icon = want;
+        }
     }
 
     /// Run the egui preferences UI for this frame and paint it. Applies any
