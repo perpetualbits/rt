@@ -2833,14 +2833,13 @@ impl App {
         }
     }
 
-    /// Draw every visible pane (grid, cursor, scrollbar, titlebar, focus border)
+    /// Draw every visible pane (grid, cursor, scrollbar, titlebar)
     /// plus the split dividers, tab strips, broadcast indicator and visible-bell
     /// stripes. Consumes the pre-fetched `snapshots` (never re-calls
     /// `render_snapshot()`) so engine damage state advances exactly once per pane
     /// per frame. The caller brackets this with `begin_frame`/`end_frame` and
     /// decides full vs scissored.
     fn draw_panes(active: &mut Active, bounds: Rect, snapshots: &[(rt_core::PaneId, PxRectSnap)]) {
-        let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline (opaque)
         let cfg_bg = active.settings.background; // configured background RGB (for the non-default cell-bg test)
 
         let focus = active.session.focus(); // which pane is focused
@@ -3135,15 +3134,23 @@ impl App {
                 let p = 4.0; // inset from the corner
                 active.backend.fill_rect(full.right() - m - p, full.y + p, m, m, group_hue(g));
             }
-            // Outline the focused pane with a thin border (four thin rects),
-            // around the whole pane including its titlebar (`full`, not content).
-            if id == focus {
-                let t = 2.0; // border thickness in pixels
-                active.backend.fill_rect(full.x, full.y, full.w, t, focus_border); // top
-                active.backend.fill_rect(full.x, full.bottom() - t, full.w, t, focus_border); // bottom
-                active.backend.fill_rect(full.x, full.y, t, full.h, focus_border); // left
-                active.backend.fill_rect(full.right() - t, full.y, t, full.h, focus_border); // right
-            }
+            // (The focused pane used to get a thin blue outline around `full`
+            // here. Removed: the titlebar already carries focus — focused panes
+            // take more tint and full-strength text — so the outline was a second
+            // answer to a question already answered, and it was a standing bug.
+            //
+            // It was drawn only on FULL frames, but a scissored frame CLEARS its
+            // bbox, so any partial frame crossing the outline erased the segment
+            // it touched and nothing redrew it: the outline eroded into fragments.
+            // It looked fine for a long time only by accident — `fill` used to
+            // paint a rect at full length whenever it so much as touched the clip,
+            // so unrelated frames kept repainting the whole outline. Fixing `fill`
+            // to trim correctly took that accident away and exposed the fragments.
+            //
+            // Drawing it properly means damaging the four bands whenever anything
+            // crosses them — real cost on every frame, for chrome the titlebar
+            // already conveys. `last_focus` still forces a full frame on focus
+            // change: the titlebar TINT is chrome with no cell-damage too.)
         }
 
         // Pane dividers: a thin line centred in each split gutter so the
