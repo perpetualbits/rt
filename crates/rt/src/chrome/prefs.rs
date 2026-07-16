@@ -178,16 +178,10 @@ pub fn scroll_for(rows: &[Row], sel: usize, scroll: usize, visible: usize) -> us
         return 0;
     }
     let max = rows.len() - visible;
-    if sel < scroll {
-        // Scrolled off the top: bring it to the top edge. But if the whole
-        // first page already contains sel, snap all the way to the true top
-        // (0) instead of just to sel. Without this, a leading header (e.g.
-        // "Font") can NEVER be revealed again once scrolled past: `sel` is
-        // never the header's own index (headers aren't selectable), so plain
-        // top-alignment can only ever reach scroll=1, stranding row 0
-        // permanently one row out of view. The bottom edge doesn't have this
-        // problem because the last row ("Close") IS selectable, so ordinary
-        // bottom-alignment naturally reaches the true end when sel lands there.
+    let want = if sel < scroll {
+        // Scrolled off the top: bring it to the top edge. If the whole first
+        // page already contains sel, snap to the true top (0) rather than to
+        // sel, so the leading "Font" header comes back with it.
         if sel < visible {
             0
         } else {
@@ -197,7 +191,25 @@ pub fn scroll_for(rows: &[Row], sel: usize, scroll: usize, visible: usize) -> us
         (sel + 1 - visible).min(max) // off the bottom: bring it to the bottom edge
     } else {
         scroll.min(max)
+    };
+    // A header labels the row beneath it, so top-aligning ON that row hides the
+    // very word that says what it means ("Behaviour", "Colours", ...): headers
+    // are never selectable, so `sel` is never the header's own index and no
+    // amount of stepping can bring it back. Pull the window back one row to
+    // reveal it. This catches BOTH ways a row lands on the top edge: a
+    // top-align (want == sel), and an already-visible selection sitting there
+    // (want == scroll == sel, reachable by arrowing up from a bottom-aligned
+    // selection). The bottom edge needs no such rule -- bottom-aligning shows
+    // `visible - 1` rows ABOVE sel, so the header comes along for free.
+    //
+    // `visible > 1` is the guard that keeps the invariant `scroll <= sel <
+    // scroll + visible` true in every branch: with room for a single row,
+    // backing up would push the selection itself out of view, and showing the
+    // selection beats labelling it.
+    if visible > 1 && want == sel && sel > 0 && rows[sel - 1].kind == RowKind::Section {
+        return (sel - 1).min(max);
     }
+    want
 }
 
 /// Lay the dialog out centred, clamped fully on-screen.
@@ -381,6 +393,52 @@ mod tests {
         assert!(last >= sc && last < sc + g.visible, "selection must be visible");
         // Selecting the first row scrolls back to the top.
         assert_eq!(scroll_for(&rows, selectable(&rows)[0], sc, g.visible), 0);
+    }
+
+    #[test]
+    fn scrolling_to_a_row_reveals_the_section_header_that_labels_it() {
+        let rows = rs(&Settings::default());
+        let visible = 7; // far fewer than the ~22 rows: every case must scroll
+
+        // Found by scanning, never hardcoded: adding a setting shifts every
+        // index, and a hardcoded one would silently stop testing what it names.
+        let sections: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| r.kind == RowKind::Section && *i > 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(sections.len() >= 3, "expected several mid-list sections, got {sections:?}");
+
+        for h in sections {
+            let sel = h + 1; // the first selectable row under the header
+            assert!(rows[sel].pref.is_some(), "the row under a header must be selectable");
+            // Approach it from the top of the list and from the bottom, so the
+            // top-align, bottom-align and already-visible branches all run.
+            for start in [0usize, rows.len() - visible] {
+                let sc = scroll_for(&rows, sel, start, visible);
+                assert!(
+                    sc <= sel && sel < sc + visible,
+                    "selection must stay visible: sel={sel} scroll={sc} start={start}"
+                );
+                assert!(
+                    h >= sc && h < sc + visible,
+                    "the {:?} header must be revealed with its row: sel={sel} scroll={sc} start={start}",
+                    rows[h].label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_one_row_window_keeps_the_selection_visible_rather_than_its_header() {
+        let rows = rs(&Settings::default());
+        // With room for a single row, backing up to show the header would push
+        // the selection itself out of view. The invariant wins; the header goes.
+        for i in selectable(&rows) {
+            let sc = scroll_for(&rows, i, 0, 1);
+            assert!(sc <= i && i < sc + 1, "selection must stay visible: sel={i} scroll={sc}");
+        }
     }
 
     #[test]
