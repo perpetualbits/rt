@@ -361,7 +361,7 @@ inst_remote=true look like it did nothing."
   - `pub struct Row { pub kind: RowKind, pub label: String, pub value: String, pub pref: Option<PrefRow>, pub enabled: bool }`
   - `pub struct Geom { pub panel: Recti, pub rows: Vec<Recti>, pub left: Vec<Option<Recti>>, pub right: Vec<Option<Recti>>, pub scroll: usize, pub visible: usize }`
   - `pub enum Hit { Row(usize), Step(usize, i32), Close }`
-  - `pub fn rows(s: &Settings, families: &[String], mem_total: u64, cols: usize) -> Vec<Row>`
+  - `pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row>`
   - `pub fn selectable(rows: &[Row]) -> Vec<usize>`
   - `pub fn next_sel(rows: &[Row], sel: usize, dir: i32) -> usize`
   - `pub fn scroll_for(rows: &[Row], sel: usize, scroll: usize, visible: usize) -> usize`
@@ -386,7 +386,7 @@ mod tests {
         vec!["DejaVu Sans Mono".to_string()]
     }
     fn rs(s: &Settings) -> Vec<Row> {
-        rows(s, &fams(), 16 * 1024 * 1024 * 1024, 80)
+        rows(s, 16 * 1024 * 1024 * 1024, 80) // 16 GB of RAM, an 80-column pane
     }
 
     #[test]
@@ -462,7 +462,7 @@ mod tests {
         let mut s = Settings::default();
         s.scrollback = 1_000_000;
         // 16 GB of RAM, 80 columns.
-        let rows = rows(&s, &fams(), 16 * 1024 * 1024 * 1024, 80);
+        let rows = rows(&s, 16 * 1024 * 1024 * 1024, 80);
         let readout = rows.iter().find(|r| matches!(r.kind, RowKind::Display)).unwrap();
         assert!(readout.value.contains("per pane"), "got {:?}", readout.value);
         assert!(readout.value.contains('%'), "must state its share of RAM: {:?}", readout.value);
@@ -616,8 +616,9 @@ fn stepper(label: &str, value: String, pref: PrefRow) -> Row {
 /// width — both feed the scrollback guardrail, which is the one piece of real
 /// logic here: it states what a FULL buffer would cost per pane, so sliding the
 /// ceiling up cannot silently pick a size no machine can hold.
-pub fn rows(s: &Settings, families: &[String], mem_total: u64, cols: usize) -> Vec<Row> {
-    let _ = families; // the family VALUE is s.font_family; the list only matters to `step`
+pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row> {
+    // No `families` param: the family VALUE shown is `s.font_family`. Only
+    // `prefs_model::step` needs the installed list, to cycle through it.
     let mut v = Vec::new();
 
     v.push(sec("Font"));
@@ -1030,7 +1031,7 @@ const PREFS_SETTLE: Duration = Duration::from_millis(150);
         // Exactly how paint_egui derived it: a full-width pane at the current
         // font size. There is no `pane.cols()`.
         let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-        let rows = chrome::prefs::rows(&s, &active.mono_families, total_ram_bytes(), cols);
+        let rows = chrome::prefs::rows(&s, total_ram_bytes(), cols);
         let g = chrome::prefs::layout(&rows, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
         let mut sw = vec![Color::rgb(s.foreground[0], s.foreground[1], s.foreground[2])];
         sw.push(Color::rgb(s.background[0], s.background[1], s.background[2]));
@@ -1060,7 +1061,7 @@ Beside the manual's shim (`if active.manual_open { … }`), add — BEFORE it, s
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
                     let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-                    let rws = chrome::prefs::rows(&s, &active.mono_families, total_ram_bytes(), cols);
+                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols);
                     let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
                     match &ke.logical_key {
                         Key::Named(NamedKey::Escape) => active.prefs_open = false,
@@ -1171,7 +1172,7 @@ In the same `if active.prefs_open` block, before the swallow arm:
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
                     let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-                    let rws = chrome::prefs::rows(&s, &active.mono_families, total_ram_bytes(), cols);
+                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols);
                     let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
                     match chrome::prefs::hit(&g, active.mouse) {
                         Some(chrome::prefs::Hit::Step(i, dir)) => {
@@ -1534,4 +1535,4 @@ Then ask the user to open preferences over `ssh -X` and check:
 
 **Placeholders.** One deliberate ellipsis remains, in Task 4 Step 3: the body of `commit_settings` is described as "the existing body from `paint_egui`, verbatim" rather than transcribed. That is intentional — it is ~40 lines of existing, working code, and re-typing it into the plan invites transcription errors; the instruction is to MOVE it unchanged. Every other step carries its real code.
 
-**Type consistency.** `PrefRow` (Task 1) is used by name in Tasks 2 and 4. `Row`/`RowKind`/`Geom`/`Hit` (Task 2) are used in Tasks 3 and 4 with matching fields. `rows(s, families, mem_total, cols)`, `layout(rows, scroll, cell_w, cell_h, win_w, win_h)`, `draw(be, g, rows, sel, swatches, cell_w, cell_h)`, `hit(g, p)`, `next_sel(rows, sel, dir)`, `scroll_for(rows, sel, scroll, visible)` and `step(s, row, dir, families)` are spelled identically everywhere they appear. The `prefs settled: … N edit(s) coalesced into 1 commit` log line is emitted in Task 4 Step 7 and asserted in Task 5 with the same wording.
+**Type consistency.** `PrefRow` (Task 1) is used by name in Tasks 2 and 4. `Row`/`RowKind`/`Geom`/`Hit` (Task 2) are used in Tasks 3 and 4 with matching fields. `rows(s, mem_total, cols)`, `layout(rows, scroll, cell_w, cell_h, win_w, win_h)`, `draw(be, g, rows, sel, swatches, cell_w, cell_h)`, `hit(g, p)`, `next_sel(rows, sel, dir)`, `scroll_for(rows, sel, scroll, visible)` and `step(s, row, dir, families)` are spelled identically everywhere they appear. The `prefs settled: … N edit(s) coalesced into 1 commit` log line is emitted in Task 4 Step 7 and asserted in Task 5 with the same wording.
