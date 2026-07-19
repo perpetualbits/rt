@@ -93,7 +93,13 @@ This is the user-visible uniform-look win. One behaviour change: the GL search
 bar is now the simpler native field (append + backspace) instead of a full egui
 text field, matching what `ssh -X` users already had.
 
-**B2 — delete egui entirely. Pending; bigger than the plan first implied.**
+**B2 — delete egui entirely. ✅ done (`81ee7eb`).** The GL renderer gained AA
+circle/ring/line primitives (coverage masks in the glyph atlas; `raster.rs` +
+`render.rs`), so `chrome::instruments` draws on both backends and `egui` /
+`egui-winit` / `egui_glow` are gone from the tree. `supports_egui()` → `is_gl()`.
+ADR-0004 superseded. Original notes below.
+
+**B2 (original note) — the shape it took:**
 The last egui user is the **border instruments** on GL (`paint_instruments`).
 The native `chrome::instruments` needs `fill_circle`/`stroke_circle`/
 `stroke_line`, but the GL renderer is a coverage-atlas triangle-soup with **no
