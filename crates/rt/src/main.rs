@@ -4347,7 +4347,22 @@ fn build_event_loop() -> EventLoop<()> {
             }
         }
     }
-    builder.build().expect("failed to create event loop")
+    // A missing display is a user-environment problem, not a bug: rt is a
+    // graphical terminal. Fail with guidance and a clean exit(1) instead of the
+    // winit panic + core dump (`XOpenDisplayFailed`) you get from `.expect`.
+    match builder.build() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!(
+                "rt: no display found — rt is a graphical terminal and needs a Wayland or X11 display."
+            );
+            eprintln!(
+                "    Over a remote shell, forward X (e.g. `ssh -X <host> rt`) or run rt in a local desktop session."
+            );
+            eprintln!("    (winit: {e})");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {
