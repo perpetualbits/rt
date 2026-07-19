@@ -6,6 +6,7 @@
 
 use crate::render::Color;
 
+pub mod colour_picker;
 pub mod instruments;
 pub mod manual;
 pub mod menu;

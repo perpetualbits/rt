@@ -296,6 +296,7 @@ struct Active {
     prefs_pending: Option<rt_config::Settings>, // edits not yet committed (see PREFS_SETTLE)
     prefs_edits: u64,                     // edits folded into the pending commit (diagnostics)
     last_prefs_edit: Instant,             // when the last edit landed
+    picker: Option<chrome::colour_picker::PickerState>, // the colour picker, open over prefs on a swatch click
     manual_open: bool,                    // whether the built-in manual overlay is showing
     manual_scroll: usize,                 // scroll offset (cell rows) into the native manual panel
     search_open: bool,                    // whether the scrollback-search bar is showing
@@ -1011,6 +1012,7 @@ impl ApplicationHandler for App {
             prefs_pending: None,
             prefs_edits: 0,
             last_prefs_edit: Instant::now(),
+            picker: None,
             manual_open: false,
             manual_scroll: 0,
             search_open: false,
@@ -1121,6 +1123,88 @@ impl ApplicationHandler for App {
             active.active_until = Instant::now() + ACTIVE_TAIL;
         }
 
+        // The colour picker sits modally over the prefs dialog (opened by clicking
+        // a swatch). Pointer-driven: drag the SV square or hue strip; Esc / Done /
+        // a press outside commit the pending colour and close it. All input
+        // swallowed; lifecycle events fall through. A drag writes the chosen RGB
+        // into `prefs_pending` and arms the settle, so the terminal recolours once
+        // (via `commit_settings`) rather than per pointer-move — cheap over ssh -X.
+        if active.picker.is_some() {
+            use chrome::colour_picker as cp;
+            let size = active.window.inner_size();
+            let (cw, ch) = active.backend.cell_size();
+            let g = cp::layout(cw, ch, size.width as f32, size.height as f32);
+            match &event {
+                WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                    if !g.panel.contains(active.mouse) {
+                        Self::close_picker(active); // a click outside dismisses
+                        return;
+                    }
+                    match cp::hit(&g, active.mouse) {
+                        cp::Hit::Close => Self::close_picker(active),
+                        cp::Hit::Sv => {
+                            let (s, v) = cp::sv_at(&g, active.mouse);
+                            {
+                                let pk = active.picker.as_mut().unwrap();
+                                pk.drag = Some(cp::Drag::Sv);
+                                pk.s = s;
+                                pk.v = v;
+                            }
+                            Self::picker_write(active);
+                        }
+                        cp::Hit::Hue => {
+                            let h = cp::hue_at(&g, active.mouse);
+                            {
+                                let pk = active.picker.as_mut().unwrap();
+                                pk.drag = Some(cp::Drag::Hue);
+                                pk.h = h;
+                            }
+                            Self::picker_write(active);
+                        }
+                        cp::Hit::None => {} // press on panel chrome: swallow, do nothing
+                    }
+                    active.window.request_redraw();
+                    return;
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    active.mouse = (position.x as f32, position.y as f32);
+                    if let Some(d) = active.picker.and_then(|p| p.drag) {
+                        {
+                            let pk = active.picker.as_mut().unwrap();
+                            match d {
+                                cp::Drag::Sv => {
+                                    let (s, v) = cp::sv_at(&g, active.mouse);
+                                    pk.s = s;
+                                    pk.v = v;
+                                }
+                                cp::Drag::Hue => pk.h = cp::hue_at(&g, active.mouse),
+                            }
+                        }
+                        Self::picker_write(active);
+                        active.window.request_redraw();
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                    if let Some(pk) = active.picker.as_mut() {
+                        pk.drag = None;
+                    }
+                    return;
+                }
+                WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
+                    if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
+                        Self::close_picker(active);
+                    }
+                    return; // swallow every key while the picker is up
+                }
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::ModifiersChanged(_) => return,
+                _ => {} // lifecycle events fall through
+            }
+        }
+
         // Preferences: a native dialog on BOTH backends (Task 4) — no egui
         // involved at all. Keys/clicks drive the dialog and never reach the PTY.
         // Every edit is one discrete step (no drags — see PREFS_SETTLE and the
@@ -1196,6 +1280,16 @@ impl ApplicationHandler for App {
                                         active.prefs_edits = 0;
                                         Self::commit_settings(active, new);
                                     }
+                                }
+                            } else if matches!(rws[i].kind, chrome::prefs::RowKind::Swatches) {
+                                // Open the colour picker on the clicked swatch.
+                                let mut sw = vec![s.foreground, s.background];
+                                sw.extend(s.palette.iter().copied());
+                                let rects = chrome::prefs::swatch_rects(g.rows[i], sw.len(), ch);
+                                if let Some(k) = rects.iter().position(|r| r.contains(active.mouse)) {
+                                    let slot = chrome::colour_picker::Slot::from_swatch_index(k);
+                                    active.picker =
+                                        Some(chrome::colour_picker::PickerState::new(slot, sw[k]));
                                 }
                             }
                         }
@@ -3294,6 +3388,9 @@ impl App {
         // instruments, each of which keeps a separate egui-vs-native rendering).
         if active.prefs_open {
             Self::paint_prefs(active);
+            if active.picker.is_some() {
+                Self::paint_picker(active); // modal, on top of the dialog
+            }
             return;
         }
         let size = active.window.inner_size();
@@ -3627,6 +3724,39 @@ impl App {
         sw.push(Color::rgb(s.background[0], s.background[1], s.background[2]));
         sw.extend(s.palette.iter().map(|c| Color::rgb(c[0], c[1], c[2])));
         chrome::prefs::draw(&mut *active.backend, &g, &rows, active.prefs_sel, &sw, cw, ch);
+    }
+
+    /// Draw the colour picker over the prefs dialog, from its live H/S/V.
+    fn paint_picker(active: &mut Active) {
+        let Some(pk) = active.picker else { return };
+        let size = active.window.inner_size();
+        let (cw, ch) = active.backend.cell_size();
+        let g = chrome::colour_picker::layout(cw, ch, size.width as f32, size.height as f32);
+        chrome::colour_picker::draw(&mut *active.backend, &g, pk.h, pk.s, pk.v, &pk.slot.label(), cw, ch);
+    }
+
+    /// Write the picker's current colour into the pending settings' slot and arm
+    /// the settle — so `commit_settings` applies + persists it once the drag
+    /// pauses, exactly like a stepped prefs edit (no per-move recolour/persist).
+    fn picker_write(active: &mut Active) {
+        let Some(pk) = active.picker else { return };
+        let rgb = pk.rgb();
+        let mut s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
+        set_slot(&mut s, pk.slot, rgb);
+        active.prefs_pending = Some(s);
+        active.prefs_edits += 1;
+        active.last_prefs_edit = Instant::now();
+    }
+
+    /// Close the picker (prefs stays open) and commit any pending colour now,
+    /// rather than stranding it behind PREFS_SETTLE — mirrors the prefs Esc path.
+    fn close_picker(active: &mut Active) {
+        active.picker = None;
+        if let Some(new) = active.prefs_pending.take() {
+            active.prefs_edits = 0;
+            Self::commit_settings(active, new);
+        }
+        active.window.request_redraw();
     }
 
     /// Apply one step to the selected row: mutate the PENDING settings and arm
@@ -4274,6 +4404,21 @@ fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -
 fn column_separator(fg: [u8; 3], bg: [u8; 3]) -> Color {
     let mid = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
     Color::rgb(mid(fg[0], bg[0]), mid(fg[1], bg[1]), mid(fg[2], bg[2]))
+}
+
+/// Write `rgb` into the colour slot the picker edits (foreground, background, or
+/// a palette entry). Out-of-range palette indices are ignored.
+fn set_slot(s: &mut rt_config::Settings, slot: chrome::colour_picker::Slot, rgb: [u8; 3]) {
+    use chrome::colour_picker::Slot;
+    match slot {
+        Slot::Fg => s.foreground = rgb,
+        Slot::Bg => s.background = rgb,
+        Slot::Palette(i) => {
+            if let Some(c) = s.palette.get_mut(i) {
+                *c = rgb;
+            }
+        }
+    }
 }
 
 /// Y positions (physical px) for scrollback-search hit markers on a pane's

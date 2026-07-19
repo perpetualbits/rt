@@ -281,6 +281,21 @@ pub fn hit(g: &Geom, p: (f32, f32)) -> Option<Hit> {
     None
 }
 
+/// The per-swatch rects in a `Swatches` row (`[fg, bg, palette…]`), laid out
+/// right-aligned. Shared by `draw` (to paint them) and the click handler (to
+/// open the colour picker on the one clicked), so the two never drift.
+pub fn swatch_rects(row: Recti, count: usize, cell_h: f32) -> Vec<Recti> {
+    let s = cell_h * 0.6;
+    let y = row.y + (row.h - s) * 0.5;
+    let mut sx = row.x + row.w - PAD_X - count as f32 * (s + 2.0);
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(Recti { x: sx, y, w: s, h: s });
+        sx += s + 2.0;
+    }
+    out
+}
+
 const PANEL_BG: Color = Color(0.10, 0.10, 0.12, 0.97);
 const PANEL_EDGE: Color = Color(0.35, 0.35, 0.42, 1.0);
 const SEL_BG: Color = Color(0.18, 0.20, 0.28, 1.0);
@@ -333,11 +348,8 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: 
         }
         // Swatches: fg, bg, then the 16 palette colours, as small squares.
         if matches!(row.kind, RowKind::Swatches) {
-            let s = cell_h * 0.6;
-            let mut sx = r.x + r.w - PAD_X - swatches.len() as f32 * (s + 2.0);
-            for c in swatches {
-                be.fill_rect(sx, r.y + (r.h - s) * 0.5, s, s, *c);
-                sx += s + 2.0;
+            for (rect, col) in swatch_rects(r, swatches.len(), cell_h).into_iter().zip(swatches) {
+                be.fill_rect(rect.x, rect.y, rect.w, rect.h, *col);
             }
             continue;
         }

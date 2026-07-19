@@ -143,8 +143,13 @@ egui's per-frame repaint, not the picker concept.
    (column rule), `9b4bcc1` (jacks), `d4aa7e3` (scrollbar hit-markers).
 2. **Slice B1** ✅ done (`e5c7452`) — menu/manual/search native on both backends;
    the uniform-look win. **B2** (delete egui) pending — see above; blocks nothing.
-3. **Slice C** — colour picker, built once on the converged native chrome. Ready
-   to start; does not need B2.
+3. **Slice C** ✅ done — native HSV colour picker (spec:
+   `docs/superpowers/specs/2026-07-19-native-colour-picker-design.md`). Click any
+   of the 18 swatches in the prefs Colours row to open a saturation/value square +
+   hue strip; all `fill_rect`/`draw_char`, so it works on both backends with no
+   dependency on B2. Edits flow through the existing `prefs_pending` + settle, so
+   the terminal recolours once on pause. **B2** (delete egui) remains the only
+   open slice.
 
 Each slice gets its own design spec + implementation plan when it is picked up;
 this document is the triage and the order, not the per-slice design.
