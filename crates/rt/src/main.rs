@@ -26,6 +26,7 @@ mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
+mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
 mod render; // the GL glyph-atlas renderer
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
@@ -287,9 +288,6 @@ struct Active {
     drag_cursor: Option<(f32, f32)>,      // live cursor (physical px) while dragging a wire
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
-    egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
-    egui_state: egui_winit::State,        // egui-winit input bridge
-    egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
     prefs_open: bool,                     // whether the preferences dialog is showing
     prefs_sel: usize,                     // selected row index into chrome::prefs::rows()
     prefs_scroll: usize,                  // first visible row (the panel scrolls when it doesn't fit)
@@ -760,8 +758,7 @@ impl ApplicationHandler for App {
         };
 
         // --- load GL function pointers into glow -------------------------
-        // Wrapped in an Arc so the terminal renderer and egui_glow's painter
-        // share one live GL context (ADR-0004).
+        // Wrapped in an Arc (the renderer keeps a clone of the live GL context).
         let gl = std::sync::Arc::new(unsafe {
             glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
         });
@@ -908,23 +905,6 @@ impl ApplicationHandler for App {
             };
         }
 
-        // egui overlay for the GL-path chrome that still uses it: menu, manual,
-        // search, and the border instruments. (Preferences moved to a native
-        // dialog on both backends — see `chrome/prefs.rs` — so it no longer needs
-        // this.) Shares our GL context via egui_glow's painter; egui-winit
-        // bridges window input.
-        let egui_ctx = egui::Context::default();
-        let egui_state = egui_winit::State::new(
-            egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            &window,
-            Some(window.scale_factor() as f32),
-            None,
-            None,
-        );
-        let egui_painter = egui_glow::Painter::new(gl.clone(), "", None, false)
-            .expect("failed to create egui painter");
-
         // Store the fully-initialised state and paint once.
         let low_power = renderer.is_software(); // read before `renderer` is moved in
         // Decide which backend *would* be used: a local unix-socket $DISPLAY (or
@@ -1003,9 +983,6 @@ impl ApplicationHandler for App {
             drag_cursor: None,
             last_click: None,
             click_count: 0,
-            egui_ctx,
-            egui_state,
-            egui_painter,
             prefs_open: false,
             prefs_sel: 0,
             prefs_scroll: 0,
@@ -1382,9 +1359,8 @@ impl ApplicationHandler for App {
             // Fell through: a non-input (lifecycle) event — let normal handling run.
         }
 
-        // The context menu is an egui overlay too: egui gets first look (for
-        // hover/click), Escape or a click outside closes it, and terminal input is
-        // suspended while it is up.
+        // The context menu: native hover/click hit-testing, Escape or a click
+        // outside closes it, and terminal input is suspended while it is up.
         // The context menu: one native handler on both backends. Hover-highlight
         // on motion, act on a click of an enabled row, dismiss on an outside press
         // / Escape. All input swallowed; lifecycle events fall through.
@@ -1515,10 +1491,10 @@ impl ApplicationHandler for App {
             // The user closed the window (title-bar button / compositor). Exit
             // the same way the last-pane-closed path does — `process::exit`,
             // NOT `event_loop.exit()`. The latter unwinds and Drops the GL
-            // context, egui_glow painter and Wayland blur objects, whose teardown
-            // ordering faults (a segfault on Wayland, an X11 GetGeometry panic on
-            // the x11 dev build). The OS reclaims everything; the PTY children get
-            // SIGHUP. This matches SessionEvent::CloseWindow below.
+            // context and Wayland blur objects, whose teardown ordering faults (a
+            // segfault on Wayland, an X11 GetGeometry panic on the x11 dev build).
+            // The OS reclaims everything; the PTY children get SIGHUP. This matches
+            // SessionEvent::CloseWindow below.
             WindowEvent::CloseRequested => exit_clean(),
 
             // Track modifier state so key events can build correct chords.
@@ -1740,8 +1716,8 @@ impl ApplicationHandler for App {
                     }
                     log::debug!("right-click at {:?} → open menu", active.mouse);
                     // Focus the pane under the cursor first, so the menu's
-                    // actions apply to the pane you right-clicked. The menu itself
-                    // is an egui overlay anchored here; egui clamps it on-screen.
+                    // actions apply to the pane you right-clicked. The native menu
+                    // is anchored here and clamped on-screen by `chrome::menu`.
                     active.session.focus_at(active.mouse.0, active.mouse.1);
                     active.menu = Some(active.mouse);
                     active.menu_hover = None; // no row highlighted until the pointer moves
@@ -2105,7 +2081,7 @@ impl ApplicationHandler for App {
         // unless `inst_animate` opts in; the local GL backend always animates.
         let pumped = Self::pump_wires(active);
         let heat_live = Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02);
-        let animate_instruments = active.backend.supports_egui()
+        let animate_instruments = active.backend.is_gl()
             || (active.settings.inst_remote && active.settings.inst_animate);
         if animate_instruments {
             if pumped || active.wires.iter().any(|w| w.rate > 1.0) {
@@ -2136,7 +2112,7 @@ impl ApplicationHandler for App {
         // animation (target "A"). Software GL caps this at ~2fps so the bling can't
         // peg the CPU; on a real GPU it repaints every frame.
         let anim_min = if active.low_power { Duration::from_millis(500) } else { Duration::ZERO };
-        if anim && active.backend.supports_egui() && now.duration_since(active.last_anim) >= anim_min {
+        if anim && active.backend.is_gl() && now.duration_since(active.last_anim) >= anim_min {
             active.last_anim = now;
             dirty = true;
         }
@@ -2147,7 +2123,7 @@ impl ApplicationHandler for App {
         // software-GL repaint throttle. `anim` gates it so a static (no-flow)
         // patch-bay costs nothing.
         let instruments_animating = anim
-            && !active.backend.supports_egui()
+            && !active.backend.is_gl()
             && active.settings.inst_remote
             && active.settings.inst_animate;
         if instruments_animating && now.duration_since(active.last_instr_tick) >= INSTRUMENT_TICK {
@@ -2874,7 +2850,7 @@ impl App {
             || overlay_open
             || !active.bell_flash.is_empty() // bell stripes span the pane top+bottom, not the output's cell-damage → full (and the expired entry, still present here until draw_panes retains it, gives one full frame to clear the stripe)
             || !active.backend.is_software()
-            || (active.backend.supports_egui() && !active.wires.is_empty())
+            || (active.backend.is_gl() && !active.wires.is_empty())
             || !active.backend.partial_present_available()
         {
             active.damage.mark_full();
@@ -3377,15 +3353,16 @@ impl App {
 
     }
 
-    /// The single egui pass per frame: the preferences dialog, the context menu,
-    /// the manual, the search bar, or (when none is up) the border instruments.
-    /// Runs after the pane draw + `end_frame`, blending over the current
-    /// framebuffer (inside the cleared scissor bbox on the partial path).
+    /// Draw whichever overlay is up (preferences + colour picker, context menu,
+    /// manual, or search bar) or — when none is — the border instruments. All
+    /// native `Backend` primitives on both backends; no egui. Runs after the pane
+    /// draw + `end_frame`, over the current framebuffer (inside the cleared
+    /// scissor bbox on the partial path).
     fn paint_overlays_or_instruments(active: &mut Active) {
-        // Preferences: one native dialog on BOTH backends (Task 4) — drawn via
-        // the `Backend` trait directly, no egui pass involved. Checked before the
-        // per-backend split below (which still governs menu/manual/search/
-        // instruments, each of which keeps a separate egui-vs-native rendering).
+        // Preferences (and the colour picker over it): a native dialog on BOTH
+        // backends. Checked before the per-backend split below, which only governs
+        // how the instruments are drawn (inline on GL vs a persistent layer on
+        // XRender) — the menu/manual/search overlays are native on both.
         if active.prefs_open {
             Self::paint_prefs(active);
             if active.picker.is_some() {
@@ -3406,48 +3383,25 @@ impl App {
         // the scissored path never re-ships instrument geometry — and hidden while
         // an overlay is up, or while dragging the scrollbar (it repaints on
         // drag-release via force_full).
-        if active.backend.supports_egui() {
+        if active.backend.is_gl() {
+            // GL: draw the instruments inline each frame (no persistent layer, no
+            // 6fps gating — GL repaints are cheap), only when nothing covers them.
             if !overlay_up {
-                Self::paint_instruments(active);
+                Self::draw_instrument_geometry(active, size);
             }
         } else {
             // Over the remote (XRender) backend the instruments are OFF by default
-            // (`inst_remote`); the user opts in.
+            // (`inst_remote`); the user opts in. They live on a persistent, separate
+            // ARGB layer redrawn only on a 6fps tick (or the first show), so a
+            // keystroke/output burst on the scissored path never re-ships them.
             let show = active.settings.inst_remote && !overlay_up && active.scroll_drag.is_none();
             if !show {
                 active.instr_layer_drawn = false; // next show redraws the layer fresh
             }
             active.backend.set_instrument_layer_visible(show);
-            // Redraw the layer's geometry only on a 6fps tick (or the first show).
-            // Advance the flow by real wall-clock time since the LAST ADVANCE (this
-            // block only runs at tick cadence), so wire packets/meters move at the
-            // right speed regardless of how often content frames happen to run.
             if show && (active.instr_tick || !active.instr_layer_drawn) {
-                let now = Instant::now();
-                let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
-                active.last_meter_tick = now;
-                advance_instrument_state(&mut active.meters, &mut active.wires, dt);
-                // Build the borrowing context from DISJOINT fields so `&mut
-                // active.backend` coexists with the `&active.*` reads.
-                let bounds = content_bounds(size);
-                let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
                 active.backend.begin_instrument_layer();
-                let ctx = chrome::instruments::InstrCtx {
-                    rects: &rects,
-                    meters: &active.meters,
-                    wires: &active.wires,
-                    heat: &active.heat,
-                    inst_output: active.settings.inst_output,
-                    inst_heat: active.settings.inst_heat,
-                    inst_latency: active.settings.inst_latency,
-                    show_jacks: active.settings.show_jacks,
-                    wiring_from: active.wiring_from,
-                    drag_cursor: active.drag_cursor,
-                    lat_phase: active.lat_phase,
-                    stall: active.stall,
-                    size,
-                };
-                chrome::instruments::draw(&mut *active.backend, &ctx);
+                Self::draw_instrument_geometry(active, size);
                 active.backend.end_instrument_layer();
                 active.instr_layer_drawn = true;
             }
@@ -3584,7 +3538,7 @@ impl App {
         // get its `paint_overlays_or_instruments` call and the layer would go
         // stale. `instr_tick` gates that: set only at 6fps in `about_to_wait`, so
         // this doesn't reintroduce coupling to keystroke/output frames.
-        if active.backend.supports_egui() || active.instr_tick {
+        if active.backend.is_gl() || active.instr_tick {
             Self::paint_overlays_or_instruments(active);
         }
         active.backend.clear_scissor(); // next frame starts with a clean scissor
@@ -3880,193 +3834,35 @@ impl App {
         total
     }
 
-    /// Draw the per-pane output-activity instrument as an egui overlay: glowing
-    /// green packets orbiting each pane's border, their speed and brightness
-    /// scaled by that pane's live output rate (ported from rt-mux). Runs its own
-    /// egui pass; called only when no dialog is up, so there is one pass a frame.
-    fn paint_instruments(active: &mut Active) {
-        // Advance the flow by real wall-clock time.
+    /// Advance the instrument animation by wall-clock time, then draw every
+    /// enabled instrument (heat borders, orbiting output packets, patch-bay wires
+    /// + jacks, latency frame) via `chrome::instruments` — the SAME native draw on
+    /// both backends. Called inline on GL each frame; inside the persistent ARGB
+    /// layer on XRender. Reads DISJOINT `active` fields so `&mut active.backend`
+    /// coexists with the `&active.*` reads.
+    fn draw_instrument_geometry(active: &mut Active, size: winit::dpi::PhysicalSize<u32>) {
         let now = Instant::now();
         let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
         active.last_meter_tick = now;
         advance_instrument_state(&mut active.meters, &mut active.wires, dt);
-        // Pane rectangles in physical pixels.
-        let size = active.window.inner_size();
         let bounds = content_bounds(size);
-        let rects = active.session.visible_rects(bounds);
-
-        // egui pass: a background painter drawing the orbiting packets.
-        let raw = active.egui_state.take_egui_input(&active.window);
-        let ctx = active.egui_ctx.clone();
-        ctx.begin_pass(raw);
-        let ppp = ctx.pixels_per_point().max(0.5); // physical px → egui points
-        // Which instruments the settings enable (patch-bay wires always draw).
-        let (inst_output, inst_heat, inst_latency) =
-            (active.settings.inst_output, active.settings.inst_heat, active.settings.inst_latency);
-        {
-            let painter =
-                ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("rt_instr")));
-            for (id, rect) in &rects {
-                let m = active.meters.get(id).copied().unwrap_or_default();
-                let act = (m.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
-                let (x, y, w, h) = (rect.x / ppp, rect.y / ppp, rect.w / ppp, rect.h / ppp);
-                // Heat: a blackbody-tinted border stroke (the pane's temperature),
-                // drawn under the green output packets so one ring shows both.
-                if inst_heat {
-                    let load = active.heat.get(id).copied().unwrap_or(0.0);
-                    painter.rect_stroke(
-                        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
-                        egui::CornerRadius::ZERO,
-                        egui::Stroke::new(2.4, heat_color32(load)),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-                for k in (0..FLOW_PACKETS).take_while(|_| inst_output) {
-                    let t = (m.phase + k as f32 / FLOW_PACKETS as f32).fract();
-                    let p = flow_point(x, y, w, h, t);
-                    let a = 0.30 + 0.70 * act; // dim when idle, vivid when busy
-                    let glow = egui::Color32::from_rgba_unmultiplied(0x28, 0xc0, 0x48, (a * 110.0) as u8);
-                    let core = egui::Color32::from_rgba_unmultiplied(0x66, 0xff, 0x7a, (a * 255.0) as u8);
-                    painter.circle_filled(p, 9.0, glow); // soft halo
-                    painter.circle_filled(p, 3.4, core); // bright centre
-                }
-            }
-            // ── Patch-bay: jacks on each pane + animated wires between them ────
-            // Jack position (points) on a pane rect: 0=stdin (left mid),
-            // 1=stdout (right upper), 2=stderr (right lower).
-            let jack_pos = |r: &rt_core::Rect, which: u8| -> egui::Pos2 {
-                let (x, y, w, h) = (r.x / ppp, r.y / ppp, r.w / ppp, r.h / ppp);
-                match which {
-                    0 => egui::pos2(x, y + h * 0.5),
-                    1 => egui::pos2(x + w, y + h / 3.0),
-                    _ => egui::pos2(x + w, y + 2.0 * h / 3.0),
-                }
-            };
-            let rect_of = |id: rt_core::PaneId| rects.iter().find(|&&(i, _)| i == id).map(|(_, r)| r);
-            // Wires first (under the jacks): a smooth cubic bezier from the source
-            // stream jack to the destination stdin jack, with stream-coloured flow
-            // packets travelling along it — the packets are the literal bytes.
-            for w in &active.wires {
-                let (Some(sr), Some(dr)) = (rect_of(w.src), rect_of(w.dst)) else { continue };
-                let p0 = jack_pos(sr, if w.stream == Stream::Stdout { 1 } else { 2 });
-                let p3 = jack_pos(dr, 0);
-                let ext = ((p3.x - p0.x).abs() * 0.4 + 40.0).min(180.0); // control-point reach
-                let p1 = egui::pos2(p0.x + ext, p0.y);
-                let p2 = egui::pos2(p3.x - ext, p3.y);
-                let hue = if w.stream == Stream::Stdout { (0x40, 0xc0, 0x54) } else { (0xd0, 0x54, 0x30) };
-                let act = (w.rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
-                const N: u32 = 56;
-                let mut prev = p0;
-                for i in 1..=N {
-                    let t = i as f32 / N as f32;
-                    let pt = cubic_bezier(p0, p1, p2, p3, t);
-                    // Brightness = nearest travelling packet, scaled by throughput.
-                    let mut best = 0.0f32;
-                    for k in 0..WIRE_PACKETS {
-                        let pp = (w.phase + k as f32 / WIRE_PACKETS as f32).fract();
-                        let d = (t - pp).abs();
-                        best = best.max((-d * d / (2.0 * 0.05 * 0.05)).exp());
-                    }
-                    let b = 0.22 + 0.78 * best * (0.30 + 0.70 * act);
-                    let col = egui::Color32::from_rgb(
-                        (hue.0 as f32 * b) as u8,
-                        (hue.1 as f32 * b) as u8,
-                        (hue.2 as f32 * b) as u8,
-                    );
-                    painter.line_segment([prev, pt], egui::Stroke::new(2.0, col));
-                    prev = pt;
-                }
-            }
-            // Rubber-band the in-progress mouse wire from its source jack to the
-            // cursor (a dashed bezier, so it reads like the finished wire).
-            if let (Some((src, stream)), Some((cx, cy))) = (active.wiring_from, active.drag_cursor) {
-                if let Some(sr) = rect_of(src) {
-                    let p0 = jack_pos(sr, if stream == Stream::Stdout { 1 } else { 2 });
-                    let p3 = egui::pos2(cx / ppp, cy / ppp);
-                    let ext = ((p3.x - p0.x).abs() * 0.4 + 40.0).min(180.0);
-                    let p1 = egui::pos2(p0.x + ext, p0.y);
-                    let p2 = egui::pos2(p3.x - ext, p3.y);
-                    let (hr, hg, hb) = if stream == Stream::Stdout { (0x40, 0xc0, 0x54) } else { (0xd0, 0x54, 0x30) };
-                    let col = egui::Color32::from_rgba_unmultiplied(hr, hg, hb, 180);
-                    let mut prev = p0;
-                    for i in 1..=40 {
-                        let t = i as f32 / 40.0;
-                        let pt = cubic_bezier(p0, p1, p2, p3, t);
-                        if i % 2 == 0 {
-                            painter.line_segment([prev, pt], egui::Stroke::new(1.6, col)); // dashed
-                        }
-                        prev = pt;
-                    }
-                }
-            }
-            // Latency: the whole-window frame, drawn last so it wins the outer
-            // ring. Short violet segments each coloured by the undulation, with a
-            // fast bright flare travelling round when a deadline was missed.
-            // Trace the content region's perimeter (inset by the standoff), not
-            // the raw window edge, so the frame is fully visible.
-            let cb = content_bounds(size);
-            let (fx, fy) = (cb.x / ppp, cb.y / ppp);
-            let (fw, fh) = (cb.w / ppp, cb.h / ppp);
-            if inst_latency {
-                // Walk each edge explicitly, corner-to-corner, so the corners are
-                // always exact segment endpoints (an even sampling of the whole
-                // perimeter straddles two corners and chords across them).
-                let per = 2.0 * (fw + fh);
-                // (corner point, cumulative distance from the top-left, clockwise).
-                let corners = [
-                    (egui::pos2(fx, fy), 0.0),
-                    (egui::pos2(fx + fw, fy), fw),
-                    (egui::pos2(fx + fw, fy + fh), fw + fh),
-                    (egui::pos2(fx, fy + fh), 2.0 * fw + fh),
-                    (egui::pos2(fx, fy), per), // back to the start
-                ];
-                const SUB: u32 = 26; // segments per edge
-                for e in 0..4 {
-                    let (pa, da) = corners[e];
-                    let (pb, db) = corners[e + 1];
-                    let mut prev = pa;
-                    for s in 1..=SUB {
-                        let f = s as f32 / SUB as f32;
-                        let pt = egui::pos2(pa.x + (pb.x - pa.x) * f, pa.y + (pb.y - pa.y) * f);
-                        // Colour at the segment midpoint's perimeter position.
-                        let mid_t = (da + (db - da) * (f - 0.5 / SUB as f32)) / per;
-                        let col = latency_color(mid_t, active.lat_phase, active.stall);
-                        painter.line_segment([prev, pt], egui::Stroke::new(2.0, col));
-                        prev = pt;
-                    }
-                }
-            }
-            // Jack dots on every pane (filled ● when a wire uses them). Drawn
-            // LAST so nothing crosses them: the latency frame and heat borders
-            // run along the very pane edges the jacks sit on, and would slice a
-            // vertical line through each disc if drawn afterwards.
-            for (id, r) in rects.iter().take_while(|_| active.settings.show_jacks) {
-                let has_in = active.wires.iter().any(|w| w.dst == *id);
-                let has_out = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
-                let has_err = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
-                let jack = |p: egui::Pos2, filled: bool, col: egui::Color32| {
-                    painter.circle_filled(p, JACK_R_BACK, egui::Color32::from_black_alpha(180)); // dark backing
-                    if filled {
-                        painter.circle_filled(p, JACK_R_FILL, col);
-                    } else {
-                        painter.circle_stroke(p, JACK_R_RING, egui::Stroke::new(JACK_RING_W, col));
-                    }
-                };
-                jack(jack_pos(r, 0), has_in, egui::Color32::from_rgb(0x88, 0x88, 0x98));
-                jack(jack_pos(r, 1), has_out, egui::Color32::from_rgb(0x40, 0xc0, 0x54));
-                jack(jack_pos(r, 2), has_err, egui::Color32::from_rgb(0xd0, 0x54, 0x30));
-            }
-        }
-        let output = ctx.end_pass();
-        active.egui_state.handle_platform_output(&active.window, output.platform_output);
-        let ppp2 = output.pixels_per_point;
-        let primitives = ctx.tessellate(output.shapes, ppp2);
-        active.egui_painter.paint_and_update_textures(
-            [size.width, size.height],
-            ppp2,
-            &primitives,
-            &output.textures_delta,
-        );
+        let rects = active.session.visible_rects(bounds); // owned Vec — no session borrow lingers
+        let ctx = chrome::instruments::InstrCtx {
+            rects: &rects,
+            meters: &active.meters,
+            wires: &active.wires,
+            heat: &active.heat,
+            inst_output: active.settings.inst_output,
+            inst_heat: active.settings.inst_heat,
+            inst_latency: active.settings.inst_latency,
+            show_jacks: active.settings.show_jacks,
+            wiring_from: active.wiring_from,
+            drag_cursor: active.drag_cursor,
+            lat_phase: active.lat_phase,
+            stall: active.stall,
+            size,
+        };
+        chrome::instruments::draw(&mut *active.backend, &ctx);
     }
 
     /// Re-run the current search query against the focused pane and replace the
@@ -4130,7 +3926,7 @@ impl App {
 /// Colour of the latency frame at perimeter position `pos` (0..1): a calm
 /// purple-blue-violet undulation, plus a bright fast-moving flare scaled by
 /// `stall` (a recent deadline miss). Ported from rt-mux.
-fn latency_color(pos: f32, phase: f32, stall: f32) -> egui::Color32 {
+fn latency_color(pos: f32, phase: f32, stall: f32) -> Color {
     use std::f32::consts::TAU;
     let wave = 0.5 + 0.5 * (TAU * (pos * 2.0 + phase)).sin(); // two slow lobes drifting
     let base = 0.20 + 0.30 * wave;
@@ -4148,7 +3944,7 @@ fn latency_color(pos: f32, phase: f32, stall: f32) -> egui::Color32 {
     let r = (56.0 + 128.0 * v + spike * 120.0).min(255.0) as u8;
     let g = (32.0 + 80.0 * v + spike * 110.0).min(255.0) as u8;
     let b = (88.0 + 152.0 * v + spike * 40.0).min(255.0) as u8;
-    egui::Color32::from_rgb(r, g, b)
+    Color::rgb(r, g, b)
 }
 
 /// Advance every meter's and wire's exponential rate + flow phase by `dt`
@@ -4179,13 +3975,13 @@ fn advance_instrument_state(
 /// Planck/blackbody colour for a CPU load (fraction of one core): idle glows a
 /// dim deep red, a busy core runs up through orange and yellow to white-hot, a
 /// pathological load goes blue-white — load *is* temperature. Ported from rt-mux.
-fn heat_color32(load: f32) -> egui::Color32 {
+fn heat_color(load: f32) -> Color {
     let n = (load / 1.5).clamp(0.0, 1.0); // normalise (≥1.5 cores = max heat)
     let s = n * n * (3.0 - 2.0 * n); // smoothstep
     let kelvin = 1200.0 + s * 9000.0; // 1200K (dim red) .. 10200K (blue-white)
     let (r, g, b) = blackbody(kelvin);
     let bright = 0.30 + 0.70 * n; // idle dim, busy vivid
-    egui::Color32::from_rgb((r * bright) as u8, (g * bright) as u8, (b * bright) as u8)
+    Color::rgb((r * bright) as u8, (g * bright) as u8, (b * bright) as u8)
 }
 
 /// Approximate blackbody RGB (0..255) for a colour temperature in kelvin
@@ -4494,29 +4290,29 @@ fn encode_mouse(report: MouseReport, col: u16, row: u16, mods: &ModifiersState, 
 
 /// A point on the cubic Bézier `p0→p3` (control points `p1`, `p2`) at `t` in
 /// 0..1 — used to draw the smooth patch-bay wires.
-fn cubic_bezier(p0: egui::Pos2, p1: egui::Pos2, p2: egui::Pos2, p3: egui::Pos2, t: f32) -> egui::Pos2 {
+fn cubic_bezier(p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32), t: f32) -> (f32, f32) {
     let u = 1.0 - t;
     let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-    egui::pos2(
-        a * p0.x + b * p1.x + c * p2.x + d * p3.x,
-        a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+    (
+        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
+        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
     )
 }
 
-/// The point at normalised position `t` (0..1, clockwise from the top-left)
-/// around the perimeter of the rectangle `(x, y, w, h)` — used to place the
-/// orbiting output-flow packets. All in egui points.
-fn flow_point(x: f32, y: f32, w: f32, h: f32, t: f32) -> egui::Pos2 {
+/// The point `(x,y)` at normalised position `t` (0..1, clockwise from the top-
+/// left) around the perimeter of the rectangle `(x, y, w, h)` — used to place the
+/// orbiting output-flow packets.
+fn flow_point(x: f32, y: f32, w: f32, h: f32, t: f32) -> (f32, f32) {
     let per = 2.0 * (w + h); // perimeter length
     let d = t.rem_euclid(1.0) * per; // distance travelled along it
     if d < w {
-        egui::pos2(x + d, y) // top edge, left → right
+        (x + d, y) // top edge, left → right
     } else if d < w + h {
-        egui::pos2(x + w, y + (d - w)) // right edge, top → bottom
+        (x + w, y + (d - w)) // right edge, top → bottom
     } else if d < 2.0 * w + h {
-        egui::pos2(x + w - (d - w - h), y + h) // bottom edge, right → left
+        (x + w - (d - w - h), y + h) // bottom edge, right → left
     } else {
-        egui::pos2(x, y + h - (d - 2.0 * w - h)) // left edge, bottom → top
+        (x, y + h - (d - 2.0 * w - h)) // left edge, bottom → top
     }
 }
 

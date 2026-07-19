@@ -9,6 +9,7 @@
 
 pub mod damage; // pure pixel-rect damage accumulator
 pub mod input; // winit key/modifiers -> Chord, and typed-key -> PTY bytes
+pub mod raster; // CPU anti-aliased coverage masks (disc/ring/bar), used by render.rs
 pub mod render; // GL glyph-atlas renderer (also declared in main.rs for the bin);
                 // exposed here so the offscreen pixel-identity gate can drive it
 

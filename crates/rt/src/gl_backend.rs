@@ -117,6 +117,16 @@ impl Backend for GlBackend {
     fn draw_underline(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
         self.renderer.draw_underline(ox, oy, col, row, color)
     }
+    // AA chrome primitives for the native instruments (previously egui-only on GL).
+    fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: Color) {
+        self.renderer.fill_circle(cx, cy, r, c)
+    }
+    fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
+        self.renderer.stroke_circle(cx, cy, r, width, c)
+    }
+    fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
+        self.renderer.stroke_line(x0, y0, x1, y1, width, c)
+    }
     fn draw_strikeout(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
         self.renderer.draw_strikeout(ox, oy, col, row, color)
     }

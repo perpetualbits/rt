@@ -133,7 +133,7 @@ pub fn scissor_box(r: crate::damage::PxRect, screen_h: i32) -> (i32, i32, i32, i
 /// The renderer owns the GL objects, the font, the atlas, and the per-frame
 /// vertex scratch buffer.
 pub struct Renderer {
-    gl: std::sync::Arc<glow::Context>, // the live GL context (shared with egui_glow via Arc)
+    gl: std::sync::Arc<glow::Context>, // the live GL context
     program: glow::Program,            // the single shader program
     vao: glow::VertexArray,            // vertex array object describing the layout
     vbo: glow::Buffer,                 // dynamic vertex buffer, re-uploaded each frame
@@ -148,6 +148,9 @@ pub struct Renderer {
     cell_h: f32,                       // cell height (line advance) in pixels
     ascent: f32,                       // baseline offset from the cell top
     glyphs: HashMap<(char, bool, bool), Glyph>, // glyph cache, keyed by (char, bold, italic)
+    // AA coverage masks for the instrument primitives, keyed by (kind, r*4, w*4):
+    // kind 0 = disc, 1 = ring, 2 = line bar. Packed into the same atlas as glyphs.
+    shape_masks: HashMap<(u8, u32, u32), Glyph>,
     shelf_x: i32,                      // next free x in the current atlas shelf
     shelf_y: i32,                      // top y of the current shelf
     shelf_h: i32,                      // height of the current shelf
@@ -285,6 +288,7 @@ impl Renderer {
                 cell_h,
                 ascent,
                 glyphs: HashMap::new(),
+                shape_masks: HashMap::new(),
                 shelf_x: 2,  // leave column 0/1 near the opaque seed texel
                 shelf_y: 2,  // first shelf sits below the seed row
                 shelf_h: 0,
@@ -327,7 +331,10 @@ impl Renderer {
         self.ascent = ascent;
         // Old cached glyphs are stale (wrong font/size); drop them and reset the
         // atlas packing cursor. Old pixels linger harmlessly until overwritten.
+        // The shape masks share the atlas, so their placements are stale too —
+        // drop them so they re-pack against the reset cursor.
         self.glyphs.clear();
+        self.shape_masks.clear();
         self.shelf_x = 2;
         self.shelf_y = 2;
         self.shelf_h = 0;
@@ -496,26 +503,41 @@ impl Renderer {
         }
         let gw = metrics.width as i32; // glyph bitmap width
         let gh = metrics.height as i32; // glyph bitmap height
-        // Advance to a new shelf if this glyph won't fit on the current one.
+        // Pack + upload the coverage bitmap into the atlas (shared with masks).
+        let (u0, v0, u1, v1) = self.pack_coverage(gw, gh, &bitmap)?;
+        let g = Glyph {
+            u0,
+            v0,
+            u1,
+            v1,
+            w: gw as f32,
+            h: gh as f32,
+            left: metrics.xmin as f32,            // horizontal bearing
+            top: metrics.ymin as f32 + gh as f32, // top = height above baseline
+        };
+        self.glyphs.insert((c, bold, italic), g); // cache for next time
+        Some(g)
+    }
+
+    /// Shelf-pack a `gw`×`gh` R8 coverage bitmap into the atlas and upload it,
+    /// returning its UV rectangle `(u0,v0,u1,v1)`. Shared by glyphs and shape
+    /// masks. `None` when the atlas is full.
+    fn pack_coverage(&mut self, gw: i32, gh: i32, bitmap: &[u8]) -> Option<(f32, f32, f32, f32)> {
+        // Advance to a new shelf if this won't fit on the current one.
         if self.shelf_x + gw + 1 >= ATLAS {
             self.shelf_y += self.shelf_h + 1; // move down past the current shelf
             self.shelf_x = 2; // back to the left margin
             self.shelf_h = 0; // new shelf starts empty
         }
-        // If we've run out of vertical room, give up caching this glyph.
         if self.shelf_y + gh + 1 >= ATLAS {
-            return None; // atlas full; render nothing for this glyph
+            return None; // atlas full
         }
-        let x = self.shelf_x; // where this glyph goes, x
-        let y = self.shelf_y; // where this glyph goes, y
+        let x = self.shelf_x;
+        let y = self.shelf_y;
         unsafe {
-            // Upload the coverage bitmap into the atlas at (x, y).
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
-            // R8 rows are tightly packed (stride == width). We must force
-            // UNPACK_ALIGNMENT=1 *here*, not just once at init: egui_glow (which
-            // now runs every frame for the instrument overlay) resets it to 4, and
-            // a stale 4 shears any glyph whose width isn't a multiple of 4 — the
-            // row-by-row skew that shows as edge artifacts on the right/bottom.
+            // R8 rows are tightly packed (stride == width); force UNPACK_ALIGNMENT=1
+            // so a width not a multiple of 4 doesn't shear.
             self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             self.gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
@@ -526,24 +548,37 @@ impl Renderer {
                 gh,
                 glow::RED,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&bitmap)),
+                glow::PixelUnpackData::Slice(Some(bitmap)),
             );
         }
-        // Advance the shelf cursor and grow the shelf height if needed.
-        self.shelf_x += gw + 1; // 1px gutter between glyphs
+        self.shelf_x += gw + 1; // 1px gutter
         self.shelf_h = self.shelf_h.max(gh);
-        // Record the glyph's UV rectangle and placement offsets.
-        let g = Glyph {
-            u0: x as f32 / ATLAS as f32,
-            v0: y as f32 / ATLAS as f32,
-            u1: (x + gw) as f32 / ATLAS as f32,
-            v1: (y + gh) as f32 / ATLAS as f32,
-            w: gw as f32,
-            h: gh as f32,
-            left: metrics.xmin as f32,   // horizontal bearing
-            top: metrics.ymin as f32 + gh as f32, // top = height above baseline
+        Some((
+            x as f32 / ATLAS as f32,
+            y as f32 / ATLAS as f32,
+            (x + gw) as f32 / ATLAS as f32,
+            (y + gh) as f32 / ATLAS as f32,
+        ))
+    }
+
+    /// Rasterise (if needed) and cache an AA shape mask (disc/ring/bar), returning
+    /// its atlas placement. `w`/`h` are the mask's pixel size; `left`/`top` unused.
+    fn mask(&mut self, kind: u8, r: f32, width: f32) -> Option<Glyph> {
+        let key = (kind, (r * 4.0).round() as u32, (width * 4.0).round() as u32);
+        if let Some(g) = self.shape_masks.get(&key) {
+            return Some(*g);
+        }
+        let (w, h, data) = match kind {
+            0 => crate::raster::rasterize_disc(r),
+            1 => crate::raster::rasterize_ring(r, width),
+            _ => crate::raster::rasterize_bar(width),
         };
-        self.glyphs.insert((c, bold, italic), g); // cache for next time
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (u0, v0, u1, v1) = self.pack_coverage(w as i32, h as i32, &data)?;
+        let g = Glyph { u0, v0, u1, v1, w: w as f32, h: h as f32, left: 0.0, top: 0.0 };
+        self.shape_masks.insert(key, g);
         Some(g)
     }
 
@@ -564,6 +599,65 @@ impl Renderer {
             x1, y, u1, v0, c.0, c.1, c.2, c.3,    // top-right
         ];
         self.verts.extend_from_slice(&quad); // append to the frame's geometry
+    }
+
+    /// Push a quad from four arbitrary corner positions + their UVs (for a rotated
+    /// line quad). Corners `[a,b,c,d]` wind around the quad; split into triangles
+    /// `(a,b,c)` and `(a,c,d)`.
+    fn push_quad_corners(&mut self, p: [(f32, f32); 4], uv: [(f32, f32); 4], c: Color) {
+        let v = |pt: (f32, f32), t: (f32, f32)| [pt.0, pt.1, t.0, t.1, c.0, c.1, c.2, c.3];
+        for &i in &[0usize, 1, 2, 0, 2, 3] {
+            self.verts.extend_from_slice(&v(p[i], uv[i]));
+        }
+    }
+
+    /// Filled anti-aliased disc of radius `r` centred at `(cx,cy)`, via a cached
+    /// coverage mask (matches the XRender path's `fill_circle`).
+    pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: Color) {
+        if r <= 0.0 {
+            return;
+        }
+        if let Some(g) = self.mask(0, r, 0.0) {
+            let off = r.ceil(); // mask centre sits at (ceil r, ceil r)
+            self.push_quad(cx - off, cy - off, g.w, g.h, (g.u0, g.v0, g.u1, g.v1), c);
+        }
+    }
+
+    /// Anti-aliased ring (outer radius `r`, stroke `width`) centred at `(cx,cy)`.
+    pub fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
+        if r <= 0.0 || width <= 0.0 {
+            return;
+        }
+        if let Some(g) = self.mask(1, r, width) {
+            let off = r.ceil();
+            self.push_quad(cx - off, cy - off, g.w, g.h, (g.u0, g.v0, g.u1, g.v1), c);
+        }
+    }
+
+    /// Anti-aliased thick line from `(x0,y0)` to `(x1,y1)` (butt caps). A per-width
+    /// bar mask is stretched along the segment on a rotated quad; the mask's AA
+    /// height axis maps across the line's width so the long edges are smooth.
+    pub fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
+        if width <= 0.0 {
+            return;
+        }
+        let Some(g) = self.mask(2, 0.0, width) else { return };
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 {
+            return;
+        }
+        // Half-width = half the mask's height (which carries the 1px AA margin each
+        // side), so the quad is a touch wider than `width` and the fringe shows.
+        let hw = g.h * 0.5;
+        let (nx, ny) = (-dy / len * hw, dx / len * hw);
+        let a = (x0 + nx, y0 + ny);
+        let b = (x1 + nx, y1 + ny);
+        let cc = (x1 - nx, y1 - ny);
+        let d = (x0 - nx, y0 - ny);
+        // +normal edge (a,b) at the mask's top row (v0); -normal edge (c,d) at v1.
+        let (u0, v0, u1, v1) = (g.u0, g.v0, g.u1, g.v1);
+        self.push_quad_corners([a, b, cc, d], [(u0, v0), (u1, v0), (u1, v1), (u0, v1)], c);
     }
 
     /// Draw a solid-colour rectangle (background fill, divider, focus border).

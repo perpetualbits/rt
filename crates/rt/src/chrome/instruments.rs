@@ -1,11 +1,11 @@
-//! Native (XRender) instruments + patch-bay: the same meters/wires/beziers as
-//! the egui path (`main.rs::paint_instruments`), drawn with `Backend`
-//! primitives. Colors/geometry come from the shared `main.rs` helpers via
-//! `chrome::col`, so there is no visual drift between the GL and native paths.
+//! The border instruments + patch-bay, drawn with `Backend` primitives on BOTH
+//! backends (GL and XRender) — the same meters/wires/beziers, no egui. Colours
+//! and geometry come from the shared `main.rs` helpers, so the two paths draw
+//! identically.
 use std::collections::HashMap;
 use crate::backend::Backend;
-use crate::chrome::col;
-use crate::{content_bounds, cubic_bezier, flow_point, heat_color32, latency_color, Meter, Wire,
+use crate::render::Color;
+use crate::{content_bounds, cubic_bezier, flow_point, heat_color, latency_color, Meter, Wire,
             BUSY_WAKEUPS, FLOW_PACKETS, WIRE_BUSY_BYTES, WIRE_PACKETS,
             JACK_R_BACK, JACK_R_FILL, JACK_R_RING, JACK_RING_W};
 use rt_core::{PaneId, Rect};
@@ -45,7 +45,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
         if inst_heat {
             let load = ctx.heat.get(id).copied().unwrap_or(0.0);
-            let c = col(heat_color32(load));
+            let c = heat_color(load);
             let t = 2.4;
             be.fill_rect(x, y, w, t, c); // top
             be.fill_rect(x, y + h - t, w, t, c); // bottom
@@ -57,10 +57,11 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
                 let tt = (m.phase + k as f32 / FLOW_PACKETS as f32).fract();
                 let p = flow_point(x, y, w, h, tt);
                 let a = 0.30 + 0.70 * act;
-                let glow = col(egui::Color32::from_rgba_unmultiplied(0x28, 0xc0, 0x48, (a * 110.0) as u8));
-                let core = col(egui::Color32::from_rgba_unmultiplied(0x66, 0xff, 0x7a, (a * 255.0) as u8));
-                be.fill_circle(p.x, p.y, 9.0, glow);
-                be.fill_circle(p.x, p.y, 3.4, core);
+                let n = |v: u8| v as f32 / 255.0;
+                let glow = Color(n(0x28), n(0xc0), n(0x48), a * 110.0 / 255.0);
+                let core = Color(n(0x66), n(0xff), n(0x7a), a);
+                be.fill_circle(p.0, p.1, 9.0, glow);
+                be.fill_circle(p.0, p.1, 3.4, core);
             }
         }
     }
@@ -90,13 +91,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         let mut prev = p0;
         for i in 1..=N {
             let t = i as f32 / N as f32;
-            let pt = cubic_bezier(
-                egui::pos2(p0.0, p0.1),
-                egui::pos2(p1.0, p1.1),
-                egui::pos2(p2.0, p2.1),
-                egui::pos2(p3.0, p3.1),
-                t,
-            );
+            let pt = cubic_bezier(p0, p1, p2, p3, t);
             let mut best = 0.0f32;
             for k in 0..WIRE_PACKETS {
                 let pp = (w.phase + k as f32 / WIRE_PACKETS as f32).fract();
@@ -104,10 +99,10 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
                 best = best.max((-d * d / (2.0 * 0.05 * 0.05)).exp());
             }
             let b = 0.22 + 0.78 * best * (0.30 + 0.70 * act);
-            let c = crate::render::Color::rgb(
+            let c = Color::rgb(
                 (hue.0 as f32 * b) as u8, (hue.1 as f32 * b) as u8, (hue.2 as f32 * b) as u8);
-            be.stroke_line(prev.0, prev.1, pt.x, pt.y, 2.0, c);
-            prev = (pt.x, pt.y);
+            be.stroke_line(prev.0, prev.1, pt.0, pt.1, 2.0, c);
+            prev = pt;
         }
     }
 
@@ -119,20 +114,15 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             let ext = ((p3.0 - p0.0).abs() * 0.4 + 40.0).min(180.0);
             let p1 = (p0.0 + ext, p0.1);
             let p2 = (p3.0 - ext, p3.1);
-            let (hr, hg, hb) = if stream == Stream::Stdout { (0x40, 0xc0, 0x54) } else { (0xd0, 0x54, 0x30) };
-            let c = col(egui::Color32::from_rgba_unmultiplied(hr, hg, hb, 180));
+            let (hr, hg, hb) = if stream == Stream::Stdout { (0x40u8, 0xc0u8, 0x54u8) } else { (0xd0, 0x54, 0x30) };
+            let n = |v: u8| v as f32 / 255.0;
+            let c = Color(n(hr), n(hg), n(hb), 180.0 / 255.0);
             let mut prev = p0;
             for i in 1..=40u32 {
                 let t = i as f32 / 40.0;
-                let pt = cubic_bezier(
-                    egui::pos2(p0.0, p0.1),
-                    egui::pos2(p1.0, p1.1),
-                    egui::pos2(p2.0, p2.1),
-                    egui::pos2(p3.0, p3.1),
-                    t,
-                );
-                if i % 2 == 0 { be.stroke_line(prev.0, prev.1, pt.x, pt.y, 1.6, c); }
-                prev = (pt.x, pt.y);
+                let pt = cubic_bezier(p0, p1, p2, p3, t);
+                if i % 2 == 0 { be.stroke_line(prev.0, prev.1, pt.0, pt.1, 1.6, c); }
+                prev = pt;
             }
         }
     }
@@ -158,7 +148,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
                 let f = s as f32 / SUB as f32;
                 let pt = (pa.0 + (pb.0 - pa.0) * f, pa.1 + (pb.1 - pa.1) * f);
                 let mid_t = (da + (db - da) * (f - 0.5 / SUB as f32)) / per;
-                let c = col(latency_color(mid_t, ctx.lat_phase, ctx.stall));
+                let c = latency_color(mid_t, ctx.lat_phase, ctx.stall);
                 be.stroke_line(prev.0, prev.1, pt.0, pt.1, 2.0, c);
                 prev = pt;
             }

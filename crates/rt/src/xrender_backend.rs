@@ -31,44 +31,8 @@ use crate::render::{Color, FontBlobs};
 /// once and is stamped by a ~20-byte reference, like a font glyph.
 type TriF = [(f32, f32); 3];
 
-/// Rasterise a filled disc of radius `r` into an A8 coverage bitmap, centred in a
-/// `side`×`side` square (`side = 2*ceil(r)+1`). Edge coverage ramps over ~1px
-/// (analytic AA). Returns `(side, side, coverage)`. Rasterised ONCE, then cached.
-fn rasterize_disc(r: f32) -> (u16, u16, Vec<u8>) {
-    let rad = r.ceil().max(1.0) as i32;
-    let side = (rad * 2 + 1) as usize;
-    let mut data = vec![0u8; side * side];
-    for py in 0..side {
-        for px in 0..side {
-            let dx = px as f32 - rad as f32;
-            let dy = py as f32 - rad as f32;
-            let d = (dx * dx + dy * dy).sqrt();
-            let cov = (r + 0.5 - d).clamp(0.0, 1.0);
-            data[py * side + px] = (cov * 255.0) as u8;
-        }
-    }
-    (side as u16, side as u16, data)
-}
-
-/// Rasterise a ring (outer radius `r`, stroke `width` inward) into an A8 mask:
-/// coverage = inside the outer edge AND outside the inner edge, both AA.
-fn rasterize_ring(r: f32, width: f32) -> (u16, u16, Vec<u8>) {
-    let rad = r.ceil().max(1.0) as i32;
-    let side = (rad * 2 + 1) as usize;
-    let ri = (r - width).max(0.0);
-    let mut data = vec![0u8; side * side];
-    for py in 0..side {
-        for px in 0..side {
-            let dx = px as f32 - rad as f32;
-            let dy = py as f32 - rad as f32;
-            let d = (dx * dx + dy * dy).sqrt();
-            let outer = (r + 0.5 - d).clamp(0.0, 1.0); // inside outer edge
-            let inner = (d - ri + 0.5).clamp(0.0, 1.0); // outside inner edge
-            data[py * side + px] = (outer.min(inner) * 255.0) as u8;
-        }
-    }
-    (side as u16, side as u16, data)
-}
+// Disc/ring coverage masks are shared with the GL backend (see `crate::raster`).
+use crate::raster::{rasterize_disc, rasterize_ring};
 
 /// Thick segment as a quad (2 triangles), butt caps, `width` centred on the line.
 fn line_tris(x0: f32, y0: f32, x1: f32, y1: f32, width: f32) -> Vec<TriF> {
@@ -905,8 +869,8 @@ impl Backend for XRenderBackend {
         // changed cells — exactly what the clip filter in fill/draw_char honours.
         true
     }
-    fn supports_egui(&self) -> bool {
-        false // no GL context → egui_glow chrome cannot render (Slice 1 degrade)
+    fn is_gl(&self) -> bool {
+        false // the XRender backend: instruments live on the persistent layer
     }
 }
 

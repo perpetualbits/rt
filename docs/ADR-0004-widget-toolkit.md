@@ -1,5 +1,15 @@
 # ADR-0004 — Adopt egui for UI chrome (keep the custom terminal renderer)
 
+> **Status: SUPERSEDED (2026-07-19).** egui was adopted as below, then removed.
+> Over `ssh -X` its full-frame, pixel-shipping overlay was far too heavy (see
+> `docs/remote-rendering-lessons.md`), so a command-drawn **native chrome** grew
+> up on the XRender backend (menu, search, manual, preferences, instruments) and
+> was then unified onto the GL path too — the GL renderer gained AA
+> circle/line/mask primitives (`raster.rs` + `render.rs`) so the instruments no
+> longer needed egui. egui / egui-winit / egui_glow are gone. The decision that
+> held: **keep the custom GL glyph renderer for the grid.** The colour picker the
+> context below anticipated is native (`chrome/colour_picker.rs`).
+
 ## Context
 rt currently hand-draws everything in GL (the terminal grid, the tab strip, the
 context menu). That was fine for those, but the Terminator feature set we want to

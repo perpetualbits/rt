@@ -50,17 +50,11 @@ glutin = { version = "0.32.2", default-features = false, features = ["egl", "way
 # back into the tree — so disable defaults and opt into only egl+wayland.
 glutin-winit = { version = "0.5.0", default-features = false, features = ["egl", "wayland"] }
 raw-window-handle = "0.6"            # handle types passed between winit and glutin
-glow = "0.17"                        # OpenGL wrapper; 0.17 matches egui_glow so they share the GL context
+glow = "0.17"                        # OpenGL wrapper for the custom glyph/atlas renderer
 fontdue = "0.9"                      # CPU glyph rasteriser feeding the GL atlas
 fontdb = "0.23"                      # pure-Rust system font discovery (family picker; no X11)
 log = "0.4"                          # diagnostics
 env_logger = "0.11"                  # RUST_LOG-driven logging for the binary
-# egui for UI chrome (preferences dialog, colour/font pickers). default-features
-# OFF everywhere to avoid egui-winit's `clipboard` feature (arboard → X11) and
-# any x11 backend; we render egui as an overlay via egui_glow (ADR-0004).
-egui = "0.35"                        # core: keep default features (default_fonts, color-picker) — no X11
-egui-winit = { version = "0.35", default-features = false, features = ["wayland"] } # NO clipboard (arboard→X11)
-egui_glow = { version = "0.35", default-features = false }
 # KDE/KWin background-blur request (org_kde_kwin_blur). Both crates are already
 # in the tree via winit, so depending on them directly adds no new crates; it
 # just lets rt ask KWin to blur behind its surface. No-op on non-KDE. The
