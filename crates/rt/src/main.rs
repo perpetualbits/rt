@@ -1222,199 +1222,148 @@ impl ApplicationHandler for App {
             }
         }
 
-        // The manual overlay behaves like the preferences dialog: egui gets events
-        // (for scrolling), Esc or F1 closes it, and terminal input is suspended.
+        // The manual overlay: Esc/F1/q close it, arrows/PageUp-Down/wheel scroll,
+        // and every other input is swallowed so it can't reach the PTY. One native
+        // handler on both backends (no egui); lifecycle events fall through.
         if active.manual_open {
-            // Native (XRender) path: no egui. Handle scroll keys/wheel directly,
-            // Esc/F1/q close, and swallow all other input so it can't reach the PTY.
-            if !active.backend.supports_egui() {
-                let size = active.window.inner_size();
-                let (cw, ch) = active.backend.cell_size();
-                let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch);
-                match &event {
-                    WindowEvent::KeyboardInput { event: ke, .. }
-                        if ke.state == ElementState::Pressed =>
-                    {
-                        match &ke.logical_key {
-                            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F1) => {
-                                active.manual_open = false;
-                            }
-                            Key::Named(NamedKey::ArrowDown) => {
-                                active.manual_scroll =
-                                    chrome::manual::clamp_scroll(active.manual_scroll + 1, &g);
-                            }
-                            Key::Named(NamedKey::ArrowUp) => {
-                                active.manual_scroll = chrome::manual::clamp_scroll(
-                                    active.manual_scroll.saturating_sub(1),
-                                    &g,
-                                );
-                            }
-                            Key::Named(NamedKey::PageDown) => {
-                                active.manual_scroll =
-                                    chrome::manual::clamp_scroll(active.manual_scroll + 10, &g);
-                            }
-                            Key::Named(NamedKey::PageUp) => {
-                                active.manual_scroll = chrome::manual::clamp_scroll(
-                                    active.manual_scroll.saturating_sub(10),
-                                    &g,
-                                );
-                            }
-                            Key::Character(s) if s.as_str() == "q" => {
-                                active.manual_open = false;
-                            }
-                            _ => {}
-                        }
-                        active.window.request_redraw(); // scroll moved / overlay closed
-                        return;
-                    }
-                    WindowEvent::MouseWheel { delta, .. } => {
-                        // Positive y = wheel up = scroll toward the top (fewer rows).
-                        let lines = match delta {
-                            MouseScrollDelta::LineDelta(_, y) => *y as isize,
-                            MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as isize,
-                        };
-                        let next = (active.manual_scroll as isize - lines).max(0) as usize;
-                        active.manual_scroll = chrome::manual::clamp_scroll(next, &g);
-                        active.window.request_redraw();
-                        return;
-                    }
-                    // Swallow all other input (releases, keys, mouse, IME, mods) so
-                    // nothing leaks to the PTY; lifecycle events fall through.
-                    WindowEvent::KeyboardInput { .. }
-                    | WindowEvent::MouseInput { .. }
-                    | WindowEvent::CursorMoved { .. }
-                    | WindowEvent::Ime(_)
-                    | WindowEvent::ModifiersChanged(_) => return,
-                    _ => {}
-                }
-                // Fell through: a non-input (lifecycle) event — let normal handling run.
-            }
-            let r = active.egui_state.on_window_event(&active.window, &event);
-            if r.repaint {
-                active.window.request_redraw();
-            }
-            match event {
-                WindowEvent::KeyboardInput { event: ref ke, .. }
-                    if ke.state == ElementState::Pressed
-                        && matches!(
-                            ke.logical_key,
-                            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F1)
-                        ) =>
+            let size = active.window.inner_size();
+            let (cw, ch) = active.backend.cell_size();
+            let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch);
+            match &event {
+                WindowEvent::KeyboardInput { event: ke, .. }
+                    if ke.state == ElementState::Pressed =>
                 {
-                    active.manual_open = false;
+                    match &ke.logical_key {
+                        Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F1) => {
+                            active.manual_open = false;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            active.manual_scroll =
+                                chrome::manual::clamp_scroll(active.manual_scroll + 1, &g);
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            active.manual_scroll = chrome::manual::clamp_scroll(
+                                active.manual_scroll.saturating_sub(1),
+                                &g,
+                            );
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            active.manual_scroll =
+                                chrome::manual::clamp_scroll(active.manual_scroll + 10, &g);
+                        }
+                        Key::Named(NamedKey::PageUp) => {
+                            active.manual_scroll = chrome::manual::clamp_scroll(
+                                active.manual_scroll.saturating_sub(10),
+                                &g,
+                            );
+                        }
+                        Key::Character(s) if s.as_str() == "q" => {
+                            active.manual_open = false;
+                        }
+                        _ => {}
+                    }
+                    active.window.request_redraw(); // scroll moved / overlay closed
+                    return;
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    // Positive y = wheel up = scroll toward the top (fewer rows).
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y as isize,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as isize,
+                    };
+                    let next = (active.manual_scroll as isize - lines).max(0) as usize;
+                    active.manual_scroll = chrome::manual::clamp_scroll(next, &g);
                     active.window.request_redraw();
                     return;
                 }
+                // Swallow all other input (releases, keys, mouse, IME, mods) so
+                // nothing leaks to the PTY; lifecycle events fall through.
                 WindowEvent::KeyboardInput { .. }
                 | WindowEvent::MouseInput { .. }
                 | WindowEvent::CursorMoved { .. }
-                | WindowEvent::MouseWheel { .. }
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
                 _ => {}
             }
+            // Fell through: a non-input (lifecycle) event — let normal handling run.
         }
 
         // The context menu is an egui overlay too: egui gets first look (for
         // hover/click), Escape or a click outside closes it, and terminal input is
         // suspended while it is up.
+        // The context menu: one native handler on both backends. Hover-highlight
+        // on motion, act on a click of an enabled row, dismiss on an outside press
+        // / Escape. All input swallowed; lifecycle events fall through.
         if let Some(pos) = active.menu {
-            // Native (XRender) path: hover-highlight on motion, act on a click of an
-            // enabled row, dismiss on an outside press / Escape. All input swallowed.
-            if !active.backend.supports_egui() {
-                // Rebuild the exact rows + geometry the native draw uses this frame.
-                let url = Self::cell_at(active, pos.0, pos.1)
-                    .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
-                let has_sel = Self::selected_text(active).is_some();
-                let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
-                let size = active.window.inner_size();
-                let (cw, ch) = active.backend.cell_size();
-                let g =
-                    chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
-                match &event {
-                    WindowEvent::CursorMoved { position, .. } => {
-                        active.mouse = (position.x as f32, position.y as f32);
-                        active.menu_hover = chrome::menu::hit_row(&g, active.mouse);
+            // Rebuild the exact rows + geometry the native draw uses this frame.
+            let url = Self::cell_at(active, pos.0, pos.1)
+                .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
+            let has_sel = Self::selected_text(active).is_some();
+            let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
+            let size = active.window.inner_size();
+            let (cw, ch) = active.backend.cell_size();
+            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
+            match &event {
+                WindowEvent::CursorMoved { position, .. } => {
+                    active.mouse = (position.x as f32, position.y as f32);
+                    active.menu_hover = chrome::menu::hit_row(&g, active.mouse);
+                    active.window.request_redraw();
+                    return;
+                }
+                WindowEvent::KeyboardInput { event: ke, .. }
+                    if ke.state == ElementState::Pressed =>
+                {
+                    // Escape dismisses; every other key is swallowed while open.
+                    if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
+                        active.menu = None;
+                        active.menu_hover = None;
                         active.window.request_redraw();
-                        return;
                     }
-                    WindowEvent::KeyboardInput { event: ke, .. }
-                        if ke.state == ElementState::Pressed =>
-                    {
-                        // Escape dismisses; every other key is swallowed while open.
-                        if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
-                            active.menu = None;
-                            active.menu_hover = None;
-                            active.window.request_redraw();
-                        }
-                        return;
-                    }
-                    WindowEvent::MouseInput { state, button, .. }
-                        if *state == ElementState::Pressed =>
-                    {
-                        if g.panel.contains(active.mouse) {
-                            // Left-click on an ENABLED row acts + closes; a click on a
-                            // disabled row or separator is ignored (menu stays open).
-                            if *button == MouseButton::Left {
-                                if let Some(i) = chrome::menu::hit_row(&g, active.mouse) {
-                                    if rows[i].enabled {
-                                        active.menu = None;
-                                        active.menu_hover = None;
-                                        active.window.request_redraw();
-                                        // Apply exactly like `paint_menu` does.
-                                        if let Some(a) =
-                                            rows.into_iter().nth(i).and_then(|r| r.action)
-                                        {
-                                            match a.into_pick() {
-                                                menu::MenuPick::Do(act) => {
-                                                    Self::apply_action(active, act)
-                                                }
-                                                menu::MenuPick::OpenUrl(u) => Self::open_url(&u),
-                                                menu::MenuPick::CopyUrl(u) => {
-                                                    if let Some(cb) = &active.clipboard {
-                                                        cb.store(u);
-                                                    }
+                    return;
+                }
+                WindowEvent::MouseInput { state, button, .. }
+                    if *state == ElementState::Pressed =>
+                {
+                    if g.panel.contains(active.mouse) {
+                        // Left-click on an ENABLED row acts + closes; a click on a
+                        // disabled row or separator is ignored (menu stays open).
+                        if *button == MouseButton::Left {
+                            if let Some(i) = chrome::menu::hit_row(&g, active.mouse) {
+                                if rows[i].enabled {
+                                    active.menu = None;
+                                    active.menu_hover = None;
+                                    active.window.request_redraw();
+                                    if let Some(a) =
+                                        rows.into_iter().nth(i).and_then(|r| r.action)
+                                    {
+                                        match a.into_pick() {
+                                            menu::MenuPick::Do(act) => {
+                                                Self::apply_action(active, act)
+                                            }
+                                            menu::MenuPick::OpenUrl(u) => Self::open_url(&u),
+                                            menu::MenuPick::CopyUrl(u) => {
+                                                if let Some(cb) = &active.clipboard {
+                                                    cb.store(u);
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            // Any press inside the panel is swallowed.
-                            return;
                         }
-                        // A press outside the panel dismisses the menu.
-                        active.menu = None;
-                        active.menu_hover = None;
-                        active.window.request_redraw();
+                        // Any press inside the panel is swallowed.
                         return;
                     }
-                    // Swallow remaining input (releases, wheel, IME, mods); lifecycle
-                    // events fall through to normal handling.
-                    WindowEvent::KeyboardInput { .. }
-                    | WindowEvent::MouseInput { .. }
-                    | WindowEvent::MouseWheel { .. }
-                    | WindowEvent::Ime(_)
-                    | WindowEvent::ModifiersChanged(_) => return,
-                    _ => {}
-                }
-            }
-            let r = active.egui_state.on_window_event(&active.window, &event);
-            if r.repaint {
-                active.window.request_redraw();
-            }
-            match event {
-                WindowEvent::KeyboardInput { event: ref ke, .. }
-                    if ke.state == ElementState::Pressed
-                        && matches!(ke.logical_key, Key::Named(NamedKey::Escape)) =>
-                {
+                    // A press outside the panel dismisses the menu.
                     active.menu = None;
+                    active.menu_hover = None;
                     active.window.request_redraw();
                     return;
                 }
+                // Swallow remaining input (releases, wheel, IME, mods); lifecycle
+                // events fall through to normal handling.
                 WindowEvent::KeyboardInput { .. }
                 | WindowEvent::MouseInput { .. }
-                | WindowEvent::CursorMoved { .. }
                 | WindowEvent::MouseWheel { .. }
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
@@ -1422,92 +1371,49 @@ impl ApplicationHandler for App {
             }
         }
 
-        // The scrollback-search bar is a lighter overlay: it captures typing (via
-        // egui) and Enter/Escape for navigation, but leaves the terminal visible
-        // and lets mouse events (scroll/click) through so the user can still look
-        // around while a search is open.
+        // The scrollback-search bar is a lighter overlay: it captures typing and
+        // Enter/Escape for navigation, but leaves the terminal visible and lets
+        // mouse events (scroll/click) through so the user can still look around
+        // while a search is open. One native handler on both backends: the query
+        // is edited directly (printable text appends + re-runs; Backspace pops;
+        // Enter/Shift-Enter step; Escape closes); mouse/lifecycle fall through.
         if active.search_open {
-            // Native (XRender) path: egui no longer captures typing, so edit the
-            // query directly. Printable text appends + re-runs; Backspace pops;
-            // Enter/Shift-Enter step; Escape closes. Mouse/lifecycle fall through so
-            // the terminal stays scrollable/clickable under the bar.
-            if !active.backend.supports_egui() {
-                match &event {
-                    WindowEvent::KeyboardInput { event: ke, .. } => {
-                        if ke.state == ElementState::Pressed {
-                            match &ke.logical_key {
-                                Key::Named(NamedKey::Escape) => {
-                                    Self::close_search(active);
-                                }
-                                Key::Named(NamedKey::Enter) => {
-                                    let dir: isize = if active.mods.shift_key() { -1 } else { 1 };
-                                    Self::search_step(active, dir);
-                                    active.window.request_redraw();
-                                }
-                                Key::Named(NamedKey::Backspace) => {
-                                    active.search_query.pop();
-                                    Self::run_search(active, true); // re-run + redraw
-                                }
-                                _ => {
-                                    // Append this key's produced text if it is printable.
-                                    if let Some(t) =
-                                        ke.text.as_ref().filter(|t| !t.is_empty())
-                                    {
-                                        if t.chars().all(|c| !c.is_control()) {
-                                            active.search_query.push_str(t);
-                                            Self::run_search(active, true); // re-run + redraw
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        return; // swallow all keyboard (presses acted on, releases dropped)
-                    }
-                    WindowEvent::ModifiersChanged(m) => {
-                        active.mods = m.state(); // Shift+Enter needs live modifiers
-                        return;
-                    }
-                    WindowEvent::Ime(_) => return, // no IME into the native query
-                    // Mouse + lifecycle fall through to the main match below.
-                    _ => {}
-                }
-            } else {
-                // Enter = jump to next hit (Shift+Enter = previous); Escape closes.
-                if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+            match &event {
+                WindowEvent::KeyboardInput { event: ke, .. } => {
                     if ke.state == ElementState::Pressed {
-                        match ke.logical_key {
+                        match &ke.logical_key {
                             Key::Named(NamedKey::Escape) => {
                                 Self::close_search(active);
-                                return;
                             }
                             Key::Named(NamedKey::Enter) => {
                                 let dir: isize = if active.mods.shift_key() { -1 } else { 1 };
                                 Self::search_step(active, dir);
                                 active.window.request_redraw();
-                                return;
                             }
-                            _ => {}
+                            Key::Named(NamedKey::Backspace) => {
+                                active.search_query.pop();
+                                Self::run_search(active, true); // re-run + redraw
+                            }
+                            _ => {
+                                // Append this key's produced text if it is printable.
+                                if let Some(t) = ke.text.as_ref().filter(|t| !t.is_empty()) {
+                                    if t.chars().all(|c| !c.is_control()) {
+                                        active.search_query.push_str(t);
+                                        Self::run_search(active, true); // re-run + redraw
+                                    }
+                                }
+                            }
                         }
                     }
+                    return; // swallow all keyboard (presses acted on, releases dropped)
                 }
-                // Keep the modifier state current (Shift+Enter above needs it), since
-                // the normal ModifiersChanged handler is bypassed while searching.
-                if let WindowEvent::ModifiersChanged(m) = &event {
-                    active.mods = m.state();
+                WindowEvent::ModifiersChanged(m) => {
+                    active.mods = m.state(); // Shift+Enter needs live modifiers
+                    return;
                 }
-                // Feed typing/edit keys to the egui text field.
-                let r = active.egui_state.on_window_event(&active.window, &event);
-                if r.repaint {
-                    active.window.request_redraw();
-                }
-                // Swallow keyboard/IME so the terminal receives no input while typing
-                // a query; mouse and lifecycle events fall through to the normal path.
-                match event {
-                    WindowEvent::KeyboardInput { .. }
-                    | WindowEvent::Ime(_)
-                    | WindowEvent::ModifiersChanged(_) => return,
-                    _ => {}
-                }
+                WindowEvent::Ime(_) => return, // no IME into the native query
+                // Mouse + lifecycle fall through to the main match below.
+                _ => {}
             }
         }
 
@@ -3390,73 +3296,68 @@ impl App {
             Self::paint_prefs(active);
             return;
         }
-        if active.backend.supports_egui() {
-            // GL path: today's egui chrome, unchanged.
-            if active.menu.is_some() {
-                Self::paint_menu(active);
-            } else if active.manual_open {
-                Self::paint_manual(active);
-            } else if active.search_open {
-                Self::paint_search(active);
-            } else {
-                Self::paint_instruments(active);
-            }
-            return;
-        }
-        // Native (XRender) path. The instrument layer is a persistent, separate
-        // ARGB picture composited over content by `present()` (Task 3/4); it is
-        // redrawn only on a 6fps `instr_tick` (or the first time it's shown), NOT
-        // on every content frame — so a keystroke/output burst on the scissored
-        // path never re-ships instrument geometry (see `about_to_wait`). Whichever
-        // overlay is up (menu/manual/search) is drawn on top of it, unchanged.
         let size = active.window.inner_size();
         let (cw, ch) = active.backend.cell_size();
-        // Over the remote (XRender) backend the instruments are OFF by default
-        // (`inst_remote`); the user opts in. Also hide the layer while an overlay
-        // (menu/manual/search) is up, or while dragging the scrollbar (the
-        // instruments repaint on drag-release via force_full).
-        let overlay_up = active.prefs_open || active.menu.is_some() || active.manual_open || active.search_open;
-        let show = active.settings.inst_remote && !overlay_up && active.scroll_drag.is_none();
-        if !show {
-            active.instr_layer_drawn = false; // next show redraws the layer fresh
+        // Whether a menu/manual/search overlay is up; instruments hide beneath it.
+        // (Preferences returned above.)
+        let overlay_up = active.menu.is_some() || active.manual_open || active.search_open;
+
+        // Instruments differ by backend. GL: an egui background pass each frame,
+        // only when nothing covers them. XRender: a persistent, separate ARGB
+        // picture composited over content by `present()` (Task 3/4), redrawn only
+        // on a 6fps `instr_tick` (or the first show) so a keystroke/output burst on
+        // the scissored path never re-ships instrument geometry — and hidden while
+        // an overlay is up, or while dragging the scrollbar (it repaints on
+        // drag-release via force_full).
+        if active.backend.supports_egui() {
+            if !overlay_up {
+                Self::paint_instruments(active);
+            }
+        } else {
+            // Over the remote (XRender) backend the instruments are OFF by default
+            // (`inst_remote`); the user opts in.
+            let show = active.settings.inst_remote && !overlay_up && active.scroll_drag.is_none();
+            if !show {
+                active.instr_layer_drawn = false; // next show redraws the layer fresh
+            }
+            active.backend.set_instrument_layer_visible(show);
+            // Redraw the layer's geometry only on a 6fps tick (or the first show).
+            // Advance the flow by real wall-clock time since the LAST ADVANCE (this
+            // block only runs at tick cadence), so wire packets/meters move at the
+            // right speed regardless of how often content frames happen to run.
+            if show && (active.instr_tick || !active.instr_layer_drawn) {
+                let now = Instant::now();
+                let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
+                active.last_meter_tick = now;
+                advance_instrument_state(&mut active.meters, &mut active.wires, dt);
+                // Build the borrowing context from DISJOINT fields so `&mut
+                // active.backend` coexists with the `&active.*` reads.
+                let bounds = content_bounds(size);
+                let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
+                active.backend.begin_instrument_layer();
+                let ctx = chrome::instruments::InstrCtx {
+                    rects: &rects,
+                    meters: &active.meters,
+                    wires: &active.wires,
+                    heat: &active.heat,
+                    inst_output: active.settings.inst_output,
+                    inst_heat: active.settings.inst_heat,
+                    inst_latency: active.settings.inst_latency,
+                    show_jacks: active.settings.show_jacks,
+                    wiring_from: active.wiring_from,
+                    drag_cursor: active.drag_cursor,
+                    lat_phase: active.lat_phase,
+                    stall: active.stall,
+                    size,
+                };
+                chrome::instruments::draw(&mut *active.backend, &ctx);
+                active.backend.end_instrument_layer();
+                active.instr_layer_drawn = true;
+            }
+            active.instr_tick = false; // consume the tick
         }
-        active.backend.set_instrument_layer_visible(show);
-        // Redraw the layer's geometry only on a 6fps tick (or the first show), so
-        // typing/output never re-ships instrument geometry. Advance the flow by
-        // real wall-clock time elapsed since the LAST ADVANCE (this block only
-        // runs at tick cadence), so wire packets/meters move at the right speed
-        // regardless of how often content frames happen to run.
-        if show && (active.instr_tick || !active.instr_layer_drawn) {
-            let now = Instant::now();
-            let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
-            active.last_meter_tick = now;
-            advance_instrument_state(&mut active.meters, &mut active.wires, dt);
-            // Build the borrowing context from DISJOINT fields so `&mut
-            // active.backend` coexists with the `&active.*` reads.
-            let bounds = content_bounds(size);
-            let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
-            active.backend.begin_instrument_layer();
-            let ctx = chrome::instruments::InstrCtx {
-                rects: &rects,
-                meters: &active.meters,
-                wires: &active.wires,
-                heat: &active.heat,
-                inst_output: active.settings.inst_output,
-                inst_heat: active.settings.inst_heat,
-                inst_latency: active.settings.inst_latency,
-                show_jacks: active.settings.show_jacks,
-                wiring_from: active.wiring_from,
-                drag_cursor: active.drag_cursor,
-                lat_phase: active.lat_phase,
-                stall: active.stall,
-                size,
-            };
-            chrome::instruments::draw(&mut *active.backend, &ctx);
-            active.backend.end_instrument_layer();
-            active.instr_layer_drawn = true;
-        }
-        active.instr_tick = false; // consume the tick
-        // Overlay draws: each reads a few `active.*` fields to build its inputs as
+        // Overlay draws — one native path on BOTH backends, on top of content and
+        // instruments. Each reads a few `active.*` fields to build its inputs as
         // locals FIRST, then takes `&mut *active.backend` (disjoint field borrows).
         if let Some(pos) = active.menu {
             let url = Self::cell_at(active, pos.0, pos.1)
@@ -3743,123 +3644,6 @@ impl App {
         active.last_prefs_edit = Instant::now();
     }
 
-    /// Run the egui context menu for this frame and paint it. Applies the picked
-    /// action and closes the menu on a selection, an outside click, or Escape.
-    fn paint_menu(active: &mut Active) {
-        let Some(pos) = active.menu else { return };
-        // Menu context, computed fresh each frame: the URL under the right-click
-        // (if any) drives the Open Link / Copy Address rows; a live selection
-        // enables Copy.
-        let url = Self::cell_at(active, pos.0, pos.1)
-            .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
-        let has_sel = Self::selected_text(active).is_some();
-        let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
-        let ctx = active.egui_ctx.clone(); // cheap Arc clone (avoids borrowing active in the closure)
-        // The menu was anchored in physical pixels; egui positions in points.
-        let ppp = active.window.scale_factor() as f32;
-        let mut chosen: Option<menu::MenuPick> = None;
-        let mut close = false;
-        ctx.begin_pass(raw_input);
-        menu::ui(&ctx, (pos.0 / ppp, pos.1 / ppp), &active.keymap, has_sel, url.as_deref(), &mut chosen, &mut close);
-        let output = ctx.end_pass();
-        // Dismiss before applying, so an action that opens another overlay (e.g.
-        // Preferences) isn't immediately re-covered by the menu.
-        if chosen.is_some() || close {
-            active.menu = None;
-        }
-        active.egui_state.handle_platform_output(&active.window, output.platform_output);
-        let out_ppp = output.pixels_per_point;
-        let primitives = ctx.tessellate(output.shapes, out_ppp);
-        let size = active.window.inner_size();
-        active.egui_painter.paint_and_update_textures(
-            [size.width, size.height],
-            out_ppp,
-            &primitives,
-            &output.textures_delta,
-        );
-        // Apply after painting/committing state so it runs the same path as a key
-        // binding (may relayout, open a dialog, or close the last pane and exit).
-        match chosen {
-            Some(menu::MenuPick::Do(action)) => {
-                Self::apply_action(active, action);
-                active.window.request_redraw();
-            }
-            Some(menu::MenuPick::OpenUrl(u)) => {
-                Self::open_url(&u);
-                active.window.request_redraw();
-            }
-            Some(menu::MenuPick::CopyUrl(u)) => {
-                if let Some(cb) = &active.clipboard {
-                    cb.store(u); // put the address on the CLIPBOARD selection
-                }
-                active.window.request_redraw();
-            }
-            None => {}
-        }
-    }
-
-    /// Run the scrollback-search bar UI for this frame and paint it. Draws a slim
-    /// bottom bar with the query field and a hit counter; re-runs the search when
-    /// the query text changes and jumps to the first hit.
-    fn paint_search(active: &mut Active) {
-        let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
-        let ctx = active.egui_ctx.clone(); // cheap Arc clone
-        let mut query = active.search_query.clone(); // the UI edits this clone
-        let mut close = false; // set by the ✕ button
-        let mut step: isize = 0; // set by the ▲/▼ buttons (prev/next)
-        let count = active.search_matches.len(); // hit count for the label
-        // Human 1-based position (0 of 0 when there are no hits).
-        let pos = if count == 0 { 0 } else { active.search_index + 1 };
-        ctx.begin_pass(raw_input);
-        egui::Window::new("rt_search")
-            .title_bar(false) // a bare bar, not a draggable window
-            .resizable(false)
-            .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -8.0]) // pinned near the bottom-left
-            .show(&ctx, |ui| {
-                ui.horizontal(|ui| {
-                ui.label("Find:"); // prompt
-                // The text field: single-line so Enter is handled by us (winit),
-                // and auto-focused so typing lands here the moment the bar opens.
-                let edit = egui::TextEdit::singleline(&mut query).desired_width(240.0);
-                let resp = ui.add(edit);
-                resp.request_focus(); // keep the caret in the field every frame
-                ui.label(format!("{pos} / {count}")); // e.g. "3 / 12"
-                // ASCII labels: egui's default font lacks the arrow/✕ glyphs.
-                if ui.button("Prev").clicked() {
-                    step = -1; // previous hit
-                }
-                if ui.button("Next").clicked() {
-                    step = 1; // next hit
-                }
-                if ui.button("Close").clicked() {
-                    close = true; // close the bar
-                }
-                ui.label("(Enter next, Shift+Enter prev, Esc close)"); // hint
-            });
-        });
-        let output = ctx.end_pass();
-        // If the query text changed, re-run the search from scratch.
-        if query != active.search_query {
-            active.search_query = query;
-            Self::run_search(active, true); // new query → jump to the first hit
-        } else if step != 0 {
-            Self::search_step(active, step); // ▲/▼ navigation
-        }
-        if close {
-            Self::close_search(active);
-        }
-        active.egui_state.handle_platform_output(&active.window, output.platform_output);
-        let ppp = output.pixels_per_point;
-        let primitives = ctx.tessellate(output.shapes, ppp);
-        let size = active.window.inner_size();
-        active.egui_painter.paint_and_update_textures(
-            [size.width, size.height],
-            ppp,
-            &primitives,
-            &output.textures_delta,
-        );
-    }
-
     /// Move bytes across every patch-bay wire: read each pane's output-stream
     /// jacks and forward to the input jack of every pane wired downstream. Reads
     /// always (even unwired) so a program writing `$RT_OUT` never blocks. Returns
@@ -3964,29 +3748,6 @@ impl App {
             }
         }
         total
-    }
-
-    /// Run the built-in manual overlay for this frame and paint it.
-    fn paint_manual(active: &mut Active) {
-        let raw_input = active.egui_state.take_egui_input(&active.window);
-        let ctx = active.egui_ctx.clone();
-        let mut close = false;
-        ctx.begin_pass(raw_input);
-        manual::ui(&ctx, &mut close);
-        let output = ctx.end_pass();
-        if close {
-            active.manual_open = false;
-        }
-        active.egui_state.handle_platform_output(&active.window, output.platform_output);
-        let ppp = output.pixels_per_point;
-        let primitives = ctx.tessellate(output.shapes, ppp);
-        let size = active.window.inner_size();
-        active.egui_painter.paint_and_update_textures(
-            [size.width, size.height],
-            ppp,
-            &primitives,
-            &output.textures_delta,
-        );
     }
 
     /// Draw the per-pane output-activity instrument as an egui overlay: glowing

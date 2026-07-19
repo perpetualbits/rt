@@ -1,35 +1,7 @@
-//! The built-in manual overlay (F1). A scrollable egui window rendering
-//! [`MANUAL`] — the full feature reference plus runnable input/output/error and
-//! wiring examples. Kept in-app so it always matches the actual keybindings.
-
-/// Render the manual window for this frame. Sets `*close = true` when dismissed.
-pub fn ui(ctx: &egui::Context, close: &mut bool) {
-    egui::Window::new("rt — manual")
-        .default_width(720.0)
-        .default_height(560.0)
-        .collapsible(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            // Reserve room for the separator + Close button, then let the scroll
-            // area fill the rest — otherwise (with auto_shrink off) it would eat
-            // the button's space and push it below the window.
-            const RESERVE: f32 = 36.0;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .max_height((ui.available_height() - RESERVE).max(80.0))
-                .show(ui, |ui| {
-                    // Monospace so the aligned key columns and example code line up.
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(MANUAL).monospace().size(13.0))
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                });
-            ui.separator();
-            if ui.button("Close  (F1 / Esc)").clicked() {
-                *close = true;
-            }
-        });
-}
+//! The built-in manual (F1). Holds [`MANUAL`] — the full feature reference plus
+//! runnable input/output/error and wiring examples — kept in-app so it always
+//! matches the actual keybindings. The overlay is drawn natively by
+//! [`crate::chrome::manual`] on both backends.
 
 /// The manual text. Plain monospace; UPPERCASE lines are section headings.
 pub const MANUAL: &str = "\

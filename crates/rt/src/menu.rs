@@ -1,5 +1,6 @@
-//! The right-click context menu, rendered with egui (ADR-0004) — the same
-//! toolkit as the preferences dialog, so the two share a look.
+//! The right-click context menu model: the rows and their actions. Rendering
+//! and hit-testing are native (`crate::chrome::menu`) on both backends, so the
+//! menu shares a look with the preferences dialog and the manual.
 //!
 //! It is rt's port of Terminator's right-click menu: the common pane actions
 //! (split/tab/close) plus rt-specific entries (newspaper columns, groups,
@@ -125,101 +126,6 @@ pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>) -> Vec<Row>
         }
     }
     out
-}
-
-/// Build the context menu for this frame at window position `pos` (egui points).
-/// `has_selection` enables **Copy**; `url` — the address under the right-click,
-/// if any — adds **Open Link** / **Copy Address** at the top (Terminator-style,
-/// present only over a link). `keymap` supplies each action's accelerator.
-/// Sets `*chosen` to the pick and `*close` when the menu should be dismissed —
-/// a click on an item, or a press anywhere outside the panel.
-pub fn ui(
-    ctx: &egui::Context,
-    pos: (f32, f32),
-    keymap: &Keymap,
-    has_selection: bool,
-    url: Option<&str>,
-    chosen: &mut Option<MenuPick>,
-    close: &mut bool,
-) {
-    // A floating, screen-constrained panel anchored at the click point. Fore-
-    // ground order so it sits above the terminal (and the border instruments).
-    let area = egui::Area::new(egui::Id::new("rt_context_menu"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(pos.0, pos.1))
-        .constrain(true) // keep the whole panel on-screen (replaces the old clamp)
-        .show(ctx, |ui| {
-            egui::Frame::menu(ui.style()).show(ui, |ui| {
-                ui.set_min_width(260.0); // room for the label plus its accelerator
-                // Justified layout: buttons stretch the full width and left-align
-                // their text, so the rows read as a menu rather than pills.
-                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                    // Link rows: only when the right-click landed on a URL.
-                    if let Some(u) = url {
-                        if ui.add(egui::Button::new("Open Link")).clicked() {
-                            *chosen = Some(MenuPick::OpenUrl(u.to_string()));
-                            *close = true;
-                        }
-                        if ui.add(egui::Button::new("Copy Address")).clicked() {
-                            *chosen = Some(MenuPick::CopyUrl(u.to_string()));
-                            *close = true;
-                        }
-                        ui.separator();
-                    }
-                    // Copy (only meaningful with a selection) + Paste, with accelerators.
-                    let mut copy = egui::Button::new("Copy");
-                    if let Some(sc) = keymap.shortcut_for(Action::Copy) {
-                        copy = copy.shortcut_text(sc);
-                    }
-                    if ui.add_enabled(has_selection, copy).clicked() {
-                        *chosen = Some(MenuPick::Do(Action::Copy));
-                        *close = true;
-                    }
-                    let mut paste = egui::Button::new("Paste");
-                    if let Some(sc) = keymap.shortcut_for(Action::Paste) {
-                        paste = paste.shortcut_text(sc);
-                    }
-                    if ui.add(paste).clicked() {
-                        *chosen = Some(MenuPick::Do(Action::Paste));
-                        *close = true;
-                    }
-                    ui.separator();
-                    // The standard pane / rt actions.
-                    for it in items() {
-                        match it {
-                            Item::Action(label, action) => {
-                                // A menu button, with the action's accelerator
-                                // right-aligned in a weak colour (egui draws it).
-                                let mut button = egui::Button::new(label);
-                                if let Some(sc) = keymap.shortcut_for(action) {
-                                    button = button.shortcut_text(sc);
-                                }
-                                if ui.add(button).clicked() {
-                                    *chosen = Some(MenuPick::Do(action));
-                                    *close = true;
-                                }
-                            }
-                            Item::Separator => {
-                                ui.separator();
-                            }
-                            Item::Info(label) => {
-                                // A dim, non-interactive footer (e.g. the version).
-                                ui.add_enabled(false, egui::Button::new(label));
-                            }
-                        }
-                    }
-                });
-            });
-        });
-    // A press outside the panel dismisses the menu, like a real context menu.
-    if ctx.input(|i| i.pointer.any_pressed()) {
-        let outside = ctx
-            .input(|i| i.pointer.interact_pos())
-            .is_some_and(|p| !area.response.rect.contains(p));
-        if outside {
-            *close = true;
-        }
-    }
 }
 
 #[cfg(test)]
