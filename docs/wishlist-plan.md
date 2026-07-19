@@ -80,22 +80,37 @@ decision. Each is a candidate for its own short spec, or bundled.
 
 ### Slice B — finish the toolkit convergence, delete egui (the backbone)
 
-Resolves #1 and clears the ground for #2. Mostly plumbing, not a rewrite:
+Resolves #1 and clears the ground for #2. Splits in two once you look at what
+each surface needs from the GL backend:
 
-1. Route the GL path's context menu and manual at the existing native
-   `chrome::menu` / `chrome::manual` units that already run on XRender. They need
-   only `fill_rect` + text (both already implemented on `GlBackend`), not the AA
-   circle primitives.
-2. Delete egui: drop `egui`, `egui-winit`, `egui_glow` from `crates/rt`, delete
-   `menu.rs` and `manual.rs` (the egui versions), and drop the egui value types
-   used as convenient geometry (`Color32`, `Pos2`, `Rect`) in favour of rt's own
-   `Color` / `Recti`.
-3. `supports_egui()` collapses to a single native chrome path; keep the method
-   only if another backend distinction still needs it, else remove it.
+**B1 — re-home menu + manual + search to native on GL. ✅ done (`e5c7452`).**
+The GL path drew these three overlays with egui; XRender already had native
+equivalents. Unified on `chrome::menu` / `chrome::manual` / `chrome::search`
+(rendering *and* input), which need only `fill_rect` + `draw_char` — both on
+`GlBackend`, as the native preferences dialog already proved. Deleted
+`paint_menu`/`paint_manual`/`paint_search` and the egui `menu::ui`/`manual::ui`.
+This is the user-visible uniform-look win. One behaviour change: the GL search
+bar is now the simpler native field (append + backspace) instead of a full egui
+text field, matching what `ssh -X` users already had.
 
-Outcome: one chrome look everywhere, a lighter binary, and a single place to add
-any future widget. Verify the existing chrome tests (menu render, prefs settle)
-still pass on both backends, and that `PutImage == 0` holds.
+**B2 — delete egui entirely. Pending; bigger than the plan first implied.**
+The last egui user is the **border instruments** on GL (`paint_instruments`).
+The native `chrome::instruments` needs `fill_circle`/`stroke_circle`/
+`stroke_line`, but the GL renderer is a coverage-atlas triangle-soup with **no
+circle or arbitrary-angle-line primitive** — only rects and glyphs. So finishing
+egui removal means writing an **AA vector layer in the GL renderer** (AA discs
+for packets/jacks; AA thick lines for the bezier wires; the latency frame is
+axis-aligned = rects). The natural fit is the same coverage-mask approach XRender
+uses (A8 masks), reusing the existing atlas pipeline — no new shader.
+
+The payoff of B2 is **not visual** (GL instruments already look identical to the
+native path via the `chrome::col` no-drift design) — it is dependency hygiene:
+drop `egui`/`egui-winit`/`egui_glow`, the egui value types (`Color32`, `Pos2`,
+`Rect`), the `egui_ctx`/`state`/`painter` fields, and collapse `supports_egui()`.
+B2 blocks nothing (Slice C does not need it), so it can come last.
+
+Verify (both slices): the chrome tests still pass on both backends, and
+`PutImage == 0` holds.
 
 ### Slice C — native colour picker (built once, on the converged chrome)
 
@@ -124,11 +139,21 @@ egui's per-frame repaint, not the picker concept.
 
 ## Sequencing
 
-1. **Slice A** first — four quick, shippable wins, each independent, none blocked
-   on the toolkit decision.
-2. **Slice B** — finish convergence, delete egui. Unblocks a uniform look and a
-   single widget home.
-3. **Slice C** — colour picker, built once on the converged chrome.
+1. **Slice A** ✅ done — four quick wins: `9222db4` (version footer), `ee1c1db`
+   (column rule), `9b4bcc1` (jacks), `d4aa7e3` (scrollbar hit-markers).
+2. **Slice B1** ✅ done (`e5c7452`) — menu/manual/search native on both backends;
+   the uniform-look win. **B2** (delete egui) pending — see above; blocks nothing.
+3. **Slice C** — colour picker, built once on the converged native chrome. Ready
+   to start; does not need B2.
 
 Each slice gets its own design spec + implementation plan when it is picked up;
 this document is the triage and the order, not the per-slice design.
+
+## Status (2026-07-19)
+
+Slice A shipped; Slice B1 shipped. Paused for live testing of B1 on the user's
+machine (and over `ssh -X`) before taking on B2 or Slice C. Everything committed
+builds in both feature configs (Wayland+X11 and Wayland-only) with the full test
+suite green; the GL-path chrome changes (B1) and all rendering tweaks still need
+a human eyeball, especially over `ssh -X`, since the sandbox can't capture a
+compositing GL frame.
