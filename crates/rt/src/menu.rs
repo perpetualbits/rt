@@ -16,6 +16,8 @@ enum Item {
     Action(&'static str, Action),
     /// A thin divider line (not clickable).
     Separator,
+    /// A non-clickable informational line, drawn dim (e.g. the version footer).
+    Info(&'static str),
 }
 
 /// The menu's rows, top to bottom. Terminator-style pane actions first, then
@@ -43,6 +45,9 @@ fn items() -> Vec<Item> {
         Item::Action("Toggle Focus-Follows-Mouse", Action::ToggleFocusFollowsMouse),
         Item::Action("Preferences…", Action::Preferences),
         Item::Action("Manual", Action::Manual),
+        Item::Separator,
+        // A dim, non-clickable footer naming the running build.
+        Item::Info(concat!("rt v", env!("CARGO_PKG_VERSION"))),
     ]
 }
 
@@ -110,6 +115,13 @@ pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>) -> Vec<Row>
                 enabled: true,
             }),
             Item::Separator => out.push(sep()),
+            // Informational: a labelled but disabled, non-dispatching row.
+            Item::Info(label) => out.push(Row {
+                label: label.to_string(),
+                accel: None,
+                action: None,
+                enabled: false,
+            }),
         }
     }
     out
@@ -190,6 +202,10 @@ pub fn ui(
                             Item::Separator => {
                                 ui.separator();
                             }
+                            Item::Info(label) => {
+                                // A dim, non-interactive footer (e.g. the version).
+                                ui.add_enabled(false, egui::Button::new(label));
+                            }
                         }
                     }
                 });
@@ -234,5 +250,16 @@ mod tests {
     fn separators_have_no_action() {
         let r = rows(&Keymap::default(), false, None);
         assert!(r.iter().any(|r| r.action.is_none()), "at least one separator");
+    }
+
+    #[test]
+    fn version_row_is_a_disabled_info_footer() {
+        let r = rows(&Keymap::default(), false, None);
+        let v = r.iter().find(|r| r.label.starts_with("rt v")).expect("a version row");
+        assert!(v.label.contains(env!("CARGO_PKG_VERSION")), "shows the crate version");
+        assert!(!v.enabled, "the version row is informational, not clickable");
+        assert!(v.action.is_none(), "the version row dispatches nothing");
+        // It is not a separator: separators carry an empty label.
+        assert!(!v.label.is_empty());
     }
 }

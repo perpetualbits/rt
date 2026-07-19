@@ -1,0 +1,6 @@
+- uniform look in all menus and the manual; maybe two different toolkits needed for wayland and X11.
+- bring back some form of color picker in the preferences. Possibly greyed out in an X11 session, because many UI elements turned out to be too heavy for X11, we discovered during development. 
+- rt version in menu
+- column separator lines can be a bit more visible. maybe use a color halfway between foreground and background colors (mean of rgb values of fore and back; just an idea, no idea if that works)
+- jack ports have little vertical lines in them because they are not drawn last. I think some of the edges are drawn later. Also they are a tiny bit too small. 
+- in scrollback search: little horizontal "hit-markers" in the scrollbar where the hits are (or clusters of them too close together to indicate with individual hit markers) , like Google Chrome and Firefox have with their ctrl-f search functionality. 

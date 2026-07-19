@@ -28,14 +28,16 @@ pub fn layout(rows: &[Row], anchor: (f32, f32), cell_w: f32, cell_h: f32, win_w:
         r.label.chars().count() + a
     }).max().unwrap_or(8);
     let w = cols as f32 * cell_w + PAD_X * 2.0;
-    let h: f32 = rows.iter().map(|r| if r.action.is_none() { SEP_H } else { row_h }).sum::<f32>() + PAD_X;
+    // A separator is the only row with an empty label; info rows (version footer)
+    // carry a label but no action, so they get a full-height row like any other.
+    let h: f32 = rows.iter().map(|r| if r.label.is_empty() { SEP_H } else { row_h }).sum::<f32>() + PAD_X;
     // Clamp so the whole panel stays visible.
     let x = anchor.0.min(win_w - w).max(0.0);
     let y = anchor.1.min(win_h - h).max(0.0);
     let mut rrects = Vec::with_capacity(rows.len());
     let mut cy = y + PAD_X * 0.5;
     for r in rows {
-        let rh = if r.action.is_none() { SEP_H } else { row_h };
+        let rh = if r.label.is_empty() { SEP_H } else { row_h };
         rrects.push(Recti { x, y: cy, w, h: rh });
         cy += rh;
     }
