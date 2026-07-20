@@ -122,6 +122,17 @@ pub struct XRenderBackend {
     // Uploaded once, stamped by reference (composite_glyphs) — cheap over ssh -X.
     shape_glyphset: render::Glyphset,
     shapes: HashMap<(u8, u32, u32), u32>, // (0=disc/1=ring, r*4, width*4) -> glyph id
+    // ssh -X request batching. Instrument primitives drawn between begin/end_
+    // instrument_layer accumulate here, MERGING consecutive same-kind, same-
+    // (quantised)-colour runs, then flush as one multi-element X request each
+    // (FillRectangles / Triangles / CompositeGlyphs) in `end_instrument_layer`.
+    // This collapses the ~300 individual requests/instrument-frame that saturated
+    // the ssh -X server-side request dispatch — the real cause of the typing lag
+    // (POLLOUT backpressure with the wire 100x under-utilised; NOT bandwidth, NOT
+    // rt CPU, NOT the removed composite). Merging only CONSECUTIVE runs preserves
+    // the exact draw order, so layering (jack backs under fills, jacks on top of
+    // wires/latency) is unchanged. See rt-sshx-instrument-lag-rootcause.
+    instr_ops: Vec<InstrOp>,
     next_shape_id: u32,
     cell_w: f32,
     cell_h: f32,
@@ -140,13 +151,129 @@ pub struct XRenderBackend {
     xd_last: std::time::Instant,
     xd_present: u32,
     xd_geom: u32,
+    xd_ops: u64,   // batched instrument X requests emitted this second (see flush_instr_batches)
     xd_flush: std::time::Duration,
     xd_dmg: u64,   // window pixels copied this second = the recomposite damage rt asks of the compositor
     win_w: u16,
     win_h: u16,
 }
 
+/// One batched instrument draw: a run of consecutive primitives of the same kind
+/// and quantised colour, flushed as a single multi-element X request.
+enum InstrOp {
+    Fill { key: u32, rects: Vec<xproto::Rectangle> },
+    Tris { key: u32, tris: Vec<Triangle> },
+    Glyphs { key: u32, items: Vec<(u32, i16, i16)> }, // (glyph id, x, y)
+}
+
+/// Quantise a colour to a bucket key by dropping the low 5 bits of each 8-bit
+/// channel (8 levels/channel). The instrument gradients (wires, latency frame,
+/// output flow) change smoothly, so adjacent segments collapse to the same key
+/// and merge into ONE batched request — which is the whole point: without coarse
+/// quantisation the ~56-segment latency frame and 32-segment wires stay one
+/// request per segment (~112 + ~64), the bulk of the per-frame request storm that
+/// saturates the ssh -X server-side dispatch. `decode_qcolor` recovers the
+/// bucket's representative. 8 levels/channel bands the gradients slightly but
+/// reads fine on the thin instruments; raise the mask toward 0xF8 if banding shows.
+fn qcolor_key(c: Color) -> u32 {
+    let q = |v: f32| (((v.clamp(0.0, 1.0) * 255.0).round() as u32).min(255)) & 0xE0;
+    (q(c.0) << 24) | (q(c.1) << 16) | (q(c.2) << 8) | q(c.3)
+}
+fn decode_qcolor(key: u32) -> Color {
+    let ch = |s: u32| ((key >> s) & 0xFF) as f32 / 255.0;
+    Color(ch(24), ch(16), ch(8), ch(0))
+}
+
 impl XRenderBackend {
+    /// True when `(cx,cy)`±`rad` lies wholly outside the current damage clip, so a
+    /// scissored instrument frame can drop the primitive client-side (the back_pic
+    /// picture clip would reject it server-side anyway, but that still ships the
+    /// request over the wire — the thing we are trying to avoid).
+    fn clip_rejects(&self, cx: f32, cy: f32, rad: f32) -> bool {
+        match self.clip {
+            Some(b) => !rect_intersects(cx - rad, cy - rad, 2.0 * rad, 2.0 * rad, b),
+            None => false,
+        }
+    }
+
+    /// Append `rect` to the current fill run, or start a new one if the last op is
+    /// not a fill of the same quantised colour. (Consecutive-run merge → order kept.)
+    fn batch_fill(&mut self, key: u32, rect: xproto::Rectangle) {
+        if let Some(InstrOp::Fill { key: k, rects }) = self.instr_ops.last_mut() {
+            if *k == key { rects.push(rect); return; }
+        }
+        self.instr_ops.push(InstrOp::Fill { key, rects: vec![rect] });
+    }
+    fn batch_tris(&mut self, key: u32, tris: &[Triangle]) {
+        if let Some(InstrOp::Tris { key: k, tris: acc }) = self.instr_ops.last_mut() {
+            if *k == key { acc.extend_from_slice(tris); return; }
+        }
+        self.instr_ops.push(InstrOp::Tris { key, tris: tris.to_vec() });
+    }
+    fn batch_glyph(&mut self, key: u32, item: (u32, i16, i16)) {
+        if let Some(InstrOp::Glyphs { key: k, items }) = self.instr_ops.last_mut() {
+            if *k == key { items.push(item); return; }
+        }
+        self.instr_ops.push(InstrOp::Glyphs { key, items: vec![item] });
+    }
+
+    /// Emit every batched instrument op in order, one multi-element X request each.
+    /// Called from `end_instrument_layer` while the back_pic clip is still the frame
+    /// scissor, so the server clips each batch to the damaged region.
+    fn flush_instr_batches(&mut self) {
+        let ops = std::mem::take(&mut self.instr_ops);
+        if self.xdiag {
+            // Each Fill = 1 request; each Tris/Glyphs = 2 (set-source + draw).
+            self.xd_ops += ops.iter().map(|o| match o {
+                InstrOp::Fill { .. } => 1u64,
+                _ => 2,
+            }).sum::<u64>();
+        }
+        for op in ops {
+            match op {
+                InstrOp::Fill { key, rects } => {
+                    // Instrument fills blend OVER the content, premultiplied.
+                    let _ = render::fill_rectangles(
+                        &self.conn, render::PictOp::OVER, self.dst_pic,
+                        premultiply(decode_qcolor(key)), &rects,
+                    );
+                }
+                InstrOp::Tris { key, tris } => {
+                    self.set_argb_src(decode_qcolor(key));
+                    // maskFormat = 0 (None) = NON-antialiased triangle fill. Software
+                    // Xwayland's per-pixel AA coverage on RENDER Triangles is the one
+                    // op it cannot drain over ssh -X (it stalls typing under load); a
+                    // solid fill is cheap. Costs the wires their smooth edge (slightly
+                    // jaggy) — an acceptable trade for a responsive remote terminal.
+                    let _ = render::triangles(
+                        &self.conn, render::PictOp::OVER, self.src_pic_argb, self.dst_pic,
+                        0u32, 0, 0, &tris,
+                    );
+                }
+                InstrOp::Glyphs { key, items } => {
+                    self.set_argb_src(decode_qcolor(key));
+                    // composite_glyphs32: one element per glyph (x_off is 0, so the
+                    // pen never advances), each with a pen-RELATIVE delta.
+                    let mut cmd = Vec::with_capacity(items.len() * 12);
+                    let (mut px, mut py) = (0i16, 0i16);
+                    for (gid, x, y) in items {
+                        let (dx, dy) = (x.wrapping_sub(px), y.wrapping_sub(py));
+                        px = x; py = y;
+                        cmd.push(1u8);
+                        cmd.extend_from_slice(&[0u8, 0, 0]);
+                        cmd.extend_from_slice(&dx.to_ne_bytes());
+                        cmd.extend_from_slice(&dy.to_ne_bytes());
+                        cmd.extend_from_slice(&gid.to_ne_bytes());
+                    }
+                    let _ = render::composite_glyphs32(
+                        &self.conn, render::PictOp::OVER, self.src_pic_argb, self.dst_pic,
+                        self.a8_format, self.shape_glyphset, 0, 0, &cmd,
+                    );
+                }
+            }
+        }
+    }
+
     pub fn try_new(window: &Window, blobs: &FontBlobs, font_px: f32) -> Option<Self> {
         let win = match window.window_handle().ok()?.as_raw() {
             RawWindowHandle::Xlib(h) => h.window as u32,
@@ -238,6 +365,7 @@ impl XRenderBackend {
             src_pic_argb,
             shape_glyphset,
             shapes: HashMap::new(),
+            instr_ops: Vec::new(),
             next_shape_id: 1,
             cell_w,
             cell_h,
@@ -252,6 +380,7 @@ impl XRenderBackend {
             xd_last: std::time::Instant::now(),
             xd_present: 0,
             xd_geom: 0,
+            xd_ops: 0,
             xd_flush: std::time::Duration::ZERO,
             xd_dmg: 0,
             win_w,
@@ -587,7 +716,14 @@ impl Backend for XRenderBackend {
         self.clip = None;
     }
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color) {
-        self.fill(x, y, w, h, c);
+        if self.drawing_instruments {
+            // Batch: trim to the scissor now, accumulate by colour, flush at end.
+            if let Some(rect) = trim_to_clip(x, y, w, h, self.clip) {
+                self.batch_fill(qcolor_key(c), rect);
+            }
+        } else {
+            self.fill(x, y, w, h, c); // content: immediate, opaque SRC
+        }
     }
     fn fill_cell(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
         self.fill(ox + col as f32 * self.cell_w, oy + row as f32 * self.cell_h, self.cell_w, self.cell_h, color);
@@ -660,20 +796,43 @@ impl Backend for XRenderBackend {
             return;
         }
         let Some(gid) = self.shape_glyph(0, r, 0.0) else { return };
-        self.set_argb_src(c);
-        self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
+        if self.drawing_instruments {
+            if self.clip_rejects(cx, cy, r + 2.0) { return; }
+            self.batch_glyph(qcolor_key(c), (gid, cx.round() as i16, cy.round() as i16));
+        } else {
+            self.set_argb_src(c);
+            self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
+        }
     }
     fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
         if r <= 0.0 || width <= 0.0 {
             return;
         }
         let Some(gid) = self.shape_glyph(1, r, width) else { return };
-        self.set_argb_src(c);
-        self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
+        if self.drawing_instruments {
+            if self.clip_rejects(cx, cy, r + width + 2.0) { return; }
+            self.batch_glyph(qcolor_key(c), (gid, cx.round() as i16, cy.round() as i16));
+        } else {
+            self.set_argb_src(c);
+            self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
+        }
     }
     fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
         // Thin lines: 2 anti-aliased triangles — cheap AND smooth (no staircase).
-        self.draw_tris(&line_tris(x0, y0, x1, y1, width), c);
+        let tris = line_tris(x0, y0, x1, y1, width);
+        if self.drawing_instruments {
+            // Clip-reject wholly-offscissor lines client-side (saves wire).
+            if let Some(b) = self.clip {
+                let (bx, by, bw, bh) = tris_bbox(&tris);
+                if !rect_intersects(bx, by, bw, bh, b) { return; }
+            }
+            let fx = |v: f32| (v * 65536.0).round() as i32;
+            let mk = |(x, y): (f32, f32)| Pointfix { x: fx(x), y: fx(y) };
+            let hw: Vec<Triangle> = tris.iter().map(|t| Triangle { p1: mk(t[0]), p2: mk(t[1]), p3: mk(t[2]) }).collect();
+            self.batch_tris(qcolor_key(c), &hw);
+        } else {
+            self.draw_tris(&tris, c);
+        }
     }
     fn end_frame(&mut self) {}
 
@@ -698,6 +857,8 @@ impl Backend for XRenderBackend {
         }
     }
     fn end_instrument_layer(&mut self) {
+        // Emit the batched instrument requests (still under the frame scissor clip).
+        self.flush_instr_batches();
         if self.xdiag {
             self.xd_geom += 1;
         }
@@ -750,12 +911,13 @@ impl Backend for XRenderBackend {
             self.xd_present += 1;
             if self.xd_last.elapsed() >= std::time::Duration::from_secs(1) {
                 eprintln!(
-                    "xdiag: {} present/s, {:.1} Mpx/s damage, flush {} ms/s, {} instr-redraw/s",
-                    self.xd_present, self.xd_dmg as f64 / 1e6, self.xd_flush.as_millis(), self.xd_geom
+                    "xdiag: {} present/s, {:.1} Mpx/s damage, flush {} ms/s, {} instr-redraw/s, {} instr-reqs/s",
+                    self.xd_present, self.xd_dmg as f64 / 1e6, self.xd_flush.as_millis(), self.xd_geom, self.xd_ops
                 );
                 self.xd_last = std::time::Instant::now();
                 self.xd_present = 0;
                 self.xd_geom = 0;
+                self.xd_ops = 0;
                 self.xd_flush = std::time::Duration::ZERO;
                 self.xd_dmg = 0;
             }
