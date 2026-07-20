@@ -5,9 +5,24 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "rt terminal engine: PTY + alacritty_terminal Term, exposing a render snapshot"
 
+# Engine selection (build-time half of the seam; see docs/engine-seam.md and
+# docs/own-engine-plan.md). The runtime half (RT_ENGINE env) lands in Phase 4,
+# once a second implementation exists to switch to.
+[features]
+default = ["vendored"]
+# The vendored, patched alacritty_terminal engine: current default, permanent
+# fallback, AND the differential-testing oracle. Optional so the future in-house
+# engine can eventually build WITHOUT it (`--no-default-features --features own`).
+vendored = ["dep:alacritty_terminal"]
+# The in-house vt-parser/vt-term engine. A marker for now — it pulls in nothing
+# until Phase 2/3 land those crates; kept here so the selection mechanism is real
+# and documented from day one.
+own = []
+
 [dependencies]
 # The heart of the "use alacritty to make it faster" mandate: we reuse
 # alacritty's battle-tested, damage-tracked terminal engine (PTY, grid, VTE/ANSI
 # parser) instead of reimplementing it. 0.26.0 is the published version matching
-# the source we studied in reference/alacritty.
-alacritty_terminal = { path = "../../vendor/alacritty_terminal" }  # vendored throughput fork (see docs/vendored-engine.md)
+# the source we studied in reference/alacritty. `optional` so the `vendored`
+# feature above gates it; with default features it is always present.
+alacritty_terminal = { path = "../../vendor/alacritty_terminal", optional = true }  # vendored throughput fork (see docs/vendored-engine.md)

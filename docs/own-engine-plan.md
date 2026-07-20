@@ -48,20 +48,31 @@ xtask (or a test bin)   # `verify` entrypoint that runs the whole battery
 
 Both rt AND rt-mux consume `rt-engine`, so the seam serves both for free.
 
-## Phase 0 — Establish the seam (enabling refactor; ships to current rt)
+## Phase 0 — Establish the seam (DONE 2026-07-21; see docs/engine-seam.md)
 
-Today `rt-engine` re-exports alacritty types (`TermMode`, `cell::Flags`,
-`grid::Scroll`, `index::*`, `Cell`). Swapping engines is impossible while rt speaks
-alacritty's vocabulary. So:
+**Finding: the decoupling was already substantially achieved by prior design.** rt and
+rt-mux name zero alacritty types (only doc comments match); `rt-engine`'s public API is
+already engine-agnostic (`Snapshot`, `SnapCell`, `CursorShape`, `Damage`, …); and
+rt-session already has a `Backend` trait with a mock, so the seam skeleton exists. rt is
+coupled to the concrete engine in ONE place: `AppSession = Session<TermPane, …>` plus
+the `spawn_env` call sites.
 
-- Define `rt-engine`'s OWN public vocabulary (extend the existing `Snapshot`/cell
-  types into a full `Mode`, `Scroll`, coordinate, damage vocabulary).
-- Make rt and rt-mux talk ONLY to `rt-engine` types. Confine every `alacritty_*`
-  path to one file (`engine/vendored.rs`).
-- **Exit criteria:** `rg alacritty crates/rt/src crates/rt-mux/src` is empty; rt and
-  rt-mux run byte-for-byte as before; all existing tests pass; deploy to the three
-  machines unchanged. This is worth doing even if the rest never happens — it
-  decouples rt from a dependency's API.
+What shipped this phase (all safe; rt unchanged at runtime):
+- **Build-time engine selection:** cargo features on `rt-engine` —
+  `default = ["vendored"]`, `vendored = ["dep:alacritty_terminal"]` (the dep is now
+  optional and gated, verified via `cargo tree`: `--no-default-features` drops
+  alacritty), `own = []` marker.
+- **Contract of record:** `docs/engine-seam.md` enumerates the exact engine interface
+  (agnostic types + the ~26 pane methods) the in-house engine must satisfy and the
+  oracle harness will drive.
+- **Design-doc homes seeded:** `docs/vt-parser-design.md`, `docs/vt-term-design.md`.
+- **Boundary guard** documented (rt/rt-mux stay alacritty-type-free).
+
+**Deferred (deliberately):** the formal `Engine` trait extraction (beyond `Backend`)
+and making `AppSession` generic over it wait until the first `own` skeleton exists — so
+the trait is validated against a real second implementation rather than guessed, and so
+working rt's generics are not churned for zero present benefit. Likewise the runtime
+`RT_ENGINE` switch lands in Phase 4 when there are two impls to choose between.
 
 ## Phase 1 — Conformance & oracle harness (built BEFORE our engine)
 
@@ -133,14 +144,61 @@ The open-ended piece, grown strictly under the harness:
   (coverage-guided if practical).
 - Corpus + ledger tracked in-repo so the conformance state is always visible.
 
-## Decisions to confirm
+## Decisions (confirmed 2026-07-20)
 
-- **Engine selection:** build-feature, runtime env, or both? (Recommend both; default
-  vendored.)
-- **Parser + Term as two crates** (recommended — isolates the tractable parser tests
-  from the hard Term tests) vs one.
-- **foot integration** now or deferred (recommend deferred; it is a tiebreaker/design
-  reference, not on the critical path).
+- **Engine selection: BOTH** a build feature AND a runtime `RT_ENGINE={vendored|own}`
+  env var. Default **vendored**.
+- **Two crates: `vt-parser` and `vt-term`.** Keeps the tractable parser tests cleanly
+  separate from the hard Term tests.
+- **foot integration is DEFERRED** — it is a tiebreaker + design reference, not on the
+  critical path. TRACKED so we don't forget: revisit in Phase 1 (optional out-of-
+  process oracle) and Phase 3 (reflow/grid design study). See "Deferred, do not
+  forget" below.
+
+## Documentation standard (a first-class deliverable)
+
+The aim is bluntly stated: **the best-documented VT parser and Term in existence.**
+Not aspirational fluff — a concrete bar every phase is held to.
+
+- **Every function** gets a thorough doc comment: what it does, *why* it exists, the
+  invariants it assumes and preserves, and any spec/reference it implements (cite the
+  ECMA-48 / DEC / xterm section or the vttest/esctest case).
+- **Inline comments where they aid understanding** and only there — explain the
+  non-obvious (a state-machine transition's rationale, a reflow edge case, a perf
+  trick and the measurement that justified it). No narration of the obvious; comments
+  earn their place or they are noise.
+- **Two companion documents** that actually *teach* the designs, not just list APIs:
+  - `docs/vt-parser-design.md` — the state machine (states, transitions, the ground
+    fast path), UTF-8 handling, the batching contract, and *why* each choice.
+  - `docs/vt-term-design.md` — the grid + scrollback data structures, damage tracking,
+    every sequence family's semantics, and reflow. A reader should finish it able to
+    reimplement the Term.
+- Design docs and code stay in lockstep; a behaviour change that isn't reflected in
+  the design doc is an incomplete change.
+
+## Performance mandate (co-equal with correctness)
+
+The parser and Term must be **REALLY fast** — we study every trick in alacritty and
+foot and aim to *beat* them, in Rust. Concretely:
+
+- **Learn, measure, then improve.** Read how alacritty and foot represent the grid,
+  track damage, scroll, and reflow; benchmark ours against both (vtebench + our own
+  harness) on identical inputs. A trick is adopted only with a measurement behind it,
+  and each such trick is commented with that measurement.
+- **Preserve the wins we already have**, and push past them: `memchr`/SIMD scan-to-
+  control on the ground state, batched printable runs (`print_str`/`input_run`) that
+  mutate the grid in bulk, cache-friendly cell layout, minimal per-cell work on the
+  hot path, damage that never over-reports.
+- **Correctness gates speed.** A faster path ships only when the differential harness
+  proves it produces identical state to the simple path (exactly the pattern
+  alacritty's own `assert_input_run_matches` uses). No speed trick escapes the oracle.
+- Perf is tracked with the same rigour as conformance: a benchmark suite in CI, and
+  regressions are failures.
+
+## Deferred, do not forget
+
+- **foot integration** (decision 3): out-of-process tiebreak oracle (Phase 1) and
+  grid/damage/reflow design study (Phase 3). Deferred, not dropped.
 
 ## Risk register
 
