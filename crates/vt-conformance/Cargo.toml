@@ -1,0 +1,13 @@
+[package]
+name = "vt-conformance"
+version = "0.2.8"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Differential-testing harness for rt's terminal engine: drive bytes at an engine, read a neutral screen state, diff two engines. The vendored alacritty_terminal is wired as the oracle; the in-house vt-parser/vt-term slot in later (docs/own-engine-plan.md, Phase 1)."
+publish = false
+
+[dependencies]
+# The ORACLE: the vendored, patched engine we test everything against. This crate
+# is dev/verification tooling — it is not built into the rt binary (deploy builds
+# `-p rt`), so depending on the engine directly here is intended.
+alacritty_terminal = { path = "../../vendor/alacritty_terminal" }

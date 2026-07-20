@@ -74,7 +74,33 @@ the trait is validated against a real second implementation rather than guessed,
 working rt's generics are not churned for zero present benefit. Likewise the runtime
 `RT_ENGINE` switch lands in Phase 4 when there are two impls to choose between.
 
-## Phase 1 — Conformance & oracle harness (built BEFORE our engine)
+## Phase 1 — Conformance & oracle harness (STARTED 2026-07-21; core landed)
+
+Shipped in `crates/vt-conformance` (dev-only; not built into the rt binary):
+- **Neutral `ScreenState`** — a materialised, comparable snapshot (grid of neutral
+  cells + cursor + alt/app-cursor modes + offset/history), naming no engine's types,
+  with a human-readable `diff`.
+- **`VtEngine` trait** — `spawn` / `feed` / `resize` / `observe`; the interface the
+  oracle and (later) `vt-term` both implement.
+- **Vendored oracle** (`vendored::Vendored`) — the alacritty `Term` + ANSI `Processor`
+  driven **synchronously** (no PTY/shell), configured to match rt-engine.
+- **Differential comparator + seeded generator** — `feed_whole`/`feed_chunks`,
+  `gen_script` (structured escape-sequence fuzz), `split` (chunk framing), a
+  dependency-free reproducible xorshift RNG.
+- **Green battery** (`cargo test -p vt-conformance`): determinism; **chunk-invariance
+  across 2000 seeds** (a real property — parser must resume across read boundaries);
+  hand-written spec cases (ED/CUP/SGR/autowrap/EL/alt-screen/DECCKM); fuzz property
+  invariants (cursor in bounds, `offset ≤ history`, dims); resize round-trip.
+
+Still to do in Phase 1 (scaffolded, not yet filled):
+- **esctest/vttest runner** — the codified xterm spec (higher-leverage than any single
+  oracle). `corpus/` exists with a README; the runner + fixtures are next.
+- **Real-app replay corpora** — capture vim/tmux/emacs/htop/git streams into
+  `corpus/*.bytes`, replay + diff.
+- **(Deferred) foot** as an out-of-process tiebreak oracle — see "Deferred, do not
+  forget".
+
+### Original design notes for Phase 1
 
 The `vt-conformance` crate, with the "system under test" slot filled by *alacritty*
 so it is green from day one and ready to accept our engine later:

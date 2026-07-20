@@ -12,6 +12,7 @@ members = [
     "crates/rt-session",             # controller: ties tree+engine+focus+broadcast into actions
     "crates/rt",                     # the binary: winit + GL front-end + input mapping
     "crates/rt-mux",                 # text-mode sibling: rt-engine panes hosted in mullion tiles
+    "crates/vt-conformance",         # dev-only: differential-testing harness (vendored engine = oracle)
 ]
 
 # Shared release profile: optimise hard and thin-LTO, mirroring alacritty's
