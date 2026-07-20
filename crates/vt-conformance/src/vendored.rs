@@ -40,10 +40,20 @@ pub struct Vendored {
     parser: ansi::Processor,
 }
 
-/// Translate an alacritty cell colour to the neutral colour.
+/// Translate an alacritty cell colour to the neutral colour. Named colours 0..=15 are
+/// the ANSI palette → `Indexed`; Foreground/Background (and the other specials) are the
+/// terminal default → the `Named(256)` sentinel. This makes the oracle and the in-house
+/// Term — which stores `Default`/`Indexed`/`Rgb` — directly comparable.
 fn neutral_color(c: Color) -> NColor {
     match c {
-        Color::Named(n) => NColor::Named(n as u16),
+        Color::Named(n) => {
+            let i = n as u16;
+            if i <= 15 {
+                NColor::Indexed(i as u8)
+            } else {
+                NColor::Named(256) // Foreground/Background/Cursor/Dim/Bright → "default"
+            }
+        }
         Color::Indexed(i) => NColor::Indexed(i),
         Color::Spec(rgb) => NColor::Rgb(rgb.r, rgb.g, rgb.b),
     }

@@ -11,6 +11,8 @@ publish = false
 # is dev/verification tooling — it is not built into the rt binary (deploy builds
 # `-p rt`), so depending on the engine directly here is intended.
 alacritty_terminal = { path = "../../vendor/alacritty_terminal" }
+# The in-house Term under test (a VtEngine impl lives in `vtterm.rs`, shared by tests).
+vt-term = { path = "../vt-term" }
 
 [dev-dependencies]
 # The in-house parser under test, and the vendored vte it is diffed against (the

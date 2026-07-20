@@ -1,0 +1,9 @@
+[package]
+name = "vt-term"
+version = "0.2.8"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "rt's in-house terminal Term: consumes vt-parser's action stream and maintains the grid, cursor, and modes. Verified against the vendored engine (docs/own-engine-plan.md Phase 3, docs/vt-term-design.md)."
+
+[dependencies]
+vt-parser = { path = "../vt-parser" }

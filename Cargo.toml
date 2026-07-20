@@ -13,6 +13,7 @@ members = [
     "crates/rt",                     # the binary: winit + GL front-end + input mapping
     "crates/rt-mux",                 # text-mode sibling: rt-engine panes hosted in mullion tiles
     "crates/vt-parser",              # in-house VT/ANSI parser (own engine, Phase 2)
+    "crates/vt-term",                # in-house Term (own engine, Phase 3)
     "crates/vt-conformance",         # dev-only: differential-testing harness (vendored engine = oracle)
 ]
 

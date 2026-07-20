@@ -1,0 +1,83 @@
+//! Adapt the in-house `vt_term::Term` to the harness [`VtEngine`] interface, so the
+//! SAME spec cases, differential fuzz, and replay corpus that validate the vendored
+//! oracle run against our Term too — and diff it against that oracle.
+
+use crate::{attr, NCell, NColor, NCursor, ScreenState, VtEngine};
+
+fn ncolor(c: vt_term::Color) -> NColor {
+    match c {
+        // The terminal default. `Named(256)` is the neutral sentinel for "default" —
+        // it lines up with alacritty's Foreground/Background (index 256/257), which
+        // the oracle maps the same way once colour reconciliation lands (Phase-3 fuzz).
+        vt_term::Color::Default => NColor::Named(256),
+        vt_term::Color::Indexed(i) => NColor::Indexed(i),
+        vt_term::Color::Rgb(r, g, b) => NColor::Rgb(r, g, b),
+    }
+}
+
+fn nattrs(a: vt_term::Attrs) -> u16 {
+    let mut m = 0;
+    if a.bold {
+        m |= attr::BOLD;
+    }
+    if a.italic {
+        m |= attr::ITALIC;
+    }
+    if a.underline {
+        m |= attr::UNDERLINE;
+    }
+    if a.inverse {
+        m |= attr::INVERSE;
+    }
+    if a.dim {
+        m |= attr::DIM;
+    }
+    if a.hidden {
+        m |= attr::HIDDEN;
+    }
+    if a.strikeout {
+        m |= attr::STRIKEOUT;
+    }
+    m
+}
+
+impl VtEngine for vt_term::Term {
+    fn spawn(cols: usize, rows: usize) -> Self {
+        vt_term::Term::new(cols, rows)
+    }
+    fn feed(&mut self, bytes: &[u8]) {
+        vt_term::Term::feed(self, bytes)
+    }
+    fn resize(&mut self, cols: usize, rows: usize) {
+        vt_term::Term::resize(self, cols, rows)
+    }
+    fn observe(&self) -> ScreenState {
+        let (cols, rows) = (self.cols(), self.rows());
+        let mut grid = vec![vec![NCell { ch: ' ', fg: NColor::Named(256), bg: NColor::Named(256), attrs: 0 }; cols]; rows];
+        for r in 0..rows {
+            for c in 0..cols {
+                let cell = self.cell(r, c);
+                grid[r][c] = NCell { ch: cell.c, fg: ncolor(cell.fg), bg: ncolor(cell.bg), attrs: nattrs(cell.attrs) };
+            }
+        }
+        let (col, line) = self.cursor();
+        let cursor = if self.cursor_visible() {
+            Some(NCursor { col, line, shape: 0, visible: true })
+        } else {
+            None
+        };
+        ScreenState {
+            cols,
+            rows,
+            grid,
+            cursor,
+            alt_screen: self.alt_screen(),
+            app_cursor: self.app_cursor(),
+            display_offset: 0, // no scrollback yet (Phase-3 later)
+            history: 0,
+        }
+    }
+    fn name() -> &'static str {
+        "vt-term"
+    }
+}

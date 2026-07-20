@@ -261,3 +261,4 @@ pub fn split(script: &[u8], seed: u64) -> Vec<&[u8]> {
 
 pub mod spec;
 pub mod vendored;
+pub mod vtterm;

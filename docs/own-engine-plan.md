@@ -167,7 +167,27 @@ canary. Can be wired to a git hook / cron; on-demand by default.
 still using alacritty's Term (zero Term risk) for a real-use shakeout — deferred to
 when it buys something; action-stream parity already proves correctness.
 
-## Phase 3 — Own Term (`vt-term`)
+## Phase 3 — Own Term (`vt-term`) — FOUNDATION LANDED 2026-07-21
+
+`crates/vt-term`: consumes `vt_parser`'s action stream, maintains the grid/cursor/pen/
+modes. Implemented: printing + deferred-wrap autowrap, cursor motion, erase (ED/EL/ECH),
+scroll regions (DECSTBM) + IND/RI/NEL/IL/DL/ICH/DCH, SGR (attrs + 16/256/truecolour),
+modes (DECAWM/DECTCEM/DECCKM/DECOM/alt-screen), DECSC/DECRC, tabs. See
+`docs/vt-term-design.md`.
+
+Verified under the harness (`vt-conformance`): the **32 spec cases PASS** against
+vt-term, and a **curated 16-script differential vs the oracle PASSES**. First random-
+fuzz sweep: **~3.5% grid divergence** (scrollback ignored) — concentrated in one
+last-column wrap edge — plus the deferred scrollback counter. The neutral colour model
+was unified (`Default`/`Indexed`/`Rgb`) so vt-term and alacritty compare directly, and
+two alacritty quirks (ED-above `line>1`, tab-glyph) were matched. Divergences tracked in
+`docs/engine-divergence.md`.
+
+**Next Phase-3 milestones:** scrollback ring; close the last-column wrap edge + cursor
+cases; random-fuzz + replay-corpus differential to green under `ci/verify.sh` (both
+arches); wide chars; then reflow (last, on the ledger). Original notes below.
+
+### Original design notes for Phase 3
 
 The open-ended piece, grown strictly under the harness:
 
