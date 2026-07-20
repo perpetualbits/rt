@@ -29,51 +29,96 @@ const MAX_OSC_PARAMS: usize = 16;
 /// colon-separated sub-parameters (e.g. `38:2:255:0:0`). Mirrors vte's iteration
 /// exactly — `iter()` yields one `&[u16]` per parameter — so the two agree on the
 /// nested structure a `csi_dispatch` handler sees.
-#[derive(Default, Debug, PartialEq, Eq, Clone)]
+///
+/// Storage is **allocation-free**: a flat `[u16; 32]` of values plus a `[u8; 32]` that,
+/// at each parameter's start index, records how many values belong to that parameter
+/// (itself + its sub-parameters). The alternative — a `Vec<Vec<u16>>` — heap-allocated
+/// on every escape sequence and made the parser ~30–45% slower than vte on CSI-heavy
+/// workloads (measured on riscv64/milkv; see `examples/parser_bench.rs`). This layout
+/// is what closed that gap.
+#[derive(Clone, Debug)]
 pub struct Params {
-    groups: Vec<Vec<u16>>, // one inner Vec per parameter; its elements are the subparams
-    open: bool,            // the last group is still accepting subparams
-    total: usize,          // total values (params + subparams), for the fullness cap
+    /// Number of values in each parameter, stored at that parameter's start index
+    /// (0 at sub-parameter positions).
+    subparams: [u8; MAX_PARAMS],
+    /// All parameter and sub-parameter values, packed.
+    params: [u16; MAX_PARAMS],
+    /// Values in the parameter currently being built.
+    current_subparams: u8,
+    /// Total values stored (parameters + sub-parameters).
+    len: usize,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params { subparams: [0; MAX_PARAMS], params: [0; MAX_PARAMS], current_subparams: 0, len: 0 }
+    }
 }
 
 impl Params {
+    #[inline]
     fn clear(&mut self) {
-        self.groups.clear();
-        self.open = false;
-        self.total = 0;
+        self.current_subparams = 0;
+        self.len = 0;
     }
+    #[inline]
     fn is_full(&self) -> bool {
-        self.total >= MAX_PARAMS
+        self.len == MAX_PARAMS
     }
-    /// Finalise `v` as a new parameter (the `;` separator, and the final byte).
-    fn push(&mut self, v: u16) {
-        if self.open {
-            self.groups.last_mut().unwrap().push(v);
-            self.open = false;
-        } else {
-            self.groups.push(vec![v]);
-        }
-        self.total += 1;
+    /// Finalise `item` as a new parameter (the `;` separator, and the final byte).
+    #[inline]
+    fn push(&mut self, item: u16) {
+        self.subparams[self.len - self.current_subparams as usize] = self.current_subparams + 1;
+        self.params[self.len] = item;
+        self.current_subparams = 0;
+        self.len += 1;
     }
-    /// Add `v` as a sub-parameter of the current parameter (the `:` separator).
-    fn extend(&mut self, v: u16) {
-        if self.open {
-            self.groups.last_mut().unwrap().push(v);
-        } else {
-            self.groups.push(vec![v]);
-            self.open = true;
-        }
-        self.total += 1;
+    /// Add `item` as a sub-parameter of the current parameter (the `:` separator).
+    #[inline]
+    fn extend(&mut self, item: u16) {
+        self.subparams[self.len - self.current_subparams as usize] = self.current_subparams + 1;
+        self.params[self.len] = item;
+        self.current_subparams += 1;
+        self.len += 1;
     }
-    /// Iterate the parameters; each item is that parameter's sub-parameter slice.
-    pub fn iter(&self) -> impl Iterator<Item = &[u16]> {
-        self.groups.iter().map(|g| g.as_slice())
+    /// Number of values (parameters plus sub-parameters). Matches vte's `len`.
+    pub fn len(&self) -> usize {
+        self.len
     }
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
+        self.len == 0
     }
-    pub fn len(&self) -> usize {
-        self.groups.len()
+    /// Iterate the parameters; each item is that parameter's sub-parameter slice.
+    pub fn iter(&self) -> ParamsIter<'_> {
+        ParamsIter { params: self, index: 0 }
+    }
+}
+
+/// Iterator over [`Params`]: yields one `&[u16]` per parameter (its sub-parameters).
+pub struct ParamsIter<'a> {
+    params: &'a Params,
+    index: usize,
+}
+
+impl<'a> Iterator for ParamsIter<'a> {
+    type Item = &'a [u16];
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u16]> {
+        if self.index >= self.params.len {
+            return None;
+        }
+        let n = self.params.subparams[self.index] as usize;
+        let slice = &self.params.params[self.index..self.index + n];
+        self.index += n;
+        Some(slice)
+    }
+}
+
+impl<'a> IntoIterator for &'a Params {
+    type Item = &'a [u16];
+    type IntoIter = ParamsIter<'a>;
+    fn into_iter(self) -> ParamsIter<'a> {
+        self.iter()
     }
 }
 
@@ -94,6 +139,7 @@ pub trait Perform {
     /// Execute a C0 or C1 control byte.
     fn execute(&mut self, _byte: u8) {}
     /// A DCS sequence's final byte arrived; subsequent `put`s carry its data string.
+    #[inline]
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     /// A byte of a DCS data string.
     fn put(&mut self, _byte: u8) {}
@@ -102,6 +148,7 @@ pub trait Perform {
     /// An OSC command: its `;`-separated parameters, and whether BEL (not ST) ended it.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
     /// A CSI sequence's final byte arrived.
+    #[inline]
     fn csi_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     /// An ESC sequence's final byte arrived.
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
@@ -155,6 +202,7 @@ impl Parser {
         Self::default()
     }
 
+    #[inline]
     fn intermediates(&self) -> &[u8] {
         &self.intermediates[..self.intermediate_idx]
     }
@@ -177,6 +225,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn change_state<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match self.state {
             State::Ground => unreachable!("ground is handled by advance_ground"),
@@ -197,6 +246,7 @@ impl Parser {
     }
 
     // ── C0/C1 "anywhere" transitions shared by many states ────────────────────
+    #[inline]
     fn anywhere(&mut self, byte: u8) {
         match byte {
             0x18 | 0x1A => self.state = State::Ground,
@@ -209,6 +259,7 @@ impl Parser {
     }
 
     // ── Escape ────────────────────────────────────────────────────────────────
+    #[inline]
     fn advance_esc<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
@@ -242,6 +293,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_esc_intermediate<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
@@ -256,6 +308,7 @@ impl Parser {
     }
 
     // ── CSI ───────────────────────────────────────────────────────────────────
+    #[inline]
     fn advance_csi_entry<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
@@ -284,6 +337,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_csi_param<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
@@ -301,6 +355,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_csi_intermediate<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
@@ -311,6 +366,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_csi_ignore<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
@@ -322,6 +378,7 @@ impl Parser {
     }
 
     // ── DCS ───────────────────────────────────────────────────────────────────
+    #[inline]
     fn advance_dcs_entry<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
@@ -351,6 +408,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_dcs_param<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
@@ -368,6 +426,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_dcs_intermediate<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
@@ -379,6 +438,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_dcs_passthrough<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x7E => performer.put(byte),
@@ -402,6 +462,7 @@ impl Parser {
     }
 
     // ── OSC ───────────────────────────────────────────────────────────────────
+    #[inline]
     fn advance_osc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => {}
@@ -425,6 +486,7 @@ impl Parser {
     }
 
     // ── Actions ───────────────────────────────────────────────────────────────
+    #[inline]
     fn csi_dispatch<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         if self.params.is_full() {
             self.ignoring = true;
@@ -435,6 +497,7 @@ impl Parser {
         self.state = State::Ground;
     }
 
+    #[inline]
     fn hook<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         if self.params.is_full() {
             self.ignoring = true;
@@ -445,6 +508,7 @@ impl Parser {
         self.state = State::DcsPassthrough;
     }
 
+    #[inline]
     fn collect(&mut self, byte: u8) {
         if self.intermediate_idx == MAX_INTERMEDIATES {
             self.ignoring = true;
@@ -454,6 +518,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn subparam(&mut self) {
         if self.params.is_full() {
             self.ignoring = true;
@@ -463,6 +528,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn param(&mut self) {
         if self.params.is_full() {
             self.ignoring = true;
@@ -472,6 +538,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn paramnext(&mut self, byte: u8) {
         if self.params.is_full() {
             self.ignoring = true;
@@ -480,6 +547,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn osc_put_param(&mut self) {
         let idx = self.osc_raw.len();
         let n = self.osc_num_params;
@@ -494,19 +562,22 @@ impl Parser {
         self.osc_num_params += 1;
     }
 
+    #[inline]
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         self.osc_put_param();
-        // Build the parameter slices into the raw buffer and dispatch.
-        let mut slices: Vec<&[u8]> = Vec::with_capacity(self.osc_num_params);
+        // Build the parameter slices into the raw buffer on the stack (no allocation)
+        // and dispatch.
+        let mut slices: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
         for i in 0..self.osc_num_params {
             let (a, b) = self.osc_params[i];
-            slices.push(&self.osc_raw[a..b]);
+            slices[i] = &self.osc_raw[a..b];
         }
-        performer.osc_dispatch(&slices, byte == 0x07);
+        performer.osc_dispatch(&slices[..self.osc_num_params], byte == 0x07);
         self.osc_raw.clear();
         self.osc_num_params = 0;
     }
 
+    #[inline]
     fn reset_params(&mut self) {
         self.intermediate_idx = 0;
         self.ignoring = false;
@@ -515,6 +586,7 @@ impl Parser {
     }
 
     // ── Ground: the SIMD fast path + UTF-8 ────────────────────────────────────
+    #[inline]
     fn advance_ground<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
         let num_bytes = bytes.len();
         let plain = memchr::memchr(0x1B, bytes).unwrap_or(num_bytes);
@@ -572,6 +644,7 @@ impl Parser {
         }
     }
 
+    #[inline]
     fn advance_partial_utf8<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
         let old = self.partial_utf8_len;
         let to_copy = bytes.len().min(self.partial_utf8.len() - old);
@@ -608,27 +681,50 @@ impl Parser {
         }
     }
 
-    /// Split a printable run at control characters (C0 and C1), `execute`-ing each and
-    /// batching the printable stretches. Preserves the exact `print`/`execute` order.
+    /// Split a printable run at control characters (C0 and C1), executing each and
+    /// batching the printable stretches. Fast path: printable ASCII bytes
+    /// (`0x20..=0x7F`) advance with a plain byte compare — no per-char UTF-8 decode,
+    /// since a validated `str` cannot hold a stray byte there. Only `< 0x20` (a C0
+    /// control) or `>= 0x80` (a multibyte codepoint, possibly a C1 control) needs a
+    /// closer look. Produces the exact print/execute order and run boundaries vte does
+    /// (the differential test proves it), while skipping char construction for the
+    /// overwhelmingly common printable-ASCII byte — the plain-text throughput win.
+    #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
+        let bytes = text.as_bytes();
         let mut run_start = 0;
-        let mut idx = 0;
-        for c in text.chars() {
-            let len = c.len_utf8();
-            if matches!(c, '\x00'..='\x1f' | '\u{80}'..='\u{9f}') {
-                Self::flush_run(performer, &text[run_start..idx]);
-                performer.execute(c as u8);
-                run_start = idx + len;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b < 0x20 {
+                // C0 control: a single byte.
+                Self::flush_run(performer, &text[run_start..i]);
+                performer.execute(b);
+                i += 1;
+                run_start = i;
+            } else if b < 0x80 {
+                // Printable ASCII: stays in the run, no decode.
+                i += 1;
+            } else {
+                // Multibyte codepoint: decode to distinguish a printable char from a
+                // C1 control (U+0080..=U+009F).
+                let c = text[i..].chars().next().unwrap();
+                let len = c.len_utf8();
+                if ('\u{80}'..='\u{9f}').contains(&c) {
+                    Self::flush_run(performer, &text[run_start..i]);
+                    performer.execute(c as u8);
+                    i += len;
+                    run_start = i;
+                } else {
+                    i += len;
+                }
             }
-            idx += len;
         }
         Self::flush_run(performer, &text[run_start..]);
     }
 
+    #[inline]
     fn flush_run<P: Perform>(performer: &mut P, run: &str) {
-        if run.is_empty() {
-            return;
-        }
         if run.len() >= Self::BATCH_MIN {
             performer.print_str(run);
         } else {

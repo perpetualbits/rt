@@ -152,10 +152,20 @@ trait and `Params` mirror vte so it is a drop-in for the parse layer. See
   plus the replay corpus. **8000+ cases, byte-identical to vte, green on first run.**
 - Plus 5 self-contained unit tests in the crate.
 
-**Still open for Phase 2:** benchmark `vt-parser` vs `vte` on x86_64 and riscv64
-(milkv), and wire `vt-parser` into rt behind the engine switch while still using
-alacritty's Term (zero Term risk) for a real-use shakeout. Deferred to when it buys
-something — the action-stream parity already proves correctness.
+**Benchmarked + tuned (2026-07-21):** `vt-parser` now BEATS vte — geomean own/vte
+**1.17× (x86_64)**, **1.09× (riscv64/milkv)**, parity-or-better on every milkv workload
+(the slow board is the canary and it went 0.65×→1.09×). Wins came from an
+allocation-free `Params`, a byte-scan `ground_dispatch`, and inline hints — all
+preserving the byte-identical action stream. See `docs/vt-parser-design.md`.
+
+**CI/CD (Phase 5, brought forward):** `ci/verify.sh [--bench] [hosts…]` runs the
+conformance battery (and optionally the benchmark) locally AND on milkv/apollo from one
+command — "CI/CD to milkv", so perf-relevant changes never land unmeasured on the riscv
+canary. Can be wired to a git hook / cron; on-demand by default.
+
+**Still open for Phase 2:** wire `vt-parser` into rt behind the engine switch while
+still using alacritty's Term (zero Term risk) for a real-use shakeout — deferred to
+when it buys something; action-stream parity already proves correctness.
 
 ## Phase 3 — Own Term (`vt-term`)
 

@@ -90,6 +90,20 @@ via `put`, and `unhook`s on cancel/ST.
   (multibyte UTF-8, C1 bytes, random bytes, CSI with subparams/intermediates/private
   markers, ESC, OSC BEL/ST, DCS) — whole-buffer AND arbitrarily chunked — plus the
   replay corpus. 8000+ cases, green.
-- **Performance:** benchmarked against vte on x86_64 (dop651/apollo) AND riscv64
-  (milkv) — the slow board magnifies regressions a fast host hides. Every speed trick
-  is commented with its measurement. (Benchmarks land alongside Phase-2 tuning.)
+- **Performance:** benchmarked against vte on x86_64 AND riscv64 (milkv) via
+  `examples/parser_bench.rs`, driven from `ci/verify.sh` (one command, both arches).
+  After tuning, `vt-parser` **beats vte** — geomean own/vte **1.17× (x86_64)** and
+  **1.09× (riscv64)**, at parity-or-better on every workload on the stable milkv board
+  (plain 1.44×, unicode 1.05×, sgr 0.99×, control 1.01×, mixed 1.00×).
+
+  Three tunings got it there, each measured on both arches:
+  1. **Allocation-free `Params`** (flat `[u16;32]` + `[u8;32]` subparam counts instead
+     of `Vec<Vec<u16>>`): the big one — CSI-heavy workloads went from ~0.53× to ~0.99×
+     on milkv, where the per-sequence heap traffic hurt most.
+  2. **Byte-scan `ground_dispatch`**: printable-ASCII bytes advance with a plain
+     compare instead of constructing a `char`, only decoding on `<0x20`/`>=0x80` —
+     ~doubled plain-text throughput (1.44× vs vte on milkv).
+  3. **Stack-array OSC dispatch** + `#[inline]` on the byte-by-byte state functions.
+
+  All three preserved the byte-identical action stream (the differential test is the
+  guardrail: optimise internals freely, the 8000-case diff proves behaviour unchanged).
