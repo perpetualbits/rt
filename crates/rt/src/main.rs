@@ -326,9 +326,8 @@ struct Active {
     resize_pending: bool,                 // a Resized arrived; the reflow waits for the drag to settle
     last_resize_at: Instant,              // when the most recent Resized arrived (drives the settle)
     deferred_resizes: u64,                // Resized events coalesced into the pending reflow (diagnostics)
-    instr_tick: bool,                     // redraw the instrument layer this frame (6fps, native path)
-    last_instr_tick: Instant,             // when the instrument layer was last redrawn
-    instr_layer_drawn: bool,              // the instrument layer has been drawn at least once since last shown
+    instr_tick: bool,                     // advance the instrument animation this frame (6fps, native path)
+    last_instr_tick: Instant,             // when the instrument animation last advanced
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -1025,7 +1024,6 @@ impl ApplicationHandler for App {
             deferred_resizes: 0,
             instr_tick: false,
             last_instr_tick: Instant::now(),
-            instr_layer_drawn: false,
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so it can be screenshotted without synthetic input.
@@ -2056,7 +2054,6 @@ impl ApplicationHandler for App {
                 if let Some(fx) = &mut active.bg_effect {
                     fx.on_resize(size.width, size.height); // blur region follows the surface
                 }
-                active.instr_layer_drawn = false; // layer pixmap was recreated + cleared
             }
             let bounds = content_bounds(size);
             let t0 = Instant::now();
@@ -2160,6 +2157,10 @@ impl ApplicationHandler for App {
         if instruments_animating && now.duration_since(active.last_instr_tick) >= INSTRUMENT_TICK {
             active.instr_tick = true;
             active.last_instr_tick = now;
+            // Instruments are baked into the content buffer now; a tick moves them,
+            // so force a FULL frame to erase the previous positions (a scissored
+            // frame would leave trails). Only 6fps, and only while animating.
+            active.force_full = true;
             dirty = true;
         }
         // While the search bar is open, keep its results current as new output
@@ -2845,28 +2846,26 @@ impl App {
         // engine damage state — runs exactly once per pane per frame.
         active.damage.begin_frame();
         let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
-        // Native (XRender) chrome: the border instruments + patch-bay now live on
-        // their OWN persistent ARGB layer (`instr_pic`), composited over content
-        // by `present()` independently of whether this frame's content damage is
-        // full or partial (Task 3/4/5). So content damage no longer needs to be
-        // marked full just because instruments are visible: the instrument layer
-        // is redrawn on its own 6fps `instr_tick` cadence (see `about_to_wait`
+        // Native (XRender) chrome: the border instruments + patch-bay are BAKED
+        // into the content back buffer each frame, clipped to the frame scissor
+        // (see `begin_instrument_layer`) — there is no separate composited layer.
+        // So a keystroke or a line of output re-bakes only the instrument geometry
+        // that falls in its (small) damage bbox and re-sends only the changed
+        // cells; it never re-ships the whole screen. That is the whole point of
+        // mechanism C — an earlier per-present composite of a full-window layer
+        // saturated the ssh link and pegged Xwayland under load.
+        //
+        // The animation only ADVANCES on the 6fps `instr_tick` (see `about_to_wait`
         // and `paint_overlays_or_instruments`), decoupled from keystroke/output
-        // frames — a keystroke or a line of output re-sends only the changed
-        // cells, never the whole screen. That is the whole point of mechanism C;
-        // forcing full content frames for instruments/wires (an earlier bug)
-        // saturated the ssh link under load. On the GL path the wires are egui
-        // chrome blended every frame across arbitrary inter-pane regions the
-        // partial path can't bound, so any wire still forces full there.
-        // The instrument LAYER is persistent and is otherwise only redrawn on a
-        // 6fps tick — which never fires unless `inst_animate` is on. So anything
-        // that moves instrument geometry with no tick (a new pane, a rotate, a
-        // divider drag, a tab switch, a wire change) left the layer showing the
-        // PREVIOUS layout, composited over the new content: jack-less new panes,
-        // borders that ignore a rotate, and tab 1's instruments bleeding onto
-        // tabs with no split at all. Same class as the focus-border bug — a
-        // visual change with no engine cell-damage — so it gets the same cure: one
-        // CENTRAL rule instead of a `instr_layer_drawn = false` at every site.
+        // frames; between ticks the geometry is static, so a scissored frame that
+        // re-bakes it lands the SAME pixels — no ghost trail. A tick, or any move
+        // of instrument geometry with no cell-damage (new pane, rotate, divider
+        // drag, tab switch, wire change), needs a FULL frame so the previous
+        // positions are erased — that is exactly what `force_full`/`chrome_moved`
+        // already arms below (the tick sets `force_full` in `about_to_wait`). On
+        // the GL path the wires are overlay chrome blended every frame across
+        // arbitrary inter-pane regions the partial path can't bound, so any wire
+        // still forces full there.
         //
         // Keyed on `force_full` (layout/chrome changed), NOT on "damage is full":
         // the engine reports Full damage on any clear/scroll, which under an
@@ -2874,9 +2873,6 @@ impl App {
         // on content frames — the exact coupling `instrument_ticks_decoupled_from_output`
         // guards against.
         let chrome_moved = active.force_full || active.session.focus() != active.last_focus;
-        if chrome_moved {
-            active.instr_layer_drawn = false; // redraw the layer against the new layout
-        }
         if chrome_moved
             || overlay_open
             || !active.bell_flash.is_empty() // bell stripes span the pane top+bottom, not the output's cell-damage → full (and the expired entry, still present here until draw_panes retains it, gives one full frame to clear the stripe)
@@ -3415,26 +3411,25 @@ impl App {
         // an overlay is up, or while dragging the scrollbar (it repaints on
         // drag-release via force_full).
         if active.backend.is_gl() {
-            // GL: draw the instruments inline each frame (no persistent layer, no
-            // 6fps gating — GL repaints are cheap), only when nothing covers them.
+            // GL: draw the instruments inline each frame (repaints are cheap),
+            // advancing the animation every frame, only when nothing covers them.
             if !overlay_up {
-                Self::draw_instrument_geometry(active, size);
+                Self::draw_instrument_geometry(active, size, true);
             }
         } else {
-            // Over the remote (XRender) backend the instruments are OFF by default
-            // (`inst_remote`); the user opts in. They live on a persistent, separate
-            // ARGB layer redrawn only on a 6fps tick (or the first show), so a
-            // keystroke/output burst on the scissored path never re-ships them.
+            // XRender: instruments are OFF by default (`inst_remote`; the user opts
+            // in). They are BAKED into the content buffer every frame (clipped to
+            // the frame scissor) — no separate layer, no per-present composite (that
+            // pegged Xwayland over ssh -X). The animation only ADVANCES on the 6fps
+            // tick, and that tick forces a full frame (see about_to_wait) so moved
+            // instruments leave no trail; between ticks the positions are static, so
+            // a scissored frame just re-bakes whatever instrument falls in its bbox.
             let show = active.settings.inst_remote && !overlay_up && active.scroll_drag.is_none();
-            if !show {
-                active.instr_layer_drawn = false; // next show redraws the layer fresh
-            }
-            active.backend.set_instrument_layer_visible(show);
-            if show && (active.instr_tick || !active.instr_layer_drawn) {
+            if show {
+                let advance = active.instr_tick;
                 active.backend.begin_instrument_layer();
-                Self::draw_instrument_geometry(active, size);
+                Self::draw_instrument_geometry(active, size, advance);
                 active.backend.end_instrument_layer();
-                active.instr_layer_drawn = true;
             }
             active.instr_tick = false; // consume the tick
         }
@@ -3865,17 +3860,24 @@ impl App {
         total
     }
 
-    /// Advance the instrument animation by wall-clock time, then draw every
-    /// enabled instrument (heat borders, orbiting output packets, patch-bay wires
-    /// + jacks, latency frame) via `chrome::instruments` — the SAME native draw on
-    /// both backends. Called inline on GL each frame; inside the persistent ARGB
-    /// layer on XRender. Reads DISJOINT `active` fields so `&mut active.backend`
-    /// coexists with the `&active.*` reads.
-    fn draw_instrument_geometry(active: &mut Active, size: winit::dpi::PhysicalSize<u32>) {
-        let now = Instant::now();
-        let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
-        active.last_meter_tick = now;
-        advance_instrument_state(&mut active.meters, &mut active.wires, dt);
+    /// Optionally advance the instrument animation by wall-clock time (see
+    /// `advance`), then draw every enabled instrument (heat borders, orbiting
+    /// output packets, patch-bay wires + jacks, latency frame) via
+    /// `chrome::instruments` — the SAME native draw on both backends. Called inline
+    /// on GL each frame; between `begin/end_instrument_layer` (baked into the
+    /// content buffer) on XRender. Reads DISJOINT `active` fields so
+    /// `&mut active.backend` coexists with the `&active.*` reads.
+    fn draw_instrument_geometry(active: &mut Active, size: winit::dpi::PhysicalSize<u32>, advance: bool) {
+        // `advance` moves the animation (orbiting packets, wire flow). GL advances
+        // every frame (cheap, smooth); XRender advances only on the 6fps tick so a
+        // static-between-ticks frame re-bakes the SAME positions (no ghost trail),
+        // and the tick forces a full frame to erase the previous positions.
+        if advance {
+            let now = Instant::now();
+            let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
+            active.last_meter_tick = now;
+            advance_instrument_state(&mut active.meters, &mut active.wires, dt);
+        }
         let bounds = content_bounds(size);
         let rects = active.session.visible_rects(bounds); // owned Vec — no session borrow lingers
         let ctx = chrome::instruments::InstrCtx {

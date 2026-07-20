@@ -48,16 +48,14 @@ pub trait Backend {
     /// Anti-aliased thick line segment (butt caps).
     fn stroke_line(&mut self, _x0: f32, _y0: f32, _x1: f32, _y1: f32, _width: f32, _c: Color) {}
 
-    /// Begin drawing onto the separate instrument layer (XRender only). Between
-    /// this and `end_instrument_layer`, `fill`/`fill_circle`/`stroke_*` land on
-    /// the ARGB instrument pixmap, not the content buffer. No-op on GL (which
-    /// draws instruments through egui).
+    /// Begin drawing instruments (XRender only). Between this and
+    /// `end_instrument_layer`, `fill`/`fill_circle`/`stroke_*` are drawn OVER
+    /// (blended into) the content back buffer, clipped to the frame scissor —
+    /// there is no separate composited layer. No-op on GL (which draws
+    /// instruments through its own overlay pass).
     fn begin_instrument_layer(&mut self) {}
-    /// Stop drawing onto the instrument layer; restore the content buffer target.
+    /// Stop drawing instruments; restore the normal (SRC) content draw mode.
     fn end_instrument_layer(&mut self) {}
-    /// Whether `present` composites the instrument layer over the content this
-    /// frame. No-op on GL.
-    fn set_instrument_layer_visible(&mut self, _visible: bool) {}
 
     // --- present + surface plumbing ---------------------------------------
     /// Resize the presentation surface (the GL window surface) to `w`×`h`.

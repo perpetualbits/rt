@@ -7,7 +7,6 @@
 //! GL context. X11 only; `try_new` returns `None` otherwise (caller keeps GL).
 #![cfg(feature = "x11")]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use fontdue::Font;
@@ -102,38 +101,18 @@ pub struct XRenderBackend {
     // currently target. Normally `back_pic` (the content buffer); temporarily
     // switched to the instrument layer between `begin/end_instrument_layer`.
     dst_pic: render::Picture,
+    // Instruments are drawn directly into the back buffer (`back_pic`) between
+    // `begin/end_instrument_layer`, clipped to the frame scissor — NOT into a
+    // separate ARGB layer that present() would composite. An earlier design kept
+    // an offscreen instrument pixmap and composited it OVER the content on every
+    // present; under Xwayland that per-frame software RENDER Composite cost the X
+    // server ~73% CPU with instruments on (invisible in any rt-side profile) and
+    // made typing over `ssh -X` unusable. Baking into the back buffer removed it.
     drawing_instruments: bool, // true between begin/end_instrument_layer: fill() uses OVER+premultiplied
-    instr_visible: bool,       // whether present() composites the instrument layer this frame
     gc: xproto::Gcontext,       // GC for the pixmap->window CopyArea
     depth: u8,                  // window/pixmap depth (for back-buffer recreation)
     win_format: Pictformat,     // the window's Pictformat (for back-buffer recreation)
     a8_format: Pictformat,      // the A8 glyph mask format
-    argb_format: Pictformat,        // 32-bit premultiplied ARGB format (instrument layer)
-    // Offscreen instrument/patch-bay layer: 32-bit ARGB, full-window, transparent
-    // except where instruments are drawn. Composited OVER the content at present.
-    instr_pixmap: xproto::Pixmap,
-    instr_pic: render::Picture,
-    // Where the instruments actually ARE. `present()` composites the layer on
-    // EVERY frame — including every keystroke — and a composite costs the X
-    // server CPU proportional to the area it covers. That cost is invisible in
-    // any client-side profile (it is not rt's CPU), which is exactly how an
-    // earlier full-window composite here shipped as a typing regression over
-    // `ssh -X`. So we clip the composite to the pixels the instruments occupy:
-    // thin border bands, not a million-pixel blend.
-    //
-    // `instr_draw_rects` accumulates each primitive's bounding box while the
-    // layer is being drawn (the primitives take `&self`, hence the RefCell);
-    // `end_instrument_layer` commits it to `instr_clip` and installs it as
-    // `win_pic`'s clip region. Over-covering is harmless (compositing a
-    // transparent pixel is a no-op), under-covering would drop instrument
-    // pixels — so every rect is rounded outward.
-    instr_draw_rects: RefCell<Vec<xproto::Rectangle>>,
-    instr_clip: Vec<xproto::Rectangle>,
-    // The instrument bands composited onto the window LAST present, so a pure
-    // instrument-animation frame can refresh (erase) exactly the old bands plus
-    // the new ones — copying thin bands instead of the whole window, which under
-    // Xwayland is a full-screen compositor recomposite per frame.
-    prev_instr_clip: Vec<xproto::Rectangle>,
     glyphset: render::Glyphset, // one shared glyph set (all styles)
     src_pixmap: xproto::Pixmap, // 1x1 repeating solid-colour source
     src_pic: render::Picture,   // the source Picture over `src_pixmap`
@@ -162,6 +141,7 @@ pub struct XRenderBackend {
     xd_present: u32,
     xd_geom: u32,
     xd_flush: std::time::Duration,
+    xd_dmg: u64,   // window pixels copied this second = the recomposite damage rt asks of the compositor
     win_w: u16,
     win_h: u16,
 }
@@ -232,19 +212,6 @@ impl XRenderBackend {
         let gc = conn.generate_id().ok()?;
         conn.create_gc(gc, win, &xproto::CreateGCAux::new()).ok()?;
 
-        // The instrument layer: a full-window 32-bit ARGB pixmap + Picture,
-        // composited OVER the content at present time.
-        let instr_pixmap = conn.generate_id().ok()?;
-        conn.create_pixmap(32, instr_pixmap, win, win_w, win_h).ok()?;
-        let instr_pic = conn.generate_id().ok()?;
-        render::create_picture(&conn, instr_pic, instr_pixmap, argb_format, &render::CreatePictureAux::new()).ok()?;
-        // Freshly-created pixmap contents are undefined — start fully transparent.
-        let _ = render::fill_rectangles(
-            &conn, render::PictOp::SRC, instr_pic,
-            render::Color { red: 0, green: 0, blue: 0, alpha: 0 },
-            &[xproto::Rectangle { x: 0, y: 0, width: win_w, height: win_h }],
-        );
-
         let fonts = parse_fonts(blobs)?;
         let (cell_w, cell_h, ascent) = measure_cell(&fonts[0], font_px);
 
@@ -260,17 +227,10 @@ impl XRenderBackend {
             back_pic,
             dst_pic: back_pic, // starts as the content buffer
             drawing_instruments: false,
-            instr_visible: false,
             gc,
             depth,
             win_format,
             a8_format,
-            argb_format,
-            instr_pixmap,
-            instr_pic,
-            instr_draw_rects: RefCell::new(Vec::new()),
-            instr_clip: Vec::new(), // nothing drawn yet: present() composites nothing
-            prev_instr_clip: Vec::new(),
             glyphset,
             src_pixmap,
             src_pic,
@@ -293,6 +253,7 @@ impl XRenderBackend {
             xd_present: 0,
             xd_geom: 0,
             xd_flush: std::time::Duration::ZERO,
+            xd_dmg: 0,
             win_w,
             win_h,
         })
@@ -340,44 +301,6 @@ impl XRenderBackend {
         Some(gid)
     }
 
-    /// Reset the WHOLE instrument layer to fully transparent. Only for a pixmap
-    /// whose contents are undefined — at creation and after `recreate_back` —
-    /// where a partial clear would leave garbage outside the cleared region.
-    /// Per-tick clearing uses `clear_instr_rects`, which is bounded by area.
-    fn clear_instr_layer(&self) {
-        let _ = render::fill_rectangles(
-            &self.conn, render::PictOp::SRC, self.instr_pic,
-            render::Color { red: 0, green: 0, blue: 0, alpha: 0 },
-            &[xproto::Rectangle { x: 0, y: 0, width: self.win_w, height: self.win_h }],
-        );
-    }
-
-    /// Clear just the region the previous tick painted. Everything outside it is
-    /// already transparent, so this restores a blank layer at a cost set by the
-    /// instruments' own area rather than the window's.
-    fn clear_instr_rects(&self) {
-        if self.instr_clip.is_empty() {
-            return; // nothing was painted; the layer is already transparent
-        }
-        let _ = render::fill_rectangles(
-            &self.conn, render::PictOp::SRC, self.instr_pic,
-            render::Color { red: 0, green: 0, blue: 0, alpha: 0 },
-            &self.instr_clip,
-        );
-    }
-
-    /// Record that an instrument primitive painted `(x, y, w, h)`, so the
-    /// composite can be clipped to it. Rounds outward and clamps to the window;
-    /// a no-op unless we're drawing the layer.
-    fn note_instr_rect(&self, x: f32, y: f32, w: f32, h: f32) {
-        if !self.drawing_instruments {
-            return;
-        }
-        if let Some(r) = outward_rect(x, y, w, h, self.win_w, self.win_h) {
-            self.instr_draw_rects.borrow_mut().push(r);
-        }
-    }
-
     fn fill(&self, x: f32, y: f32, w: f32, h: f32, c: Color) {
         // TRIM to the damage clip — do not merely skip fills that miss it.
         //
@@ -407,10 +330,8 @@ impl XRenderBackend {
             );
         }
         if self.drawing_instruments {
-            // ARGB layer: OVER with premultiplied colour so alpha blends correctly.
-            // Instruments draw with clip=None (see begin_instrument_layer), so the
-            // untrimmed float coords ARE what got issued; note them for the composite.
-            self.note_instr_rect(x, y, w, h); // clip the composite to what we paint
+            // Instruments bake into the content buffer with OVER (premultiplied so
+            // alpha blends correctly), trimmed to the frame scissor by `rect` above.
             let _ = render::fill_rectangles(&self.conn, render::PictOp::OVER, self.dst_pic, premultiply(c), &[rect]);
         } else {
             // Content buffer: opaque SRC, exactly as before.
@@ -481,10 +402,6 @@ impl XRenderBackend {
             if !rect_intersects(x, y, w, h, b) { return; }
         }
         self.set_argb_src(c);
-        // Clip the composite to the mesh's extent (bbox is already computed for
-        // clip rejection above, but that path only runs when a damage clip is set).
-        let (bx, by, bw, bh) = tris_bbox(tris);
-        self.note_instr_rect(bx, by, bw, bh);
         // f32 window px → 16.16 fixed point.
         let fx = |v: f32| (v * 65536.0).round() as i32;
         let mk = |(x, y): (f32, f32)| Pointfix { x: fx(x), y: fx(y) };
@@ -513,44 +430,7 @@ impl XRenderBackend {
         }
         // keep the draw target pointing at the new back buffer (invalidated on resize)
         self.dst_pic = self.back_pic;
-        // Recreate the instrument layer at the new size, transparent.
-        let _ = render::free_picture(&self.conn, self.instr_pic);
-        let _ = self.conn.free_pixmap(self.instr_pixmap);
-        if let Ok(pm) = self.conn.generate_id() {
-            if self.conn.create_pixmap(32, pm, self.window, w, h).is_ok() {
-                self.instr_pixmap = pm;
-                if let Ok(pic) = self.conn.generate_id() {
-                    let _ = render::create_picture(&self.conn, pic, pm, self.argb_format, &render::CreatePictureAux::new());
-                    self.instr_pic = pic;
-                }
-            }
-        }
-        self.clear_instr_layer(); // fresh pixmap: contents undefined, so clear it ALL
-        // The old occupancy describes the old size and a pixmap that no longer
-        // exists. Drop it: present() then composites nothing until the layer is
-        // redrawn, which the resize path arms via `instr_layer_drawn = false`.
-        self.instr_clip.clear();
-        self.instr_draw_rects.borrow_mut().clear();
     }
-}
-
-/// Round a float rect OUTWARD to whole pixels and clamp it to the window,
-/// returning `None` when nothing of it lands on screen. Used to record where
-/// instrument primitives paint, so the layer composite can be clipped to them.
-///
-/// The rounding direction is the whole point: this rect becomes a clip region,
-/// so under-covering by even a pixel would shave the edge off an instrument,
-/// while over-covering only composites already-transparent pixels (a visual
-/// no-op). Hence floor the origin, ceil the far edge.
-fn outward_rect(x: f32, y: f32, w: f32, h: f32, win_w: u16, win_h: u16) -> Option<xproto::Rectangle> {
-    let x0 = x.floor().max(0.0) as i32;
-    let y0 = y.floor().max(0.0) as i32;
-    let x1 = (x + w).ceil().min(win_w as f32) as i32;
-    let y1 = (y + h).ceil().min(win_h as f32) as i32;
-    if x1 <= x0 || y1 <= y0 {
-        return None; // empty, or wholly off the window
-    }
-    Some(xproto::Rectangle { x: x0 as i16, y: y0 as i16, width: (x1 - x0) as u16, height: (y1 - y0) as u16 })
 }
 
 /// Trim a float fill rect to `clip` (if any) and convert it to an integer pixel
@@ -781,10 +661,6 @@ impl Backend for XRenderBackend {
         }
         let Some(gid) = self.shape_glyph(0, r, 0.0) else { return };
         self.set_argb_src(c);
-        // The mask is rasterised at radius `r.ceil()` and stamped centred; +2px
-        // covers that rounding and the AA fringe.
-        let e = r.ceil() + 2.0;
-        self.note_instr_rect(cx - e, cy - e, 2.0 * e, 2.0 * e);
         self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
     }
     fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
@@ -793,9 +669,6 @@ impl Backend for XRenderBackend {
         }
         let Some(gid) = self.shape_glyph(1, r, width) else { return };
         self.set_argb_src(c);
-        // Ring band straddles `r`, so the mask reaches r + width/2; round out.
-        let e = r.ceil() + width + 2.0;
-        self.note_instr_rect(cx - e, cy - e, 2.0 * e, 2.0 * e);
         self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
     }
     fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
@@ -805,29 +678,34 @@ impl Backend for XRenderBackend {
     fn end_frame(&mut self) {}
 
     fn begin_instrument_layer(&mut self) {
-        self.clear_instr_rects();          // blank only what the last tick painted
-        self.instr_draw_rects.borrow_mut().clear(); // start a fresh occupancy record
-        self.dst_pic = self.instr_pic;     // retarget drawing at the layer
-        self.clip = None;                  // the whole layer is in play (no scissor)
-        self.drawing_instruments = true;   // fill() switches to OVER + premultiplied
+        // BAKE instruments straight into the content buffer (`back_pic`) with OVER,
+        // instead of a separate ARGB layer composited over the window every
+        // present. That per-present RENDER `Composite` is software in Xwayland and
+        // pegged it (0%→73% CPU) over `ssh -X`; drawing into `back_pic` means the
+        // instruments ride the normal content `CopyArea` — no composite at all.
+        // fill_circle/stroke_line don't self-trim, so clip `back_pic` to the frame
+        // scissor here (fill() already trims; this covers the mask/triangle prims)
+        // so a scissored frame only touches its bbox and the wire stays small.
+        self.drawing_instruments = true; // fill() switches to OVER + premultiplied
+        if let Some(b) = self.clip {
+            let r = xproto::Rectangle {
+                x: b.x as i16,
+                y: b.y as i16,
+                width: b.w.max(0) as u16,
+                height: b.h.max(0) as u16,
+            };
+            let _ = render::set_picture_clip_rectangles(&self.conn, self.back_pic, 0, 0, &[r]);
+        }
     }
     fn end_instrument_layer(&mut self) {
         if self.xdiag {
-            self.xd_geom += 1; // one instrument-geometry redraw (should be ~6/s)
+            self.xd_geom += 1;
         }
-        self.dst_pic = self.back_pic;      // back to the content buffer
         self.drawing_instruments = false;
-        // Commit this tick's occupancy as the window Picture's clip region, so
-        // `present()`'s composite touches only instrument pixels. The clip stays
-        // installed until the next tick changes it; it constrains ONLY RENDER ops
-        // on `win_pic` (our composite) — the content CopyArea goes through `gc`
-        // and is unaffected.
-        let rects = std::mem::take(&mut *self.instr_draw_rects.borrow_mut());
-        self.instr_clip = rects;
-        let _ = render::set_picture_clip_rectangles(&self.conn, self.win_pic, 0, 0, &self.instr_clip);
-    }
-    fn set_instrument_layer_visible(&mut self, visible: bool) {
-        self.instr_visible = visible;
+        // Restore back_pic to a full-drawable clip so the next frame's content
+        // draws aren't scissored to this frame's instrument bbox.
+        let full = xproto::Rectangle { x: 0, y: 0, width: self.win_w, height: self.win_h };
+        let _ = render::set_picture_clip_rectangles(&self.conn, self.back_pic, 0, 0, &[full]);
     }
 
     fn resize_surface(&mut self, w: std::num::NonZeroU32, h: std::num::NonZeroU32) {
@@ -836,69 +714,33 @@ impl Backend for XRenderBackend {
         self.recreate_back(); // back buffer must match the new window size
     }
     fn present(&mut self, _window: &Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
-        // Copy the finished back buffer to the window. A CopyArea is server-side
-        // (zero wire pixels), but under XWAYLAND the copied region becomes the
-        // compositor's damage: a full-window copy makes cosmic-comp recomposite
-        // the WHOLE screen. Run continuously by the 6fps instrument tick, that
-        // pegs the compositor and lags the entire desktop over `ssh -X` (loop
-        // stalls of seconds while flush stays 0 — the cost is the compositor, not
-        // the wire).
-        //
-        // Content frames (a real damage bbox) and full frames still copy the whole
-        // window — they are infrequent (a keystroke, a scroll) and a whole-window
-        // copy both stays fast AND avoids the "half-drawn borders" bug (chrome
-        // fills whole rects into the back buffer, so a bbox-only copy would show
-        // only slivers). But a PURE instrument-animation frame (empty content
-        // bbox — the CONTINUOUS 6fps case) copies only the instrument bands, old
-        // positions plus new, so the compositor recomposites thin bands not the
-        // screen. Still zero PutImage.
-        // Full frames (chrome moved: force_full) copy the whole window — they are
-        // infrequent and a whole-window copy avoids the half-drawn-border bug.
-        // Everything else copies only the CHANGED content region plus the thin
-        // instrument bands (old + new positions), so cosmic-comp recomposites the
-        // changed cells + bands, never the whole screen — the back buffer is a
-        // valid full-content buffer, so copying any sub-region is correct.
-        let full = damage.is_none();
-        if full {
-            let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
-        } else {
-            if let Some((b, _)) = damage {
+        // Instruments are BAKED into the back buffer (see begin_instrument_layer),
+        // so present is just a CopyArea — NO RENDER Composite (that per-present
+        // software composite was what pegged Xwayland over ssh -X). Full frames
+        // (chrome moved) copy the whole window; scissored frames copy only the
+        // damage bbox — the back buffer is a valid full-content buffer, so any
+        // sub-region is correct, and it keeps both the wire and cosmic-comp's
+        // recomposite small.
+        match damage {
+            None => {
+                let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
+                if self.xdiag {
+                    self.xd_dmg += self.win_w as u64 * self.win_h as u64;
+                }
+            }
+            Some((b, _)) => {
                 let x = b.x.clamp(0, self.win_w as i32) as i16;
                 let y = b.y.clamp(0, self.win_h as i32) as i16;
                 let w = (b.w.min(self.win_w as i32 - x as i32)).max(0) as u16;
                 let h = (b.h.min(self.win_h as i32 - y as i32)).max(0) as u16;
                 if w > 0 && h > 0 {
                     let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, x, y, x, y, w, h);
+                    if self.xdiag {
+                        self.xd_dmg += w as u64 * h as u64;
+                    }
                 }
             }
-            // Erase the previous frame's instruments and refresh content under the
-            // new bands, so moving instruments leave no trail.
-            for r in self.prev_instr_clip.iter().chain(self.instr_clip.iter()) {
-                let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, r.x, r.y, r.x, r.y, r.width, r.height);
-            }
         }
-        // Instrument layer OVER the content, when visible this frame. `instr_pic`
-        // is premultiplied ARGB (see `premultiply` + `fill`'s OVER path), so a
-        // plain RENDER `Composite` with `PictOp::OVER` and no mask blends it
-        // straight onto the window Picture — still a server-side RENDER request,
-        // never a client-side pixel upload (PutImage stays 0).
-        //
-        // The request names the whole window, but `win_pic` carries the clip
-        // region installed by `end_instrument_layer`, so the server only blends
-        // the instrument bands. That clip is what keeps this affordable: this
-        // runs on EVERY frame, so an unclipped full-window blend here is a
-        // per-keystroke area-proportional cost on the X server (it was, and it
-        // regressed typing over `ssh -X`). Empty clip = nothing drawn = skip.
-        if self.instr_visible && !self.instr_clip.is_empty() {
-            let _ = render::composite(
-                &self.conn, render::PictOp::OVER,
-                self.instr_pic, 0u32 /* mask: Picture::NONE */, self.win_pic,
-                0, 0, 0, 0, 0, 0, self.win_w, self.win_h,
-            );
-        }
-        // Remember which bands are on the window now, so the next pure-instrument
-        // frame erases exactly these before re-compositing (avoids ghost trails).
-        self.prev_instr_clip = if self.instr_visible { self.instr_clip.clone() } else { Vec::new() };
         let ft = std::time::Instant::now();
         let _ = self.conn.flush();
         if self.xdiag {
@@ -908,13 +750,14 @@ impl Backend for XRenderBackend {
             self.xd_present += 1;
             if self.xd_last.elapsed() >= std::time::Duration::from_secs(1) {
                 eprintln!(
-                    "xdiag: {} present/s, flush blocked {} ms/s, {} instr-redraw/s",
-                    self.xd_present, self.xd_flush.as_millis(), self.xd_geom
+                    "xdiag: {} present/s, {:.1} Mpx/s damage, flush {} ms/s, {} instr-redraw/s",
+                    self.xd_present, self.xd_dmg as f64 / 1e6, self.xd_flush.as_millis(), self.xd_geom
                 );
                 self.xd_last = std::time::Instant::now();
                 self.xd_present = 0;
                 self.xd_geom = 0;
                 self.xd_flush = std::time::Duration::ZERO;
+                self.xd_dmg = 0;
             }
         }
         false // never needs the GL fallback
@@ -957,8 +800,6 @@ impl Drop for XRenderBackend {
         let _ = xproto::free_pixmap(&self.conn, self.back_pixmap);
         let _ = xproto::free_pixmap(&self.conn, self.src_pixmap);
         let _ = xproto::free_gc(&self.conn, self.gc);
-        let _ = render::free_picture(&self.conn, self.instr_pic);
-        let _ = xproto::free_pixmap(&self.conn, self.instr_pixmap);
         let _ = self.conn.flush();
     }
 }
@@ -1071,47 +912,6 @@ mod fill_clip_tests {
     }
 }
 
-#[cfg(test)]
-mod instr_clip_tests {
-    use super::*;
-
-    #[test]
-    fn outward_rect_rounds_out_never_in() {
-        // A rect on fractional bounds must GROW to whole pixels: the clip it
-        // feeds would otherwise shave the instrument's edge off.
-        let r = outward_rect(10.7, 20.2, 5.1, 3.9, 100, 100).unwrap();
-        assert_eq!(r.x, 10); // floor(10.7)
-        assert_eq!(r.y, 20); // floor(20.2)
-        assert_eq!(r.width, 6); // ceil(15.8) - 10
-        assert_eq!(r.height, 5); // ceil(24.1) - 20
-    }
-
-    #[test]
-    fn outward_rect_clamps_to_window_and_drops_offscreen() {
-        // Overhanging the window clamps rather than emitting an invalid rect.
-        let r = outward_rect(90.0, 90.0, 50.0, 50.0, 100, 100).unwrap();
-        assert_eq!((r.x, r.y, r.width, r.height), (90, 90, 10, 10));
-        // Wholly outside, or degenerate, contributes no clip rect at all.
-        assert!(outward_rect(200.0, 200.0, 10.0, 10.0, 100, 100).is_none());
-        assert!(outward_rect(10.0, 10.0, 0.0, 0.0, 100, 100).is_none());
-        assert!(outward_rect(-50.0, 10.0, 10.0, 10.0, 100, 100).is_none());
-    }
-
-    #[test]
-    fn outward_rect_covers_a_disc_stamp_fully() {
-        // fill_circle notes (cx-e, cy-e, 2e, 2e) with e = ceil(r)+2; the mask is
-        // rasterised at radius ceil(r) around the centre, so the noted rect must
-        // contain [cx-ceil(r), cx+ceil(r)] in both axes.
-        let (cx, cy, r) = (50.0f32, 40.0f32, 7.3f32);
-        let e = r.ceil() + 2.0;
-        let rect = outward_rect(cx - e, cy - e, 2.0 * e, 2.0 * e, 200, 200).unwrap();
-        let rad = r.ceil();
-        assert!((rect.x as f32) <= cx - rad, "left edge clips the mask");
-        assert!((rect.y as f32) <= cy - rad, "top edge clips the mask");
-        assert!((rect.x as f32 + rect.width as f32) >= cx + rad, "right edge clips the mask");
-        assert!((rect.y as f32 + rect.height as f32) >= cy + rad, "bottom edge clips the mask");
-    }
-}
 
 #[cfg(test)]
 mod premult_tests {
