@@ -129,13 +129,27 @@ Where the time goes, and the optimisation path (mirrors how the parser went from
    call site is unchanged and the allocation is gone. **Result: control-heavy ~0.8× →
    ~1.0× (parity), sgr-heavy ~0.97× → ~1.12×.** Correctness pinned: fuzz 0/10000.
 
-**Where it stands (x86_64): vt-term beats our patched alacritty on every workload** — a
-clean-machine sweep reads plain 1.04×, **unicode 1.63×**, sgr 1.12×, control 0.99× (tie),
-mixed 1.07×, spiral (real capture) 1.05×, **geomean ~1.13×**. The four grid/dispatch passes
-(occ, packed Cell, batched print_str, stack CSI params) took it from 0.73× to here, with
-correctness pinned by the 0/10000 differential throughout.
+6. **char-width ASCII fast path + recycle-pool scroll — LANDED (2026-07-21), the riscv
+   levers.** riscv trailed x86, and profiling on the board found two in-order-sensitive
+   costs. (a) `char::width()` — the per-glyph unicode-width probe — is short-circuited for
+   printable ASCII (`0x20..=0x7e`) before the table lookup. (b) The big one: `scroll_up`
+   cloned a whole row (malloc + full-row copy) into scrollback **once per line fed**, which
+   a disable-the-clone experiment showed was *half* the plain-text time on riscv. It now
+   MOVES the scrolled-off row into history (no clone) and swaps in a blank from a **recycle
+   pool** fed by scrollback eviction (coloured-erase scrolls keep the clone path); because
+   rows carry `occ`, the recycled blanks clear cheaply. **Result: riscv geomean 0.92× →
+   1.05×** (plain 0.85× → 1.18×, unicode → 1.33×). Correctness pinned: fuzz 0/10000,
+   chunk-invariance 0/3000, reflow unchanged.
 
-riscv64 trails x86 (its in-order core is most sensitive to per-cell/dispatch costs, so it
-gained the most from each pass — 0.56× → 0.83× and rising). Any remaining headroom is
-incremental (per-workload micro-tuning, or a ring for truly O(1) scroll); the big levers
-are spent.
+**Where it stands: vt-term beats our patched alacritty on BOTH arches.** x86_64 geomean
+~1.2× (plain ~1.9×, unicode ~1.6×); riscv64 geomean **1.05×** (plain 1.18×, unicode 1.33×,
+sgr/control at parity). Six passes — occ tracking, packed Cell, batched print_str, stack
+CSI params, ASCII char-width, recycle-pool scroll — took the Term from 0.73×/0.56× to here,
+with correctness pinned by the 0/10000 differential the entire way. Combined with the
+parser (already ~1.1× vs patched vte), the whole in-house engine is now faster than both
+patched vendored components it replaces.
+
+The one remaining sub-1.0 workload is riscv **spiral** (~0.88×): a real capture that runs
+mostly on the *alt* screen, which has no scrollback and so doesn't benefit from the recycle
+pool. Closing it would need alt-screen-specific tuning or the full ring; it's incremental —
+the big levers are spent.
