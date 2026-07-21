@@ -27,6 +27,33 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// The two character sets vt-term maps: plain ASCII, and DEC Special Graphics (the
+/// box-drawing / line-drawing set that `ESC ( 0` selects).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Charset {
+    Ascii,
+    Special,
+}
+
+/// Map a char through a charset (identity for ASCII; the DEC line-drawing table for
+/// Special, matching alacritty's `StandardCharset::map`).
+fn map_charset(cs: Charset, c: char) -> char {
+    match cs {
+        Charset::Ascii => c,
+        Charset::Special => match c {
+            '_' => ' ', '`' => '\u{25c6}', 'a' => '\u{2592}', 'b' => '\u{2409}',
+            'c' => '\u{240c}', 'd' => '\u{240d}', 'e' => '\u{240a}', 'f' => '\u{b0}',
+            'g' => '\u{b1}', 'h' => '\u{2424}', 'i' => '\u{240b}', 'j' => '\u{2518}',
+            'k' => '\u{2510}', 'l' => '\u{250c}', 'm' => '\u{2514}', 'n' => '\u{253c}',
+            'o' => '\u{23ba}', 'p' => '\u{23bb}', 'q' => '\u{2500}', 'r' => '\u{23bc}',
+            's' => '\u{23bd}', 't' => '\u{251c}', 'u' => '\u{2524}', 'v' => '\u{2534}',
+            'w' => '\u{252c}', 'x' => '\u{2502}', 'y' => '\u{2264}', 'z' => '\u{2265}',
+            '{' => '\u{3c0}', '|' => '\u{2260}', '}' => '\u{a3}', '~' => '\u{b7}',
+            _ => c,
+        },
+    }
+}
+
 /// A cell's rendition attributes.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Attrs {
@@ -64,7 +91,7 @@ pub struct Term {
     rows: usize,
     grid: Vec<Vec<Cell>>,
     // Primary-screen state saved while the alternate screen is active.
-    saved_screen: Option<(Vec<Vec<Cell>>, usize, usize, Cell, bool)>, // grid,row,col,pen,pending_wrap
+    saved_screen: Option<(Vec<Vec<Cell>>, usize, usize, Cell, bool, [Charset; 4])>, // + designations
     row: usize,
     col: usize,
     /// Template for printed/erased cells (fg/bg/attrs); its `c` is unused.
@@ -79,7 +106,11 @@ pub struct Term {
     /// Deferred wrap: the cursor sits on the last column having just printed there; the
     /// next printable char wraps first. This is xterm's DECAWM behaviour.
     pending_wrap: bool,
-    saved_cursor: (usize, usize, Cell, bool, bool), // DECSC: row, col, pen, origin, pending_wrap
+    saved_cursor: (usize, usize, Cell, bool, bool, [Charset; 4]), // DECSC state (charsets, not gl)
+    /// The four designatable character sets (G0–G3) and which is currently invoked into
+    /// GL (`gl`). `ESC ( 0` designates G0 = Special; SI/SO invoke G0/G1.
+    charsets: [Charset; 4],
+    gl: usize,
     /// Lines scrolled off the top of the primary screen (oldest at the front), capped
     /// at SCROLLBACK. Only its length is observed today (display_offset stays 0); it
     /// exists so `history_size` tracks the oracle and future scrolling can read it.
@@ -106,7 +137,9 @@ impl Term {
             app_cursor: false,
             alt: false,
             pending_wrap: false,
-            saved_cursor: (0, 0, Cell::default(), false, false),
+            saved_cursor: (0, 0, Cell::default(), false, false, [Charset::Ascii; 4]),
+            charsets: [Charset::Ascii; 4],
+            gl: 0,
             history: VecDeque::new(),
             parser: Parser::new(),
         }
@@ -238,6 +271,7 @@ impl Term {
     // ── Printing ──────────────────────────────────────────────────────────────
     /// Write `cell` at the cursor with the current pen colours/attrs but the given char.
     fn write_cell(&mut self, c: char) {
+        let c = map_charset(self.charsets[self.gl], c);
         let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
         self.grid[self.row][self.col] = Cell { c, fg, bg, attrs, spacer: false };
     }
@@ -566,15 +600,18 @@ impl Term {
     fn swap_alt(&mut self, to_alt: bool) {
         if to_alt && !self.alt {
             let saved = std::mem::replace(&mut self.grid, vec![vec![Cell::default(); self.cols]; self.rows]);
-            self.saved_screen = Some((saved, self.row, self.col, self.pen, self.pending_wrap));
+            // Designations (G0–G3) are part of the cursor → saved and restored across the
+            // alt screen. The active charset `gl` is Term-global and is NOT.
+            self.saved_screen = Some((saved, self.row, self.col, self.pen, self.pending_wrap, self.charsets));
             self.alt = true;
         } else if !to_alt && self.alt {
-            if let Some((grid, row, col, pen, wrap)) = self.saved_screen.take() {
+            if let Some((grid, row, col, pen, wrap, charsets)) = self.saved_screen.take() {
                 self.grid = grid;
                 self.row = row.min(self.rows - 1);
                 self.col = col.min(self.cols - 1);
                 self.pen = pen;
                 self.pending_wrap = wrap;
+                self.charsets = charsets;
             }
             self.alt = false;
         }
@@ -626,6 +663,8 @@ impl Perform for Term {
                 self.pending_wrap = false;
                 self.col = self.col.saturating_sub(1);
             }
+            0x0E => self.gl = 1, // SO: invoke G1 into GL
+            0x0F => self.gl = 0, // SI: invoke G0 into GL
             0x09 => self.put_tab(), // HT
             _ => {} // BEL and others: no grid effect
         }
@@ -678,19 +717,25 @@ impl Perform for Term {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        if !intermediates.is_empty() {
-            return; // charset designations etc. — ignored (ASCII assumed) for now
+        if let Some(&i) = intermediates.first() {
+            // Charset designation: ESC ( ) * + <final>. '0' = DEC special graphics; any
+            // other final designates ASCII. Other intermediates (e.g. ESC # …) are ignored.
+            if let Some(idx) = match i { b'(' => Some(0), b')' => Some(1), b'*' => Some(2), b'+' => Some(3), _ => None } {
+                self.charsets[idx] = if byte == b'0' { Charset::Special } else { Charset::Ascii };
+            }
+            return;
         }
         match byte {
-            b'7' => self.saved_cursor = (self.row, self.col, self.pen, self.origin, self.pending_wrap), // DECSC
+            b'7' => self.saved_cursor = (self.row, self.col, self.pen, self.origin, self.pending_wrap, self.charsets), // DECSC
             b'8' => {
                 // DECRC
-                let (r, c, pen, origin, wrap) = self.saved_cursor;
+                let (r, c, pen, origin, wrap, charsets) = self.saved_cursor;
                 self.row = r.min(self.rows - 1);
                 self.col = c.min(self.cols - 1);
                 self.pen = pen;
                 self.origin = origin;
                 self.pending_wrap = wrap;
+                self.charsets = charsets;
             }
             b'D' => self.line_feed(),         // IND
             b'M' => self.reverse_line_feed(),  // RI

@@ -199,12 +199,32 @@ pub fn gen_script(seed: u64, tokens: usize) -> Vec<u8> {
     let mut r = Rng::new(seed);
     let mut out = Vec::new();
     for _ in 0..tokens {
-        match r.below(12) {
+        match r.below(13) {
             0..=4 => {
                 // a run of printable letters
                 let n = 1 + r.below(8);
                 for _ in 0..n {
                     out.push(b'A' + r.below(26) as u8);
+                }
+            }
+            12 => {
+                // Charsets: designate G0 (and sometimes G1) as ASCII (B) or DEC special
+                // graphics (0), optionally invoke via SI/SO, and print mapping-eligible
+                // chars (0x61..0x7e = a-z and { | } ~).
+                out.extend_from_slice(if r.below(2) == 0 { b"\x1b(0" } else { b"\x1b(B" });
+                if r.below(3) == 0 {
+                    out.extend_from_slice(if r.below(2) == 0 { b"\x1b)0" } else { b"\x1b)B" });
+                }
+                match r.below(3) {
+                    0 => out.push(0x0e), // SO
+                    1 => out.push(0x0f), // SI
+                    _ => {}
+                }
+                for _ in 0..1 + r.below(6) {
+                    out.push(0x61 + r.below(30) as u8);
+                }
+                if r.below(2) == 0 {
+                    out.push(0x0f); // SI back to G0
                 }
             }
             10 => {

@@ -48,6 +48,12 @@ Wide characters (CJK/emoji) reconciled to the oracle:
   cells left of the cursor.
 - CNL (`ESC [ E`) / CPL (`ESC [ F`) added; private-marker CSI (`ESC [ ? … H`) ignored.
 
+Charsets (DEC line drawing) reconciled to the oracle:
+- G0–G3 designations (`ESC ( ) * + <final>`, `0` = Special) are part of the CURSOR:
+  saved/restored by the alt screen and DECSC. The active charset `gl` (SI/SO) is
+  Term-GLOBAL and is NOT swapped by the alt screen — matching alacritty exactly. The
+  DEC special-graphics map matches `StandardCharset::map` character-for-character.
+
 ## Open divergences
 
 - **Combining mark exactly at a pending-wrap boundary.** A zero-width mark arriving when
@@ -57,7 +63,7 @@ Wide characters (CJK/emoji) reconciled to the oracle:
   fuzz generator. Everywhere else combining marks match (attach to the base, ignored).
 
 The scrollback ring is implemented; the full differential (grid, cursor, modes, history,
-AND wide chars) is **0/8000**. `display_offset` is always observed at 0 (bottom of the
+wide chars AND charsets) is **0/10000**. `display_offset` is always observed at 0 (bottom of the
 view); reading scrolled-back lines / viewport scrolling are future.
 
 ## Known not-yet-implemented (will diverge when exercised)
@@ -66,7 +72,6 @@ view); reading scrolled-back lines / viewport scrolling are future.
   isolated to the end by design.
 - **Colon sub-parameter SGR** beyond the extended-colour case.
 - **OSC / DCS semantics** (title, clipboard, hyperlinks): parsed but not applied.
-- **Charsets** (G0–G3 designations): ignored (ASCII assumed).
 - **Origin mode** edge interactions, DECSCUSR cursor shape, LNM newline mode.
 
 ## Reconciliations already done

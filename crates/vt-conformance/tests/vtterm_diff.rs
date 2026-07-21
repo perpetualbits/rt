@@ -40,6 +40,11 @@ fn vt_term_matches_oracle_on_curated_scripts() {
         ("overwrite wide spacer", "AB\u{4e2d}CD\u{1b}[1;3H\u{1b}[4CZ".as_bytes()),
         ("wide at right edge", "\u{1b}[1;23HAB\u{754c}".as_bytes()),
         ("combining mark", "cafe\u{0301} out".as_bytes()),
+        // charsets: DEC special graphics box-drawing, SI/SO invocation, alt-screen keeps
+        // designations but not the active charset (gl is global).
+        ("dec line drawing", b"\x1b(0lqqk x mqqj\x1b(B done"),
+        ("SO/SI invoke", b"\x1b)0abc\x0expq\x0fabc"),
+        ("charset across alt", b"\x1b(0\x1b[?1049hqq\x1b[?1049lqq"),
     ];
     let mut fails = Vec::new();
     for (name, input) in scripts {

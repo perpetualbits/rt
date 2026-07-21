@@ -1,7 +1,7 @@
 # vt-term design
 
 > Status: **matches the oracle on all fuzzed input** (Phase 3). Common sequences +
-> scrollback are in; the full differential (grid, cursor, modes, history) is 0/10000 vs
+> scrollback are in; the full differential (grid, cursor, modes, history, wide chars, charsets) is 0/10000 vs
 > the vendored oracle on x86_64 and riscv64. Reflow and OSC/DCS semantics
 > remain (see `docs/engine-divergence.md`). Code: `crates/vt-term/src/lib.rs`; doc and
 > code stay in lockstep.
@@ -33,6 +33,9 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
 - **Modes.** DECAWM (?7), DECTCEM (?25), DECCKM (?1), DECOM (?6), alternate screen
   (?47/?1047/?1049 with cursor+screen save/restore). DECSC/DECRC, RIS.
 - **Tabs.** Every-8 stops, matching alacritty's write-`\t`-into-the-start-cell quirk.
+- **Charsets.** G0–G3 designations + DEC special graphics (line-drawing) mapping, SI/SO
+  invocation. Designations are per-cursor (saved by alt/DECSC); the active charset `gl`
+  is Term-global.
 - **Wide characters.** CJK/emoji occupy two cells (glyph + `spacer`), with a leading
   spacer + wrap at the right edge, and the WIDE flag derived from char width — matching
   alacritty cell-for-cell (a `spacer` flag distinguishes a real spacer from an erased
@@ -54,9 +57,9 @@ alacritty compare apples-to-apples.
 
 ## Open (see `docs/engine-divergence.md`)
 
-The full differential (grid, cursor, modes, history, wide chars) is **0/8000** vs the
+The full differential (grid, cursor, modes, history, wide chars, charsets) is **0/10000** vs the
 oracle. What remains: **reflow on resize** (the hard part, last), OSC/DCS semantics,
-charsets, colon sub-param SGR, and the one obscure combining-mark-at-pending-wrap edge.
+colon sub-param SGR, and the one obscure combining-mark-at-pending-wrap edge.
 
 ## Performance
 
