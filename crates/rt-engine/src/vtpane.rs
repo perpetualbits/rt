@@ -364,13 +364,13 @@ impl VtPane {
             let mut s = String::new();
             for c in lo..=hi.min(cols - 1) {
                 let cell = t.cell_at(line, c);
-                if !cell.spacer {
+                if !cell.spacer() {
                     s.push(cell.c);
                 }
             }
             // A soft-wrapped line (WRAPLINE on its last cell) continues into the next, so
             // join without trimming or a newline — matching alacritty's copy behaviour.
-            let wrapped = !block && line != h.1 && t.cell_at(line, cols - 1).wrapline;
+            let wrapped = !block && line != h.1 && t.cell_at(line, cols - 1).wrapline();
             if wrapped {
                 out.push_str(&s);
             } else {
@@ -397,7 +397,7 @@ impl VtPane {
             let mut text = String::with_capacity(cols);
             for c in 0..cols {
                 let cell = t.cell_at(abs, c);
-                text.push(if cell.spacer { '\0' } else { cell.c });
+                text.push(if cell.spacer() { '\0' } else { cell.c });
             }
             let hay = if case_sensitive { text.clone() } else { text.to_lowercase() };
             let mut from = 0;
@@ -415,23 +415,27 @@ impl VtPane {
     /// One resolved cell at absolute line/col, for history snapshots.
     fn snapcell(&self, t: &vt_term::Term, abs: i32, col: usize) -> SnapCell {
         let cell = t.cell_at(abs, col);
-        let a = cell.attrs;
         let mut fg = self.rgb(cell.fg, true);
         let mut bg = self.rgb(cell.bg, false);
-        if a.dim {
+        if cell.dim() {
             fg = palette::dim(fg);
         }
-        if a.inverse {
+        if cell.inverse() {
             std::mem::swap(&mut fg, &mut bg);
         }
-        if a.hidden {
+        if cell.hidden() {
             fg = bg;
         }
         SnapCell {
             c: cell.c,
             fg,
             bg,
-            attrs: CellAttrs { bold: a.bold, underline: a.underline, italic: a.italic, strikeout: a.strikeout },
+            attrs: CellAttrs {
+                bold: cell.bold(),
+                underline: cell.underline(),
+                italic: cell.italic(),
+                strikeout: cell.strikeout(),
+            },
         }
     }
 

@@ -15,29 +15,15 @@ fn ncolor(c: vt_term::Color) -> NColor {
     }
 }
 
-fn nattrs(a: vt_term::Attrs) -> u16 {
+fn nattrs(c: &vt_term::Cell) -> u16 {
     let mut m = 0;
-    if a.bold {
-        m |= attr::BOLD;
-    }
-    if a.italic {
-        m |= attr::ITALIC;
-    }
-    if a.underline {
-        m |= attr::UNDERLINE;
-    }
-    if a.inverse {
-        m |= attr::INVERSE;
-    }
-    if a.dim {
-        m |= attr::DIM;
-    }
-    if a.hidden {
-        m |= attr::HIDDEN;
-    }
-    if a.strikeout {
-        m |= attr::STRIKEOUT;
-    }
+    if c.bold() { m |= attr::BOLD; }
+    if c.italic() { m |= attr::ITALIC; }
+    if c.underline() { m |= attr::UNDERLINE; }
+    if c.inverse() { m |= attr::INVERSE; }
+    if c.dim() { m |= attr::DIM; }
+    if c.hidden() { m |= attr::HIDDEN; }
+    if c.strikeout() { m |= attr::STRIKEOUT; }
     m
 }
 
@@ -57,7 +43,7 @@ impl VtEngine for vt_term::Term {
         for r in 0..rows {
             for c in 0..cols {
                 let cell = self.cell(r, c);
-                let mut attrs = nattrs(cell.attrs);
+                let mut attrs = nattrs(&cell);
                 // A double-width glyph carries the WIDE flag (alacritty's Flags::WIDE_CHAR),
                 // derived here from the char so vt-term needn't store it separately.
                 if unicode_width::UnicodeWidthChar::width(cell.c) == Some(2) {

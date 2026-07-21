@@ -54,38 +54,71 @@ fn map_charset(cs: Charset, c: char) -> char {
     }
 }
 
-/// A cell's rendition attributes.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct Attrs {
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub inverse: bool,
-    pub dim: bool,
-    pub hidden: bool,
-    pub strikeout: bool,
-}
+// Packed [`Cell`] flag bits: the seven SGR attributes, plus the wide-glyph `SPACER` and
+// soft-wrap `WRAPLINE` structural markers. All live in one `u16` word.
+const BOLD: u16 = 1 << 0;
+const ITALIC: u16 = 1 << 1;
+const UNDERLINE: u16 = 1 << 2;
+const INVERSE: u16 = 1 << 3;
+const DIM: u16 = 1 << 4;
+const HIDDEN: u16 = 1 << 5;
+const STRIKEOUT: u16 = 1 << 6;
+/// Trailing/leading spacer of a wide glyph — invisible (`c == ' '`) but NOT empty;
+/// overwriting it clears the wide glyph beside it (alacritty's WIDE_CHAR_SPACER /
+/// LEADING_WIDE_CHAR_SPACER).
+const SPACER: u16 = 1 << 7;
+/// Last cell of a soft-wrapped (autowrapped) row, as opposed to a hard break; reflow joins
+/// rows across it, and it makes the cell non-empty (alacritty's WRAPLINE).
+const WRAPLINE: u16 = 1 << 8;
+/// The SGR-attribute bits (bold…strikeout) a printed cell inherits from the pen; the
+/// structural SPACER/WRAPLINE bits are per-cell and never copied from the pen.
+const ATTR_MASK: u16 = BOLD | ITALIC | UNDERLINE | INVERSE | DIM | HIDDEN | STRIKEOUT;
 
-/// One grid cell: a character and its rendition.
+/// One grid cell: a character, its resolved fg/bg, and packed rendition/structural flags.
+/// 16 bytes (`char` + two `Color`s + a `u16`) — smaller than alacritty's `Cell` (which also
+/// carries an `Option<Arc<..>>`), keeping the memcpy on fills/scrolls/clones cheap. Read the
+/// flags via the accessor methods; module-internal code touches the `flags` bits directly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cell {
     pub c: char,
     pub fg: Color,
     pub bg: Color,
-    pub attrs: Attrs,
-    /// This cell is the blank trailing (or leading) spacer of a wide glyph — invisible
-    /// (`c == ' '`) but NOT empty, and overwriting it clears the wide glyph beside it.
-    /// Mirrors alacritty's WIDE_CHAR_SPACER / LEADING_WIDE_CHAR_SPACER flags.
-    pub spacer: bool,
-    /// Set on the last cell of a row that soft-wrapped (autowrap) into the next — as
-    /// opposed to a hard line break. Reflow joins rows across this flag. Mirrors
-    /// alacritty's WRAPLINE flag; also makes the cell non-empty.
-    pub wrapline: bool,
+    flags: u16,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { c: ' ', fg: Color::Default, bg: Color::Default, attrs: Attrs::default(), spacer: false, wrapline: false }
+        Cell { c: ' ', fg: Color::Default, bg: Color::Default, flags: 0 }
+    }
+}
+
+impl Cell {
+    pub fn bold(&self) -> bool {
+        self.flags & BOLD != 0
+    }
+    pub fn italic(&self) -> bool {
+        self.flags & ITALIC != 0
+    }
+    pub fn underline(&self) -> bool {
+        self.flags & UNDERLINE != 0
+    }
+    pub fn inverse(&self) -> bool {
+        self.flags & INVERSE != 0
+    }
+    pub fn dim(&self) -> bool {
+        self.flags & DIM != 0
+    }
+    pub fn hidden(&self) -> bool {
+        self.flags & HIDDEN != 0
+    }
+    pub fn strikeout(&self) -> bool {
+        self.flags & STRIKEOUT != 0
+    }
+    pub fn spacer(&self) -> bool {
+        self.flags & SPACER != 0
+    }
+    pub fn wrapline(&self) -> bool {
+        self.flags & WRAPLINE != 0
     }
 }
 
@@ -395,7 +428,7 @@ impl Term {
 
         // Final cursor reflow (resize.rs 374-388): pending-wrap at the width, else clamp.
         let cline = cur.line.clamp(0, lines as i32 - 1) as usize;
-        let at_wrap = grid[cline].get(new_cols - 1).map(|c| c.wrapline).unwrap_or(false);
+        let at_wrap = grid[cline].get(new_cols - 1).map(|c| c.wrapline()).unwrap_or(false);
         if cur.col == new_cols && !at_wrap {
             self.pending_wrap = true;
             self.row = cline;
@@ -529,7 +562,7 @@ impl Term {
     fn blank(&self) -> Cell {
         // Erased cells keep the current background (xterm/alacritty behaviour), default
         // foreground, no attributes.
-        Cell { c: ' ', fg: Color::Default, bg: self.pen.bg, attrs: Attrs::default(), spacer: false, wrapline: false }
+        Cell { c: ' ', fg: Color::Default, bg: self.pen.bg, flags: 0 }
     }
     /// Reset row `r` to `blank` in place, keeping its heap allocation — the scroll/erase
     /// hot path. Replacing the `Vec` (`grid[r] = blank_row()`) allocated a fresh row every
@@ -604,15 +637,15 @@ impl Term {
     /// Write `cell` at the cursor with the current pen colours/attrs but the given char.
     fn write_cell(&mut self, c: char) {
         let c = map_charset(self.charsets[self.gl], c);
-        let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
-        self.grid[self.row][self.col] = Cell { c, fg, bg, attrs, spacer: false, wrapline: false };
+        let (fg, bg, flags) = (self.pen.fg, self.pen.bg, self.pen.flags & ATTR_MASK);
+        self.grid[self.row][self.col] = Cell { c, fg, bg, flags };
     }
 
     /// Write a wide-glyph spacer at the cursor: a blank that carries the pen colours/
     /// attrs and the `spacer` flag.
     fn write_spacer(&mut self) {
-        let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
-        self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, attrs, spacer: true, wrapline: false };
+        let (fg, bg, flags) = (self.pen.fg, self.pen.bg, (self.pen.flags & ATTR_MASK) | SPACER);
+        self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, flags };
     }
 
     /// If the cursor cell is the trailing spacer of a wide glyph to its left, overwriting
@@ -623,7 +656,7 @@ impl Term {
         // keys this off the WIDE_CHAR_SPACER flag. clear_wide only sets c=' ' (the WIDE
         // flag, here derived from width, then clears); fg/bg/attrs are kept.
         if self.col > 0
-            && self.grid[self.row][self.col].spacer
+            && self.grid[self.row][self.col].spacer()
             && self.grid[self.row][self.col - 1].c.width() == Some(2)
         {
             self.grid[self.row][self.col - 1].c = ' ';
@@ -633,7 +666,7 @@ impl Term {
     /// Soft (autowrap) line break: mark the current row's last cell WRAPLINE so reflow
     /// can rejoin it, then move to column 0 of the next line and clear the pending wrap.
     fn soft_wrap(&mut self) {
-        self.grid[self.row][self.cols - 1].wrapline = true;
+        self.grid[self.row][self.cols - 1].flags |= WRAPLINE;
         self.col = 0;
         self.line_feed();
         self.pending_wrap = false;
@@ -856,22 +889,19 @@ impl Term {
         while i < p.len() {
             match p[i] {
                 0 => self.pen = Cell::default(),
-                1 => self.pen.attrs.bold = true,
-                2 => self.pen.attrs.dim = true,
-                3 => self.pen.attrs.italic = true,
-                4 => self.pen.attrs.underline = true,
-                7 => self.pen.attrs.inverse = true,
-                8 => self.pen.attrs.hidden = true,
-                9 => self.pen.attrs.strikeout = true,
-                22 => {
-                    self.pen.attrs.bold = false;
-                    self.pen.attrs.dim = false;
-                }
-                23 => self.pen.attrs.italic = false,
-                24 => self.pen.attrs.underline = false,
-                27 => self.pen.attrs.inverse = false,
-                28 => self.pen.attrs.hidden = false,
-                29 => self.pen.attrs.strikeout = false,
+                1 => self.pen.flags |= BOLD,
+                2 => self.pen.flags |= DIM,
+                3 => self.pen.flags |= ITALIC,
+                4 => self.pen.flags |= UNDERLINE,
+                7 => self.pen.flags |= INVERSE,
+                8 => self.pen.flags |= HIDDEN,
+                9 => self.pen.flags |= STRIKEOUT,
+                22 => self.pen.flags &= !(BOLD | DIM),
+                23 => self.pen.flags &= !ITALIC,
+                24 => self.pen.flags &= !UNDERLINE,
+                27 => self.pen.flags &= !INVERSE,
+                28 => self.pen.flags &= !HIDDEN,
+                29 => self.pen.flags &= !STRIKEOUT,
                 30..=37 => self.pen.fg = Color::Indexed((p[i] - 30) as u8),
                 38 => i += self.sgr_color(p, i, true),
                 39 => self.pen.fg = Color::Default,
@@ -992,14 +1022,11 @@ impl Term {
 /// glyph with the default foreground/background and no attributes.
 fn cell_is_empty(c: &Cell) -> bool {
     (c.c == ' ' || c.c == '\t')
-        && !c.spacer
-        && !c.wrapline
+        && (c.flags & (SPACER | WRAPLINE)) == 0
         && c.fg == Color::Default
         && c.bg == Color::Default
         // alacritty's is_empty ignores bold/dim/italic; only these mark a blank non-empty.
-        && !c.attrs.inverse
-        && !c.attrs.underline
-        && !c.attrs.strikeout
+        && (c.flags & (INVERSE | UNDERLINE | STRIKEOUT)) == 0
 }
 
 /// The cursor state carried through a column reflow: visible line (may go transiently
@@ -1022,7 +1049,7 @@ fn reflow_is_wide(c: &Cell) -> bool {
 /// A *leading* wide-char spacer (alacritty's `LEADING_WIDE_CHAR_SPACER`): a spacer with no
 /// wide glyph immediately before it (as opposed to a wide glyph's trailing spacer).
 fn reflow_is_leading_spacer(row: &[Cell], i: usize) -> bool {
-    row[i].spacer && (i == 0 || row[i - 1].c.width() != Some(2))
+    row[i].flags & SPACER != 0 && (i == 0 || row[i - 1].c.width() != Some(2))
 }
 /// Split cells beyond `columns` off `row`, trimming trailing empties from the remainder —
 /// alacritty's `Row::shrink`. Returns the (non-empty) overflow, or `None` if it all fits.
@@ -1085,7 +1112,7 @@ fn grow_columns_impl(
     for (i, mut row) in rows.into_iter().enumerate().rev() {
         let should_reflow = reversed.last().map_or(false, |last: &Vec<Cell>| {
             let l = last.len();
-            l > 0 && l < columns && last[l - 1].wrapline
+            l > 0 && l < columns && last[l - 1].wrapline()
         });
         if !should_reflow {
             reversed.push(row);
@@ -1095,7 +1122,7 @@ fn grow_columns_impl(
         {
             let last_row = reversed.last_mut().unwrap();
             if let Some(cell) = last_row.last_mut() {
-                cell.wrapline = false;
+                cell.flags &= !WRAPLINE;
             }
             let mut last_len = last_row.len();
             if last_len >= 1 && reflow_is_leading_spacer(last_row, last_len - 1) {
@@ -1108,7 +1135,7 @@ fn grow_columns_impl(
                 num_wrapped -= 1;
                 let mut cells = reflow_front_split_off(&mut row, len - 1);
                 let mut spacer = Cell::default();
-                spacer.spacer = true;
+                spacer.flags |= SPACER;
                 cells.push(spacer);
                 cells
             } else {
@@ -1140,7 +1167,7 @@ fn grow_columns_impl(
             }
 
             if let Some(cell) = last_row.last_mut() {
-                cell.wrapline = true;
+                cell.flags |= WRAPLINE;
             }
         }
         reversed.push(row);
@@ -1215,7 +1242,7 @@ fn shrink_columns_impl(
 
             if row.len() >= columns && reflow_is_wide(&row[columns - 1]) {
                 let mut spacer = Cell::default();
-                spacer.spacer = true;
+                spacer.flags |= SPACER;
                 let wide = std::mem::replace(&mut row[columns - 1], spacer);
                 wrapped.insert(0, wide);
             }
@@ -1223,23 +1250,23 @@ fn shrink_columns_impl(
             let len = wrapped.len();
             if len > 0 && reflow_is_leading_spacer(&wrapped, len - 1) {
                 if len == 1 {
-                    row[columns - 1].wrapline = true;
+                    row[columns - 1].flags |= WRAPLINE;
                     new_raw.push(row);
                     break;
                 } else {
-                    wrapped[len - 2].wrapline = true;
+                    wrapped[len - 2].flags |= WRAPLINE;
                     wrapped.truncate(len - 1);
                 }
             }
 
             new_raw.push(row);
             if let Some(cell) = new_raw.last_mut().and_then(|r| r.last_mut()) {
-                cell.wrapline = true;
+                cell.flags |= WRAPLINE;
             }
 
-            if wrapped.last().map_or(false, |c| c.wrapline && i >= 1) && wrapped.len() < columns {
+            if wrapped.last().map_or(false, |c| c.wrapline() && i >= 1) && wrapped.len() < columns {
                 if let Some(cell) = wrapped.last_mut() {
-                    cell.wrapline = false;
+                    cell.flags &= !WRAPLINE;
                 }
                 buffered = Some(wrapped);
                 break;

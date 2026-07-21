@@ -97,12 +97,23 @@ Where the time goes, and the optimisation path (mirrors how the parser went from
    real spiral ~0.79× → ~0.87×** — with a small (~5%) regression on write-heavy plain text
    from the per-write `occ` bump. Correctness pinned: non-resize fuzz still 0/10000,
    chunk-invariance 0/2000, reflow unchanged (`occ` is never observed).
-2. **Grid layout — next.** `Vec<Line>` is still a heap allocation per row and poor
-   locality; alacritty uses one contiguous buffer. A general ~1.3× penalty, and the likely
-   source of the remaining gap (and the plain-text regression).
-3. **`Cell` size.** Seven separate `bool`s for attributes; packing them into bitflags
-   shrinks the per-cell memcpy on fills/scrolls, and pairs well with a contiguous grid.
+2. **Packed `Cell` — LANDED (2026-07-21).** The seven attribute `bool`s plus the
+   `spacer`/`wrapline` markers are now one packed `u16` (`Cell { c, fg, bg, flags }`),
+   shrinking `Cell` **24 → 16 bytes** — *smaller* than alacritty's `Cell`, which also
+   carries an `Option<Arc<CellExtra>>`. Read via accessor methods; module-internal code
+   touches the bits. **Result: geomean ~0.85× → ~0.91×, with mixed-tui at parity (~1.0×),
+   real spiral ~0.97×, unicode/sgr ~1.0×.** Correctness pinned: fuzz 0/10000,
+   chunk-invariance 0/2000, reflow unchanged.
+3. **"Contiguous grid" — was a MISDIAGNOSIS, dropped.** The earlier note claimed alacritty
+   uses one contiguous buffer; it does **not** — `Storage` is `Vec<Row<T>>` with `Row =
+   Vec<T> + occ` in a ring (zero-offset for O(1) scroll), i.e. exactly our `Vec<Line>`. A
+   flat cell buffer would *hurt* scroll (copying cells instead of rotating row pointers).
+   Our `Vec<Line>` already rotates pointers on scroll (O(rows), not O(rows·cols)). No win
+   here; not pursued.
 
-Also landed earlier: scroll/erase **blank rows in place** (reuse the row's allocation).
-The next focused pass is the contiguous grid + packed `Cell`; correctness stays pinned by
-the 0/10000 differential.
+Remaining gap is the **write-heavy** workloads (plain text ~0.77×, control ~0.79×), where
+the cost is per-char `put_char` dispatch (autowrap/width checks per glyph). The lever there
+is a batched `print_str` fast path for runs of simple narrow ASCII (bump `occ` once, skip
+the per-char wrap machinery until the run hits the edge). That, plus a possible ring for
+truly O(1) scroll, is the next pass. Also landed earlier: scroll/erase blank rows in place.
+Correctness stays pinned by the 0/10000 differential.
