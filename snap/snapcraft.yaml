@@ -4,8 +4,9 @@ adopt-info: rt
 summary: Wayland-native tiling terminal multiplexer
 description: |
   rt is a Wayland-native (and X11-capable) tiling terminal multiplexer — a loose
-  port of Terminator's ideas onto the alacritty_terminal engine, with a custom
-  OpenGL glyph renderer, an egui chrome layer, and a per-pane fd patch-bay.
+  port of Terminator's ideas onto its own in-house VT engine (vt-parser + vt-term,
+  verified cell-for-cell against alacritty_terminal and faster than it), with a
+  custom OpenGL glyph renderer, an egui chrome layer, and a per-pane fd patch-bay.
 license: GPL-3.0-or-later
 grade: stable
 

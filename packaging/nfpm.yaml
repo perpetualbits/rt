@@ -11,9 +11,10 @@ version_schema: none
 maintainer: "perpetualbits <perpetualbits@gmail.com>"
 description: |
   Wayland-native tiling terminal multiplexer.
-  A loose port of Terminator's ideas onto the alacritty_terminal engine, with a
-  custom OpenGL glyph renderer, an egui chrome layer, and a per-pane fd patch-bay.
-  Runs native on Wayland (preferred) and on X11.
+  A loose port of Terminator's ideas onto its own in-house VT engine (vt-parser +
+  vt-term, verified cell-for-cell against alacritty_terminal and faster than it),
+  with a custom OpenGL glyph renderer, an egui chrome layer, and a per-pane fd
+  patch-bay. Runs native on Wayland (preferred) and on X11.
 vendor: perpetualbits
 homepage: https://github.com/perpetualbits/rt
 license: GPL-3.0-or-later

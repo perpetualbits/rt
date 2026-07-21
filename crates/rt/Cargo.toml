@@ -18,12 +18,14 @@ name = "rt"
 path = "src/main.rs"
 
 [features]
-vtterm-default = ["rt-engine/vtterm-default"]  # install with this to default to the in-house engine
+vtterm-default = ["rt-engine/vtterm-default"]  # the in-house engine as the built-in default (on by default)
 # Universal by default: ship a single binary that runs on Wayland AND X11 (winit
 # picks the backend at runtime, preferring native Wayland — see build_event_loop).
 # Build a lean Wayland-only binary with --no-default-features if you want zero
-# X11 crates.
-default = ["x11"]
+# X11 crates. `vtterm-default` is ON so a plain `cargo install` / release build
+# runs the in-house `vt-parser` + `vt-term` engine (RT_ENGINE=alacritty still
+# selects the vendored engine at runtime for a comparison).
+default = ["x11", "vtterm-default"]
 # First-class X11 support: adds the X11/XWayland backends (winit/glutin) AND an
 # X11 clipboard (arboard) so copy/paste + PRIMARY work, not just rendering. The
 # same code runs on either backend — winit auto-selects from WAYLAND_DISPLAY /
