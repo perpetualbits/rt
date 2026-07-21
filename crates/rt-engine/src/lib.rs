@@ -1,7 +1,7 @@
 //! `rt-engine` — one terminal pane's backend, wrapping `alacritty_terminal`.
 //!
 //! Each visible leaf in the `rt-core` layout tree is backed by exactly one
-//! [`TermPane`] from this crate. A `TermPane` owns:
+//! [`AlacPane`] from this crate. A `AlacPane` owns:
 //!   * a PTY running the user's shell,
 //!   * an `alacritty_terminal::Term` (the fast grid + VTE/ANSI parser),
 //!   * the background I/O thread (`EventLoop`) that reads PTY bytes and applies
@@ -15,6 +15,7 @@
 //! the direct antidote to Terminator's unguarded-callback crashes.
 
 mod palette; // xterm 256-colour palette + cell-colour resolution
+mod vtpane; // in-house (vt-term) pane backend, selected by RT_ENGINE=vtterm
 pub use palette::{Palette, Rgb, CURSOR, DEFAULT_BG, DEFAULT_FG}; // colours + configurable palette
 // (CursorShape/CursorPos are defined below and used by the renderer.)
 
@@ -41,7 +42,7 @@ pub const CELL_BYTES: usize = std::mem::size_of::<alacritty_terminal::term::cell
 
 /// High-level events a pane can surface to the GUI, distilled from
 /// `alacritty_terminal`'s richer event enum down to what rt's UI actually acts
-/// on. Draining these (via [`TermPane::drain_events`]) replaces Terminator's
+/// on. Draining these (via [`AlacPane::drain_events`]) replaces Terminator's
 /// scattered GTK signal handlers with one explicit, race-free queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneEvent {
@@ -179,7 +180,7 @@ impl Snapshot {
     }
 }
 
-/// Line-index bounds of the grid, returned by [`TermPane::line_bounds`]. All
+/// Line-index bounds of the grid, returned by [`AlacPane::line_bounds`]. All
 /// values are in `alacritty_terminal`'s integer line space: `0..screen_lines`
 /// is the visible screen, negative indices are scrollback history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,7 +211,7 @@ pub struct SearchMatch {
 
 /// Fixed initial grid dimensions expressed as an `alacritty_terminal`
 /// `Dimensions`. The engine is told how many columns/lines it has; the renderer
-/// recomputes this from pixel size ÷ cell size and calls [`TermPane::resize`].
+/// recomputes this from pixel size ÷ cell size and calls [`AlacPane::resize`].
 struct Size {
     cols: usize,        // visible columns
     screen_lines: usize, // visible rows
@@ -297,7 +298,7 @@ impl Proxy {
 }
 
 /// One terminal pane: PTY + parser + I/O thread, with a small host-facing API.
-pub struct TermPane {
+pub struct AlacPane {
     // The shared terminal state. `FairMutex` (alacritty's fair lock) is shared
     // with the I/O thread, which locks it to apply parsed bytes while we lock it
     // to read a render snapshot.
@@ -323,7 +324,7 @@ pub struct TermPane {
     scrollback_limit: usize,
 }
 
-impl TermPane {
+impl AlacPane {
     /// Spawn a new pane running `shell` (or the user's default shell if `None`)
     /// in `working_directory`, sized `cols` × `rows` cells.
     ///
@@ -426,7 +427,7 @@ impl TermPane {
             let _ = handle.join(); // block until the loop stops, ignore its result
         });
 
-        Ok(TermPane {
+        Ok(AlacPane {
             term,
             sender,
             events,
@@ -819,7 +820,7 @@ impl TermPane {
     /// valid `[topmost, bottommost]` range come back blank, so callers never
     /// have to bounds-check. This is the history-aware primitive that newspaper
     /// columns are built on (it fetches the `N × height` lines a multi-column
-    /// view shows at once); [`TermPane::snapshot`] handles the ordinary visible
+    /// view shows at once); [`AlacPane::snapshot`] handles the ordinary visible
     /// screen.
     pub fn snapshot_lines(&self, top: i32, rows: usize) -> Snapshot {
         use alacritty_terminal::index::{Column, Line}; // integer grid coordinates
@@ -923,7 +924,7 @@ impl TermPane {
     }
 }
 
-impl Drop for TermPane {
+impl Drop for AlacPane {
     /// Cleanly stop the I/O thread when the pane is dropped (pane closed). We
     /// send `Shutdown`, then join the thread so no orphaned PTY reader lingers.
     /// This deterministic teardown is what lets rt avoid Terminator's
@@ -933,6 +934,218 @@ impl Drop for TermPane {
         if let Some(handle) = self.io_thread.take() {
             let _ = handle.join(); // wait for it to actually exit
         }
+    }
+}
+
+/// A terminal pane, backed by either the vendored `alacritty_terminal` engine (the
+/// default, [`AlacPane`]) or the in-house `vt_parser` + `vt_term` engine
+/// ([`vtpane::VtPane`], selected with `RT_ENGINE=vtterm`). Every method dispatches on the
+/// variant, so callers (rt's GUI) use one type regardless of backend — the seam is
+/// invisible above this line. The vt-term backend is opt-in dogfooding and has degraded
+/// features (see `vtpane`); the default path is unchanged.
+pub enum TermPane {
+    Alac(AlacPane),
+    Vt(vtpane::VtPane),
+}
+
+impl TermPane {
+    /// Spawn a pane; the backend is chosen by `RT_ENGINE` (`vtterm` → in-house, anything
+    /// else / unset → the vendored alacritty engine).
+    pub fn spawn(
+        shell: Option<(String, Vec<String>)>,
+        working_directory: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+    ) -> std::io::Result<Self> {
+        Self::spawn_env(shell, working_directory, cols, rows, &[], DEFAULT_SCROLLBACK)
+    }
+
+    /// Like [`spawn`](Self::spawn) with extra child env + explicit scrollback.
+    pub fn spawn_env(
+        shell: Option<(String, Vec<String>)>,
+        working_directory: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+        env: &[(String, String)],
+        scrollback: usize,
+    ) -> std::io::Result<Self> {
+        if std::env::var("RT_ENGINE").as_deref() == Ok("vtterm") {
+            eprintln!("rt: RT_ENGINE=vtterm — using the in-house engine (degraded features)");
+            Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
+                shell, working_directory, cols, rows, env, scrollback,
+            )?))
+        } else {
+            Ok(TermPane::Alac(AlacPane::spawn_env(
+                shell, working_directory, cols, rows, env, scrollback,
+            )?))
+        }
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Alac(p) => p.pid(),
+            Self::Vt(p) => p.pid(),
+        }
+    }
+    pub fn scrollback_limit(&self) -> usize {
+        match self {
+            Self::Alac(p) => p.scrollback_limit(),
+            Self::Vt(p) => p.scrollback_limit(),
+        }
+    }
+    pub fn write(&self, bytes: &[u8]) {
+        match self {
+            Self::Alac(p) => p.write(bytes),
+            Self::Vt(p) => p.write(bytes),
+        }
+    }
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        match self {
+            Self::Alac(p) => p.resize(cols, rows),
+            Self::Vt(p) => p.resize(cols, rows),
+        }
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        match self {
+            Self::Alac(p) => p.snapshot(),
+            Self::Vt(p) => p.snapshot(),
+        }
+    }
+    pub fn render_snapshot(&self) -> Snapshot {
+        match self {
+            Self::Alac(p) => p.render_snapshot(),
+            Self::Vt(p) => p.render_snapshot(),
+        }
+    }
+    pub fn set_palette(&mut self, palette: Palette) {
+        match self {
+            Self::Alac(p) => p.set_palette(palette),
+            Self::Vt(p) => p.set_palette(palette),
+        }
+    }
+    pub fn scroll(&self, delta: isize) {
+        match self {
+            Self::Alac(p) => p.scroll(delta),
+            Self::Vt(p) => p.scroll(delta),
+        }
+    }
+    pub fn scroll_to_bottom(&self) {
+        match self {
+            Self::Alac(p) => p.scroll_to_bottom(),
+            Self::Vt(p) => p.scroll_to_bottom(),
+        }
+    }
+    pub fn scroll_to_line(&self, line: i32) {
+        match self {
+            Self::Alac(p) => p.scroll_to_line(line),
+            Self::Vt(p) => p.scroll_to_line(line),
+        }
+    }
+    pub fn scroll_info(&self) -> (usize, usize, usize) {
+        match self {
+            Self::Alac(p) => p.scroll_info(),
+            Self::Vt(p) => p.scroll_info(),
+        }
+    }
+    pub fn selection_text(&self, anchor: (usize, i32), head: (usize, i32), block: bool) -> String {
+        match self {
+            Self::Alac(p) => p.selection_text(anchor, head, block),
+            Self::Vt(p) => p.selection_text(anchor, head, block),
+        }
+    }
+    pub fn line_bounds(&self) -> LineBounds {
+        match self {
+            Self::Alac(p) => p.line_bounds(),
+            Self::Vt(p) => p.line_bounds(),
+        }
+    }
+    pub fn app_cursor_keys(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.app_cursor_keys(),
+            Self::Vt(p) => p.app_cursor_keys(),
+        }
+    }
+    pub fn wants_mouse(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.wants_mouse(),
+            Self::Vt(p) => p.wants_mouse(),
+        }
+    }
+    pub fn wants_motion(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.wants_motion(),
+            Self::Vt(p) => p.wants_motion(),
+        }
+    }
+    pub fn mouse_sgr(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.mouse_sgr(),
+            Self::Vt(p) => p.mouse_sgr(),
+        }
+    }
+    pub fn is_alt_screen(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.is_alt_screen(),
+            Self::Vt(p) => p.is_alt_screen(),
+        }
+    }
+    pub fn snapshot_lines(&self, top: i32, rows: usize) -> Snapshot {
+        match self {
+            Self::Alac(p) => p.snapshot_lines(top, rows),
+            Self::Vt(p) => p.snapshot_lines(top, rows),
+        }
+    }
+    pub fn search(&self, needle: &str, case_sensitive: bool) -> Vec<SearchMatch> {
+        match self {
+            Self::Alac(p) => p.search(needle, case_sensitive),
+            Self::Vt(p) => p.search(needle, case_sensitive),
+        }
+    }
+    pub fn drain_events(&self) -> Vec<PaneEvent> {
+        match self {
+            Self::Alac(p) => p.drain_events(),
+            Self::Vt(p) => p.drain_events(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod vtpane_tests {
+    use super::*;
+
+    /// The in-house backend drives a real PTY: spawn a shell that prints a marker, poll
+    /// the snapshot until it appears, and confirm the child-exit event arrives.
+    #[test]
+    fn vtpane_runs_a_real_command() {
+        let mut pane = vtpane::VtPane::spawn_env(
+            Some(("/bin/sh".into(), vec!["-c".into(), "printf HELLO_VTTERM".into()])),
+            None,
+            40,
+            10,
+            &[],
+            1000,
+        )
+        .expect("spawn vt-term pane");
+
+        let mut saw_text = false;
+        let mut saw_exit = false;
+        for _ in 0..200 {
+            if pane.snapshot().to_text().contains("HELLO_VTTERM") {
+                saw_text = true;
+            }
+            if pane.drain_events().iter().any(|e| matches!(e, PaneEvent::Exited)) {
+                saw_exit = true;
+            }
+            if saw_text && saw_exit {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_text, "vt-term pane never rendered the child's output");
+        assert!(saw_exit, "vt-term pane never reported the child exit");
+        // Resize must not panic and must keep the content addressable.
+        pane.resize(20, 6);
+        let _ = pane.snapshot();
     }
 }
 
@@ -964,7 +1177,7 @@ mod damage_tests {
     // idle pane (i.e. reset_damage() actually runs).
     #[test]
     fn render_snapshot_resets_and_converges_to_lines() {
-        let pane = TermPane::spawn(
+        let pane = AlacPane::spawn(
             Some(("sh".into(), vec!["-c".into(), "printf 'hello\\n'; sleep 30".into()])),
             None,
             20,

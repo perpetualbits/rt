@@ -26,3 +26,5 @@ own = []
 # the source we studied in reference/alacritty. `optional` so the `vendored`
 # feature above gates it; with default features it is always present.
 alacritty_terminal = { path = "../../vendor/alacritty_terminal", optional = true }  # vendored throughput fork (see docs/vendored-engine.md)
+libc = "0.2"  # PTY read/write/ioctl for the in-house (vt-term) backend
+vt-term = { path = "../vt-term" }  # the in-house Term (RT_ENGINE=vtterm backend)
