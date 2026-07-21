@@ -2,7 +2,7 @@
 
 > Status: **matches the oracle on all fuzzed input** (Phase 3). Common sequences +
 > scrollback are in; the full differential (grid, cursor, modes, history) is 0/10000 vs
-> the vendored oracle on x86_64 and riscv64. Reflow, wide chars, and OSC/DCS semantics
+> the vendored oracle on x86_64 and riscv64. Reflow and OSC/DCS semantics
 > remain (see `docs/engine-divergence.md`). Code: `crates/vt-term/src/lib.rs`; doc and
 > code stay in lockstep.
 
@@ -33,6 +33,11 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
 - **Modes.** DECAWM (?7), DECTCEM (?25), DECCKM (?1), DECOM (?6), alternate screen
   (?47/?1047/?1049 with cursor+screen save/restore). DECSC/DECRC, RIS.
 - **Tabs.** Every-8 stops, matching alacritty's write-`\t`-into-the-start-cell quirk.
+- **Wide characters.** CJK/emoji occupy two cells (glyph + `spacer`), with a leading
+  spacer + wrap at the right edge, and the WIDE flag derived from char width — matching
+  alacritty cell-for-cell (a `spacer` flag distinguishes a real spacer from an erased
+  blank for the clear-wide and emptiness rules). Combining marks attach to the base
+  (observably ignored) except the pending-wrap boundary edge (ledgered).
 - **Scrollback.** A ring (cap 10 000) of lines scrolled off the top of the *primary*
   screen. Grows only on a top-anchored scroll and on `\x1b[2J` (which scrolls the
   viewport into history, not a plain blank); the alt screen has none. `history_size`
@@ -49,41 +54,12 @@ alacritty compare apples-to-apples.
 
 ## Open (see `docs/engine-divergence.md`)
 
-Scrollback (history), reflow on resize (the hard part, last), wide characters, colon
-sub-param SGR, OSC/DCS semantics, charsets — and the last-column wrap × scroll edge that
-accounts for most of the current ~3.5% grid-fuzz divergence.
+The full differential (grid, cursor, modes, history, wide chars) is **0/8000** vs the
+oracle. What remains: **reflow on resize** (the hard part, last), OSC/DCS semantics,
+charsets, colon sub-param SGR, and the one obscure combining-mark-at-pending-wrap edge.
 
 ## Performance
 
 Same discipline as the parser: benchmark vs alacritty on x86_64 AND riscv64 (milkv) via
 `ci/verify.sh` once the Term is feature-complete enough for a fair comparison; the grid
-representation and damage tracking are where the speed work lands.
-
-## Sections to write (outline)
-
-1. **Data model** — the cell (glyph + attributes + colour), the grid, and the
-   scrollback ring. Memory layout and *why* (cache-friendliness on the hot path; the
-   measurement). Compare alacritty's and foot's representations.
-2. **Cursor & printing** — advance, wrap (pending-wrap / deferred wrap semantics),
-   insert vs replace, wide characters + combining/zero-width, tab stops.
-3. **SGR & colour** — attributes, 16/256/truecolour, palette resolution.
-4. **Modes** — DECSET/DECRST private modes (the big compatibility surface), scroll
-   regions (DECSTBM), origin mode, autowrap, charsets (G0–G3), insert mode.
-5. **Screens** — primary vs alternate screen; save/restore cursor.
-6. **Scrollback** — the ring buffer, display offset, scroll-region interaction with
-   history, limits.
-7. **Damage tracking** — what changed since the last snapshot, kept tight (never
-   over-report — that was rt's whole ssh-X performance story). The snapshot the
-   renderer consumes.
-8. **Reflow** — THE hard part. Rewrapping wrapped lines on resize while preserving
-   scrollback, selection, and cursor. Study alacritty's `grid/resize.rs` and foot.
-   Ships LAST; interim behaviour is clear/redraw-on-resize with reflow tests on the
-   divergence ledger (`docs/engine-divergence.md`).
-9. **OSC handlers** — title, clipboard (OSC 52), hyperlinks (OSC 8), colour queries.
-10. **Mouse & bracketed paste** — reporting modes (1000/1002/1003/1006), the query
-    methods (`wants_mouse`, `mouse_sgr`, …) the engine contract exposes.
-11. **Performance** — per-trick, each with its measurement; comparison vs alacritty and
-    foot.
-12. **Verification** — differential fuzzing against the oracle; esctest/vttest; property
-    invariants (cursor in bounds, scrollback ≤ limit, reflow preserves content, resize
-    round-trip); real-app replay corpora; the divergence ledger.
+representation and damage tracking are where the speed work lands. Not yet started.

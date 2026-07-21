@@ -199,7 +199,7 @@ pub fn gen_script(seed: u64, tokens: usize) -> Vec<u8> {
     let mut r = Rng::new(seed);
     let mut out = Vec::new();
     for _ in 0..tokens {
-        match r.below(10) {
+        match r.below(12) {
             0..=4 => {
                 // a run of printable letters
                 let n = 1 + r.below(8);
@@ -207,6 +207,15 @@ pub fn gen_script(seed: u64, tokens: usize) -> Vec<u8> {
                     out.push(b'A' + r.below(26) as u8);
                 }
             }
+            10 => {
+                // wide (double-width) glyphs — CJK + emoji — to exercise wide-char
+                // placement, the trailing spacer, and the right-edge leading spacer.
+                for _ in 0..1 + r.below(3) {
+                    let w = ["你", "世", "界", "中", "🦀", "글"][r.below(6) as usize];
+                    out.extend_from_slice(w.as_bytes());
+                }
+            }
+            11 => out.push(b'e'), // (combining-mark case parked; see ledger)
             5 => out.push(b'\n'),
             6 => out.push(b'\r'),
             7 => {

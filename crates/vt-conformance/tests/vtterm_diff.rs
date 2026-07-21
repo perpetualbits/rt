@@ -34,6 +34,12 @@ fn vt_term_matches_oracle_on_curated_scripts() {
         ("tabs", b"a\tb\tc\td"),
         ("alt screen", b"primary\x1b[?1049h\x1b[2JalT\x1b[?1049l"),
         ("save/restore cursor", b"\x1b[3;3H\x1b7\x1b[8;8Hzz\x1b8Q"),
+        // wide chars: placement + spacer, overwrite-spacer clears the glyph, right-edge
+        // leading spacer, and a combining mark attached to a base (common, non-edge).
+        ("wide glyphs", "hi \u{4f60}\u{597d} \u{1f980}x".as_bytes()),
+        ("overwrite wide spacer", "AB\u{4e2d}CD\u{1b}[1;3H\u{1b}[4CZ".as_bytes()),
+        ("wide at right edge", "\u{1b}[1;23HAB\u{754c}".as_bytes()),
+        ("combining mark", "cafe\u{0301} out".as_bytes()),
     ];
     let mut fails = Vec::new();
     for (name, input) in scripts {

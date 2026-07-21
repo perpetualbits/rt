@@ -57,7 +57,13 @@ impl VtEngine for vt_term::Term {
         for r in 0..rows {
             for c in 0..cols {
                 let cell = self.cell(r, c);
-                grid[r][c] = NCell { ch: cell.c, fg: ncolor(cell.fg), bg: ncolor(cell.bg), attrs: nattrs(cell.attrs) };
+                let mut attrs = nattrs(cell.attrs);
+                // A double-width glyph carries the WIDE flag (alacritty's Flags::WIDE_CHAR),
+                // derived here from the char so vt-term needn't store it separately.
+                if unicode_width::UnicodeWidthChar::width(cell.c) == Some(2) {
+                    attrs |= attr::WIDE;
+                }
+                grid[r][c] = NCell { ch: cell.c, fg: ncolor(cell.fg), bg: ncolor(cell.bg), attrs };
             }
         }
         let (col, line) = self.cursor();

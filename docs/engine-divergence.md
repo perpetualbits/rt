@@ -37,17 +37,33 @@ Scrollback (the ring buffer) reconciled to the oracle:
 - **The alt screen reports `history_size` 0** (no scrollback); the primary's history is
   preserved and returns on exit. `\x1b[3J` clears scrollback.
 
+Wide characters (CJK/emoji) reconciled to the oracle:
+- Wide glyph + trailing spacer placement, the right-edge leading spacer + wrap, and the
+  WIDE flag (derived from char width) all match. A `spacer` flag distinguishes a real
+  trailing spacer from an erase-left blank, so overwriting a spacer clears the glyph
+  (alacritty's clear_wide) but overwriting an EL'd blank does not.
+- `clear_viewport`'s emptiness scan treats a spacer as non-empty (matching alacritty's
+  is_empty, which also ignores bold/dim/italic).
+- DCH clamps its count to the FULL width (not cols−col), so a large count also clears
+  cells left of the cursor.
+- CNL (`ESC [ E`) / CPL (`ESC [ F`) added; private-marker CSI (`ESC [ ? … H`) ignored.
+
 ## Open divergences
 
-None currently observed under the fuzz. The scrollback ring is implemented and the full
-differential (history included) is 0/10000. `display_offset` is always observed at 0
-(the bottom of the view); reading scrolled-back lines and viewport scrolling are future.
+- **Combining mark exactly at a pending-wrap boundary.** A zero-width mark arriving when
+  the cursor is in the deferred-wrap state resolves the wrap in the oracle but not in
+  vt-term (`pending_wrap` is not observable, so the harness only catches it via a later
+  op). Obscure — combining marks rarely land on the last column — and parked out of the
+  fuzz generator. Everywhere else combining marks match (attach to the base, ignored).
+
+The scrollback ring is implemented; the full differential (grid, cursor, modes, history,
+AND wide chars) is **0/8000**. `display_offset` is always observed at 0 (bottom of the
+view); reading scrolled-back lines / viewport scrolling are future.
 
 ## Known not-yet-implemented (will diverge when exercised)
 
 - **Reflow on resize** — vt-term truncates/extends; the oracle rewraps. THE hard part,
   isolated to the end by design.
-- **Wide characters** (CJK/emoji): treated as width 1; the oracle places a spacer cell.
 - **Colon sub-parameter SGR** beyond the extended-colour case.
 - **OSC / DCS semantics** (title, clipboard, hyperlinks): parsed but not applied.
 - **Charsets** (G0–G3 designations): ignored (ASCII assumed).

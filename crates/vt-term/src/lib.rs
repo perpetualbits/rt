@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 
+use unicode_width::UnicodeWidthChar;
 use vt_parser::{Params, Parser, Perform};
 
 /// Maximum scrollback lines, matching the vendored oracle's `scrolling_history`.
@@ -45,11 +46,15 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    /// This cell is the blank trailing (or leading) spacer of a wide glyph — invisible
+    /// (`c == ' '`) but NOT empty, and overwriting it clears the wide glyph beside it.
+    /// Mirrors alacritty's WIDE_CHAR_SPACER / LEADING_WIDE_CHAR_SPACER flags.
+    pub spacer: bool,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { c: ' ', fg: Color::Default, bg: Color::Default, attrs: Attrs::default() }
+        Cell { c: ' ', fg: Color::Default, bg: Color::Default, attrs: Attrs::default(), spacer: false }
     }
 }
 
@@ -173,7 +178,7 @@ impl Term {
     fn blank(&self) -> Cell {
         // Erased cells keep the current background (xterm/alacritty behaviour), default
         // foreground, no attributes.
-        Cell { c: ' ', fg: Color::Default, bg: self.pen.bg, attrs: Attrs::default() }
+        Cell { c: ' ', fg: Color::Default, bg: self.pen.bg, attrs: Attrs::default(), spacer: false }
     }
     fn blank_row(&self) -> Vec<Cell> {
         vec![self.blank(); self.cols]
@@ -231,14 +236,72 @@ impl Term {
     }
 
     // ── Printing ──────────────────────────────────────────────────────────────
+    /// Write `cell` at the cursor with the current pen colours/attrs but the given char.
+    fn write_cell(&mut self, c: char) {
+        let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
+        self.grid[self.row][self.col] = Cell { c, fg, bg, attrs, spacer: false };
+    }
+
+    /// Write a wide-glyph spacer at the cursor: a blank that carries the pen colours/
+    /// attrs and the `spacer` flag.
+    fn write_spacer(&mut self) {
+        let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
+        self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, attrs, spacer: true };
+    }
+
+    /// If the cursor cell is the trailing spacer of a wide glyph to its left, overwriting
+    /// it would orphan that glyph — so blank the glyph half (alacritty's `clear_wide`).
+    fn clear_wide_left(&mut self) {
+        // Only when the cursor cell is a real trailing spacer whose glyph is to its
+        // left (not, e.g., a blank an erase left behind) — matching alacritty, which
+        // keys this off the WIDE_CHAR_SPACER flag. clear_wide only sets c=' ' (the WIDE
+        // flag, here derived from width, then clears); fg/bg/attrs are kept.
+        if self.col > 0
+            && self.grid[self.row][self.col].spacer
+            && self.grid[self.row][self.col - 1].c.width() == Some(2)
+        {
+            self.grid[self.row][self.col - 1].c = ' ';
+        }
+    }
+
     fn put_char(&mut self, c: char) {
+        // Character display width (unicode-width): 0 = combining/zero-width, 1 = normal,
+        // 2 = wide (CJK/emoji). Matches alacritty's `input`.
+        let width = c.width().unwrap_or(0);
+        if width == 0 {
+            // Zero-width/combining: alacritty attaches it to the previous cell's base
+            // glyph without changing that cell's `.c` or the cursor — observably a no-op.
+            return;
+        }
         if self.pending_wrap {
             self.col = 0;
             self.line_feed();
             self.pending_wrap = false;
         }
-        let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
-        self.grid[self.row][self.col] = Cell { c, fg, bg, attrs };
+        self.clear_wide_left(); // preserve wide-char pair integrity at the write position
+        if width == 2 {
+            // A wide glyph needs two columns. If it would run off the last column, place
+            // a blank leading spacer and wrap first (autowrap on), else defer the wrap.
+            if self.col + 1 >= self.cols {
+                if self.autowrap {
+                    self.write_spacer(); // leading spacer
+                    self.col = 0;
+                    self.line_feed();
+                    self.pending_wrap = false;
+                } else {
+                    self.pending_wrap = true;
+                    return;
+                }
+            }
+            self.write_cell(c); // the wide glyph
+            if self.col + 1 < self.cols {
+                self.col += 1;
+                self.write_spacer(); // trailing spacer occupying the second cell
+            }
+        } else {
+            self.write_cell(c);
+        }
+        // Common cursor advance (shared with alacritty's width==1/2 tail).
         if self.col + 1 < self.cols {
             self.col += 1;
         } else if self.autowrap {
@@ -375,12 +438,19 @@ impl Term {
             row[c] = blank;
         }
     }
-    fn delete_chars(&mut self, n: usize) {
+    fn delete_chars(&mut self, count: usize) {
+        // Matches alacritty: the count is clamped to the FULL width (not cols−col), and
+        // the last `count` columns are cleared — so a large count also blanks cells to
+        // the LEFT of the cursor.
+        let cols = self.cols;
+        let count = count.min(cols);
+        let start = self.col;
         let blank = self.blank();
-        let row = &mut self.grid[self.row];
-        let n = n.min(self.cols - self.col);
-        for c in self.col..self.cols {
-            row[c] = if c + n < self.cols { row[c + n] } else { blank };
+        for c in start..cols {
+            self.grid[self.row][c] = if c + count < cols { self.grid[self.row][c + count] } else { blank };
+        }
+        for c in (cols - count)..cols {
+            self.grid[self.row][c] = blank;
         }
     }
     fn insert_lines(&mut self, n: usize) {
@@ -519,7 +589,14 @@ impl Term {
 /// A cell alacritty treats as "empty" for the clear_viewport scan: a space or tab
 /// glyph with the default foreground/background and no attributes.
 fn cell_is_empty(c: &Cell) -> bool {
-    (c.c == ' ' || c.c == '\t') && c.fg == Color::Default && c.bg == Color::Default && c.attrs == Attrs::default()
+    (c.c == ' ' || c.c == '\t')
+        && !c.spacer
+        && c.fg == Color::Default
+        && c.bg == Color::Default
+        // alacritty's is_empty ignores bold/dim/italic; only these mark a blank non-empty.
+        && !c.attrs.inverse
+        && !c.attrs.underline
+        && !c.attrs.strikeout
 }
 
 /// First value of each parameter as a flat `Vec` (drops sub-parameters — the common
@@ -572,6 +649,14 @@ impl Perform for Term {
         match action {
             'A' => self.cursor_up(count(&p, 0)),
             'B' | 'e' => self.cursor_down(count(&p, 0)),
+            'E' => {
+                self.cursor_down(count(&p, 0)); // CNL: down N lines, to column 0
+                self.col = 0;
+            }
+            'F' => {
+                self.cursor_up(count(&p, 0)); // CPL: up N lines, to column 0
+                self.col = 0;
+            }
             'C' | 'a' => self.cursor_right(count(&p, 0)),
             'D' => self.cursor_left(count(&p, 0)),
             'G' | '`' => self.set_col(count(&p, 0) - 1), // CHA / HPA

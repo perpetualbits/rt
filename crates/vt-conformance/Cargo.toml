@@ -13,6 +13,9 @@ publish = false
 alacritty_terminal = { path = "../../vendor/alacritty_terminal" }
 # The in-house Term under test (a VtEngine impl lives in `vtterm.rs`, shared by tests).
 vt-term = { path = "../vt-term" }
+# To flag wide-char cells in the neutral state (mirrors alacritty's WIDE_CHAR flag),
+# derived from the cell's char — same crate/version the engine uses.
+unicode-width = "0.2"
 
 [dev-dependencies]
 # The in-house parser under test, and the vendored vte it is diffed against (the

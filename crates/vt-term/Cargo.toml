@@ -7,3 +7,6 @@ description = "rt's in-house terminal Term: consumes vt-parser's action stream a
 
 [dependencies]
 vt-parser = { path = "../vt-parser" }
+# Character display width — the SAME crate + major version alacritty uses, so wide-char
+# (CJK/emoji) placement matches the oracle cell-for-cell.
+unicode-width = "0.2"
