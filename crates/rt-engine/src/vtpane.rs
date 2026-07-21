@@ -451,6 +451,15 @@ impl VtPane {
     pub fn mouse_sgr(&self) -> bool {
         self.term.lock().map(|t| t.mouse_sgr()).unwrap_or(false)
     }
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.lock().map(|t| t.bracketed_paste()).unwrap_or(false)
+    }
+    pub fn focus_events(&self) -> bool {
+        self.term.lock().map(|t| t.focus_events()).unwrap_or(false)
+    }
+    pub fn alt_scroll(&self) -> bool {
+        self.term.lock().map(|t| t.alt_scroll()).unwrap_or(false)
+    }
 
     pub fn drain_events(&self) -> Vec<PaneEvent> {
         self.events.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()

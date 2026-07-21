@@ -787,6 +787,25 @@ impl AlacPane {
         term.mode().intersects(TermMode::MOUSE_MODE) // click | motion | drag
     }
 
+    /// Whether the program enabled bracketed paste (DECSET 2004): the host should wrap
+    /// pasted text in `\x1b[200~`…`\x1b[201~` so the app can tell paste from typing.
+    pub fn bracketed_paste(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+    /// Whether focus reporting (DECSET 1004) is on: the host emits `\x1b[I`/`\x1b[O` on
+    /// focus in/out.
+    pub fn focus_events(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT)
+    }
+    /// Whether alternate scroll (DECSET 1007) is on: on the alt screen the host turns wheel
+    /// events into cursor-key presses.
+    pub fn alt_scroll(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().mode().contains(TermMode::ALTERNATE_SCROLL)
+    }
+
     /// Whether the program requested *any-motion* mouse tracking (mode 1003): it
     /// wants pointer motion reported even with no button held, e.g. to highlight
     /// whatever the pointer hovers over. Distinct from the click/drag modes so the
@@ -1081,6 +1100,24 @@ impl TermPane {
         match self {
             Self::Alac(p) => p.mouse_sgr(),
             Self::Vt(p) => p.mouse_sgr(),
+        }
+    }
+    pub fn bracketed_paste(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.bracketed_paste(),
+            Self::Vt(p) => p.bracketed_paste(),
+        }
+    }
+    pub fn focus_events(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.focus_events(),
+            Self::Vt(p) => p.focus_events(),
+        }
+    }
+    pub fn alt_scroll(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.alt_scroll(),
+            Self::Vt(p) => p.alt_scroll(),
         }
     }
     pub fn is_alt_screen(&self) -> bool {

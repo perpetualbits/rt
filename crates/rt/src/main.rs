@@ -2448,7 +2448,23 @@ impl App {
         if let Some(cb) = &active.clipboard {
             if let Ok(text) = cb.load() {
                 if !text.is_empty() {
-                    active.session.feed_input(text.as_bytes()); // respects broadcast mode
+                    // Bracketed paste (DECSET 2004): if the focused pane's app enabled it,
+                    // wrap the text in `\x1b[200~`…`\x1b[201~` so it can distinguish a paste
+                    // from typing. Strip any embedded end-marker first so pasted content
+                    // can't break out of the bracket (paste-injection guard).
+                    let focus = active.session.focus();
+                    let bracketed =
+                        active.session.pane(focus).map_or(false, |p| p.bracketed_paste());
+                    if bracketed {
+                        let body = text.replace("\u{1b}[201~", "");
+                        let mut wrapped = Vec::with_capacity(body.len() + 12);
+                        wrapped.extend_from_slice(b"\x1b[200~");
+                        wrapped.extend_from_slice(body.as_bytes());
+                        wrapped.extend_from_slice(b"\x1b[201~");
+                        active.session.feed_input(&wrapped); // respects broadcast mode
+                    } else {
+                        active.session.feed_input(text.as_bytes()); // respects broadcast mode
+                    }
                 }
             }
         }
