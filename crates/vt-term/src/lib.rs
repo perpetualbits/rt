@@ -146,6 +146,10 @@ pub struct Term {
     /// (1006) is on. Term-global.
     mouse_mode: MouseMode,
     mouse_sgr: bool,
+    /// Input-affecting modes a host encodes keys/paste against (DECSET 1004/1007/2004).
+    focus_events: bool,
+    alt_scroll: bool,
+    bracketed_paste: bool,
     /// Pending window title set via OSC 0/2, consumed by [`take_title`](Term::take_title).
     title: Option<String>,
     parser: Parser,
@@ -178,6 +182,9 @@ impl Term {
             cursor_shape: CursorShape::Block,
             mouse_mode: MouseMode::Off,
             mouse_sgr: false,
+            focus_events: false,
+            alt_scroll: false,
+            bracketed_paste: false,
             title: None,
             parser: Parser::new(),
         }
@@ -378,6 +385,19 @@ impl Term {
     pub fn mouse_sgr(&self) -> bool {
         self.mouse_sgr
     }
+    /// Whether focus in/out reporting (DECSET 1004) is enabled.
+    pub fn focus_events(&self) -> bool {
+        self.focus_events
+    }
+    /// Whether alt-screen scroll-to-arrow-keys (DECSET 1007) is enabled.
+    pub fn alt_scroll(&self) -> bool {
+        self.alt_scroll
+    }
+    /// Whether bracketed paste (DECSET 2004) is enabled — a host should wrap pasted text
+    /// in `\x1b[200~` … `\x1b[201~` so the app can tell paste from typing.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
     /// Take the pending window title (OSC 0/2), clearing it. Returns `None` if unchanged
     /// since the last call.
     pub fn take_title(&mut self) -> Option<String> {
@@ -441,8 +461,14 @@ impl Term {
         // foreground, no attributes.
         Cell { c: ' ', fg: Color::Default, bg: self.pen.bg, attrs: Attrs::default(), spacer: false, wrapline: false }
     }
-    fn blank_row(&self) -> Vec<Cell> {
-        vec![self.blank(); self.cols]
+    /// Reset row `r` to `blank` in place, keeping its heap allocation — the scroll/erase
+    /// hot path. Replacing the `Vec` (`grid[r] = blank_row()`) allocated a fresh row every
+    /// time; reusing the buffer is what alacritty's ring-buffer reset does.
+    #[inline]
+    fn fill_row(&mut self, r: usize, blank: Cell) {
+        for cell in &mut self.grid[r] {
+            *cell = blank;
+        }
     }
 
     /// Scroll the scroll region up by `n` lines (content moves up; blanks fill in at
@@ -470,8 +496,9 @@ impl Term {
             }
         }
         self.grid[t..=b].rotate_left(n);
+        let blank = self.blank();
         for r in (b + 1 - n)..=b {
-            self.grid[r] = self.blank_row();
+            self.fill_row(r, blank);
         }
     }
     /// Scroll the scroll region down by `n` lines (blanks fill in at the top).
@@ -479,8 +506,9 @@ impl Term {
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(b - t + 1);
         self.grid[t..=b].rotate_right(n);
+        let blank = self.blank();
         for r in t..(t + n) {
-            self.grid[r] = self.blank_row();
+            self.fill_row(r, blank);
         }
     }
 
@@ -649,7 +677,7 @@ impl Term {
                 // line is always cleared from its start to the cursor.
                 if self.row > 1 {
                     for r in 0..self.row {
-                        self.grid[r] = vec![blank; self.cols];
+                        self.fill_row(r, blank);
                     }
                 }
                 for c in 0..=self.col {
@@ -677,7 +705,7 @@ impl Term {
                     }
                 }
                 for r in 0..self.rows {
-                    self.grid[r] = vec![blank; self.cols];
+                    self.fill_row(r, blank);
                 }
             }
             3 => self.history.clear(), // ED-Saved: clear scrollback only
@@ -686,7 +714,7 @@ impl Term {
                     self.grid[self.row][c] = blank;
                 }
                 for r in (self.row + 1)..self.rows {
-                    self.grid[r] = vec![blank; self.cols];
+                    self.fill_row(r, blank);
                 }
             }
         }
@@ -732,8 +760,9 @@ impl Term {
         let (top, b) = (self.row, self.scroll_bottom);
         let n = n.min(b - top + 1);
         self.grid[top..=b].rotate_right(n);
+        let blank = self.blank();
         for r in top..(top + n) {
-            self.grid[r] = self.blank_row();
+            self.fill_row(r, blank);
         }
     }
     fn delete_lines(&mut self, n: usize) {
@@ -743,8 +772,9 @@ impl Term {
         let (top, b) = (self.row, self.scroll_bottom);
         let n = n.min(b - top + 1);
         self.grid[top..=b].rotate_left(n);
+        let blank = self.blank();
         for r in (b + 1 - n)..=b {
-            self.grid[r] = self.blank_row();
+            self.fill_row(r, blank);
         }
     }
 
@@ -838,6 +868,9 @@ impl Term {
                 1003 => self.mouse_mode = if set { MouseMode::Motion } else { self.mouse_off_if(MouseMode::Motion) },
                 1006 => self.mouse_sgr = set,             // SGR mouse encoding
                 1005 => if set { self.mouse_sgr = false }, // UTF-8 encoding clears SGR
+                1004 => self.focus_events = set,          // report focus in/out
+                1007 => self.alt_scroll = set,            // alt-screen wheel → arrow keys
+                2004 => self.bracketed_paste = set,       // bracketed paste
                 _ => {}
             }
         }

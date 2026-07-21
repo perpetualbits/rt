@@ -78,6 +78,26 @@ colon sub-param SGR, and the one obscure combining-mark-at-pending-wrap edge.
 
 ## Performance
 
-Same discipline as the parser: benchmark vs alacritty on x86_64 AND riscv64 (milkv) via
-`ci/verify.sh` once the Term is feature-complete enough for a fair comparison; the grid
-representation and damage tracking are where the speed work lands. Not yet started.
+Benchmarked vs `alacritty_terminal` (the full Term — parse **and** build the grid) with
+`examples/term_bench.rs` (`cargo run --release --example term_bench -p vt-conformance`),
+80×24, 4 MiB workloads. First measurement (x86_64, 2026-07-21): **geomean ~0.7× alacritty**
+— faster on some workloads (unicode, control-heavy, real spiral capture at ~1.1–1.35×),
+slower on others. Note the parser *beats* vte; the gap is the **grid layer**.
+
+Where the time goes, and the optimisation path (mirrors how the parser went from 0.65× to
+1.17× vs vte):
+
+1. **No `occ` (occupied-length) tracking — the dominant lever.** A `\x1b[2J`-heavy TUI
+   workload runs at only ~0.22×: we reset all 80 cols × 24 rows every clear, while
+   alacritty's `Row::reset` only touches the *written* cells (a near-empty screen → ~40×
+   less work). Tracking a per-row `occ` and clearing/scrolling only up to it is the single
+   biggest win. It wants a `Row { cells, occ }` type (occ travels with the row on rotate).
+2. **Grid layout.** `Vec<Vec<Cell>>` is a double indirection with a heap allocation per
+   row and poor locality; alacritty uses one contiguous buffer. A general ~1.3× penalty.
+3. **`Cell` size.** Seven separate `bool`s for attributes; packing them into bitflags
+   shrinks the per-cell memcpy on fills/scrolls.
+
+Already landed: scroll/erase **blank rows in place** (reuse the row's allocation instead
+of allocating a fresh `Vec`), which lifted the scroll-heavy workloads. The `occ` + `Row`
+refactor is the next focused pass; correctness stays pinned by the 0/10000 differential.
+Not yet benchmarked on riscv64.
