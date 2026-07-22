@@ -42,11 +42,11 @@ fn curated_reflow_matches_oracle() {
 #[test]
 fn reflow_fuzz_rate_within_ceiling() {
     const N: u64 = 3000;
-    // Current rate ~0.9% (28/3000) after porting alacritty's leading-spacer clear on
-    // wide-glyph overwrite (was 5.2%). Guard a little above it so noise doesn't flake, but
-    // tight enough to catch a real regression. Drive this DOWN as edges are fixed; never
-    // raise it.
-    const CEILING: usize = 40; // ~1.3% of N; residual is the trailing-spacer-clear edge (ledger)
+    // Current rate ~0.8% (24/3000) after porting alacritty's wide-glyph overwrite cleanup
+    // (leading + trailing spacer clears) and adding CHT/CBT (was 5.2%). Guard a little above
+    // it so noise doesn't flake, but tight enough to catch a real regression. Drive this
+    // DOWN as edges are fixed; never raise it.
+    const CEILING: usize = 30; // ~1.0% of N; residual is grow-path wide-glyph + cursor edges (ledger)
     let mut div = 0;
     for seed in 0..N {
         let s = gen_script(seed, 100);

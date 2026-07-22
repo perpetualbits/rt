@@ -766,11 +766,13 @@ impl Term {
     /// column. Missing the last case left a stray spacer that reflow misclassified — the
     /// wide-glyph column-shift divergence.
     fn clear_wide_left(&mut self) {
-        // Overwriting a trailing spacer: blank the wide glyph to its left.
-        if self.col > 0
-            && self.grid[self.row][self.col].spacer()
-            && char_width(self.grid[self.row][self.col - 1].c) == 2
-        {
+        let cur = self.grid[self.row][self.col];
+        let wide = char_width(cur.c) == 2;
+        if wide && self.col + 1 < self.cols {
+            // Overwriting the wide glyph: drop its trailing spacer to the right.
+            self.grid[self.row][self.col + 1].flags &= !SPACER;
+        } else if self.col > 0 && cur.spacer() && char_width(self.grid[self.row][self.col - 1].c) == 2 {
+            // Overwriting a trailing spacer: blank the wide glyph to its left.
             self.grid[self.row][self.col - 1].c = ' ';
         }
         // Overwriting a wrapped wide glyph (now at column 0/1): clear the leading spacer it
@@ -1582,6 +1584,8 @@ impl Perform for Term {
             }
             'C' | 'a' => self.cursor_right(count(&p, 0)),
             'D' => self.cursor_left(count(&p, 0)),
+            'I' => self.cursor_forward_tabs(count(&p, 0)), // CHT
+            'Z' => self.cursor_backward_tabs(count(&p, 0)), // CBT
             'G' | '`' => self.set_col(count(&p, 0) - 1), // CHA / HPA
             'd' => self.set_row(count(&p, 0) - 1),        // VPA
             'H' | 'f' => self.goto(count(&p, 0) - 1, count(&p, 1) - 1),
@@ -1649,6 +1653,29 @@ impl Term {
         }
         if self.col + 1 < self.cols {
             self.col = (((self.col / 8) + 1) * 8).min(self.cols - 1);
+        }
+    }
+
+    /// CHT — advance the cursor to the next tab stop, `count` times (every-8 stops, matching
+    /// `put_tab`), clamped to the last column. Cursor-only (no `\t` glyph). alacritty's
+    /// `move_forward_tabs`.
+    fn cursor_forward_tabs(&mut self, count: usize) {
+        for _ in 0..count {
+            if self.col + 1 >= self.cols {
+                break;
+            }
+            self.col = (((self.col / 8) + 1) * 8).min(self.cols - 1);
+        }
+    }
+
+    /// CBT — move the cursor back to the previous tab stop, `count` times. alacritty's
+    /// `move_backward_tabs`.
+    fn cursor_backward_tabs(&mut self, count: usize) {
+        for _ in 0..count {
+            if self.col == 0 {
+                break;
+            }
+            self.col = ((self.col - 1) / 8) * 8;
         }
     }
 }

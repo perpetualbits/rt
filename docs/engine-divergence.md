@@ -101,9 +101,13 @@ zero:
   stray spacer (repro `"VXEKSWNANACVKWRm\x1b[5C界世\rX"` 24×8→21×18: oracle `界··X`, vt-term
   `界·X`). Fixed by porting that case, guarded so our single `SPACER` bit only clears a
   *leading* spacer (predecessor at `cols-2` not wide) and never orphans a trailing one.
-  **Residual ~28/3000:** the sibling *trailing* `WIDE_CHAR_SPACER` clear (alacritty
-  `term/mod.rs:998`) is still skipped — porting it naively regresses the non-resize fuzz
-  (2/8000), so it needs the same leading-vs-trailing care. Next edge to drive down.
+  Then the sibling *trailing* `WIDE_CHAR_SPACER` clear (alacritty `term/mod.rs:998`) and
+  CHT/CBT (`ESC[I`/`ESC[Z`, which were unimplemented — a real cursor gap) were added:
+  **156/3000 → 24/3000 (0.8%)**, non-resize fuzz still 0. **Residual ~24** (20 pure-cell +
+  2 cursor + 2 history): a *distinct, deeper* set — a one-cell wide-glyph shift in the
+  **grow-columns** path (repro reduces to a wide glyph near the right edge on a 24→25 grow),
+  plus the deepest cursor/overflow arithmetic and two history-count edges. Each is its own
+  investigation; the overwrite-clear family is now closed.
 - **Residual cursor edges (~20).** A few cursor positions still off, in the deepest
   split/overflow interactions.
 
