@@ -90,20 +90,20 @@ on **~95%** (≈156/3000 diverge, down from ~242 with the logical-line reimpleme
 cursor arithmetic). Guarded by `tests/vtterm_reflow.rs`. Remaining divergences, to drive to
 zero:
 
-- **Wide-glyph reflow edges (~128 pure one-cell shifts + ~24 history-count, 2026-07-22).**
-  A one-column shift around a wide glyph at a wrap boundary. **Corrected diagnosis:** the
-  earlier note blamed our single `spacer` flag *inferring* `LEADING_WIDE_CHAR_SPACER` by
-  position (`char_width(prev) != 2`) rather than storing it. This is **wrong** — storing a
-  distinct `LEADING_SPACER` flag was tried and produced *byte-identical* output (still
-  156/3000), because the cell immediately before a leading spacer is *provably never* a
-  wide glyph (a wide glyph there would claim the leading-spacer's own column for its
-  trailing spacer), so the inference is always correct. The real cause is a genuine
-  one-cell divergence in the column-reflow rejoin: minimised to a 28-byte repro
-  `"VXEKSWNANACVKWRm\x1b[5C界世\rX"` resized 24×8→21×18, where the oracle yields `界··X` and
-  vt-term `界·X` (one blank the oracle keeps around the rewrapped wide glyph). `shrink_columns`'s
-  tail is a faithful port and the resize order (lines-then-columns) matches, so the missing
-  cell is upstream — still unidentified; needs instrumenting both engines' `shrink_columns`
-  on the repro. History content itself matches on a rows-only resize.
+- **Wide-glyph reflow edges — root-caused and largely fixed (156/3000 → 28/3000,
+  2026-07-22).** The one-column shift around a wide glyph at a wrap boundary was NOT in the
+  reflow code at all (the earlier "leading-spacer inference" diagnosis was wrong — the
+  inference is provably always correct). It was in the **cell-overwrite path**:
+  `clear_wide_left` ported only part of alacritty's `write_at_cursor` cleanup and skipped
+  the *"remove leading spacers"* step. When a narrow glyph overwrites a wide glyph that had
+  autowrapped to the start of a continuation row, alacritty clears the leading spacer in the
+  *previous* row's last column; vt-term left it, so column reflow later misclassified the
+  stray spacer (repro `"VXEKSWNANACVKWRm\x1b[5C界世\rX"` 24×8→21×18: oracle `界··X`, vt-term
+  `界·X`). Fixed by porting that case, guarded so our single `SPACER` bit only clears a
+  *leading* spacer (predecessor at `cols-2` not wide) and never orphans a trailing one.
+  **Residual ~28/3000:** the sibling *trailing* `WIDE_CHAR_SPACER` clear (alacritty
+  `term/mod.rs:998`) is still skipped — porting it naively regresses the non-resize fuzz
+  (2/8000), so it needs the same leading-vs-trailing care. Next edge to drive down.
 - **Residual cursor edges (~20).** A few cursor positions still off, in the deepest
   split/overflow interactions.
 
