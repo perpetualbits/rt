@@ -714,7 +714,13 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
                     self.relayout(self.bounds); // reflow
                 }
                 None => {
-                    self.tree.close(new_id); // undo; keep existing panes
+                    self.tree.close(new_id); // undo the tab; keep existing panes
+                    // In a pre-existing multi-tab group, close() lands `active` on the last
+                    // surviving tab, which may not be the one holding the still-focused
+                    // original pane — re-reveal it so focus doesn't hide behind a non-active
+                    // tab page, then reflow.
+                    self.tree.activate_tab(self.focus);
+                    self.relayout(self.bounds);
                 }
             }
         }
