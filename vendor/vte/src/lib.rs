@@ -554,6 +554,16 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 return;
             }
         }
+        // rt: cap the std (unbounded Vec) path too — an unterminated OSC would otherwise grow
+        // without bound (memory-exhaustion DoS). Matches vt-parser's OSC_RAW_MAX so the
+        // parser differential stays byte-identical. [review RT-SEC-001]
+        #[cfg(feature = "std")]
+        {
+            const OSC_RAW_MAX: usize = 64 * 1024;
+            if self.osc_raw.len() >= OSC_RAW_MAX {
+                return;
+            }
+        }
         self.osc_raw.push(byte);
     }
 

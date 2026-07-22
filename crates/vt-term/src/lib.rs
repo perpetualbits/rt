@@ -938,7 +938,14 @@ impl Term {
                     self.fill_row(r, blank);
                 }
             }
-            3 => self.history.clear(), // ED-Saved: clear scrollback only
+            3 => {
+                // ED-Saved: clear scrollback. Keep the byte accounting and viewport in step
+                // — otherwise history_bytes counts bytes that no longer exist and the next
+                // pushes get evicted prematurely. [review RT-TERM-002]
+                self.history.clear();
+                self.history_bytes = 0;
+                self.display_offset = 0;
+            }
             _ => {
                 for c in self.col..self.cols {
                     self.grid[self.row][c] = blank;
@@ -1143,7 +1150,14 @@ impl Term {
 
     fn reset(&mut self) {
         let (cols, rows) = (self.cols, self.rows);
+        // Preserve the host-configured scrollback policy across RIS — it is a property of
+        // the pane, not terminal state, so a child printing `ESC c` must not silently reset
+        // the line/byte caps back to the library defaults (matches alacritty, whose Config
+        // is separate from the reset Term). [review RT-TERM-001]
+        let (lines, bytes) = (self.scrollback_lines, self.scrollback_bytes);
         *self = Term::new(cols, rows);
+        self.scrollback_lines = lines;
+        self.scrollback_bytes = bytes;
     }
 }
 
@@ -1718,5 +1732,26 @@ mod scrollback_tests {
             "history memory ({}) stays within the {}-byte budget",
             t.history_bytes, budget
         );
+    }
+
+    #[test]
+    fn ris_preserves_the_configured_scrollback_policy() {
+        // RIS (ESC c) is terminal state, not pane policy — a child must not reset the caps.
+        let mut t = Term::new(80, 24);
+        t.set_scrollback(500, 1_234_567);
+        t.feed(b"\x1bc"); // RIS
+        assert_eq!(t.scrollback_lines, 500, "RIS must keep the configured line cap");
+        assert_eq!(t.scrollback_bytes, 1_234_567, "RIS must keep the configured byte budget");
+    }
+
+    #[test]
+    fn ed3_clears_history_and_its_byte_accounting() {
+        let mut t = Term::new(80, 24);
+        feed_lines(&mut t, 100);
+        assert!(t.history_size() > 0 && t.history_bytes > 0, "history should have built up");
+        t.feed(b"\x1b[3J"); // ED-Saved: clear scrollback
+        assert_eq!(t.history_size(), 0, "ED 3 clears the history");
+        assert_eq!(t.history_bytes, 0, "ED 3 must reset the byte accounting with it");
+        assert_eq!(t.display_offset, 0, "ED 3 must snap the viewport to the (now empty) bottom");
     }
 }

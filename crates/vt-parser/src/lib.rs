@@ -24,6 +24,13 @@ use core::str;
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_PARAMS: usize = 32;
 const MAX_OSC_PARAMS: usize = 16;
+/// Max raw bytes retained for one OSC string. Without a cap, a child that starts an OSC
+/// (`ESC ] …`) and never terminates it grows `osc_raw` until memory exhaustion — a trivial
+/// DoS over any untrusted stream (ssh, `cat` of a hostile file). 64 KiB is far more than any
+/// real title or (ignored) OSC-52 clipboard payload; overflow bytes are dropped until the
+/// terminator. The vendored vte oracle is capped to the same value so the differential still
+/// agrees byte-for-byte. [review RT-SEC-001]
+const OSC_RAW_MAX: usize = 64 * 1024;
 
 /// The CSI/DCS parameter list: a sequence of parameters, each of which may carry
 /// colon-separated sub-parameters (e.g. `38:2:255:0:0`). Mirrors vte's iteration
@@ -640,6 +647,9 @@ impl Parser {
                 self.state = State::Escape;
             }
             0x3B => self.osc_put_param(),
+            // Drop overflow bytes past the cap (keep parsing so the terminator still fires
+            // and the state machine recovers) — bounds an unterminated OSC. [RT-SEC-001]
+            _ if self.osc_raw.len() >= OSC_RAW_MAX => {}
             _ => self.osc_raw.push(byte),
         }
     }
@@ -988,6 +998,30 @@ mod tests {
             p.advance(&mut l, &[*b]);
         }
         assert_eq!(l.0, vec![Ev::Print('🦀')]);
+    }
+
+    #[test]
+    fn oversized_osc_is_capped_and_the_parser_recovers() {
+        // ESC ] 2 ; then well past the cap with no terminator, then BEL, then a normal char.
+        let mut bytes = b"\x1b]2;".to_vec();
+        bytes.extend(std::iter::repeat(b'x').take(OSC_RAW_MAX + 50_000));
+        bytes.push(0x07); // BEL terminates the OSC
+        bytes.push(b'A'); // must parse normally afterward
+        let evs = run(&bytes);
+        // The OSC still dispatched, with a payload bounded by the cap (not the 64K+50K sent).
+        let osc = evs
+            .iter()
+            .find_map(|e| if let Ev::Osc(p, _) = e { Some(p) } else { None })
+            .expect("OSC should still dispatch after overflow");
+        assert!(
+            osc.iter().map(|p| p.len()).sum::<usize>() <= OSC_RAW_MAX,
+            "OSC payload exceeds the {OSC_RAW_MAX}-byte cap"
+        );
+        // The trailing 'A' parsed normally — the state machine fully recovered.
+        assert!(
+            evs.iter().any(|e| matches!(e, Ev::Print('A'))),
+            "parser did not recover after an oversized OSC"
+        );
     }
 }
 
