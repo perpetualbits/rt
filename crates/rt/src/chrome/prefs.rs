@@ -135,6 +135,14 @@ pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row> {
     v.push(toggle("Focus follows mouse", s.focus_follows_mouse, PrefRow::Ffm, true));
     v.push(toggle("Show per-pane titlebars", s.show_titlebar, PrefRow::Titlebar, true));
     v.push(stepper("Scrollback (lines)", crate::fmt_lines(s.scrollback), PrefRow::Scrollback));
+    v.push(toggle("Hold-arrow acceleration", s.arrow_accel, PrefRow::ArrowAccel, true));
+    v.push(Row {
+        kind: RowKind::Step,
+        label: "Max arrow speed (x)".into(),
+        value: s.arrow_accel_max.to_string(),
+        pref: Some(PrefRow::ArrowAccelMax),
+        enabled: enabled(s, PrefRow::ArrowAccelMax), // dimmed while acceleration is off
+    });
     // The guardrail, carried over from the egui dialog intact.
     let per_line = cols.max(1) as u64 * rt_engine::CELL_BYTES as u64 + 32; // + row overhead
     let full = (s.scrollback as u64).saturating_mul(per_line);
@@ -393,6 +401,7 @@ mod tests {
         let want = [
             PrefRow::FontSize, PrefRow::FontFamily, PrefRow::Opacity, PrefRow::Blur,
             PrefRow::Preset, PrefRow::Ffm, PrefRow::Titlebar, PrefRow::Scrollback,
+            PrefRow::ArrowAccel, PrefRow::ArrowAccelMax,
             PrefRow::InstOutput, PrefRow::InstHeat, PrefRow::InstLatency, PrefRow::Jacks,
             PrefRow::InstRemote, PrefRow::InstAnimate, PrefRow::Close,
         ];

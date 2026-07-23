@@ -23,6 +23,8 @@ pub enum PrefRow {
     Jacks,
     InstRemote,
     InstAnimate,
+    ArrowAccel,
+    ArrowAccelMax,
     Close,
 }
 
@@ -46,6 +48,7 @@ const OPACITY_STEP: f32 = 0.05;
 pub fn enabled(s: &Settings, row: PrefRow) -> bool {
     match row {
         PrefRow::InstAnimate => s.inst_remote,
+        PrefRow::ArrowAccelMax => s.arrow_accel, // the cap is moot when acceleration is off
         _ => true,
     }
 }
@@ -123,6 +126,11 @@ pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String]) {
         PrefRow::Jacks => s.show_jacks = !s.show_jacks,
         PrefRow::InstRemote => s.inst_remote = !s.inst_remote,
         PrefRow::InstAnimate => s.inst_animate = !s.inst_animate,
+        PrefRow::ArrowAccel => s.arrow_accel = !s.arrow_accel,
+        PrefRow::ArrowAccelMax => {
+            s.arrow_accel_max =
+                (s.arrow_accel_max as i32 + dir).clamp(1, Settings::MAX_ARROW_ACCEL as i32) as u32;
+        }
         PrefRow::Close => {} // handled by the caller; edits nothing
     }
 }

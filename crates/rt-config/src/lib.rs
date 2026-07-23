@@ -172,6 +172,16 @@ pub struct Settings {
     /// memory (~tens of bytes per column per line). Applies to terminals opened
     /// after the change.
     pub scrollback: usize,
+    /// Arrow-key acceleration: when true, HOLDING an arrow key (a run of auto-repeats) sends
+    /// progressively more cursor moves per repeat, so the cursor speeds up the longer you
+    /// hold — turning a long crawl through a line or through `less`/history into a second or
+    /// two. A single tap is always exactly one move. When false, each repeat is one move (the
+    /// plain OS keyboard repeat rate). Applies to all four arrow keys.
+    pub arrow_accel: bool,
+    /// The cap on arrow acceleration — the most cursor moves sent per held repeat. Effective
+    /// top speed ≈ this × the OS keyboard repeat rate. Clamped to `1..=MAX_ARROW_ACCEL`; `1`
+    /// disables acceleration even with `arrow_accel` on.
+    pub arrow_accel_max: u32,
 }
 
 /// The default 16-colour ANSI palette (classic xterm values).
@@ -216,6 +226,8 @@ impl Default for Settings {
             font_family: "DejaVu Sans Mono".to_string(), // ubiquitous monospace default
             font_size: 18.0,               // pixels
             scrollback: 10_000,            // matches rt_engine::DEFAULT_SCROLLBACK
+            arrow_accel: true,             // hold-to-accelerate arrows on by default
+            arrow_accel_max: 10,           // up to 10 cursor moves per held repeat
         }
     }
 }
@@ -231,6 +243,10 @@ impl Settings {
     /// as it fills, so an unused ceiling is cheap. Was 20M — lowered so even the vendored
     /// backend (line-capped only, no byte budget) can't be driven to an OOM.
     pub const MAX_SCROLLBACK: usize = 5_000_000;
+
+    /// Upper bound for the arrow-acceleration slider: the most cursor moves sent per held
+    /// key-repeat. Effective top speed is this times the OS keyboard repeat rate.
+    pub const MAX_ARROW_ACCEL: u32 = 30;
 
     /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
     /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.
@@ -264,6 +280,14 @@ impl Settings {
                 self.scrollback, Self::MAX_SCROLLBACK
             );
             self.scrollback = Self::MAX_SCROLLBACK;
+        }
+        if self.arrow_accel_max < 1 || self.arrow_accel_max > Self::MAX_ARROW_ACCEL {
+            let c = self.arrow_accel_max.clamp(1, Self::MAX_ARROW_ACCEL);
+            eprintln!(
+                "rt: config arrow_accel_max {} out of range [1, {}]; clamped to {c}",
+                self.arrow_accel_max, Self::MAX_ARROW_ACCEL
+            );
+            self.arrow_accel_max = c;
         }
     }
 }

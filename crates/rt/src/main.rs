@@ -345,6 +345,9 @@ struct Active {
     drag_cursor: Option<(f32, f32)>,      // live cursor (physical px) while dragging a wire
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
+    // Arrow-key acceleration: (which arrow 0..4, last-press time, consecutive-repeat count).
+    // While an arrow is held, the count grows and `arrow_accel_step` sends more moves/repeat.
+    arrow_hold: Option<(u8, Instant, u32)>,
     prefs_open: bool,                     // whether the preferences dialog is showing
     prefs_sel: usize,                     // selected row index into chrome::prefs::rows()
     prefs_scroll: usize,                  // first visible row (the panel scrolls when it doesn't fit)
@@ -1080,6 +1083,7 @@ impl ApplicationHandler for App {
             drag_cursor: None,
             last_click: None,
             click_count: 0,
+            arrow_hold: None,
             prefs_open: false,
             prefs_sel: 0,
             prefs_scroll: 0,
@@ -3071,8 +3075,41 @@ impl App {
             },
         };
         if let Some(bytes) = bytes {
-            active.session.feed_input(&bytes); // send to the shell(s)
-            active.last_input = Instant::now(); // restart the cursor blink window
+            // Arrow-key acceleration: while an arrow is HELD (a run of auto-repeats), send
+            // several cursor moves per repeat so it speeds up the longer you hold. A single
+            // tap, a pause, or any other key resets it to exactly one move. Off → always one.
+            let arrow = match &key_event.logical_key {
+                Key::Named(NamedKey::ArrowLeft) => Some(0u8),
+                Key::Named(NamedKey::ArrowRight) => Some(1u8),
+                Key::Named(NamedKey::ArrowUp) => Some(2u8),
+                Key::Named(NamedKey::ArrowDown) => Some(3u8),
+                _ => None,
+            };
+            let now = Instant::now();
+            let step = match (active.settings.arrow_accel, arrow) {
+                (true, Some(a)) => {
+                    let repeats = match active.arrow_hold {
+                        Some((prev, t, n)) if prev == a && now.duration_since(t) < ARROW_HOLD_GAP => n + 1,
+                        _ => 0, // fresh press, different arrow, or a gap → start over
+                    };
+                    active.arrow_hold = Some((a, now, repeats));
+                    arrow_accel_step(repeats, active.settings.arrow_accel_max)
+                }
+                _ => {
+                    active.arrow_hold = None; // a non-arrow key (or accel off) breaks the hold
+                    1
+                }
+            };
+            if step > 1 {
+                let mut payload = Vec::with_capacity(bytes.len() * step);
+                for _ in 0..step {
+                    payload.extend_from_slice(&bytes);
+                }
+                active.session.feed_input(&payload); // N moves this repeat
+            } else {
+                active.session.feed_input(&bytes); // send to the shell(s)
+            }
+            active.last_input = now; // restart the cursor blink window
             // Typing returns you to the live prompt: if the focused pane was
             // scrolled up in history, snap it back to the bottom.
             if let Some(pane) = active.session.pane(active.session.focus()) {
@@ -4643,6 +4680,22 @@ fn fmt_lines(n: usize) -> String {
 /// thumb_h)` in pixels. Shared by the renderer (which draws the thumb) and the
 /// drag hit-test (which grabs it), so the visible thumb and the grabbable region
 /// are always the same rectangle. Only meaningful when `history > 0`.
+/// How close two arrow-key presses must be to count as the same HELD run (rather than a fresh
+/// tap). A touch longer than a slow auto-repeat interval so consecutive repeats always chain.
+const ARROW_HOLD_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Cursor moves to send for a held arrow at `repeats` consecutive repeats, capped at `max`. A
+/// tap or brief hold (`repeats < THRESHOLD`) stays 1:1 for precision; past that it ramps +1
+/// move per repeat up to `max`. `max == 1` disables acceleration.
+fn arrow_accel_step(repeats: u32, max: u32) -> usize {
+    const THRESHOLD: u32 = 4;
+    let max = max.max(1) as usize;
+    if max == 1 {
+        return 1;
+    }
+    (1 + repeats.saturating_sub(THRESHOLD) as usize).min(max)
+}
+
 fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -> (f32, f32, f32, f32) {
     let total = (history + screen) as f32; // whole buffer height in lines
     // Draw the scrollbar in the pane's right PADDING gutter (PANE_PAD = 5px, just RIGHT of
