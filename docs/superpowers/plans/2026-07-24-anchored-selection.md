@@ -611,14 +611,24 @@ Near `compose_cancel`:
 
 - [ ] **Step 2: Shift+click sets the head and commits; plain click cancels**
 
-Replace the Task-3 compose intercept at the top of the left-press arm (`main.rs:1896`) with:
+Replace the Task-3 compose intercept at the top of the left-press arm (`main.rs:1896`) with the version below. **Preserve the multi-click-continuation guard that Task 3's fix added** (a Shift+double/triple-click's first release enters compose; the second press must resume the normal word/line select, not commit/cancel) — it comes FIRST, before the Shift/plain branch:
 
 ```rust
                     // While composing, a click finishes or aborts — never starts a
-                    // new selection. Shift+click sets the end at the clicked cell and
-                    // commits; a plain click cancels.
+                    // new selection. But a rapid same-spot follow-up is a Shift+
+                    // double/triple-click whose first release entered compose:
+                    // abandon compose and let the normal word/line select run.
                     if active.composing {
-                        if active.mods.shift_key() {
+                        let now = Instant::now();
+                        let continuation = matches!(active.last_click, Some((t, (lx, ly)))
+                            if now.duration_since(t) < Duration::from_millis(400)
+                               && (mx - lx).abs() < 5.0 && (my - ly).abs() < 5.0);
+                        if continuation {
+                            active.composing = false;
+                            active.shift_press = false;
+                            // fall through to the normal press handling below
+                        } else if active.mods.shift_key() {
+                            // Shift+click sets the end at the clicked cell and commits.
                             if let Some((pane, col, row)) = Self::cell_at(active, mx, my) {
                                 if let Some(sel) = active.selection.as_mut() {
                                     if sel.pane == pane {
@@ -632,14 +642,15 @@ Replace the Task-3 compose intercept at the top of the left-press arm (`main.rs:
                                 }
                             }
                             Self::compose_commit(active);
+                            return;
                         } else {
-                            Self::compose_cancel(active);
+                            Self::compose_cancel(active); // a plain click cancels
+                            return;
                         }
-                        return;
                     }
 ```
 
-(Confirm `mx`/`my` are in scope at the top of the arm; the arm computes the pointer position early — if `mx`/`my` are derived later, use `active.mouse.0`/`active.mouse.1`, which `cell_at` also accepts.)
+(Confirm `mx`/`my` are in scope at the top of the arm; the arm computes the pointer position early — if `mx`/`my` are derived later, use `active.mouse.0`/`active.mouse.1`, which `cell_at` also accepts. `now`/`last_click`/the 400ms·5px predicate mirror the existing click-count logic later in the arm.)
 
 - [ ] **Step 3: Enter commits in place**
 
