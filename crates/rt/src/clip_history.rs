@@ -55,6 +55,41 @@ impl ClipHistory {
     }
 }
 
+/// A one-line preview of a clip for the overlay: newlines shown as `↵`, tabs as
+/// spaces, truncated to `max_cols` characters with a trailing `…`. Never spans
+/// lines; the real (multi-line) text is only ever used at paste time.
+pub fn preview(text: &str, max_cols: usize) -> String {
+    let flat: String = text
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '\n' => '↵',
+            '\r' => '↵',
+            '\t' => ' ',
+            c => c,
+        })
+        .collect();
+    if flat.chars().count() <= max_cols {
+        return flat;
+    }
+    let keep = max_cols.saturating_sub(1);
+    let mut s: String = flat.chars().take(keep).collect();
+    s.push('…');
+    s
+}
+
+/// A compact size badge: `"<chars>c"`, prefixed with `"<lines>L·"` when the clip
+/// spans more than one line.
+pub fn badge(text: &str) -> String {
+    let chars = text.chars().count();
+    let lines = text.lines().count().max(1);
+    if lines > 1 {
+        format!("{lines}L·{chars}c")
+    } else {
+        format!("{chars}c")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +135,23 @@ mod tests {
         h.clear();
         assert!(h.is_empty());
         assert_eq!(h.get(0), None);
+    }
+
+    #[test]
+    fn preview_is_one_line_and_truncated() {
+        // Newlines become ↵, tabs become spaces, kept on one line.
+        assert_eq!(preview("git log\n--oneline", 40), "git log↵--oneline");
+        assert_eq!(preview("a\tb", 40), "a b");
+        // Truncation adds an ellipsis and never exceeds max_cols chars.
+        let p = preview("0123456789abcdef", 8);
+        assert_eq!(p.chars().count(), 8);
+        assert!(p.ends_with('…'));
+        assert_eq!(p, "0123456…");
+    }
+
+    #[test]
+    fn badge_counts_chars_and_lines() {
+        assert_eq!(badge("hello"), "5c");
+        assert_eq!(badge("a\nb\nc"), "3L·5c");
     }
 }
