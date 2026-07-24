@@ -391,6 +391,7 @@ struct Active {
     instr_tick: bool,                     // advance the instrument animation this frame (6fps, native path)
     last_instr_tick: Instant,             // when the instrument animation last advanced
     last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
+    autoscroll_accel: (isize, u32), // drag auto-scroll ramp: (last_dir, ticks held in the edge zone)
 }
 
 /// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
@@ -1132,6 +1133,7 @@ impl ApplicationHandler for App {
             instr_tick: false,
             last_instr_tick: Instant::now(),
             last_autoscroll: Instant::now(),
+            autoscroll_accel: (0, 0),
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so it can be screenshotted without synthetic input.
@@ -2867,6 +2869,7 @@ impl App {
     /// a tick that didn't scroll yet), so the caller keeps the loop awake.
     fn autoscroll_selection(active: &mut Active, now: Instant) -> bool {
         if !active.selecting {
+            active.autoscroll_accel = (0, 0); // drag ended: forget the ramp
             return false;
         }
         let Some(sel) = active.selection else { return false };
@@ -2875,18 +2878,24 @@ impl App {
         // +1 = scroll toward older history (pointer above top); -1 = toward newest.
         let dir: isize = if my < content.y { 1 } else if my >= content.y + content.h { -1 } else { 0 };
         if dir == 0 {
+            active.autoscroll_accel = (0, 0); // back inside the grid: restart slow next time
             return false; // pointer is within the grid: normal motion handling covers it
         }
-        // One line per ~35ms, independent of frame rate, so the scroll is smooth
-        // but not runaway-fast.
+        // One gated tick per ~35ms, independent of frame rate; the number of LINES
+        // per tick ramps the longer the pointer is held in the edge zone (feature C).
         if now.duration_since(active.last_autoscroll) < Duration::from_millis(35) {
             return true; // in the zone; ask the caller to keep waking us
         }
         active.last_autoscroll = now;
+        let (step, new_accel) =
+            autoscroll_step(active.autoscroll_accel, dir, active.settings.arrow_accel, active.settings.arrow_accel_max);
+        active.autoscroll_accel = new_accel;
         let (cw, _) = active.backend.cell_size();
         let (off, col, edge_row) = {
             let Some(pane) = active.session.pane(sel.pane) else { return false };
-            pane.scroll(dir); // move the view one line
+            for _ in 0..step {
+                pane.scroll(dir); // move the view `step` lines this tick
+            }
             let (offset, _, screen) = pane.scroll_info();
             let col = ((active.mouse.0 - content.x) / cw).max(0.0) as usize;
             // Extend to the top row when scrolling up, the bottom row when down.
@@ -5082,6 +5091,20 @@ fn arrow_accel_step(repeats: u32, max: u32) -> usize {
     (1 + repeats.saturating_sub(THRESHOLD) as usize).min(max)
 }
 
+/// Lines to scroll this drag-auto-scroll tick, and the next accel state. `state`
+/// is `(last_dir, ticks)` — the direction the ramp was built in and how many
+/// consecutive gated ticks it has been held. A change of `dir` (top edge ↔
+/// bottom edge) resets the ramp to the grace band. The line count follows the
+/// shared arrow-accel curve (`arrow_accel_step`) so keyboard and drag accelerate
+/// identically; with `accel` off it is always 1 (today's flat rate). `dir` is
+/// the current, non-zero scroll direction.
+fn autoscroll_step(state: (isize, u32), dir: isize, accel: bool, max: u32) -> (usize, (isize, u32)) {
+    let (last_dir, ticks) = state;
+    let ticks = if dir == last_dir { ticks } else { 0 }; // direction flip → restart the ramp
+    let step = if accel { arrow_accel_step(ticks, max) } else { 1 };
+    (step, (dir, ticks + 1))
+}
+
 fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -> (f32, f32, f32, f32) {
     let total = (history + screen) as f32; // whole buffer height in lines
     // Draw the scrollbar in the pane's right PADDING gutter (PANE_PAD = 5px, just RIGHT of
@@ -5447,5 +5470,40 @@ mod instr_tests {
         assert_eq!(w.moved, 0, "moved counter is consumed");
         assert!(w.rate > 0.0, "wire rate rises with activity");
         assert!(w.phase >= 0.0 && w.phase < 1.0, "wire phase stays in [0,1)");
+    }
+}
+
+#[cfg(test)]
+mod autoscroll_tests {
+    use super::autoscroll_step;
+
+    #[test]
+    fn grace_then_ramps_with_held_ticks_and_threads_state() {
+        // accel on, max 10. First tick (ticks 0) is in the grace band → 1 line;
+        // the returned state stores the direction and the incremented tick count.
+        let (s0, st1) = autoscroll_step((0, 0), 1, true, 10);
+        assert_eq!(s0, 1);
+        assert_eq!(st1, (1, 1));
+        // Held into the ramp: at ticks 5, arrow_accel_step(5,10) = 1 + (5-4) = 2.
+        assert_eq!(autoscroll_step((1, 5), 1, true, 10).0, 2);
+        // Capped at max regardless of how long it is held.
+        assert_eq!(autoscroll_step((1, 100), 1, true, 10).0, 10);
+    }
+
+    #[test]
+    fn off_is_always_one() {
+        // arrow_accel off → flat 1 line/tick (today's behavior), state still threads.
+        let (s, st) = autoscroll_step((1, 50), 1, false, 10);
+        assert_eq!(s, 1);
+        assert_eq!(st, (1, 51));
+    }
+
+    #[test]
+    fn direction_flip_resets_the_ramp() {
+        // Was fast scrolling up (dir 1, ticks 50); pointer now past the bottom
+        // (dir -1) → ramp resets to the grace band, new state starts at (-1, 1).
+        let (s, st) = autoscroll_step((1, 50), -1, true, 10);
+        assert_eq!(s, 1);
+        assert_eq!(st, (-1, 1));
     }
 }
