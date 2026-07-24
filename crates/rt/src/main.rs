@@ -5082,6 +5082,20 @@ fn arrow_accel_step(repeats: u32, max: u32) -> usize {
     (1 + repeats.saturating_sub(THRESHOLD) as usize).min(max)
 }
 
+/// Lines to scroll this drag-auto-scroll tick, and the next accel state. `state`
+/// is `(last_dir, ticks)` — the direction the ramp was built in and how many
+/// consecutive gated ticks it has been held. A change of `dir` (top edge ↔
+/// bottom edge) resets the ramp to the grace band. The line count follows the
+/// shared arrow-accel curve (`arrow_accel_step`) so keyboard and drag accelerate
+/// identically; with `accel` off it is always 1 (today's flat rate). `dir` is
+/// the current, non-zero scroll direction.
+fn autoscroll_step(state: (isize, u32), dir: isize, accel: bool, max: u32) -> (usize, (isize, u32)) {
+    let (last_dir, ticks) = state;
+    let ticks = if dir == last_dir { ticks } else { 0 }; // direction flip → restart the ramp
+    let step = if accel { arrow_accel_step(ticks, max) } else { 1 };
+    (step, (dir, ticks + 1))
+}
+
 fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -> (f32, f32, f32, f32) {
     let total = (history + screen) as f32; // whole buffer height in lines
     // Draw the scrollbar in the pane's right PADDING gutter (PANE_PAD = 5px, just RIGHT of
@@ -5447,5 +5461,40 @@ mod instr_tests {
         assert_eq!(w.moved, 0, "moved counter is consumed");
         assert!(w.rate > 0.0, "wire rate rises with activity");
         assert!(w.phase >= 0.0 && w.phase < 1.0, "wire phase stays in [0,1)");
+    }
+}
+
+#[cfg(test)]
+mod autoscroll_tests {
+    use super::autoscroll_step;
+
+    #[test]
+    fn grace_then_ramps_with_held_ticks_and_threads_state() {
+        // accel on, max 10. First tick (ticks 0) is in the grace band → 1 line;
+        // the returned state stores the direction and the incremented tick count.
+        let (s0, st1) = autoscroll_step((0, 0), 1, true, 10);
+        assert_eq!(s0, 1);
+        assert_eq!(st1, (1, 1));
+        // Held into the ramp: at ticks 5, arrow_accel_step(5,10) = 1 + (5-4) = 2.
+        assert_eq!(autoscroll_step((1, 5), 1, true, 10).0, 2);
+        // Capped at max regardless of how long it is held.
+        assert_eq!(autoscroll_step((1, 100), 1, true, 10).0, 10);
+    }
+
+    #[test]
+    fn off_is_always_one() {
+        // arrow_accel off → flat 1 line/tick (today's behavior), state still threads.
+        let (s, st) = autoscroll_step((1, 50), 1, false, 10);
+        assert_eq!(s, 1);
+        assert_eq!(st, (1, 51));
+    }
+
+    #[test]
+    fn direction_flip_resets_the_ramp() {
+        // Was fast scrolling up (dir 1, ticks 50); pointer now past the bottom
+        // (dir -1) → ramp resets to the grace band, new state starts at (-1, 1).
+        let (s, st) = autoscroll_step((1, 50), -1, true, 10);
+        assert_eq!(s, 1);
+        assert_eq!(st, (-1, 1));
     }
 }
