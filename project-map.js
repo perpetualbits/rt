@@ -104,7 +104,7 @@ window.PROJECT_MAP = {
       parts: [
         { label: "Drag / word / line select", status: "done", desc: "Copy-on-select to PRIMARY; wrap-aware word and logical-line." },
         { label: "Anchored mode", status: "done", desc: "Shipped v0.3.12: Shift-click anchor → navigate → commit, block via Ctrl." },
-        { label: "Clipboard history in titlebar (B)", status: "planned", desc: "A ring of recent clippings, surfaced and clickable in the titlebar." },
+        { label: "Clipboard history in titlebar (B)", status: "active", desc: "In-memory MRU ring of recent clippings; titlebar affordance + Ctrl+Shift+H overlay pastes a chosen clip. Design approved 2026-07-24." },
         { label: "Drag auto-scroll acceleration (C)", status: "planned", desc: "Ramp the fixed 35ms edge auto-scroll the way the arrow keys accelerate." }
       ],
       deps: ["rt-session"]
