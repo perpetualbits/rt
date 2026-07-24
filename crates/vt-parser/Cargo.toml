@@ -1,6 +1,6 @@
 [package]
 name = "vt-parser"
-version = "0.3.11"
+version = "0.3.12"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "rt's in-house VT/ANSI parser: a clean-room Williams state machine turning a byte stream into an action stream, matching vte's observable actions (verified by differential testing). Keeps the memchr ground fast path and print_str batching."
