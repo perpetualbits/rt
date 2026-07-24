@@ -312,6 +312,7 @@ struct Active {
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
     clip_overlay: Option<usize>,          // clipboard-history overlay open, carrying the selected row
+    clip_affordance: Option<chrome::Recti>, // titlebar "⎘ N" hit-rect for the focused pane this frame, if drawn
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
     clip_history: clip_history::ClipHistory, // in-memory MRU ring of this session's copies
@@ -1056,6 +1057,7 @@ impl ApplicationHandler for App {
             menu: None,
             menu_hover: None,
             clip_overlay: None,
+            clip_affordance: None,
             ime_preedit: false,
             clipboard,
             clip_history: clip_history::ClipHistory::new(),
@@ -1973,6 +1975,17 @@ impl ApplicationHandler for App {
                         let size = active.window.inner_size();
                         let bounds = content_bounds(size);
                         let (mx, my) = active.mouse;
+                        // A press on the clipboard-history titlebar affordance opens
+                        // the overlay. Checked first (like the jack/divider/scrollbar
+                        // hit-tests below) so it wins over click-to-focus/selection —
+                        // the rect only exists on the focused pane's titlebar, where
+                        // `cell_at` would return None (no selection) anyway.
+                        if let Some(r) = active.clip_affordance {
+                            if r.contains(active.mouse) {
+                                Self::open_clip_history(active);
+                                return;
+                            }
+                        }
                         // A press on an output jack starts a drag-to-wire. Checked
                         // *before* the divider, since jacks sit on the pane edge
                         // (which is also the divider) and should win.
@@ -3626,6 +3639,11 @@ impl App {
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, cell_h) = active.backend.cell_size(); // px per cell
         let sep = column_separator(active.settings.foreground, cfg_bg); // fg/bg midpoint: visible but not text-weight
+        // Reset the clip-history titlebar affordance's hit-rect before the
+        // per-pane pass: it is set at most once below (focused pane, non-empty
+        // history), so a stale rect from a previous frame must not survive the
+        // pane unfocusing or the history emptying.
+        active.clip_affordance = None;
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.) Iterates the pre-fetched
         // snapshots so the engine's damage state is not advanced again here.
@@ -3956,6 +3974,18 @@ impl App {
                         }
                         left_of = mx; // title truncates before the meter
                     }
+                }
+                // Clipboard-history affordance: on the focused pane's titlebar, a
+                // clip glyph + count that opens the history overlay on click.
+                if focused && !active.clip_history.is_empty() {
+                    let label = format!("⎘ {}", active.clip_history.len());
+                    let lw = label.chars().count() as f32 * cell_w;
+                    let lx = (left_of - 2.0 * cell_w - lw).max(left_x);
+                    for (i, ch) in label.chars().enumerate() {
+                        active.backend.draw_char(lx, text_top, i, 0, ch, Color::rgb(0x8b, 0x98, 0xa9), false, false);
+                    }
+                    active.clip_affordance = Some(chrome::Recti { x: lx, y: full.y, w: lw, h: bar_h });
+                    left_of = lx;
                 }
                 // Title on the left, truncated so it never runs into the meter/size.
                 // While composing an anchored selection in this pane, replace the

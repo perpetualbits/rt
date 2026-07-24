@@ -30,6 +30,7 @@ fn items() -> Vec<Item> {
         Item::Action("New Tab", Action::NewTab),
         Item::Action("Maximise / Restore Pane", Action::ToggleZoom),
         Item::Action("Search Scrollback…", Action::Search),
+        Item::Action("Clear Clipboard History", Action::ClearClipHistory),
         Item::Separator,
         Item::Action("Close Terminal", Action::CloseTerm),
         Item::Separator,
