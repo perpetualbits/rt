@@ -391,6 +391,7 @@ struct Active {
     instr_tick: bool,                     // advance the instrument animation this frame (6fps, native path)
     last_instr_tick: Instant,             // when the instrument animation last advanced
     last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
+    autoscroll_accel: (isize, u32), // drag auto-scroll ramp: (last_dir, ticks held in the edge zone)
 }
 
 /// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
@@ -1132,6 +1133,7 @@ impl ApplicationHandler for App {
             instr_tick: false,
             last_instr_tick: Instant::now(),
             last_autoscroll: Instant::now(),
+            autoscroll_accel: (0, 0),
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so it can be screenshotted without synthetic input.
@@ -2867,6 +2869,7 @@ impl App {
     /// a tick that didn't scroll yet), so the caller keeps the loop awake.
     fn autoscroll_selection(active: &mut Active, now: Instant) -> bool {
         if !active.selecting {
+            active.autoscroll_accel = (0, 0); // drag ended: forget the ramp
             return false;
         }
         let Some(sel) = active.selection else { return false };
@@ -2875,18 +2878,24 @@ impl App {
         // +1 = scroll toward older history (pointer above top); -1 = toward newest.
         let dir: isize = if my < content.y { 1 } else if my >= content.y + content.h { -1 } else { 0 };
         if dir == 0 {
+            active.autoscroll_accel = (0, 0); // back inside the grid: restart slow next time
             return false; // pointer is within the grid: normal motion handling covers it
         }
-        // One line per ~35ms, independent of frame rate, so the scroll is smooth
-        // but not runaway-fast.
+        // One gated tick per ~35ms, independent of frame rate; the number of LINES
+        // per tick ramps the longer the pointer is held in the edge zone (feature C).
         if now.duration_since(active.last_autoscroll) < Duration::from_millis(35) {
             return true; // in the zone; ask the caller to keep waking us
         }
         active.last_autoscroll = now;
+        let (step, new_accel) =
+            autoscroll_step(active.autoscroll_accel, dir, active.settings.arrow_accel, active.settings.arrow_accel_max);
+        active.autoscroll_accel = new_accel;
         let (cw, _) = active.backend.cell_size();
         let (off, col, edge_row) = {
             let Some(pane) = active.session.pane(sel.pane) else { return false };
-            pane.scroll(dir); // move the view one line
+            for _ in 0..step {
+                pane.scroll(dir); // move the view `step` lines this tick
+            }
             let (offset, _, screen) = pane.scroll_info();
             let col = ((active.mouse.0 - content.x) / cw).max(0.0) as usize;
             // Extend to the top row when scrolling up, the bottom row when down.
