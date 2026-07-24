@@ -1837,12 +1837,34 @@ impl ApplicationHandler for App {
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
                     // While composing an anchored selection, a click finishes or
-                    // aborts it — it never starts a new selection.
+                    // aborts it — it never starts a new selection. EXCEPT: a
+                    // Shift+double/triple-click is two press/release pairs, and the
+                    // FIRST press always resolves as a plain single-click (the
+                    // click-count counter only advances on the *next* press), so its
+                    // release — no drag, shift held — promotes into compose before the
+                    // second press ever arrives. Without this check that second press
+                    // would just cancel compose and swallow the word/line selection.
+                    // Detect that continuation with the same timing+proximity test the
+                    // click-count logic below uses, and if it matches, abandon compose
+                    // and fall through so the word/line select still runs.
                     if active.composing {
-                        // (Shift+click → set head + commit is added in Task 6;
-                        // for now any click cancels so the mode is always escapable.)
-                        Self::compose_cancel(active);
-                        return;
+                        let now = Instant::now();
+                        let (mx, my) = active.mouse;
+                        let continuation = matches!(active.last_click, Some((t, (lx, ly)))
+                            if now.duration_since(t) < Duration::from_millis(400)
+                                && (mx - lx).abs() < 5.0 && (my - ly).abs() < 5.0);
+                        if continuation {
+                            // A Shift+double/triple-click whose first release entered
+                            // compose: abandon compose and let the normal word/line
+                            // select below run.
+                            active.composing = false;
+                            active.shift_press = false;
+                        } else {
+                            // (Shift+click → set head + commit is added in Task 6;
+                            // for now any other click cancels so the mode is always escapable.)
+                            Self::compose_cancel(active);
+                            return;
+                        }
                     }
                     {
                         let size = active.window.inner_size();
