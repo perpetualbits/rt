@@ -3827,16 +3827,18 @@ impl App {
                 // never fights with the unfocused/dimmed title colour.
                 let composing_here =
                     active.composing && active.selection.is_some_and(|sel| sel.pane == id);
+                let avail = ((left_of - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
                 if composing_here {
                     let sel = active.selection.unwrap();
                     let status = select::status_text(sel.anchor, sel.head, sel.block);
                     let scol = Color::rgb(0x6a, 0xa9, 0xff); // the focus-accent blue
-                    for (i, ch) in status.chars().enumerate() {
+                    // Cap to the same room the title gets, so a long status ("◉
+                    // selecting · 12345 lines") never runs into the meter/size.
+                    for (i, ch) in status.chars().take(avail).enumerate() {
                         active.backend.draw_char(left_x, text_top, i, 0, ch, scol, false, false);
                     }
                 } else {
                     let title = active.session.title_of(id).filter(|t| !t.is_empty()).unwrap_or("Terminal");
-                    let avail = ((left_of - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
                     for (i, ch) in title.chars().take(avail).enumerate() {
                         active.backend.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
                     }
