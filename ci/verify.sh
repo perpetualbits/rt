@@ -28,14 +28,29 @@ done
 PKGS=(-p vt-parser -p vt-conformance)
 FAIL=0
 
-tests_cmd='cargo test -q -p vt-parser -p vt-conformance 2>&1 | grep -E "test result:|error\[|FAILED|panicked"'
+# Keep error: (colon) alongside error[ so cargo/build errors (e.g. a dead path override →
+# "error: failed to update path override") stay VISIBLE in the filtered remote output
+# instead of being silently dropped and mistaken for a clean run.
+tests_cmd='cargo test -q -p vt-parser -p vt-conformance 2>&1 | grep -E "test result:|error\[|error:|FAILED|panicked"'
 bench_cmd='cargo run -q --release --example parser_bench -p vt-conformance 2>&1 | grep -vE "Compiling|Finished|Running|warning:"'
 
-check_output() { grep -qE "FAILED|error\[|panicked|0 passed; [1-9]" && return 1 || return 0; }
+# Evaluate one host's captured test output. A run PASSES only if it emitted at least one
+# "test result:" line AND shows no failure markers. Crucially, EMPTY or error-only output
+# (build failure, missing cargo, a dead .cargo/config.toml path override, an unreachable
+# host, …) has no "test result:" line → treated as FAILURE. This closes the trap where a
+# remote that produced nothing usable was silently counted as green (no riscv64 coverage).
+eval_run() { # $1 = label, $2 = captured output
+  local label=$1 out=$2
+  if printf '%s\n' "$out" | grep -qE "FAILED|panicked|error\[|error:"; then
+    echo "$label: FAIL (errors above)"; FAIL=1
+  elif ! printf '%s\n' "$out" | grep -qE "test result:"; then
+    echo "$label: FAIL (no 'test result:' line — build/env error or no output from host)"; FAIL=1
+  fi
+}
 
 echo "########## LOCAL ($(uname -m)) ##########"
-out=$(cargo test -q "${PKGS[@]}" 2>&1); echo "$out" | grep -E "test result:|error\[|FAILED|panicked"
-echo "$out" | grep -qE "FAILED|error\[|panicked" && { echo "LOCAL: FAIL"; FAIL=1; }
+out=$(cargo test -q "${PKGS[@]}" 2>&1); echo "$out" | grep -E "test result:|error\[|error:|FAILED|panicked"
+eval_run "LOCAL" "$out"
 if [ $BENCH = 1 ]; then eval "$bench_cmd"; fi
 
 for h in "${REMOTES[@]}"; do
@@ -45,7 +60,7 @@ for h in "${REMOTES[@]}"; do
   fi
   out=$(ssh "$h" ". ~/.cargo/env 2>/dev/null||true; cd ~/git/rt; $tests_cmd" 2>&1)
   echo "$out"
-  echo "$out" | grep -qE "FAILED|error\[|panicked" && { echo "$h: FAIL"; FAIL=1; }
+  eval_run "$h" "$out"
   if [ $BENCH = 1 ]; then
     ssh "$h" ". ~/.cargo/env 2>/dev/null||true; cd ~/git/rt; $bench_cmd" 2>&1
   fi
