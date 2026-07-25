@@ -1908,7 +1908,7 @@ impl Perform for Term {
                 (Some(&b'?'), 'l') => self.set_mode(&p, false),
                 // DECSCUSR: CSI Ps SP q (intermediate = space).
                 (Some(&b' '), 'q') => self.set_cursor_shape(p.first().copied().unwrap_or(0)),
-                (Some(&b'>'), 'c') => self.device_attributes(true), // DA2
+                (Some(&b'>'), 'c') if p.first().copied().unwrap_or(0) == 0 => self.device_attributes(true), // DA2
                 _ => {}
             }
             return;
@@ -1943,7 +1943,7 @@ impl Perform for Term {
             'r' => self.set_scroll_region(&p),
             'm' => self.sgr(&p),
             'n' => self.device_status(p.first().copied().unwrap_or(0)),
-            'c' => self.device_attributes(false), // DA1 (param 0/absent; alacritty ignores others)
+            'c' if p.first().copied().unwrap_or(0) == 0 => self.device_attributes(false), // DA1
             _ => {}
         }
     }
@@ -2008,6 +2008,7 @@ impl Term {
         if secondary {
             // vt-term's crate version in xterm's major*10000+minor*100+patch form.
             let v = env!("CARGO_PKG_VERSION");
+            let v = v.split('-').next().unwrap_or(v);
             let mut it = v.split('.').map(|s| s.parse::<u32>().unwrap_or(0));
             let (maj, min, pat) = (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0));
             let ver = maj * 10_000 + min * 100 + pat;
@@ -2159,6 +2160,13 @@ mod device_status_tests {
     }
 
     #[test]
+    fn da1_non_zero_param_is_silent() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[5c");
+        assert_eq!(t.take_output(), Vec::<u8>::new());
+    }
+
+    #[test]
     fn da2_secondary_device_attributes_shape() {
         let mut t = Term::new(80, 24);
         t.feed(b"\x1b[>c");
@@ -2166,5 +2174,12 @@ mod device_status_tests {
         // `\x1b[>0;<version>;1c` — version is vt-term's own (masked in the differential).
         assert!(out.starts_with(b"\x1b[>0;"), "got {out:?}");
         assert!(out.ends_with(b";1c"), "got {out:?}");
+    }
+
+    #[test]
+    fn da2_non_zero_param_is_silent() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[>5c");
+        assert_eq!(t.take_output(), Vec::<u8>::new());
     }
 }
