@@ -219,7 +219,7 @@ pub fn gen_script(seed: u64, tokens: usize) -> Vec<u8> {
     let mut r = Rng::new(seed);
     let mut out = Vec::new();
     for _ in 0..tokens {
-        match r.below(13) {
+        match r.below(15) {
             0..=4 => {
                 // a run of printable letters
                 let n = 1 + r.below(8);
@@ -256,6 +256,20 @@ pub fn gen_script(seed: u64, tokens: usize) -> Vec<u8> {
                 }
             }
             11 => out.push(b'e'), // (combining-mark case parked; see ledger)
+            13 => {
+                // ANSI SM/RM for IRM (4) and LNM (20): toggle insert / newline mode.
+                let mode = if r.below(2) == 0 { 4 } else { 20 };
+                let set = r.below(2) == 0;
+                out.extend_from_slice(b"\x1b[");
+                out.extend_from_slice(format!("{mode}").as_bytes());
+                out.push(if set { b'h' } else { b'l' });
+            }
+            14 => {
+                // DECSCUSR: CSI Ps SP q, Ps in 0..=6.
+                out.extend_from_slice(b"\x1b[");
+                out.extend_from_slice(format!("{}", r.below(7)).as_bytes());
+                out.extend_from_slice(b" q");
+            }
             5 => out.push(b'\n'),
             6 => out.push(b'\r'),
             7 => {
