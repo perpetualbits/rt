@@ -1908,6 +1908,7 @@ impl Perform for Term {
                 (Some(&b'?'), 'l') => self.set_mode(&p, false),
                 // DECSCUSR: CSI Ps SP q (intermediate = space).
                 (Some(&b' '), 'q') => self.set_cursor_shape(p.first().copied().unwrap_or(0)),
+                (Some(&b'>'), 'c') => self.device_attributes(true), // DA2
                 _ => {}
             }
             return;
@@ -1942,6 +1943,7 @@ impl Perform for Term {
             'r' => self.set_scroll_region(&p),
             'm' => self.sgr(&p),
             'n' => self.device_status(p.first().copied().unwrap_or(0)),
+            'c' => self.device_attributes(false), // DA1 (param 0/absent; alacritty ignores others)
             _ => {}
         }
     }
@@ -1994,6 +1996,24 @@ impl Term {
                 self.reply(format!("\x1b[{r};{c}R").as_bytes());
             }
             _ => {}
+        }
+    }
+
+    /// DA — Device Attributes. Matches alacritty `identify_terminal` (term/mod.rs:1367):
+    /// primary (`CSI c` / `CSI 0 c`) → `\x1b[?6c` (VT102); secondary (`CSI > c`) →
+    /// `\x1b[>0;<version>;1c`. The secondary version is this emulator's own — apps use it
+    /// only for feature sniffing — so it legitimately differs from the oracle's and is the
+    /// one field the differential masks.
+    fn device_attributes(&mut self, secondary: bool) {
+        if secondary {
+            // vt-term's crate version in xterm's major*10000+minor*100+patch form.
+            let v = env!("CARGO_PKG_VERSION");
+            let mut it = v.split('.').map(|s| s.parse::<u32>().unwrap_or(0));
+            let (maj, min, pat) = (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0));
+            let ver = maj * 10_000 + min * 100 + pat;
+            self.reply(format!("\x1b[>0;{ver};1c").as_bytes());
+        } else {
+            self.reply(b"\x1b[?6c");
         }
     }
 
@@ -2127,5 +2147,24 @@ mod device_status_tests {
         let mut t = Term::new(80, 24);
         t.feed(b"\x1b[9n");
         assert_eq!(t.take_output(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn da1_primary_device_attributes() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[c");
+        assert_eq!(t.take_output(), b"\x1b[?6c"); // VT102, matching alacritty
+        t.feed(b"\x1b[0c"); // explicit 0 is the same query
+        assert_eq!(t.take_output(), b"\x1b[?6c");
+    }
+
+    #[test]
+    fn da2_secondary_device_attributes_shape() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[>c");
+        let out = t.take_output();
+        // `\x1b[>0;<version>;1c` — version is vt-term's own (masked in the differential).
+        assert!(out.starts_with(b"\x1b[>0;"), "got {out:?}");
+        assert!(out.ends_with(b";1c"), "got {out:?}");
     }
 }
