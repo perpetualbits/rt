@@ -80,14 +80,23 @@ const DIM: u16 = 1 << 4;
 const HIDDEN: u16 = 1 << 5;
 const STRIKEOUT: u16 = 1 << 6;
 /// Trailing/leading spacer of a wide glyph — invisible (`c == ' '`) but NOT empty;
-/// overwriting it clears the wide glyph beside it (alacritty's WIDE_CHAR_SPACER /
-/// LEADING_WIDE_CHAR_SPACER).
+/// overwriting a TRAILING one clears the wide glyph beside it (alacritty's
+/// WIDE_CHAR_SPACER). See [`LEADING`] for the other kind.
 const SPACER: u16 = 1 << 7;
 /// Last cell of a soft-wrapped (autowrapped) row, as opposed to a hard break; reflow joins
 /// rows across it, and it makes the cell non-empty (alacritty's WRAPLINE).
 const WRAPLINE: u16 = 1 << 8;
+/// Marks a [`SPACER`] as the "before-wrap placeholder" alacritty writes at the last column
+/// when a wide glyph doesn't fit and must wrap to the next row (its `LEADING_WIDE_CHAR_SPACER`),
+/// as opposed to an ordinary TRAILING spacer (the second half of a wide glyph pair, its
+/// `WIDE_CHAR_SPACER`). The distinction matters for `clear_wide_left`'s cleanup: alacritty's
+/// `write_at_cursor` only treats `WIDE_CHAR | WIDE_CHAR_SPACER` as "overwriting something
+/// wide-related" — `LEADING_WIDE_CHAR_SPACER` is deliberately excluded, so overwriting a leading
+/// placeholder does NOT clear anything, while overwriting a real trailing spacer clears the
+/// glyph to its left. Always set together with `SPACER` (never alone).
+const LEADING: u16 = 1 << 9;
 /// The SGR-attribute bits (bold…strikeout) a printed cell inherits from the pen; the
-/// structural SPACER/WRAPLINE bits are per-cell and never copied from the pen.
+/// structural SPACER/WRAPLINE/LEADING bits are per-cell and never copied from the pen.
 const ATTR_MASK: u16 = BOLD | ITALIC | UNDERLINE | INVERSE | DIM | HIDDEN | STRIKEOUT;
 
 /// One grid cell: a character, its resolved fg/bg, and packed rendition/structural flags.
@@ -132,6 +141,12 @@ impl Cell {
     }
     pub fn spacer(&self) -> bool {
         self.flags & SPACER != 0
+    }
+    /// A [`SPACER`] written as the before-wrap placeholder (alacritty's
+    /// `LEADING_WIDE_CHAR_SPACER`), not an ordinary trailing spacer. Meaningless if
+    /// `spacer()` is false.
+    fn leading_spacer(&self) -> bool {
+        self.flags & LEADING != 0
     }
     pub fn wrapline(&self) -> bool {
         self.flags & WRAPLINE != 0
@@ -977,11 +992,15 @@ impl Term {
     /// Line feed: cursor down one, scrolling the region if already at its bottom.
     /// Does NOT clear `pending_wrap` — alacritty's linefeed/newline leave it set, so a
     /// char printed after a bare LF still wraps once more (matched behaviour).
+    ///
+    /// Deliberately ignores `newline_mode` (ANSI LNM): the vendored oracle's `vte::ansi`
+    /// parser calls `Handler::linefeed()` directly for the C0 LF/VT/FF bytes AND for
+    /// ESC D (IND) — never the `Handler::newline()` default method that would consult
+    /// `TermMode::LINE_FEED_NEW_LINE`. So in the oracle LNM has zero effect on any
+    /// linefeed's cursor behaviour; it is tracked only so DECRQM (`CSI 20 $p`) reports
+    /// it accurately. Confirmed empirically: feeding `\x1b[20hAB\n` to the vendored
+    /// alacritty leaves the cursor at column 2, not 0.
     fn line_feed(&mut self) {
-        if self.newline_mode {
-            self.col = 0;          // LNM: LF also carriage-returns
-            self.pending_wrap = false;
-        }
         if self.row == self.scroll_bottom {
             self.scroll_up(1);
         } else if self.row + 1 < self.rows {
@@ -1012,49 +1031,60 @@ impl Term {
     }
 
     /// Write a wide-glyph spacer at the cursor: a blank that carries the pen colours/
-    /// attrs and the `spacer` flag. Like `write_cell`, it cleans up the overwritten cell
-    /// first (the at-position half of alacritty's `write_at_cursor`).
-    ///
-    /// `leading` distinguishes the two spacer kinds. A *leading* spacer (placed at the last
-    /// column before a wide glyph wraps) may legitimately cut off a wide glyph to its left,
-    /// so it runs the full cleanup — matching alacritty, which `clear_wide`s the cell to the
-    /// left. A *trailing* spacer, however, is written immediately to the right of the wide
-    /// glyph we just placed this same call: the cell to its left is our OWN glyph and must
-    /// never be blanked. (Alacritty avoids this only because its grid is never left in an
-    /// inconsistent state; vt-term's single SPACER bit can leave a stale spacer that would
-    /// otherwise make the trailing-spacer cleanup blank our just-written glyph.)
-    fn write_spacer(&mut self, leading: bool) {
-        self.clear_wide_left_impl(leading);
-        let (fg, bg, flags) = (self.pen.fg, self.pen.bg, (self.pen.flags & ATTR_MASK) | SPACER);
+    /// attrs, the `SPACER` flag, and — for the before-wrap placeholder only — `LEADING`.
+    /// Like `write_cell`, it cleans up the overwritten cell first (the at-position half of
+    /// alacritty's `write_at_cursor`); that cleanup is now unconditional (see
+    /// `clear_wide_left`'s doc comment for why the old per-call-site `blank_left` toggle
+    /// was the wrong abstraction).
+    fn write_spacer(&mut self, is_leading: bool) {
+        self.clear_wide_left();
+        let mut flags = (self.pen.flags & ATTR_MASK) | SPACER;
+        if is_leading {
+            flags |= LEADING;
+        }
+        let (fg, bg) = (self.pen.fg, self.pen.bg);
         self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, flags };
         self.damage.cell(self.row, self.col);
     }
 
     /// Clear the cells related to a wide glyph before overwriting the cursor cell — a
     /// faithful port of alacritty's `write_at_cursor` cleanup (`term/mod.rs`), which only
-    /// runs when the cell being overwritten is a wide glyph or one of its spacers. Three
-    /// cases: overwriting the glyph drops its trailing spacer to the right; overwriting a
-    /// trailing spacer blanks the glyph to the left; and overwriting a wrapped wide glyph
-    /// (now at column 0/1) clears the leading spacer it left in the previous row's last
-    /// column. Missing the last case left a stray spacer that reflow misclassified — the
-    /// wide-glyph column-shift divergence.
+    /// runs when the cell being overwritten is a wide glyph or a TRAILING spacer (its
+    /// `WIDE_CHAR | WIDE_CHAR_SPACER`; a `LEADING_WIDE_CHAR_SPACER` — our before-wrap
+    /// placeholder — is deliberately excluded, so overwriting one clears nothing). Three
+    /// cases: overwriting the glyph drops its trailing spacer to the right (or, if it has
+    /// no right-hand neighbor because it is pinned at the very last column, falls through
+    /// to case two instead); overwriting a trailing spacer blanks the glyph to its left;
+    /// and overwriting a wrapped wide glyph (now at column 0/1) clears the leading spacer
+    /// it left in the previous row's last column.
+    ///
+    /// Unconditional now — an earlier version gated case two behind a per-call-site
+    /// `blank_left` flag (false only when writing a wide glyph's own just-placed trailing
+    /// spacer, to avoid apparently self-erasing that glyph). That was the wrong fix for a
+    /// real bug: alacritty's own insert-mode shift (`input()`'s raw cell swaps, ported here
+    /// as `insert_shift_for_print`) can leave an UNRELATED cell carrying a genuine trailing
+    /// `SPACER` flag immediately after we just wrote a fresh wide glyph, and the oracle DOES
+    /// blank that glyph in that case (confirmed with a whitebox cell dump against the
+    /// vendored engine) — alacritty has no special case here at all, it always clears
+    /// unconditionally. The actual leading-vs-trailing ambiguity is resolved by the
+    /// `LEADING` flag instead (see its doc comment), which needed adding regardless.
     fn clear_wide_left(&mut self) {
-        self.clear_wide_left_impl(true);
-    }
-    /// `blank_left`: whether overwriting a trailing spacer may blank the wide glyph to the
-    /// left (case C). True for glyph writes and leading-spacer writes; false when writing a
-    /// wide glyph's own trailing spacer (the left cell is that glyph — see [`write_spacer`]).
-    fn clear_wide_left_impl(&mut self, blank_left: bool) {
         let cur = self.grid[self.row][self.col];
         let wide = char_width(cur.c) == 2;
-        if wide && self.col + 1 < self.cols {
-            // Overwriting the wide glyph: drop its trailing spacer to the right.
-            self.grid[self.row][self.col + 1].flags &= !SPACER;
-            self.damage.cell(self.row, self.col + 1);
-        } else if blank_left && self.col > 0 && cur.spacer() && char_width(self.grid[self.row][self.col - 1].c) == 2 {
-            // Overwriting a trailing spacer: blank the wide glyph to its left.
-            self.grid[self.row][self.col - 1].c = ' ';
-            self.damage.cell(self.row, self.col - 1);
+        let trailing_spacer = cur.spacer() && !cur.leading_spacer();
+        if wide || trailing_spacer {
+            if wide && self.col + 1 < self.cols {
+                // Overwriting the wide glyph: drop its trailing spacer to the right.
+                self.grid[self.row][self.col + 1].flags &= !SPACER;
+                self.damage.cell(self.row, self.col + 1);
+            } else if self.col > 0 {
+                // Overwriting a trailing spacer, OR a wide glyph with no right-hand
+                // spacer to clear (pinned at the last column): blank the cell to the
+                // left. Matches alacritty's `clear_wide` exactly — it does NOT check
+                // that the left neighbor is actually a wide glyph before blanking it.
+                self.grid[self.row][self.col - 1].c = ' ';
+                self.damage.cell(self.row, self.col - 1);
+            }
         }
         // Overwriting a wrapped wide glyph (now at column 0/1): clear the leading spacer it
         // left in the PREVIOUS physical row's last column. That row is the row above in the
@@ -1062,11 +1092,8 @@ impl Term {
         // (alacritty indexes history as negative grid lines, so its `grid[line-1]` reaches
         // into history there; we index `history.back()` explicitly). Missing this left a
         // stray spacer that column reflow misclassified — the wide-glyph one-column-shift
-        // divergence. Our one SPACER bit can't distinguish a leading spacer from a trailing
-        // one (alacritty has two flags), so only clear it when it is a *leading* spacer: its
-        // predecessor is never a wide glyph (a trailing spacer's is), so `cols-2` not being
-        // wide identifies it — else we would orphan a legitimate wide glyph at `cols-2`.
-        if self.col <= 1 && (char_width(cur.c) == 2 || cur.spacer()) {
+        // divergence.
+        if self.col <= 1 && (wide || cur.spacer()) {
             let cols = self.cols;
             let last = cols - 1;
             let on_visible_prev = self.row > 0;
@@ -1077,11 +1104,8 @@ impl Term {
             };
             let mut cleared = false;
             if let Some(prev) = prev {
-                if prev.cells.len() >= cols
-                    && prev.cells[last].spacer()
-                    && (cols < 2 || char_width(prev.cells[cols - 2].c) != 2)
-                {
-                    prev.cells[last].flags &= !SPACER;
+                if prev.cells.len() >= cols && prev.cells[last].spacer() && prev.cells[last].leading_spacer() {
+                    prev.cells[last].flags &= !(SPACER | LEADING);
                     cleared = true;
                 }
             }
@@ -1121,7 +1145,7 @@ impl Term {
         // A wide glyph at the last column(s) is NOT shifted — it wraps via the normal
         // wide-glyph path below, so the rightmost cell isn't wrongly blanked.
         if self.insert_mode && self.col + width < self.cols {
-            self.insert_chars(width);
+            self.insert_shift_for_print(width);
         }
         // Cleanup of the cell(s) being overwritten is done per-write inside `write_cell`/
         // `write_spacer` (mirroring alacritty's `write_at_cursor`), so it runs at the ACTUAL
@@ -1292,6 +1316,10 @@ impl Term {
     }
 
     // ── Insert / delete ───────────────────────────────────────────────────────
+    /// Explicit ICH (`CSI Ps @`): shift `[col, cols)` right by `n`, blanking the freed
+    /// columns. Matches alacritty's `insert_blank`, which also swaps then explicitly
+    /// fills `source..destination` with a background blank — nothing gets printed
+    /// afterward, so the vacated cells must be real blanks, not the swapped-out tail.
     fn insert_chars(&mut self, n: usize) {
         let blank = self.blank();
         let row = &mut self.grid[self.row];
@@ -1303,6 +1331,40 @@ impl Term {
             row[c] = blank;
         }
         self.damage.span(self.row, self.col, self.cols - 1); // cursor..edge all shifted
+    }
+    /// IRM's inline shift, run just before printing a glyph in insert mode (`put_char`).
+    /// Unlike `insert_chars` (explicit ICH), this does NOT blank the vacated columns —
+    /// it matches alacritty's `input()` INSERT branch, which shifts via raw pairwise cell
+    /// swaps (`for col in (cursor..cols-width).rev() { row.swap(col+width, col) }`) and
+    /// relies on the glyph write immediately following to overwrite `[col, col+width)`.
+    ///
+    /// This is DELIBERATELY the exact swap sequence, not `[col..cols].rotate_right(width)`
+    /// — they agree only when `width` evenly divides the shifted length; otherwise (the
+    /// common case) the swap chain is a single width-`width`-stride permutation that
+    /// leaves the wrapped-around tail cells in REVERSED relative order, not rotate's
+    /// order-preserving shift. E.g. shifting `[m,N,界L,界SP,blank]` right by 2 (5 cells,
+    /// not a multiple of 2): the swap chain yields `[blank,界SP,m,N,界L]`, while
+    /// `rotate_right(2)` would give `[界SP,blank,m,N,界L]` — different cells end up
+    /// holding the SPACER flag. That difference is observable: the cell(s) shifted into
+    /// `[col, col+width)` carry whatever flags (notably the wide-glyph `SPACER` bit) were
+    /// on the row's tail before the shift, and `write_cell`/`write_spacer`'s
+    /// `clear_wide_left` cleanup inspects exactly that pre-overwrite content — so which
+    /// cell ends up spacer-flagged determines which neighbor gets a (spurious-looking but
+    /// oracle-matching) clear. Confirmed against the vendored oracle with a whitebox cell
+    /// dump: IRM + a wide glyph pinned at the last two columns + one more inserted
+    /// character reproduces exactly this swap-chain permutation.
+    fn insert_shift_for_print(&mut self, width: usize) {
+        let width = width.min(self.cols - self.col);
+        if width == 0 {
+            return;
+        }
+        let row = &mut self.grid[self.row];
+        let (col, cols) = (self.col, self.cols);
+        for c in (col..cols - width).rev() {
+            row.cells.swap(c + width, c);
+        }
+        row.occ = row.occ.max(cols);
+        self.damage.span(self.row, col, cols - 1);
     }
     fn delete_chars(&mut self, count: usize) {
         // Matches alacritty: the count is clamped to the FULL width (not cols−col), and
@@ -1339,6 +1401,17 @@ impl Term {
         }
         let (top, b) = (self.row, self.scroll_bottom);
         let n = n.min(b - top + 1);
+        // Matches alacritty: DL (`CSI Ps M`) rotates the grid via the SAME primitive a
+        // top-anchored linefeed scroll uses (`scroll_up_relative`, whose history push is
+        // keyed on `origin == 0` where origin is the CURSOR's row, not `scroll_top`). So
+        // when the cursor sits at the absolute top row, the evicted rows go into
+        // scrollback just like a normal scroll would — confirmed against the vendored
+        // oracle: `\x1b[M` on a fresh terminal (cursor at row 0) yields `history == 1`.
+        if top == 0 && !self.alt {
+            for r in 0..n {
+                self.push_history(self.grid[r].clone());
+            }
+        }
         self.grid[top..=b].rotate_left(n);
         let blank = self.blank();
         for r in (b + 1 - n)..=b {
@@ -1454,7 +1527,9 @@ impl Term {
 
     /// ANSI SM/RM (`CSI Ps h` / `CSI Ps l`, no `?`). vt-term supports the ANSI modes
     /// alacritty does: 20 = LNM (newline). Unknown modes are ignored,
-    /// matching the oracle (`set_mode`/`unset_mode`, term/mod.rs).
+    /// matching the oracle (`set_mode`/`unset_mode`, term/mod.rs). `newline_mode` is
+    /// tracked purely for DECRQM reporting — see `line_feed`'s doc comment for why it
+    /// has no effect on LF's cursor behaviour (matching the oracle exactly).
     fn set_ansi_mode(&mut self, p: &[u16], set: bool) {
         for &mode in p {
             match mode {
@@ -1541,10 +1616,16 @@ fn reflow_is_clear(row: &[Cell]) -> bool {
 fn reflow_is_wide(c: &Cell) -> bool {
     char_width(c.c) == 2
 }
-/// A *leading* wide-char spacer (alacritty's `LEADING_WIDE_CHAR_SPACER`): a spacer with no
-/// wide glyph immediately before it (as opposed to a wide glyph's trailing spacer).
+/// A *leading* wide-char spacer (alacritty's `LEADING_WIDE_CHAR_SPACER`): the before-wrap
+/// placeholder written when a wide glyph doesn't fit on the line, as opposed to an ordinary
+/// trailing spacer (a wide glyph's second half). Reads the explicit `LEADING` flag directly
+/// (matching alacritty's own `flags().contains(Flags::LEADING_WIDE_CHAR_SPACER)` check) —
+/// an earlier version used `char_width(row[i-1].c) != 2` as a proxy (no predecessor wide
+/// glyph), which misclassifies a stray/orphaned trailing-spacer flag (one insert-mode's
+/// `insert_shift_for_print` left on an unrelated cell, per its doc comment) as leading,
+/// wrongly truncating a column reflow should keep — the reflow-after-IRM divergence.
 fn reflow_is_leading_spacer(row: &[Cell], i: usize) -> bool {
-    row[i].flags & SPACER != 0 && (i == 0 || char_width(row[i - 1].c) != 2)
+    row[i].spacer() && row[i].leading_spacer()
 }
 /// Split cells beyond `columns` off `row`, trimming trailing empties from the remainder —
 /// alacritty's `Row::shrink`. Returns the (non-empty) overflow, or `None` if it all fits.
@@ -1975,8 +2056,20 @@ impl Perform for Term {
             'G' | '`' => self.set_col(count(&p, 0) - 1), // CHA / HPA
             'd' => self.set_row(count(&p, 0) - 1),        // VPA
             'H' | 'f' => self.goto(count(&p, 0) - 1, count(&p, 1) - 1),
-            'J' => self.erase_in_display(p.first().copied().unwrap_or(0)),
-            'K' => self.erase_in_line(p.first().copied().unwrap_or(0)),
+            // ED/EL: matches vte's own `ansi.rs` param validation exactly — `next_param_or(0)`
+            // mapped through an explicit 0..=3 (ED) / 0..=2 (EL) match with an `unhandled!();
+            // return` catch-all, so an out-of-range parameter (e.g. `CSI 7 K`) reaches the
+            // handler NEVER, not as some default mode. Silently falling through to "mode 0"
+            // (as a bare `unwrap_or` + match `_` arm would) is a real divergence, not a
+            // harmless default.
+            'J' => match p.first().copied().unwrap_or(0) {
+                m @ 0..=3 => self.erase_in_display(m),
+                _ => {}
+            },
+            'K' => match p.first().copied().unwrap_or(0) {
+                m @ 0..=2 => self.erase_in_line(m),
+                _ => {}
+            },
             'L' => self.insert_lines(count(&p, 0)),
             'M' => self.delete_lines(count(&p, 0)),
             '@' => self.insert_chars(count(&p, 0)),
@@ -2382,13 +2475,18 @@ mod lnm_tests {
     use super::*;
 
     #[test]
-    fn lnm_makes_linefeed_carriage_return() {
+    fn lnm_on_linefeed_keeps_column() {
+        // Matches the vendored oracle: alacritty's ansi parser calls `linefeed()`
+        // directly for LF (never the LNM-aware `newline()` default), so LNM has no
+        // effect on LF's cursor behaviour even when set. Confirmed empirically against
+        // the vendored engine (crates/vt-conformance) — feeding this same script there
+        // leaves the oracle's cursor at column 12 too.
         let mut t = Term::new(80, 24);
         t.feed(b"\x1b[5;10Habc");      // cursor to row5 col10 (1-based), print -> col advances
         t.feed(b"\x1b[20h");            // LNM on
-        t.feed(b"\n");                  // LF should now also CR -> column 0
+        t.feed(b"\n");                  // LF: column unaffected by LNM
         let (col, _line) = t.cursor();
-        assert_eq!(col, 0, "LNM on: LF returns to column 0");
+        assert_eq!(col, 12, "LNM on: LF still preserves column (matches oracle)");
     }
 
     #[test]
