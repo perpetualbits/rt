@@ -1114,7 +1114,10 @@ impl Term {
         // IRM (insert mode): shift the row's cells from the cursor right by the glyph
         // width, dropping the rightmost, then write into the freed cell(s). Matches
         // alacritty's INSERT branch in `input`. `insert_chars` is the same shift ICH uses.
-        if self.insert_mode {
+        // Match alacritty (term/mod.rs:1204): only shift when the glyph fits on the line.
+        // A wide glyph at the last column(s) is NOT shifted — it wraps via the normal
+        // wide-glyph path below, so the rightmost cell isn't wrongly blanked.
+        if self.insert_mode && self.col + width < self.cols {
             self.insert_chars(width);
         }
         // Cleanup of the cell(s) being overwritten is done per-write inside `write_cell`/
@@ -2376,5 +2379,30 @@ mod irm_tests {
         assert_eq!(t.take_output(), b"\x1b[4;2$y");
         t.feed(b"\x1b[4h\x1b[4$p");
         assert_eq!(t.take_output(), b"\x1b[4;1$y");
+    }
+
+    #[test]
+    fn irm_wide_glyph_at_edge_not_shifted() {
+        // Regression for a divergence found while implementing this task: a wide glyph
+        // that doesn't fit on the line (cursor at the last column) must NOT run the
+        // insert shift — alacritty only shifts when `col + width < cols` (term/mod.rs:
+        // 1204). Shifting anyway would blank the row's trailing cell via `insert_chars`'
+        // own clamp, even though the wide glyph never lands on this row at all (it wraps
+        // to the next row via the ordinary wide-glyph path).
+        let mut t = Term::new(5, 2);
+        t.feed(b"ABCDE\x1b[H");     // row0 = "ABCDE", cursor home
+        t.feed(b"\x1b[1;5H");       // cursor to row0 col4 (0-based) = last column
+        t.feed(b"\x1b[4h");         // IRM on
+        t.feed("\u{4e16}".as_bytes()); // wide glyph "世" (width 2): doesn't fit -> wraps
+        // Observable invariant: row0's trailing cell is exactly what the ordinary
+        // (non-insert) wide-glyph-wrap path leaves — a displaced leading spacer over
+        // the old 'E', NOT an insert-shift-blanked cell followed by a shifted-in
+        // survivor. I.e. no insert-shift touched row0 at all.
+        assert_eq!(row_string(&t, 0), "ABCD ");
+        // The wide glyph landed on the next row, at its start, untouched by any
+        // insert-shift clamp artifact (which would otherwise have corrupted its cells).
+        assert_eq!(t.cell(1, 0).c, '\u{4e16}');
+        let (col, line) = t.cursor();
+        assert_eq!((col, line), (2, 1));
     }
 }
