@@ -1909,6 +1909,10 @@ impl Perform for Term {
                 // DECSCUSR: CSI Ps SP q (intermediate = space).
                 (Some(&b' '), 'q') => self.set_cursor_shape(p.first().copied().unwrap_or(0)),
                 (Some(&b'>'), 'c') if p.first().copied().unwrap_or(0) == 0 => self.device_attributes(true), // DA2
+                // DECRQM: CSI ? Ps $ p (private modes).
+                (Some(&b'?'), 'p') if intermediates.last() == Some(&b'$') => self.report_mode(p.first().copied().unwrap_or(0), true),
+                // DECRQM: CSI Ps $ p (ANSI modes).
+                (Some(&b'$'), 'p') => self.report_mode(p.first().copied().unwrap_or(0), false),
                 _ => {}
             }
             return;
@@ -2016,6 +2020,36 @@ impl Term {
         } else {
             self.reply(b"\x1b[?6c");
         }
+    }
+
+    /// DECRQM — Request Mode (`CSI Ps $ p`, or `CSI ? Ps $ p` for private/DEC modes).
+    /// Replies `CSI [?] Ps ; St $ y` where St is the DEC mode state: 0 not-recognised,
+    /// 1 set, 2 reset (alacritty's `ModeState`, term/mod.rs:2387). We report the private
+    /// modes vt-term actually tracks; every other mode replies 0 — matching the oracle
+    /// wherever the oracle also has no state (see the plan's Task 3 design note for the
+    /// deliberately-excluded modes).
+    fn report_mode(&mut self, mode: u16, private: bool) {
+        // DEC mode state: 1 = set, 2 = reset (bool→ModeState), 0 = not recognised.
+        let st = |b: bool| if b { 1u8 } else { 2u8 };
+        let state: u8 = if private {
+            match mode {
+                1 => st(self.app_cursor),
+                6 => st(self.origin),
+                7 => st(self.autowrap),
+                25 => st(self.show_cursor),
+                1004 => st(self.focus_events),
+                1006 => st(self.mouse_sgr),
+                1007 => st(self.alt_scroll),
+                2004 => st(self.bracketed_paste),
+                1049 => st(self.alt_screen()),
+                2026 => 2, // SyncUpdate: alacritty always reports Reset
+                _ => 0,    // ColumnMode(3), unknown, and untracked → NotSupported
+            }
+        } else {
+            0 // vt-term tracks no ANSI modes yet (IRM/LNM unimplemented) → NotSupported
+        };
+        let marker = if private { "?" } else { "" };
+        self.reply(format!("\x1b[{marker}{mode};{state}$y").as_bytes());
     }
 
     /// Horizontal tab, matching alacritty: at a pending wrap it line-breaks; otherwise
@@ -2181,5 +2215,46 @@ mod device_status_tests {
         let mut t = Term::new(80, 24);
         t.feed(b"\x1b[>5c");
         assert_eq!(t.take_output(), Vec::<u8>::new());
+    }
+}
+
+#[cfg(test)]
+mod decrqm_tests {
+    use super::*;
+
+    #[test]
+    fn decrqm_private_tracked_modes() {
+        let mut t = Term::new(80, 24);
+        // DECOM (6): default reset → 2; set → 1.
+        t.feed(b"\x1b[?6$p");
+        assert_eq!(t.take_output(), b"\x1b[?6;2$y");
+        t.feed(b"\x1b[?6h\x1b[?6$p");
+        assert_eq!(t.take_output(), b"\x1b[?6;1$y");
+        // DECAWM (7): default set → 1.
+        t.feed(b"\x1b[?7$p");
+        assert_eq!(t.take_output(), b"\x1b[?7;1$y");
+        // DECTCEM (25): default set → 1; reset → 2.
+        t.feed(b"\x1b[?25l\x1b[?25$p");
+        assert_eq!(t.take_output(), b"\x1b[?25;2$y");
+        // Bracketed paste (2004): default reset → 2.
+        t.feed(b"\x1b[?2004$p");
+        assert_eq!(t.take_output(), b"\x1b[?2004;2$y");
+    }
+
+    #[test]
+    fn decrqm_fixed_and_unknown() {
+        let mut t = Term::new(80, 24);
+        // SyncUpdate (2026): alacritty always reports Reset(2).
+        t.feed(b"\x1b[?2026$p");
+        assert_eq!(t.take_output(), b"\x1b[?2026;2$y");
+        // ColumnMode (3): NotSupported(0).
+        t.feed(b"\x1b[?3$p");
+        assert_eq!(t.take_output(), b"\x1b[?3;0$y");
+        // Unknown private mode → 0.
+        t.feed(b"\x1b[?9999$p");
+        assert_eq!(t.take_output(), b"\x1b[?9999;0$y");
+        // Unknown ANSI mode → 0 (note: no `?`).
+        t.feed(b"\x1b[99$p");
+        assert_eq!(t.take_output(), b"\x1b[99;0$y");
     }
 }
