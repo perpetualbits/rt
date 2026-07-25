@@ -431,6 +431,8 @@ pub struct Term {
     display_offset: usize,
     /// Cursor shape (DECSCUSR); Term-global, not saved by the alt screen or DECSC.
     cursor_shape: CursorShape,
+    /// Cursor blink (DECSCUSR odd `Ps`, or DECSET/DECRST 12 directly); Term-global.
+    cursor_blink: bool,
     /// Mouse-reporting bits (DECSET 1000/1002/1003), independent of each other and of
     /// SGR (1006)/UTF-8 (1005) encoding — matches the oracle's `TermMode` bit model, so
     /// DECRQM can report each one on its own. Term-global.
@@ -491,6 +493,7 @@ impl Term {
             blank_pool: Vec::new(),
             display_offset: 0,
             cursor_shape: CursorShape::Block,
+            cursor_blink: false,
             mouse_click: false,
             mouse_drag: false,
             mouse_motion: false,
@@ -1430,6 +1433,7 @@ impl Term {
                     }
                 }
                 7 => self.autowrap = set,      // DECAWM
+                12 => self.cursor_blink = set, // cursor blink (att610)
                 25 => self.show_cursor = set,  // DECTCEM
                 47 | 1047 | 1049 => self.swap_alt(set),
                 // Mouse-reporting bits are independent (matches the oracle's `TermMode`
@@ -1461,13 +1465,16 @@ impl Term {
         }
     }
 
-    /// DECSCUSR (`CSI Ps SP q`): 0/1/2 = block, 3/4 = underline, 5/6 = bar. Blink ignored.
+    /// DECSCUSR (`CSI Ps SP q`): 0/1/2 = block, 3/4 = underline, 5/6 = bar; odd = blink.
     fn set_cursor_shape(&mut self, ps: u16) {
         self.cursor_shape = match ps {
             3 | 4 => CursorShape::Underline,
             5 | 6 => CursorShape::Beam,
             _ => CursorShape::Block,
         };
+        // Blink: 1/3/5 blink, 2/4/6 steady. Ps 0 = default; start with steady and let
+        // the DECRQM differential (Task 6) pin whether the oracle blinks on `\x1b[0 q`.
+        self.cursor_blink = matches!(ps, 1 | 3 | 5);
     }
 
     fn swap_alt(&mut self, to_alt: bool) {
@@ -2071,6 +2078,7 @@ impl Term {
                 1 => st(self.app_cursor),
                 6 => st(self.origin),
                 7 => st(self.autowrap),
+                12 => st(self.cursor_blink),
                 25 => st(self.show_cursor),
                 1000 => st(self.mouse_click),
                 1002 => st(self.mouse_drag),
@@ -2300,6 +2308,30 @@ mod decrqm_tests {
         // Unknown ANSI mode → 0 (note: no `?`).
         t.feed(b"\x1b[99$p");
         assert_eq!(t.take_output(), b"\x1b[99;0$y");
+    }
+}
+
+#[cfg(test)]
+mod cursor_shape_tests {
+    use super::*;
+
+    #[test]
+    fn decscusr_sets_shape() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[4 q"); assert_eq!(t.cursor_shape(), CursorShape::Underline); // steady underline
+        t.feed(b"\x1b[6 q"); assert_eq!(t.cursor_shape(), CursorShape::Beam);      // steady bar
+        t.feed(b"\x1b[2 q"); assert_eq!(t.cursor_shape(), CursorShape::Block);     // steady block
+    }
+
+    #[test]
+    fn decrqm_blink_from_decscusr_and_mode12() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[2 q");           // steady block -> blink off
+        t.feed(b"\x1b[?12$p"); assert_eq!(t.take_output(), b"\x1b[?12;2$y");
+        t.feed(b"\x1b[1 q");           // blinking block -> blink on
+        t.feed(b"\x1b[?12$p"); assert_eq!(t.take_output(), b"\x1b[?12;1$y");
+        t.feed(b"\x1b[?12l");          // mode 12 reset -> blink off
+        t.feed(b"\x1b[?12$p"); assert_eq!(t.take_output(), b"\x1b[?12;2$y");
     }
 }
 

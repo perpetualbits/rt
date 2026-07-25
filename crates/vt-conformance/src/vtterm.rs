@@ -57,7 +57,12 @@ impl VtEngine for vt_term::Term {
         }
         let (col, line) = self.cursor();
         let cursor = if self.cursor_visible() {
-            Some(NCursor { col, line, shape: 0, visible: true })
+            let shape = match self.cursor_shape() {
+                vt_term::CursorShape::Block => 0,
+                vt_term::CursorShape::Underline => 1,
+                vt_term::CursorShape::Beam => 2,
+            };
+            Some(NCursor { col, line, shape, visible: true })
         } else {
             None
         };
