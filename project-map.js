@@ -316,7 +316,7 @@ window.PROJECT_MAP = {
         { label: "Wide characters", status: "done", desc: "WIDE_CHAR / spacer handling matched to the oracle." },
         { label: "Reflow on resize", status: "done", desc: "Grow/shrink both dims incl. wide glyphs + scrollback: 0/20000." },
         { label: "Native damage tracking", status: "done", desc: "Per-line dirty spans + scroll signals; no per-frame full diff." },
-        { label: "OSC / DCS & query-report edges", status: "active", desc: "Not-yet-exercised sequence families being driven under the harness." }
+        { label: "OSC / DCS & query-report edges", status: "active", desc: "OSC (title) and query-report (DSR/CPR, DA1/DA2, DECRQM) done — the latter proven by a dedicated 0/4000 differential vs the oracle. DCS still unexercised." }
       ],
       deps: ["vt-parser"]
     },
@@ -334,6 +334,7 @@ window.PROJECT_MAP = {
       parts: [
         { label: "Chunk-invariance + spec suite", status: "done", desc: "Parser resumes across read boundaries; 32 spec cases pass." },
         { label: "Full + reflow differential", status: "done", desc: "0/10000 grid+cursor+modes+scrollback; 0/20000 resize." },
+        { label: "Query/report differential", status: "done", desc: "DSR/CPR, DA1/DA2, DECRQM interleaved with mode/cursor mutators; reply streams matched byte-for-byte (DA2 version masked), 0/4000 vs the oracle." },
         { label: "xtask verify / nightly soak", status: "planned", desc: "Phase 5: cargo xtask verify in CI + coverage-guided soak." }
       ],
       deps: ["vt-term", "vendored-oracle"]

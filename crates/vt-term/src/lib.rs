@@ -493,7 +493,7 @@ impl Term {
             mouse_mode: MouseMode::Off,
             mouse_sgr: false,
             focus_events: false,
-            alt_scroll: false,
+            alt_scroll: true, // xterm/alacritty both default DECSET 1007 (alt-screen wheel→arrows) on
             bracketed_paste: false,
             title: None,
             output: Vec::new(),
@@ -1400,7 +1400,15 @@ impl Term {
         for &mode in p {
             match mode {
                 1 => self.app_cursor = set,   // DECCKM
-                6 => self.origin = set,        // DECOM
+                6 => {
+                    // DECOM. Setting (not resetting) unconditionally homes the cursor —
+                    // matches alacritty's Origin handler, which calls goto(0,0) only on
+                    // set, even if the mode was already on.
+                    self.origin = set;
+                    if set {
+                        self.goto(0, 0);
+                    }
+                }
                 7 => self.autowrap = set,      // DECAWM
                 25 => self.show_cursor = set,  // DECTCEM
                 47 | 1047 | 1049 => self.swap_alt(set),
