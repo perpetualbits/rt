@@ -52,6 +52,12 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
   1006 → `mouse_sgr`, mutually exclusive like alacritty), DECSCUSR cursor shape
   (`cursor_shape`), and the OSC 0/2 window title (`take_title`) are tracked and exposed for
   a host to act on.
+- **Query / report.** DSR (`CSI 5 n` → `\x1b[0n`), CPR (`CSI 6 n` → `\x1b[{row};{col}R`,
+  absolute 1-based cursor), DA1 (`CSI c` / `CSI 0 c` → `\x1b[?6c`, VT102) and DA2
+  (`CSI > c` → `\x1b[>0;{version};1c`, this crate's own version — DA1/DA2 only reply
+  when the parameter is 0 or absent, matching alacritty), and DECRQM (`CSI Ps $ p` /
+  `CSI ? Ps $ p` → `CSI [?] Ps ; St $ y`) are all implemented and wired to a real PTY.
+  See "Query / report" below for the reply formats and drain contract.
 - **Reflow on resize.** Resize does lines first (a pure row move that scrolls to keep the
   cursor placed — into scrollback on the primary, discarded on the alt), then columns.
   Column reflow is a **faithful port of alacritty's `grow_columns`/`shrink_columns`**: a
@@ -61,6 +67,66 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
   needed. The alt screen doesn't reflow (truncate/extend + clamp), matching alacritty.
   ~95% of random resizes match the oracle exactly; the deepest wide-glyph edges remain —
   see the ledger.
+
+## Query / report
+
+Some CSI sequences don't mutate the grid — they ask the terminal a question, and the
+answer must go back to the child over the PTY (the host's write side, not the render
+side). `Term` models this with a second drainable buffer, parallel to `title`/
+`take_title`:
+
+- **`output: Vec<u8>`** collects host-bound reply bytes. The private `reply(&mut self,
+  bytes: &[u8])` helper (`output.extend_from_slice`) is called from the CSI dispatch
+  handlers below, during `feed`.
+- **`take_output(&mut self) -> Vec<u8>`** drains it (`mem::take`), exactly like
+  `take_title`. Empty when the last feed produced no reply. The host (`vtpane`'s reader
+  loop) calls it right after `feed` returns and writes whatever comes back straight to
+  the PTY — mirroring how the vendored engine answers `Event::PtyWrite`.
+
+**Timing.** Replies are generated **inline during `feed`**, at the exact point the query
+byte is parsed, and drained **immediately after** that `feed` call returns — never
+batched across feeds, never deferred to a later tick. This matters for CPR in particular:
+the reply must reflect the cursor position *at parse time*, i.e. after every grid
+mutation earlier in the same input chunk has already been applied and before any later
+chunk's mutations exist. Generating the reply eagerly, in dispatch order, is what makes
+that guarantee hold with zero extra bookkeeping — there is no "pending query" state to
+track, just bytes appended to a buffer in the same order the input was parsed.
+
+### Reply formats
+
+- **DSR (`CSI Ps n`, `device_status`).** `Ps = 5` (status) → `\x1b[0n` ("terminal OK").
+  `Ps = 6` (CPR, cursor position report) → `\x1b[{row};{col}R`, where `row`/`col` are the
+  **1-based, absolute** cursor position (`self.row + 1`, `self.col + 1` — the internal
+  fields are 0-based). Any other `Ps` is silently ignored, matching alacritty.
+- **DA1 (`CSI c` / `CSI 0 c`, `device_attributes(secondary=false)`)** → `\x1b[?6c` (VT102),
+  matching alacritty's `identify_terminal`.
+- **DA2 (`CSI > c`, `device_attributes(secondary=true)`)** → `\x1b[>0;{version};1c`, where
+  `version` is **vt-term's own** crate version (`CARGO_PKG_VERSION`, pre-release suffix
+  stripped, encoded as xterm's `major*10000 + minor*100 + patch`) — not the oracle's. Apps
+  only use this field for feature sniffing, so it legitimately differs from alacritty's;
+  it's the one field the conformance comparator masks (see `docs/engine-divergence.md`).
+- **DA1/DA2 parameter gate.** Both only reply when the CSI parameter is `0` or absent
+  (`p.first().copied().unwrap_or(0) == 0`) — a non-zero parameter is not a valid DA
+  request and gets no reply, matching alacritty.
+- **DECRQM (`CSI Ps $ p` for ANSI modes, `CSI ? Ps $ p` for private/DEC modes,
+  `report_mode`)** replies `CSI [?] Ps ; St $ y`, where `St` is the DEC mode state:
+  `0` = not recognised, `1` = set, `2` = reset. Only the private modes vt-term actually
+  tracks get a real `1`/`2`; every other mode (including all ANSI modes — IRM/LNM are not
+  yet implemented) reports `0`. The tracked-private-mode table:
+
+  | Mode | Meaning | Backing flag |
+  |---|---|---|
+  | 1 | DECCKM (app cursor keys) | `app_cursor` |
+  | 6 | DECOM (origin mode) | `origin` |
+  | 7 | DECAWM (autowrap) | `autowrap` |
+  | 25 | DECTCEM (cursor visible) | `show_cursor` |
+  | 1004 | Focus event reporting | `focus_events` |
+  | 1006 | SGR mouse encoding | `mouse_sgr` |
+  | 1007 | Alt-screen wheel → arrow keys | `alt_scroll` |
+  | 2004 | Bracketed paste | `bracketed_paste` |
+  | 1049 | Alt screen | `alt_screen()` |
+  | 2026 | Synchronized update | always `2` (reset) — matches alacritty, which never reports it set, even mid-sync |
+  | everything else | — | `0` (not recognised) |
 
 ## Verification
 

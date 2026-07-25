@@ -109,7 +109,14 @@ Also landed (Phase 1 finished 2026-07-21):
 Future options (not blocking; noted so they are not forgotten):
 - **Drive the actual Python esctest** — it relies on DSR/DECRQCRA report replies, so
   hooking it additionally exercises the engine's query/report path; a good Phase-3
-  forcing function.
+  forcing function. **PROGRESSED (2026-07-25):** the query/report path itself is done —
+  DSR/CPR, DA1/DA2, and DECRQM replies are implemented in vt-term, differentially
+  verified byte-for-byte against the oracle (`vtterm_report.rs`, **0/4000 on both x86_64
+  and riscv64**), and wired to the real PTY from `vtpane`'s reader loop (see
+  `docs/engine-divergence.md`). The actual Python `esctest` hookup is still pending — it
+  additionally needs DECRQCRA (request checksum of rectangular area) and related checksum
+  queries, which alacritty itself doesn't implement, so there's no oracle reply to match
+  yet; that's a later slice once we decide how to source a reference answer.
 - **(Deferred) foot** as an out-of-process tiebreak oracle — see "Deferred, do not
   forget".
 

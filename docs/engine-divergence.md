@@ -14,9 +14,14 @@ Status snapshot (2026-07-22):
 - Random-**resize** differential (`vtterm_reflow.rs`, 3000 scripts) — reflow on grow/shrink
   of both dims incl. wide glyphs and scrollback: **0 divergences** (verified 0/20000 in a
   wider sweep). Ceiling locked at 0.
+- Random query/report differential (`vtterm_report.rs`, 4000 scripts, added 2026-07-25) —
+  DSR/CPR, DA1/DA2, and DECRQM reply bytes interleaved with mode/cursor mutators, compared
+  byte-for-byte against the oracle's reply stream (not just observable `Term` state):
+  **0 divergences**, green on x86_64 AND riscv64. See "Query / report" below.
 
-**vt-term now matches the vendored oracle exactly on every fuzzed input, resize included.**
-The open items below are not-yet-exercised features (nothing in the fuzz reaches them yet).
+**vt-term now matches the vendored oracle exactly on every fuzzed input, resize and
+query/report included.** The open items below are not-yet-exercised features (nothing in
+the fuzz reaches them yet).
 
 ### Fixed under the harness (2026-07-21)
 Four alacritty behaviours the differential fuzz surfaced, each traced to a minimal
@@ -136,6 +141,55 @@ the fuzz (the generator emits no 2026). All four corpus fixtures now match the o
 whole-feed and chunk-split (`tests/replay.rs::replay_corpus_matches_oracle`). The raw
 `Parser::advance` path is unchanged, so the parser-vs-`vte` differential and the throughput
 bench are unaffected.
+
+## Query / report — implemented and verified (2026-07-25)
+
+DSR/CPR (`\x1b[5n` / `\x1b[6n`), DA1/DA2 (`\x1b[c` / `\x1b[>c`), and DECRQM
+(`\x1b[Ps$p` / `\x1b[?Ps$p`) are implemented in vt-term (`Term::device_status` /
+`device_attributes` / `report_mode`), surfaced through a drainable `output` buffer
+(`take_output`, parallel to `take_title`), and wired all the way to the real PTY from the
+`vtpane` reader loop — mirroring how the vendored engine answers `Event::PtyWrite`. See
+`docs/vt-term-design.md`'s "Query / report" section for the reply formats and the
+tracked-mode table.
+
+A new differential strand, `tests/vtterm_report.rs` in `vt-conformance`, interleaves the
+query set with mode- and cursor-mutating input and asserts the two engines' reply BYTE
+STREAMS match exactly (via `reports_match`) — the first strand that compares wire replies
+rather than the neutral `ScreenState`. **0/4000, on both x86_64 and riscv64** via
+`ci/verify.sh`; locked in as a regression ceiling like the other strands.
+
+**Intentional divergence: the DA2 version field.** `\x1b[>0;{version};1c` embeds the
+emulator's own version; apps use it only for feature sniffing, so vt-term legitimately
+reports its OWN crate version rather than the oracle's alacritty version. `reports_match`
+masks this one numeric field (`mask_da2` in `vt-conformance/src/lib.rs`) before comparing —
+every other byte of every reply must match exactly. This is a deliberate, documented
+difference, not a bug, and is the only masked field in the comparator.
+
+**Two reconciliations the differential forced into vt-term** (state that the earlier
+fuzz/reflow strands never observed, because nothing before read it back over the wire):
+- **DECSET 1007 (alternate-scroll mode) now defaults ON.** vt-term previously defaulted it
+  off; alacritty's `TermMode::default()` has it on (so mouse-wheel input on the alt screen
+  is translated to arrow keys unless a running app explicitly turns it off). Fixed by
+  flipping vt-term's default to match.
+- **DECOM (DECSET/DECRST 6, origin mode) now homes the cursor (`goto(0, 0)`) on SET
+  only, not on RESET.** Matches alacritty's `Origin` handler, which calls `goto(0,0)` only
+  when the mode is being turned ON — even if it was already on — and leaves the cursor
+  alone when the mode is turned off. The `goto` itself is origin-aware, consistent with the
+  rest of cursor motion.
+
+**Deliberately excluded from the differential (known gaps, awaiting the
+observable-state-edges slice).** DECRQM reports `0` (not-recognised) for any mode vt-term
+doesn't track, so the two engines would trivially "agree" on unimplemented modes if the
+fuzz queried them — the `vtterm_report.rs` `QUERIES` pool is therefore restricted to modes
+vt-term actually represents, and specifically excludes:
+- **ANSI IRM (mode 4, insert/replace)** and **LNM (mode 20, linefeed/newline)** — no ANSI
+  mode tracking exists yet.
+- **Private BlinkingCursor (12), Utf8Mouse (1005), UrgencyHints (1042)** — parsed (1005 even
+  has a side effect, see `set_mode`) but no dedicated tracked state a DECRQM reply could
+  read.
+- **The mouse-report trio (1000/1002/1003).** `mouse_mode` IS tracked, but `report_mode` has
+  no case for these yet, so a query today would under-report versus the oracle rather than
+  answer correctly — a real gap, not a masked field.
 
 ## Known not-yet-implemented (will diverge when exercised)
 
