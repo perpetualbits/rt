@@ -451,6 +451,10 @@ pub struct Term {
     bracketed_paste: bool,
     /// Pending window title set via OSC 0/2, consumed by [`take_title`](Term::take_title).
     title: Option<String>,
+    /// Bytes the terminal wants to send back to the host (query replies: DSR/CPR,
+    /// device attributes, DECRQM). Drained by [`take_output`](Term::take_output)
+    /// after each feed — mirrors `title`/`take_title`. Empty on the common path.
+    output: Vec<u8>,
     /// Per-frame visible-grid damage, marked at every mutation and drained by
     /// [`take_damage`](Term::take_damage) so a renderer redraws only changed cells.
     damage: GridDamage,
@@ -492,6 +496,7 @@ impl Term {
             alt_scroll: false,
             bracketed_paste: false,
             title: None,
+            output: Vec::new(),
             damage: GridDamage::new(cols, rows),
             parser: Parser::new(),
         }
@@ -761,6 +766,19 @@ impl Term {
     /// since the last call.
     pub fn take_title(&mut self) -> Option<String> {
         self.title.take()
+    }
+
+    /// Take the pending host-bound reply bytes (DSR/CPR, DA, DECRQM), clearing the
+    /// buffer. Empty when the last feed produced no query reply. The host writes these
+    /// straight back to the PTY (see rt-engine `vtpane`), exactly as the vendored engine
+    /// answers `Event::PtyWrite`.
+    pub fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.output)
+    }
+
+    /// Queue reply bytes for the host. Called from CSI query handlers during `feed`.
+    fn reply(&mut self, bytes: &[u8]) {
+        self.output.extend_from_slice(bytes);
     }
 
     // ── Scrollback viewport ────────────────────────────────────────────────────
@@ -1923,6 +1941,7 @@ impl Perform for Term {
             'T' => self.scroll_down(count(&p, 0)),
             'r' => self.set_scroll_region(&p),
             'm' => self.sgr(&p),
+            'n' => self.device_status(p.first().copied().unwrap_or(0)),
             _ => {}
         }
     }
@@ -1963,6 +1982,21 @@ impl Perform for Term {
 }
 
 impl Term {
+    /// DSR — Device Status Report (`CSI Ps n`). Matches alacritty `device_status`
+    /// (term/mod.rs:1442): 5 → terminal-OK, 6 → CPR (absolute, 1-based cursor).
+    /// Any other argument is silently ignored, as in the oracle.
+    fn device_status(&mut self, arg: u16) {
+        match arg {
+            5 => self.reply(b"\x1b[0n"),
+            6 => {
+                let r = self.row + 1;
+                let c = self.col + 1;
+                self.reply(format!("\x1b[{r};{c}R").as_bytes());
+            }
+            _ => {}
+        }
+    }
+
     /// Horizontal tab, matching alacritty: at a pending wrap it line-breaks; otherwise
     /// it writes a `\t` glyph into the (blank) starting cell, then advances to the next
     /// tab stop (every 8 columns), clamped to the last column.
@@ -2062,5 +2096,36 @@ mod scrollback_tests {
         assert_eq!(t.history_size(), 0, "ED 3 clears the history");
         assert_eq!(t.history_bytes, 0, "ED 3 must reset the byte accounting with it");
         assert_eq!(t.display_offset, 0, "ED 3 must snap the viewport to the (now empty) bottom");
+    }
+}
+
+#[cfg(test)]
+mod device_status_tests {
+    use super::*;
+
+    #[test]
+    fn dsr_status_report() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[5n");
+        assert_eq!(t.take_output(), b"\x1b[0n");
+        // Drained: a second take returns empty.
+        assert_eq!(t.take_output(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn cpr_reports_absolute_cursor_1based() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[6n"); // cursor home
+        assert_eq!(t.take_output(), b"\x1b[1;1R");
+        // Move to row 3, col 5 (CUP is 1-based) then query.
+        t.feed(b"\x1b[3;5H\x1b[6n");
+        assert_eq!(t.take_output(), b"\x1b[3;5R");
+    }
+
+    #[test]
+    fn dsr_unknown_arg_is_silent() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[9n");
+        assert_eq!(t.take_output(), Vec::<u8>::new());
     }
 }
