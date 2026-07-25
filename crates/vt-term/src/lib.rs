@@ -217,16 +217,6 @@ pub enum CursorShape {
     Beam,
 }
 
-/// Mouse-reporting protocol. Mutually exclusive, matching xterm/alacritty: DECSET
-/// 1000 → `Click`, 1002 → `Drag` (button-motion), 1003 → `Motion` (any-motion).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MouseMode {
-    Off,
-    Click,
-    Drag,
-    Motion,
-}
-
 /// A damaged (needs-redraw) span on one visible row: columns `left..=right` inclusive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LineDamage {
@@ -441,14 +431,20 @@ pub struct Term {
     display_offset: usize,
     /// Cursor shape (DECSCUSR); Term-global, not saved by the alt screen or DECSC.
     cursor_shape: CursorShape,
-    /// Active mouse-reporting protocol (DECSET 1000/1002/1003), and whether SGR encoding
-    /// (1006) is on. Term-global.
-    mouse_mode: MouseMode,
-    mouse_sgr: bool,
+    /// Mouse-reporting bits (DECSET 1000/1002/1003), independent of each other and of
+    /// SGR (1006)/UTF-8 (1005) encoding — matches the oracle's `TermMode` bit model, so
+    /// DECRQM can report each one on its own. Term-global.
+    mouse_click: bool,   // DECSET 1000
+    mouse_drag: bool,    // DECSET 1002 (button-motion)
+    mouse_motion: bool,  // DECSET 1003 (any-motion)
+    mouse_sgr: bool,     // DECSET 1006 (SGR encoding)
+    utf8_mouse: bool,    // DECSET 1005 (UTF-8 encoding; independent of SGR 1006)
     /// Input-affecting modes a host encodes keys/paste against (DECSET 1004/1007/2004).
     focus_events: bool,
     alt_scroll: bool,
     bracketed_paste: bool,
+    /// Urgency-hint window signalling (DECSET 1042). Term-global.
+    urgency_hints: bool,
     /// ANSI newline mode (SM/RM 20): when set, LF/VT/FF also carriage-return.
     newline_mode: bool,
     /// ANSI insert mode (SM/RM 4, IRM): when set, printing a character inserts at the
@@ -495,11 +491,15 @@ impl Term {
             blank_pool: Vec::new(),
             display_offset: 0,
             cursor_shape: CursorShape::Block,
-            mouse_mode: MouseMode::Off,
+            mouse_click: false,
+            mouse_drag: false,
+            mouse_motion: false,
             mouse_sgr: false,
+            utf8_mouse: false,
             focus_events: false,
             alt_scroll: true, // xterm/alacritty both default DECSET 1007 (alt-screen wheel→arrows) on
             bracketed_paste: false,
+            urgency_hints: false,
             newline_mode: false,
             insert_mode: false,
             title: None,
@@ -745,12 +745,12 @@ impl Term {
     }
     /// Whether any mouse reporting is enabled (DECSET 1000/1002/1003).
     pub fn wants_mouse(&self) -> bool {
-        self.mouse_mode != MouseMode::Off
+        self.mouse_click || self.mouse_drag || self.mouse_motion
     }
     /// Whether *any-motion* reporting is enabled (DECSET 1003) — matching rt-engine's
     /// `wants_motion`, which keys only on 1003, not 1002's button-motion.
     pub fn wants_motion(&self) -> bool {
-        self.mouse_mode == MouseMode::Motion
+        self.mouse_motion
     }
     /// Whether SGR mouse encoding (DECSET 1006) is active.
     pub fn mouse_sgr(&self) -> bool {
@@ -1432,16 +1432,17 @@ impl Term {
                 7 => self.autowrap = set,      // DECAWM
                 25 => self.show_cursor = set,  // DECTCEM
                 47 | 1047 | 1049 => self.swap_alt(set),
-                // Mouse protocols are mutually exclusive (xterm/alacritty): setting one
-                // replaces any other; resetting clears only if it is the active one.
-                1000 => self.mouse_mode = if set { MouseMode::Click } else { self.mouse_off_if(MouseMode::Click) },
-                1002 => self.mouse_mode = if set { MouseMode::Drag } else { self.mouse_off_if(MouseMode::Drag) },
-                1003 => self.mouse_mode = if set { MouseMode::Motion } else { self.mouse_off_if(MouseMode::Motion) },
-                1006 => self.mouse_sgr = set,             // SGR mouse encoding
-                1005 => if set { self.mouse_sgr = false }, // UTF-8 encoding clears SGR
-                1004 => self.focus_events = set,          // report focus in/out
-                1007 => self.alt_scroll = set,            // alt-screen wheel → arrow keys
-                2004 => self.bracketed_paste = set,       // bracketed paste
+                // Mouse-reporting bits are independent (matches the oracle's `TermMode`
+                // bit model): setting/resetting one leaves the others untouched.
+                1000 => self.mouse_click = set,
+                1002 => self.mouse_drag = set,
+                1003 => self.mouse_motion = set,
+                1006 => self.mouse_sgr = set,      // SGR encoding — independent
+                1005 => self.utf8_mouse = set,     // UTF-8 encoding — independent (does NOT touch mouse_sgr)
+                1004 => self.focus_events = set,   // report focus in/out
+                1007 => self.alt_scroll = set,     // alt-screen wheel → arrow keys
+                1042 => self.urgency_hints = set,  // urgency-hint window signalling
+                2004 => self.bracketed_paste = set, // bracketed paste
                 _ => {}
             }
         }
@@ -1457,16 +1458,6 @@ impl Term {
                 4 => self.insert_mode = set,   // IRM
                 _ => {}
             }
-        }
-    }
-
-    /// `Off` if `active` is the current mouse mode, else leave it unchanged — matches
-    /// alacritty removing only the specific mode bit on DECRST.
-    fn mouse_off_if(&self, active: MouseMode) -> MouseMode {
-        if self.mouse_mode == active {
-            MouseMode::Off
-        } else {
-            self.mouse_mode
         }
     }
 
@@ -2081,9 +2072,14 @@ impl Term {
                 6 => st(self.origin),
                 7 => st(self.autowrap),
                 25 => st(self.show_cursor),
+                1000 => st(self.mouse_click),
+                1002 => st(self.mouse_drag),
+                1003 => st(self.mouse_motion),
                 1004 => st(self.focus_events),
+                1005 => st(self.utf8_mouse),
                 1006 => st(self.mouse_sgr),
                 1007 => st(self.alt_scroll),
+                1042 => st(self.urgency_hints),
                 2004 => st(self.bracketed_paste),
                 1049 => st(self.alt_screen()),
                 2026 => 2, // SyncUpdate: alacritty always reports Reset
@@ -2304,6 +2300,48 @@ mod decrqm_tests {
         // Unknown ANSI mode → 0 (note: no `?`).
         t.feed(b"\x1b[99$p");
         assert_eq!(t.take_output(), b"\x1b[99;0$y");
+    }
+}
+
+#[cfg(test)]
+mod mouse_mode_tests {
+    use super::*;
+
+    #[test]
+    fn mouse_modes_are_independent() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[?1000h\x1b[?1003h"); // click + any-motion both on
+        t.feed(b"\x1b[?1000$p");
+        assert_eq!(t.take_output(), b"\x1b[?1000;1$y");
+        t.feed(b"\x1b[?1003$p");
+        assert_eq!(t.take_output(), b"\x1b[?1003;1$y");
+        // resetting one leaves the other
+        t.feed(b"\x1b[?1003l");
+        t.feed(b"\x1b[?1000$p");
+        assert_eq!(t.take_output(), b"\x1b[?1000;1$y");
+        t.feed(b"\x1b[?1003$p");
+        assert_eq!(t.take_output(), b"\x1b[?1003;2$y");
+        assert!(t.wants_mouse()); // 1000 still on
+    }
+
+    #[test]
+    fn utf8_mouse_does_not_clear_sgr() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[?1006h\x1b[?1005h"); // SGR then UTF8
+        assert!(t.mouse_sgr(), "1005 must NOT clear 1006");
+        t.feed(b"\x1b[?1005$p");
+        assert_eq!(t.take_output(), b"\x1b[?1005;1$y");
+        t.feed(b"\x1b[?1006$p");
+        assert_eq!(t.take_output(), b"\x1b[?1006;1$y");
+    }
+
+    #[test]
+    fn urgency_hints_flag() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[?1042$p");
+        assert_eq!(t.take_output(), b"\x1b[?1042;2$y");
+        t.feed(b"\x1b[?1042h\x1b[?1042$p");
+        assert_eq!(t.take_output(), b"\x1b[?1042;1$y");
     }
 }
 
