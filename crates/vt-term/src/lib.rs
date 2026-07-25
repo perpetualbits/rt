@@ -449,6 +449,8 @@ pub struct Term {
     focus_events: bool,
     alt_scroll: bool,
     bracketed_paste: bool,
+    /// ANSI newline mode (SM/RM 20): when set, LF/VT/FF also carriage-return.
+    newline_mode: bool,
     /// Pending window title set via OSC 0/2, consumed by [`take_title`](Term::take_title).
     title: Option<String>,
     /// Bytes the terminal wants to send back to the host (query replies: DSR/CPR,
@@ -495,6 +497,7 @@ impl Term {
             focus_events: false,
             alt_scroll: true, // xterm/alacritty both default DECSET 1007 (alt-screen wheel→arrows) on
             bracketed_paste: false,
+            newline_mode: false,
             title: None,
             output: Vec::new(),
             damage: GridDamage::new(cols, rows),
@@ -968,6 +971,10 @@ impl Term {
     /// Does NOT clear `pending_wrap` — alacritty's linefeed/newline leave it set, so a
     /// char printed after a bare LF still wraps once more (matched behaviour).
     fn line_feed(&mut self) {
+        if self.newline_mode {
+            self.col = 0;          // LNM: LF also carriage-returns
+            self.pending_wrap = false;
+        }
         if self.row == self.scroll_bottom {
             self.scroll_up(1);
         } else if self.row + 1 < self.rows {
@@ -1426,6 +1433,19 @@ impl Term {
             }
         }
     }
+
+    /// ANSI SM/RM (`CSI Ps h` / `CSI Ps l`, no `?`). vt-term supports the ANSI modes
+    /// alacritty does: 20 = LNM (newline). Unknown modes are ignored,
+    /// matching the oracle (`set_mode`/`unset_mode`, term/mod.rs).
+    fn set_ansi_mode(&mut self, p: &[u16], set: bool) {
+        for &mode in p {
+            match mode {
+                20 => self.newline_mode = set, // LNM
+                _ => {}
+            }
+        }
+    }
+
     /// `Off` if `active` is the current mouse mode, else leave it unchanged — matches
     /// alacritty removing only the specific mode bit on DECRST.
     fn mouse_off_if(&self, active: MouseMode) -> MouseMode {
@@ -1956,6 +1976,8 @@ impl Perform for Term {
             'm' => self.sgr(&p),
             'n' => self.device_status(p.first().copied().unwrap_or(0)),
             'c' if p.first().copied().unwrap_or(0) == 0 => self.device_attributes(false), // DA1
+            'h' => self.set_ansi_mode(&p, true),
+            'l' => self.set_ansi_mode(&p, false),
             _ => {}
         }
     }
@@ -2054,7 +2076,10 @@ impl Term {
                 _ => 0,    // ColumnMode(3), unknown, and untracked → NotSupported
             }
         } else {
-            0 // vt-term tracks no ANSI modes yet (IRM/LNM unimplemented) → NotSupported
+            match mode {
+                20 => st(self.newline_mode),
+                _ => 0,
+            }
         };
         let marker = if private { "?" } else { "" };
         self.reply(format!("\x1b[{marker}{mode};{state}$y").as_bytes());
@@ -2264,5 +2289,37 @@ mod decrqm_tests {
         // Unknown ANSI mode → 0 (note: no `?`).
         t.feed(b"\x1b[99$p");
         assert_eq!(t.take_output(), b"\x1b[99;0$y");
+    }
+}
+
+#[cfg(test)]
+mod lnm_tests {
+    use super::*;
+
+    #[test]
+    fn lnm_makes_linefeed_carriage_return() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[5;10Habc");      // cursor to row5 col10 (1-based), print -> col advances
+        t.feed(b"\x1b[20h");            // LNM on
+        t.feed(b"\n");                  // LF should now also CR -> column 0
+        let (col, _line) = t.cursor();
+        assert_eq!(col, 0, "LNM on: LF returns to column 0");
+    }
+
+    #[test]
+    fn lnm_off_linefeed_keeps_column() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[5;10Habc\x1b[20l\n"); // LNM explicitly off
+        let (col, _line) = t.cursor();
+        assert_eq!(col, 12, "LNM off: LF preserves column (col 10 + 'abc'=3 -> 0-based 12)");
+    }
+
+    #[test]
+    fn decrqm_ansi_lnm() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[20$p");
+        assert_eq!(t.take_output(), b"\x1b[20;2$y"); // default reset
+        t.feed(b"\x1b[20h\x1b[20$p");
+        assert_eq!(t.take_output(), b"\x1b[20;1$y"); // set
     }
 }
