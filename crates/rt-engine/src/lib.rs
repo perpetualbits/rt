@@ -1509,6 +1509,57 @@ mod damage_tests {
         assert!(seen, "writer thread never delivered the typed command to the shell");
     }
 
+    /// Task 6: the reader thread must drain vt-term's auto-generated replies
+    /// (`take_output()`) and forward them back through the PTY to the child, exactly as a
+    /// real terminal answers a query. `printf '\e[6n'` (DSR, cursor position report) makes
+    /// vt-term queue a `\e[row;colR` reply; the child then reads it off its own stdin (that's
+    /// how a real app like vim/tmux receives the answer to its handshake) and re-emits it
+    /// through `%q` so the raw ESC byte becomes literal, renderable text (`$'\E[...'`)
+    /// instead of being reinterpreted as another control sequence when it loops back through
+    /// vt-term. Proves the whole drain -> reply_tx -> writer-thread -> PTY path end to end,
+    /// without needing an interactive session.
+    #[test]
+    fn vtpane_answers_cursor_position_query() {
+        use std::time::{Duration, Instant};
+        let pane = vtpane::VtPane::spawn_env(
+            Some((
+                "/bin/bash".into(),
+                vec![
+                    "-c".into(),
+                    "printf '\\e[6n'; IFS= read -rs -t 5 -d R x; printf 'CPR_Q_ANSWER:%q\\n' \"$x\""
+                        .into(),
+                ],
+            )),
+            None,
+            80,
+            24,
+            &[],
+            1000,
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = pane.snapshot().to_text();
+            if text.contains("CPR_Q_ANSWER:") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            text.contains("CPR_Q_ANSWER:"),
+            "child never got past its `read` — no CPR reply arrived on its stdin: {text:?}"
+        );
+        // `%q` renders an embedded ESC as the literal text `\E`, so a real CSI cursor-position
+        // reply (not an empty/garbage answer from a dropped or malformed query) shows up as
+        // `$'\E[`, regardless of the exact row/col numbers.
+        assert!(
+            text.contains("CPR_Q_ANSWER:$'\\E["),
+            "reply didn't look like a CSI cursor position report: {text:?}"
+        );
+    }
+
     /// Copying a line that WRAPS across screen rows (one logical line, too long for the width)
     /// must NOT insert a newline at the wrap — otherwise a pasted key/URL/token gains spurious
     /// line breaks. 25 chars into a 20-wide pane wraps 20+5; the copy must rejoin them.

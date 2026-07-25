@@ -190,6 +190,8 @@ impl VtPane {
         });
 
         let (term_r, events_r, dirty_r) = (term.clone(), events.clone(), dirty.clone());
+        let reply_tx = input_tx.clone();
+        let reply_queued = queued_bytes.clone();
         // A second set of handles for the crash handler below (the loop moves the `*_r` set).
         let (events_c, dirty_c, exited_c, crashed_c) =
             (events.clone(), dirty.clone(), exited.clone(), crashed.clone());
@@ -214,9 +216,24 @@ impl VtPane {
                         }
                         Ok(n) => {
                             let mut title = None;
+                            let mut reply = Vec::new();
                             if let Ok(mut t) = term_r.lock() {
                                 t.feed(&buf[..n]);
                                 title = t.take_title(); // OSC 0/2 while holding the lock
+                                reply = t.take_output(); // DSR/CPR, DA, DECRQM replies
+                            }
+                            // Answer terminal queries by writing straight back to the PTY,
+                            // exactly as the vendored engine answers Event::PtyWrite
+                            // (rt-engine lib.rs:300). Replies are tiny and MUST NOT be
+                            // dropped (a swallowed CPR hangs the querying app), so unlike
+                            // `write` this path skips the WRITE_QUEUE_MAX cap. It keeps the
+                            // same queued_bytes accounting so the counter stays balanced.
+                            if !reply.is_empty() {
+                                reply_queued.fetch_add(reply.len(), Ordering::AcqRel);
+                                let len = reply.len();
+                                if reply_tx.send(reply).is_err() {
+                                    reply_queued.fetch_sub(len, Ordering::AcqRel);
+                                }
                             }
                             let mut q = events_r.lock().unwrap();
                             if let Some(t) = title {
@@ -301,8 +318,11 @@ impl VtPane {
         // Refuse to queue past WRITE_QUEUE_MAX: if the child has stalled and the writer
         // thread can't drain, growing the channel without bound is an OOM path. Dropping
         // here (rather than blocking, which would re-freeze the GUI) bounds memory; only a
-        // pathological paste into a wedged child ever reaches the cap. (Single writer of
-        // `queued_bytes` — the GUI thread — so the check-then-add needs no CAS.)
+        // pathological paste into a wedged child ever reaches the cap. (The GUI thread is
+        // the primary writer of `queued_bytes`, but the reader thread also adds atomically
+        // for query replies — see the reader loop above — so this check-then-add can
+        // momentarily overshoot WRITE_QUEUE_MAX by a few reply bytes; benign and bounded,
+        // and still needs no CAS since only this thread ever subtracts here.)
         if self.queued_bytes.load(Ordering::Acquire) + bytes.len() > WRITE_QUEUE_MAX {
             return;
         }
