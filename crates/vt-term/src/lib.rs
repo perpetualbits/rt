@@ -451,6 +451,9 @@ pub struct Term {
     bracketed_paste: bool,
     /// ANSI newline mode (SM/RM 20): when set, LF/VT/FF also carriage-return.
     newline_mode: bool,
+    /// ANSI insert mode (SM/RM 4, IRM): when set, printing a character inserts at the
+    /// cursor (shifting the row right, dropping the rightmost) instead of overwriting.
+    insert_mode: bool,
     /// Pending window title set via OSC 0/2, consumed by [`take_title`](Term::take_title).
     title: Option<String>,
     /// Bytes the terminal wants to send back to the host (query replies: DSR/CPR,
@@ -498,6 +501,7 @@ impl Term {
             alt_scroll: true, // xterm/alacritty both default DECSET 1007 (alt-screen wheel→arrows) on
             bracketed_paste: false,
             newline_mode: false,
+            insert_mode: false,
             title: None,
             output: Vec::new(),
             damage: GridDamage::new(cols, rows),
@@ -1107,6 +1111,12 @@ impl Term {
         if self.pending_wrap {
             self.soft_wrap();
         }
+        // IRM (insert mode): shift the row's cells from the cursor right by the glyph
+        // width, dropping the rightmost, then write into the freed cell(s). Matches
+        // alacritty's INSERT branch in `input`. `insert_chars` is the same shift ICH uses.
+        if self.insert_mode {
+            self.insert_chars(width);
+        }
         // Cleanup of the cell(s) being overwritten is done per-write inside `write_cell`/
         // `write_spacer` (mirroring alacritty's `write_at_cursor`), so it runs at the ACTUAL
         // write position — crucially, after a wide glyph autowraps to the next row, where it
@@ -1441,6 +1451,7 @@ impl Term {
         for &mode in p {
             match mode {
                 20 => self.newline_mode = set, // LNM
+                4 => self.insert_mode = set,   // IRM
                 _ => {}
             }
         }
@@ -1828,7 +1839,7 @@ impl Perform for Term {
     fn print_str(&mut self, s: &str) {
         // Only ASCII G0/GL is fast-pathed; a designated special-graphics set needs the
         // per-char mapping, so fall back wholesale (charsets can't change mid-run).
-        if self.charsets[self.gl] != Charset::Ascii {
+        if self.charsets[self.gl] != Charset::Ascii || self.insert_mode {
             for c in s.chars() {
                 self.put_char(c);
             }
@@ -2078,6 +2089,7 @@ impl Term {
         } else {
             match mode {
                 20 => st(self.newline_mode),
+                4 => st(self.insert_mode),
                 _ => 0,
             }
         };
@@ -2321,5 +2333,48 @@ mod lnm_tests {
         assert_eq!(t.take_output(), b"\x1b[20;2$y"); // default reset
         t.feed(b"\x1b[20h\x1b[20$p");
         assert_eq!(t.take_output(), b"\x1b[20;1$y"); // set
+    }
+}
+
+#[cfg(test)]
+mod irm_tests {
+    use super::*;
+
+    fn row_string(t: &Term, row: usize) -> String {
+        (0..t.cols()).map(|c| t.cell(row, c).c).collect()
+    }
+
+    #[test]
+    fn irm_inserts_shifting_cells_right() {
+        let mut t = Term::new(10, 2);
+        t.feed(b"ABCDE\x1b[H");   // row0 = "ABCDE     ", cursor home (row0 col0)
+        t.feed(b"\x1b[4h");        // IRM on
+        t.feed(b"X");              // insert X at col0 -> "XABCDE    "
+        assert_eq!(row_string(&t, 0), "XABCDE    ");
+        let (col, _l) = t.cursor();
+        assert_eq!(col, 1);
+    }
+
+    #[test]
+    fn irm_off_overwrites() {
+        let mut t = Term::new(10, 2);
+        t.feed(b"ABCDE\x1b[H\x1b[4lX"); // IRM explicitly off -> overwrite
+        assert_eq!(row_string(&t, 0), "XBCDE     ");
+    }
+
+    #[test]
+    fn irm_drops_last_cell_at_edge() {
+        let mut t = Term::new(5, 1);
+        t.feed(b"ABCDE\x1b[H\x1b[4hZ"); // insert at col0 in a full row -> "ZABCD" (E dropped)
+        assert_eq!(row_string(&t, 0), "ZABCD");
+    }
+
+    #[test]
+    fn decrqm_ansi_irm() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[4$p");
+        assert_eq!(t.take_output(), b"\x1b[4;2$y");
+        t.feed(b"\x1b[4h\x1b[4$p");
+        assert_eq!(t.take_output(), b"\x1b[4;1$y");
     }
 }
