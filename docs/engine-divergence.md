@@ -168,9 +168,10 @@ difference, not a bug, and is the only masked field in the comparator.
 **Two reconciliations the differential forced into vt-term** (state that the earlier
 fuzz/reflow strands never observed, because nothing before read it back over the wire):
 - **DECSET 1007 (alternate-scroll mode) now defaults ON.** vt-term previously defaulted it
-  off; alacritty's `TermMode::default()` has it on (so mouse-wheel input on the alt screen
-  is translated to arrow keys unless a running app explicitly turns it off). Fixed by
-  flipping vt-term's default to match.
+  off; alacritty's `TermMode::default()` has it on. In xterm/alacritty this mode makes the
+  alt-screen mouse wheel emit arrow keys, but rt does not yet act on `alt_scroll` for input —
+  so this flip is currently observable only as a corrected DECRQM `?1007$p` reply (now
+  matching the oracle). Fixed by flipping vt-term's default to match.
 - **DECOM (DECSET/DECRST 6, origin mode) now homes the cursor (`goto(0, 0)`) on SET
   only, not on RESET.** Matches alacritty's `Origin` handler, which calls `goto(0,0)` only
   when the mode is being turned ON — even if it was already on — and leaves the cursor
