@@ -146,6 +146,11 @@ pub trait VtEngine {
     fn resize(&mut self, cols: usize, rows: usize);
     /// Materialise the current observable state.
     fn observe(&self) -> ScreenState;
+    /// Drain the engine's pending host-bound reply bytes (query replies: DSR/CPR, DA,
+    /// DECRQM). Empty when the last feed produced none. This is the query/report
+    /// counterpart to `observe`: `observe` reads screen state, `take_output` reads what
+    /// the engine would write back to the PTY.
+    fn take_output(&mut self) -> Vec<u8>;
     /// Human name, for diagnostics.
     fn name() -> &'static str
     where
@@ -303,6 +308,59 @@ pub fn split(script: &[u8], seed: u64) -> Vec<&[u8]> {
     chunks
 }
 
+/// Compare two reply streams for the differential. Byte-equal, EXCEPT the DA2 secondary-
+/// device-attributes version field: `\x1b[>0;<version>;1c` embeds the emulator's own
+/// version, which vt-term legitimately reports differently from the oracle — an
+/// intentional, documented divergence (see docs/engine-divergence.md). We normalise that
+/// one numeric field before comparing; everything else must match exactly.
+pub fn reports_match(a: &[u8], b: &[u8]) -> bool {
+    mask_da2(a) == mask_da2(b)
+}
+
+/// Replace the version field of any `\x1b[>0;<n>;1c` DA2 reply with a fixed sentinel.
+fn mask_da2(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    let tag = b"\x1b[>0;";
+    while i < s.len() {
+        if s[i..].starts_with(tag) {
+            // Find the terminating `;1c` and drop the digits between.
+            if let Some(end) = s[i + tag.len()..].windows(3).position(|w| w == b";1c") {
+                out.extend_from_slice(tag);
+                out.extend_from_slice(b"V"); // version sentinel
+                out.extend_from_slice(b";1c");
+                i += tag.len() + end + 3;
+                continue;
+            }
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    out
+}
+
 pub mod spec;
 pub mod vendored;
 pub mod vtterm;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn oracle_and_vtterm_agree_on_cpr() {
+        use crate::{vendored::Vendored, VtEngine};
+        let mut o = Vendored::spawn(80, 24);
+        let mut v = <vt_term::Term as VtEngine>::spawn(80, 24);
+        for e in [&mut o as &mut dyn VtEngine, &mut v as &mut dyn VtEngine] {
+            e.feed(b"\x1b[3;5H\x1b[6n");
+        }
+        assert!(crate::reports_match(&o.take_output(), &v.take_output()));
+    }
+
+    #[test]
+    fn da2_version_is_masked() {
+        // Same shape, different version → still a match.
+        assert!(crate::reports_match(b"\x1b[>0;4001;1c", b"\x1b[>0;314;1c"));
+        // Different structure → not a match.
+        assert!(!crate::reports_match(b"\x1b[>0;1;1c", b"\x1b[?6c"));
+    }
+}

@@ -37,6 +37,9 @@ impl VtEngine for vt_term::Term {
     fn resize(&mut self, cols: usize, rows: usize) {
         vt_term::Term::resize(self, cols, rows)
     }
+    fn take_output(&mut self) -> Vec<u8> {
+        vt_term::Term::take_output(self)
+    }
     fn observe(&self) -> ScreenState {
         let (cols, rows) = (self.cols(), self.rows());
         let mut grid = vec![vec![NCell { ch: ' ', fg: NColor::Named(256), bg: NColor::Named(256), attrs: 0 }; cols]; rows];

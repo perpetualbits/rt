@@ -3,7 +3,10 @@
 //! reference every candidate engine is diffed against, and — via chunk-invariance —
 //! a useful test subject in its own right before the in-house engine exists.
 
-use alacritty_terminal::event::EventListener;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -11,11 +14,18 @@ use alacritty_terminal::vte::ansi::{self, Color, CursorShape};
 
 use crate::{attr, NCell, NColor, NCursor, ScreenState, VtEngine};
 
-/// A no-op event listener. `EventListener::send_event` has a default empty body, so
-/// terminal events (title, bell, query replies) are simply dropped — none of them
-/// affect grid state, which is all conformance compares.
-struct Noop;
-impl EventListener for Noop {}
+/// Captures the oracle's host-bound writes. `Term` calls `send_event(Event::PtyWrite(s))`
+/// for query replies (DSR/CPR, DA, DECRQM); we append the bytes so the harness can diff
+/// them against vt-term. All other events don't affect grid state or replies — dropped.
+#[derive(Clone)]
+struct Capture(Rc<RefCell<Vec<u8>>>);
+impl EventListener for Capture {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(text) = event {
+            self.0.borrow_mut().extend_from_slice(text.as_bytes());
+        }
+    }
+}
 
 /// Grid dimensions handed to `Term::new`/`resize`.
 struct Dims {
@@ -36,8 +46,9 @@ impl Dimensions for Dims {
 
 /// The vendored engine as a [`VtEngine`]: a `Term` plus the ANSI `Processor`.
 pub struct Vendored {
-    term: Term<Noop>,
+    term: Term<Capture>,
     parser: ansi::Processor,
+    out: Rc<RefCell<Vec<u8>>>,
 }
 
 /// Translate an alacritty cell colour to the neutral colour. Named colours 0..=15 are
@@ -94,8 +105,13 @@ impl VtEngine for Vendored {
         // Match rt-engine's configuration so the oracle behaves exactly like the
         // engine rt actually ships (same scrollback default).
         let config = Config { scrolling_history: 10_000, ..Config::default() };
-        let term = Term::new(config, &Dims { cols, rows }, Noop);
-        Vendored { term, parser: ansi::Processor::new() }
+        let out = Rc::new(RefCell::new(Vec::new()));
+        let term = Term::new(config, &Dims { cols, rows }, Capture(out.clone()));
+        Vendored { term, parser: ansi::Processor::new(), out }
+    }
+
+    fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.out.borrow_mut())
     }
 
     fn feed(&mut self, bytes: &[u8]) {
