@@ -316,7 +316,7 @@ window.PROJECT_MAP = {
         { label: "Wide characters", status: "done", desc: "WIDE_CHAR / spacer handling matched to the oracle." },
         { label: "Reflow on resize", status: "done", desc: "Grow/shrink both dims incl. wide glyphs + scrollback: 0/20000." },
         { label: "Native damage tracking", status: "done", desc: "Per-line dirty spans + scroll signals; no per-frame full diff." },
-        { label: "OSC / DCS & query-report edges", status: "active", desc: "OSC (title) and query-report (DSR/CPR, DA1/DA2, DECRQM) wired end-to-end: reply bytes proven byte-identical to the oracle by a dedicated 0/4000 differential, and the vtpane reader loop now forwards them to the real PTY so real apps (vim, tmux, vttest) under RT_ENGINE=vtterm actually get answered. DCS still unexercised." }
+        { label: "OSC / DCS & query-report edges", status: "active", desc: "query/report shipped v0.3.15: OSC (title) and query-report (DSR/CPR, DA1/DA2, DECRQM) wired end-to-end — reply bytes proven byte-identical to the oracle by a dedicated 0/4000 differential, and the vtpane reader loop now forwards them to the real PTY so real apps (vim, tmux, vttest) under RT_ENGINE=vtterm actually get answered. OSC side-effects (clipboard/hyperlink) and DCS still unexercised." }
       ],
       deps: ["vt-parser"]
     },
@@ -334,7 +334,7 @@ window.PROJECT_MAP = {
       parts: [
         { label: "Chunk-invariance + spec suite", status: "done", desc: "Parser resumes across read boundaries; 32 spec cases pass." },
         { label: "Full + reflow differential", status: "done", desc: "0/10000 grid+cursor+modes+scrollback; 0/20000 resize." },
-        { label: "Query/report differential", status: "done", desc: "DSR/CPR, DA1/DA2, DECRQM interleaved with mode/cursor mutators; reply streams matched byte-for-byte (DA2 version masked), 0/4000 vs the oracle." },
+        { label: "Query/report differential", status: "done", desc: "Shipped v0.3.15: DSR/CPR, DA1/DA2, DECRQM interleaved with mode/cursor mutators; reply streams matched byte-for-byte (DA2 version masked), 0/4000 vs the oracle on x86-64 AND riscv-64. Caught+fixed two real engine divergences (DECSET 1007 default, DECOM homing)." },
         { label: "xtask verify / nightly soak", status: "planned", desc: "Phase 5: cargo xtask verify in CI + coverage-guided soak." }
       ],
       deps: ["vt-term", "vendored-oracle"]
