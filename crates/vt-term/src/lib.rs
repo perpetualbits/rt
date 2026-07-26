@@ -448,19 +448,22 @@ pub struct Term {
     cursor_shape: CursorShape,
     /// Cursor blink (DECSCUSR odd `Ps`, or DECSET/DECRST 12 directly); Term-global.
     cursor_blink: bool,
-    /// Mouse-reporting bits (DECSET 1000/1002/1003), independent of each other and of
-    /// SGR (1006)/UTF-8 (1005) encoding — matches the oracle's `TermMode` bit model, so
-    /// DECRQM can report each one on its own. Term-global.
+    /// Mouse tracking bits (DECSET 1000/1002/1003): mutually exclusive on SET (setting
+    /// one clears the other two, matching the oracle's `TermMode::MOUSE_MODE` and real
+    /// xterm), but RESET only clears its own bit. The SGR (1006)/UTF-8 (1005) encodings
+    /// are likewise mutually exclusive on SET ("Mouse encodings are mutually exclusive"
+    /// per the oracle), independent of the tracking-mode bits above. Term-global.
     mouse_click: bool,   // DECSET 1000
     mouse_drag: bool,    // DECSET 1002 (button-motion)
     mouse_motion: bool,  // DECSET 1003 (any-motion)
     mouse_sgr: bool,     // DECSET 1006 (SGR encoding)
-    utf8_mouse: bool,    // DECSET 1005 (UTF-8 encoding; independent of SGR 1006)
+    utf8_mouse: bool,    // DECSET 1005 (UTF-8 encoding)
     /// Input-affecting modes a host encodes keys/paste against (DECSET 1004/1007/2004).
     focus_events: bool,
     alt_scroll: bool,
     bracketed_paste: bool,
-    /// Urgency-hint window signalling (DECSET 1042). Term-global.
+    /// Urgency-hint window signalling (DECSET 1042). Term-global. Defaults to set,
+    /// matching the oracle's `TermMode::default()` (which includes `URGENCY_HINTS`).
     urgency_hints: bool,
     /// ANSI newline mode (SM/RM 20): when set, LF/VT/FF also carriage-return.
     newline_mode: bool,
@@ -517,7 +520,7 @@ impl Term {
             focus_events: false,
             alt_scroll: true, // xterm/alacritty both default DECSET 1007 (alt-screen wheel→arrows) on
             bracketed_paste: false,
-            urgency_hints: false,
+            urgency_hints: true, // oracle's TermMode::default() includes URGENCY_HINTS
             newline_mode: false,
             insert_mode: false,
             title: None,
@@ -1509,13 +1512,46 @@ impl Term {
                 12 => self.cursor_blink = set, // cursor blink (att610)
                 25 => self.show_cursor = set,  // DECTCEM
                 47 | 1047 | 1049 => self.swap_alt(set),
-                // Mouse-reporting bits are independent (matches the oracle's `TermMode`
-                // bit model): setting/resetting one leaves the others untouched.
-                1000 => self.mouse_click = set,
-                1002 => self.mouse_drag = set,
-                1003 => self.mouse_motion = set,
-                1006 => self.mouse_sgr = set,      // SGR encoding — independent
-                1005 => self.utf8_mouse = set,     // UTF-8 encoding — independent (does NOT touch mouse_sgr)
+                // Mouse tracking modes 1000/1002/1003 are mutually exclusive on SET
+                // (matches the oracle's `TermMode::MOUSE_MODE` clear-then-insert, and
+                // real xterm: only one tracking mode is active at a time). RESET only
+                // clears its own bit — it does not touch the other two.
+                1000 => {
+                    if set {
+                        self.mouse_drag = false;
+                        self.mouse_motion = false;
+                    }
+                    self.mouse_click = set;
+                }
+                1002 => {
+                    if set {
+                        self.mouse_click = false;
+                        self.mouse_motion = false;
+                    }
+                    self.mouse_drag = set;
+                }
+                1003 => {
+                    if set {
+                        self.mouse_click = false;
+                        self.mouse_drag = false;
+                    }
+                    self.mouse_motion = set;
+                }
+                // Mouse encodings 1005/1006 are mutually exclusive on SET (matches the
+                // oracle: "Mouse encodings are mutually exclusive"), RESET only clears
+                // its own bit.
+                1006 => {
+                    if set {
+                        self.utf8_mouse = false;
+                    }
+                    self.mouse_sgr = set;
+                }
+                1005 => {
+                    if set {
+                        self.mouse_sgr = false;
+                    }
+                    self.utf8_mouse = set;
+                }
                 1004 => self.focus_events = set,   // report focus in/out
                 1007 => self.alt_scroll = set,     // alt-screen wheel → arrow keys
                 1042 => self.urgency_hints = set,  // urgency-hint window signalling
@@ -2433,37 +2469,57 @@ mod mouse_mode_tests {
     use super::*;
 
     #[test]
-    fn mouse_modes_are_independent() {
+    fn mouse_modes_are_mutually_exclusive_on_set() {
         let mut t = Term::new(80, 24);
-        t.feed(b"\x1b[?1000h\x1b[?1003h"); // click + any-motion both on
+        // Setting 1003 after 1000 clears 1000 — only one tracking mode active at a
+        // time, matching the oracle's `TermMode::MOUSE_MODE` clear-then-insert.
+        t.feed(b"\x1b[?1000h\x1b[?1003h");
         t.feed(b"\x1b[?1000$p");
-        assert_eq!(t.take_output(), b"\x1b[?1000;1$y");
+        assert_eq!(t.take_output(), b"\x1b[?1000;2$y");
         t.feed(b"\x1b[?1003$p");
         assert_eq!(t.take_output(), b"\x1b[?1003;1$y");
-        // resetting one leaves the other
-        t.feed(b"\x1b[?1003l");
-        t.feed(b"\x1b[?1000$p");
-        assert_eq!(t.take_output(), b"\x1b[?1000;1$y");
+        assert!(t.wants_mouse());
+
+        // RESET only clears its own bit, independent of the other two.
+        t.feed(b"\x1b[?1002h"); // now 1002 is the active mode, 1003 cleared
+        t.feed(b"\x1b[?1002$p");
+        assert_eq!(t.take_output(), b"\x1b[?1002;1$y");
         t.feed(b"\x1b[?1003$p");
         assert_eq!(t.take_output(), b"\x1b[?1003;2$y");
-        assert!(t.wants_mouse()); // 1000 still on
+        t.feed(b"\x1b[?1002l");
+        t.feed(b"\x1b[?1002$p");
+        assert_eq!(t.take_output(), b"\x1b[?1002;2$y");
+        assert!(!t.wants_mouse());
     }
 
     #[test]
-    fn utf8_mouse_does_not_clear_sgr() {
+    fn mouse_encodings_are_mutually_exclusive_on_set() {
         let mut t = Term::new(80, 24);
-        t.feed(b"\x1b[?1006h\x1b[?1005h"); // SGR then UTF8
-        assert!(t.mouse_sgr(), "1005 must NOT clear 1006");
+        // SGR then UTF8: setting 1005 clears 1006 — matches the oracle ("Mouse
+        // encodings are mutually exclusive").
+        t.feed(b"\x1b[?1006h\x1b[?1005h");
+        assert!(!t.mouse_sgr(), "1005 must clear 1006");
         t.feed(b"\x1b[?1005$p");
         assert_eq!(t.take_output(), b"\x1b[?1005;1$y");
         t.feed(b"\x1b[?1006$p");
-        assert_eq!(t.take_output(), b"\x1b[?1006;1$y");
+        assert_eq!(t.take_output(), b"\x1b[?1006;2$y");
+
+        // RESET only clears its own bit.
+        t.feed(b"\x1b[?1006h"); // now 1006 active, 1005 cleared
+        t.feed(b"\x1b[?1006l");
+        t.feed(b"\x1b[?1005$p");
+        assert_eq!(t.take_output(), b"\x1b[?1005;2$y");
+        t.feed(b"\x1b[?1006$p");
+        assert_eq!(t.take_output(), b"\x1b[?1006;2$y");
     }
 
     #[test]
     fn urgency_hints_flag() {
         let mut t = Term::new(80, 24);
+        // Defaults to set, matching the oracle's `TermMode::default()`.
         t.feed(b"\x1b[?1042$p");
+        assert_eq!(t.take_output(), b"\x1b[?1042;1$y");
+        t.feed(b"\x1b[?1042l\x1b[?1042$p");
         assert_eq!(t.take_output(), b"\x1b[?1042;2$y");
         t.feed(b"\x1b[?1042h\x1b[?1042$p");
         assert_eq!(t.take_output(), b"\x1b[?1042;1$y");
