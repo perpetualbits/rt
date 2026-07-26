@@ -5,23 +5,24 @@ oracle. The Phase-3 process (see `docs/own-engine-plan.md`) is to drive this lis
 empty (or to *intentional*, documented differences) under the `vt-conformance` harness.
 Each entry: what diverges, the measured impact, and the plan.
 
-Status snapshot (2026-07-22):
+Status snapshot (2026-07-26):
 - Spec cases (`spec.rs`, 32 cases): **PASS** against vt-term.
 - Curated differential (`vtterm_diff.rs`, 16 scripts): **PASS**.
 - Random-fuzz FULL differential (`vtterm_fuzz.rs`, 8000 scripts) — grid, cursor, modes,
-  AND scrollback history: **0 divergences** (verified 0/10000 in a wider sweep). Locked
-  in as a test, green on x86_64 and riscv64.
+  scrollback history, ANSI SM/RM (IRM/LNM), AND DECSCUSR (widened 2026-07-26): **0
+  divergences**. Locked in as a test, green on x86_64 and riscv64.
 - Random-**resize** differential (`vtterm_reflow.rs`, 3000 scripts) — reflow on grow/shrink
   of both dims incl. wide glyphs and scrollback: **0 divergences** (verified 0/20000 in a
   wider sweep). Ceiling locked at 0.
-- Random query/report differential (`vtterm_report.rs`, 4000 scripts, added 2026-07-25) —
-  DSR/CPR, DA1/DA2, and DECRQM reply bytes interleaved with mode/cursor mutators, compared
-  byte-for-byte against the oracle's reply stream (not just observable `Term` state):
-  **0 divergences**, green on x86_64 AND riscv64. See "Query / report" below.
+- Random query/report differential (`vtterm_report.rs`, 4000 scripts, added 2026-07-25,
+  widened 2026-07-26 to cover IRM/LNM/12/mouse-trio/1005/1042) — DSR/CPR, DA1/DA2, and
+  DECRQM reply bytes interleaved with mode/cursor mutators, compared byte-for-byte against
+  the oracle's reply stream (not just observable `Term` state): **0 divergences**, green
+  on x86_64 AND riscv64. See "Query / report" and "Observable-state edges" below.
 
-**vt-term now matches the vendored oracle exactly on every fuzzed input, resize and
-query/report included.** The open items below are not-yet-exercised features (nothing in
-the fuzz reaches them yet).
+**vt-term now matches the vendored oracle exactly on every fuzzed input, resize,
+query/report, and observable-state-edge (IRM/LNM/DECSCUSR/mouse-mode) input.** The open
+items below are not-yet-exercised features (nothing in the fuzz reaches them yet).
 
 ### Fixed under the harness (2026-07-21)
 Four alacritty behaviours the differential fuzz surfaced, each traced to a minimal
@@ -178,25 +179,78 @@ fuzz/reflow strands never observed, because nothing before read it back over the
   alone when the mode is turned off. The `goto` itself is origin-aware, consistent with the
   rest of cursor motion.
 
-**Deliberately excluded from the differential (known gaps, awaiting the
-observable-state-edges slice).** DECRQM reports `0` (not-recognised) for any mode vt-term
-doesn't track, so the two engines would trivially "agree" on unimplemented modes if the
-fuzz queried them — the `vtterm_report.rs` `QUERIES` pool is therefore restricted to modes
-vt-term actually represents, and specifically excludes:
-- **ANSI IRM (mode 4, insert/replace)** and **LNM (mode 20, linefeed/newline)** — no ANSI
-  mode tracking exists yet.
-- **Private BlinkingCursor (12), Utf8Mouse (1005), UrgencyHints (1042)** — parsed (1005 even
-  has a side effect, see `set_mode`) but no dedicated tracked state a DECRQM reply could
-  read.
-- **The mouse-report trio (1000/1002/1003).** `mouse_mode` IS tracked, but `report_mode` has
-  no case for these yet, so a query today would under-report versus the oracle rather than
-  answer correctly — a real gap, not a masked field.
+**Previously excluded from the differential — closed by the observable-state-edges
+slice (2026-07-26).** ANSI IRM (mode 4)/LNM (mode 20), private BlinkingCursor (12),
+Utf8Mouse (1005), UrgencyHints (1042), and the mouse-report trio (1000/1002/1003) are
+all now implemented, tracked, and covered by both `vtterm_fuzz.rs` (SM/RM + DECSCUSR
+generation) and `vtterm_report.rs` (DECRQM queries/mutators for all of the above). No
+mode remains excluded from either pool. See "Observable-state edges" below.
+
+## Observable-state edges — implemented and verified (2026-07-26)
+
+ANSI SM/RM (IRM mode 4, LNM mode 20), DECSCUSR cursor shape + blink (incl. private mode
+12), and the mouse-mode reconciliation (tracking trio 1000/1002/1003, encoding pair
+1005/1006, urgency hints 1042) are implemented in vt-term and differentially verified.
+Two of `vt-conformance`'s generators were widened to reach them: `gen_script` (the grid
+fuzzer, `vtterm_fuzz.rs`) now emits ANSI SM/RM and DECSCUSR sequences, and
+`vtterm_report.rs`'s `QUERIES`/`MUTATORS` pools now cover all of the modes above. **Both
+strands hold at 0 divergences (`vtterm_fuzz`: 0/8000+; `vtterm_report`: 0/4000) on
+x86_64 AND riscv64.**
+
+Widening the generators surfaced real vt-term/oracle divergences — each was root-caused
+against the vendored `alacritty_terminal` source and fixed in vt-term, never masked in
+the harness. **Two of these corrected the original design premises for this slice** (the
+initial plan/spec assumed the opposite of what alacritty actually does):
+
+- **LNM (mode 20) is a print-stream NO-OP — corrected from the original design.** The
+  original design had LNM make LF carriage-return. The oracle's `vte::ansi` parser calls
+  `Handler::linefeed()` directly for C0 LF/VT/FF and for ESC D (IND) — never the
+  `Handler::newline()` default method that consults `TermMode::LINE_FEED_NEW_LINE` — so
+  LNM has zero effect on any linefeed's cursor behaviour in alacritty; it is tracked only
+  so DECRQM (`CSI 20 $p`) reports it accurately. Confirmed empirically: `\x1b[20hAB\n`
+  against the vendored oracle leaves the cursor at column 2, not 0. vt-term's
+  `line_feed()` had the CR-on-LF branch removed to match.
+- **Mouse tracking (1000/1002/1003) and encodings (1005/1006) are mutually exclusive ON
+  SET, not independent bits — corrected from the original design.** The original design
+  modeled all five as fully independent bits. The oracle's `set_private_mode`
+  (`alacritty_terminal-0.26.0/src/term/mod.rs:2063-2141`) clears the other two tracking
+  bits when one of 1000/1002/1003 is set, and clears the sibling encoding when 1005 or
+  1006 is set — its own comments read "Mouse protocols are mutually exclusive" / "Mouse
+  encodings are mutually exclusive" (real xterm semantics). RESET only ever clears the
+  mode's own bit. vt-term still uses per-bit fields (so DECRQM reports each mode
+  individually), but `set_mode`'s SET arms for these five modes now enforce the same
+  exclusion.
+- **UrgencyHints (mode 1042) defaults ON**, matching alacritty's `TermMode::default()`
+  (vt-term previously defaulted it off, the same class of miss as the DECSET 1007 default
+  fixed earlier in the query/report work).
+- **IRM (mode 4)** is insert-on-print: printing shifts the row right by the glyph's width
+  before writing, guarded by alacritty's line-fit check (`col + width < cols`,
+  `term/mod.rs:1204`) so a glyph that can't fit isn't shifted (it falls through to the
+  normal wrap path instead).
+- **DECSCUSR** shape (0/1/2 = block/underline/bar) is now wired into
+  `vt-conformance`'s `observe()` for differential comparison, and blink (odd `Ps`, or
+  DECSET/DECRST 12) is tracked and reported by DECRQM 12. The `Ps 0` (DECSCUSR default)
+  blink state is provisional-steady — the fuzz's DECSCUSR generator never emits a bare
+  `\x1b[0 q`, so this default was never pinned by a divergence.
+
+**Two pre-existing bugs, unrelated to IRM/LNM/DECSCUSR/mouse, were also reconciled**
+once the widened `gen_script` reached code paths the earlier fuzz never touched:
+- **DL (`CSI Ps M`, delete-line) now pushes evicted rows into scrollback** when the
+  cursor is at absolute row 0 on the primary screen (not the alt screen) — matching
+  alacritty's `delete_lines`/`scroll_up_relative`, whose history push is keyed on the
+  cursor's row being the absolute top, not on the scroll-region's top margin. vt-term's
+  `delete_lines` previously never touched history at all.
+- **ED/EL out-of-range parameters are now a no-op**, not silently aliased to mode 0. ED
+  is valid for `Ps` `0..=3`, EL for `0..=2`; anything else is validated at the CSI
+  dispatch site before calling `erase_in_display`/`erase_in_line`, matching `vte`'s own
+  `ansi.rs` (which never reaches the handler for an invalid `Ps`).
+
+See `docs/vt-term-design.md` for the design writeup of each of these.
 
 ## Known not-yet-implemented (will diverge when exercised)
 
 - **Colon sub-parameter SGR** beyond the extended-colour case.
 - **OSC / DCS semantics** (title, clipboard, hyperlinks): parsed but not applied.
-- **Origin mode** edge interactions, DECSCUSR cursor shape, LNM newline mode.
 
 ## Reconciliations already done
 

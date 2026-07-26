@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-07-25"
+    updated: "2026-07-26"
   },
 
   statuses: {
@@ -316,7 +316,7 @@ window.PROJECT_MAP = {
         { label: "Wide characters", status: "done", desc: "WIDE_CHAR / spacer handling matched to the oracle." },
         { label: "Reflow on resize", status: "done", desc: "Grow/shrink both dims incl. wide glyphs + scrollback: 0/20000." },
         { label: "Native damage tracking", status: "done", desc: "Per-line dirty spans + scroll signals; no per-frame full diff." },
-        { label: "OSC / DCS & query-report edges", status: "active", desc: "query/report shipped v0.3.15: OSC (title) and query-report (DSR/CPR, DA1/DA2, DECRQM) wired end-to-end — reply bytes proven byte-identical to the oracle by a dedicated 0/4000 differential, and the vtpane reader loop now forwards them to the real PTY so real apps (vim, tmux, vttest) under RT_ENGINE=vtterm actually get answered. OSC side-effects (clipboard/hyperlink) and DCS still unexercised." }
+        { label: "OSC / DCS & query-report edges", status: "active", desc: "query/report shipped v0.3.15: OSC (title) and query-report (DSR/CPR, DA1/DA2, DECRQM) wired end-to-end — reply bytes proven byte-identical to the oracle by a dedicated 0/4000 differential, and the vtpane reader loop now forwards them to the real PTY so real apps (vim, tmux, vttest) under RT_ENGINE=vtterm actually get answered. Mode coverage widened (observable-state-edges slice, 2026-07-26): ANSI IRM (insert mode, 4) and LNM (mode 20, tracked for DECRQM only — a print-stream no-op, matching the oracle), DECSCUSR cursor shape+blink, and the mouse-mode reconciliation (tracking trio + encoding pair mutually exclusive on SET, urgency hints 1042 defaults on) are implemented and 0-divergence verified (widened vtterm_fuzz + vtterm_report, x86-64 AND riscv-64). OSC side-effects (clipboard/hyperlink), DCS, and colon-subparam SGR still unexercised." }
       ],
       deps: ["vt-parser"]
     },

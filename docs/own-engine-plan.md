@@ -197,9 +197,22 @@ pending-wrap/CSI quirks) AND scrollback are done. The **full** differential
 oracle, green on x86_64 AND riscv64 via `ci/verify.sh`. Each fix was a delta-debugged
 minimal reproducer matched to alacritty's real behaviour; see `docs/engine-divergence.md`.
 
-**Remaining Phase-3 work:** wide characters; OSC/DCS semantics; then reflow (last, the
-hard part). After that, Phase 4 — wire `vt-term` into rt behind `RT_ENGINE`. Original
-notes below.
+**Update 2026-07-26 — observable-state-edges: mode coverage widened.** ANSI SM/RM (IRM
+mode 4, LNM mode 20), DECSCUSR shape + blink observability (incl. private mode 12), and
+the mouse-mode reconciliation (tracking trio 1000/1002/1003 and encoding pair 1005/1006,
+each mutually exclusive on SET; urgency hints 1042 defaults on) are implemented and
+differentially verified — the widened `vtterm_fuzz` (SM/RM + DECSCUSR generation) and
+`vtterm_report` (DECRQM coverage of all of the above) both hold at 0 divergences on
+x86_64 and riscv64. Two corrections to the original design fell out of the differential:
+LNM turned out to be a print-stream no-op (tracked for DECRQM only, never affecting LF),
+and the mouse tracking/encoding bits turned out to be mutually exclusive on SET rather
+than fully independent — see `docs/engine-divergence.md`'s "Observable-state edges"
+section for the full writeup. Colon-subparam SGR and OSC/DCS semantics (side effects,
+not just parsing) remain the open Phase-3 gaps.
+
+**Remaining Phase-3 work:** OSC/DCS side-effect semantics (clipboard/hyperlink/etc.),
+colon-subparam SGR. After that, Phase 4 — wire `vt-term` into rt behind `RT_ENGINE`.
+Original notes below.
 
 ### Original design notes for Phase 3
 

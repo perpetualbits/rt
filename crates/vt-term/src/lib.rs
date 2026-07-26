@@ -1562,10 +1562,11 @@ impl Term {
     }
 
     /// ANSI SM/RM (`CSI Ps h` / `CSI Ps l`, no `?`). vt-term supports the ANSI modes
-    /// alacritty does: 20 = LNM (newline). Unknown modes are ignored,
-    /// matching the oracle (`set_mode`/`unset_mode`, term/mod.rs). `newline_mode` is
-    /// tracked purely for DECRQM reporting — see `line_feed`'s doc comment for why it
-    /// has no effect on LF's cursor behaviour (matching the oracle exactly).
+    /// alacritty does: 4 = IRM (insert mode, insert-on-print) and 20 = LNM (newline).
+    /// Unknown modes are ignored, matching the oracle (`set_mode`/`unset_mode`,
+    /// term/mod.rs). `newline_mode` is tracked purely for DECRQM reporting — see
+    /// `line_feed`'s doc comment for why it has no effect on LF's cursor behaviour
+    /// (matching the oracle exactly).
     fn set_ansi_mode(&mut self, p: &[u16], set: bool) {
         for &mode in p {
             match mode {

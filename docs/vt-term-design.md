@@ -25,13 +25,59 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
 - **Cursor motion.** CUU/CUD/CUF/CUB, CHA/HPA, VPA, CUP/HVP (origin-aware), with the
   region-aware clamping alacritty uses. Any move clears `pending_wrap`.
 - **Erase.** ED (0/1/2) and EL (0/1/2), ECH. ED(Above) matches alacritty's
-  `cursor.line > 1` quirk; erased cells take the current background.
+  `cursor.line > 1` quirk; erased cells take the current background. `Ps` is validated
+  at the CSI dispatch site before calling in (ED valid `0..=3`, EL valid `0..=2`);
+  out-of-range is a no-op, matching `vte`'s own `ansi.rs` validation (which never reaches
+  the handler for an invalid `Ps`) — vt-term's earlier bare `unwrap_or(0)` had silently
+  aliased any out-of-range `Ps` to mode 0 instead of no-op'ing.
 - **Scroll.** Line feed / reverse line feed within the scroll region (DECSTBM); IND/RI/
-  NEL; SU/SD; IL/DL and ICH/DCH; region scrolling via slice rotation.
+  NEL; SU/SD; IL/DL and ICH/DCH; region scrolling via slice rotation. DL (`CSI Ps M`)
+  pushes the evicted rows into scrollback when the cursor is at absolute row 0 on the
+  primary screen (not the alt screen) — matching alacritty's `delete_lines`, whose
+  history push is keyed on the cursor's row being the absolute top, not on the
+  scroll-region's top margin.
 - **SGR.** Attributes + reset, ANSI 30–37/90–97 and 40–47/100–107 (→ `Indexed`),
   `38;2;r;g;b`/`48;2` (→ `Rgb`), `38;5;n`/`48;5` (→ `Indexed`), 39/49 (→ `Default`).
 - **Modes.** DECAWM (?7), DECTCEM (?25), DECCKM (?1), DECOM (?6), alternate screen
   (?47/?1047/?1049 with cursor+screen save/restore). DECSC/DECRC, RIS.
+- **ANSI SM/RM (`CSI Ps h` / `CSI Ps l`, no `?`).** A separate small dispatcher,
+  `set_ansi_mode`, handles the non-private ANSI modes distinct from DECSET/DECRST's
+  `set_mode`: IRM (mode 4) and LNM (mode 20). Unknown ANSI modes are silently ignored,
+  matching the oracle.
+- **IRM — insert mode (ANSI mode 4).** When set, printing a character first shifts the
+  row right by the glyph's width (reusing the ICH shift primitive), then writes — so the
+  new glyph is inserted rather than overwriting. Gated by alacritty's own line-fit check
+  (`cursor.column + width < cols`, term/mod.rs:1204): a glyph that wouldn't fit on the
+  current line is **not** shifted — it falls through to the normal wrap-to-next-row path
+  instead, so a wide glyph pinned at the last column(s) doesn't corrupt the donor row.
+  The batched ASCII `print_str` fast path is skipped whenever IRM is active (every
+  character routes through the per-char path, which does the shift correctly).
+- **LNM — newline mode (ANSI mode 20) is a print-stream NO-OP.** vt-term tracks
+  `newline_mode` purely so DECRQM (`CSI 20 $p`) reports it accurately; `line_feed`
+  deliberately ignores it. This matches the vendored oracle: `vte::ansi`'s parser calls
+  `Handler::linefeed()` directly for the C0 LF/VT/FF bytes and for ESC D (IND) — never
+  the `Handler::newline()` default method that would consult `TermMode::LINE_FEED_NEW_LINE`.
+  So in alacritty, setting LNM has zero effect on any linefeed's cursor behaviour; feeding
+  `\x1b[20hAB\n` still leaves the cursor at column 2, not 0. (An earlier design draft had
+  LNM make LF carriage-return — that was wrong and was corrected once the differential
+  fuzz caught it; see `docs/engine-divergence.md`.)
+- **DECSCUSR — cursor shape + blink.** `CSI Ps SP q` maps `Ps` 0/1/2 → block, 3/4 →
+  underline, 5/6 → bar (`cursor_shape`, surfaced through the conformance `observe()` for
+  differential comparison), and odd `Ps` (1/3/5) → blinking (`cursor_blink`); even
+  `Ps` (2/4/6) → steady. `cursor_blink` is also set directly by DECSET/DECRST 12 and
+  reported by DECRQM 12. `Ps 0` (DECSCUSR's own default) is treated as steady/non-blinking
+  — provisional, since the fuzz never exercises a bare `\x1b[0 q` — see the ledger.
+- **Mouse-mode model — per-bit fields, mutual exclusion enforced on SET.** Five
+  independent `bool` fields (`mouse_click`/1000, `mouse_drag`/1002, `mouse_motion`/1003,
+  `mouse_sgr`/1006, `utf8_mouse`/1005) back `wants_mouse()` (any of the tracking trio) and
+  `wants_motion()`/`mouse_sgr()`. Each mode still has its own DECRQM-visible bit, but
+  **SET is not independent**: setting one of the tracking trio (1000/1002/1003) clears the
+  other two; setting one of the encoding pair (1005/1006) clears the other. RESET only
+  ever clears the mode's own bit. This matches the vendored oracle's `set_private_mode`
+  (`term/mod.rs:2063-2141`, whose own comments read "Mouse protocols are mutually
+  exclusive" / "Mouse encodings are mutually exclusive") — real xterm semantics, not the
+  "three/five fully independent bits" model an earlier design draft assumed before the
+  differential caught it.
 - **Tabs.** Every-8 stops, matching alacritty's write-`\t`-into-the-start-cell quirk.
 - **Charsets.** G0–G3 designations + DEC special graphics (line-drawing) mapping, SI/SO
   invocation. Designations are per-cursor (saved by alt/DECSC); the active charset `gl`
@@ -49,9 +95,9 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
   (`topmost..=bottommost`, history negative), so a host can render scrollback, extract
   selections, and search. New output while scrolled keeps the view anchored.
 - **Reporting modes.** Mouse reporting (DECSET 1000/1002/1003 → `wants_mouse`/`wants_motion`,
-  1006 → `mouse_sgr`, mutually exclusive like alacritty), DECSCUSR cursor shape
-  (`cursor_shape`), and the OSC 0/2 window title (`take_title`) are tracked and exposed for
-  a host to act on.
+  1005/1006 → `utf8_mouse`/`mouse_sgr`, each pair mutually exclusive on SET like alacritty),
+  DECSCUSR cursor shape + blink (`cursor_shape`/`cursor_blink`), and the OSC 0/2 window
+  title (`take_title`) are tracked and exposed for a host to act on.
 - **Query / report.** DSR (`CSI 5 n` → `\x1b[0n`), CPR (`CSI 6 n` → `\x1b[{row};{col}R`,
   absolute 1-based cursor), DA1 (`CSI c` / `CSI 0 c` → `\x1b[?6c`, VT102) and DA2
   (`CSI > c` → `\x1b[>0;{version};1c`, this crate's own version — DA1/DA2 only reply
@@ -110,23 +156,38 @@ track, just bytes appended to a buffer in the same order the input was parsed.
   request and gets no reply, matching alacritty.
 - **DECRQM (`CSI Ps $ p` for ANSI modes, `CSI ? Ps $ p` for private/DEC modes,
   `report_mode`)** replies `CSI [?] Ps ; St $ y`, where `St` is the DEC mode state:
-  `0` = not recognised, `1` = set, `2` = reset. Only the private modes vt-term actually
-  tracks get a real `1`/`2`; every other mode (including all ANSI modes — IRM/LNM are not
-  yet implemented) reports `0`. The tracked-private-mode table:
+  `0` = not recognised, `1` = set, `2` = reset. Only the modes vt-term actually tracks get
+  a real `1`/`2`; every other mode reports `0`. The tracked ANSI-mode table:
+
+  | Mode | Meaning | Backing flag |
+  |---|---|---|
+  | 4 | IRM (insert mode) | `insert_mode` |
+  | 20 | LNM (newline mode) | `newline_mode` — tracked for this reply ONLY, no print-stream effect (see above) |
+
+  The tracked-private-mode table:
 
   | Mode | Meaning | Backing flag |
   |---|---|---|
   | 1 | DECCKM (app cursor keys) | `app_cursor` |
   | 6 | DECOM (origin mode) | `origin` |
   | 7 | DECAWM (autowrap) | `autowrap` |
+  | 12 | Cursor blink (att610) | `cursor_blink` |
   | 25 | DECTCEM (cursor visible) | `show_cursor` |
+  | 1000 | Mouse click tracking | `mouse_click` |
+  | 1002 | Mouse button-motion tracking | `mouse_drag` |
+  | 1003 | Mouse any-motion tracking | `mouse_motion` |
   | 1004 | Focus event reporting | `focus_events` |
+  | 1005 | UTF-8 mouse encoding | `utf8_mouse` |
   | 1006 | SGR mouse encoding | `mouse_sgr` |
   | 1007 | Alt-screen wheel → arrow keys | `alt_scroll` |
+  | 1042 | Urgency hints (defaults ON — matches the oracle's `TermMode::default()`) | `urgency_hints` |
   | 2004 | Bracketed paste | `bracketed_paste` |
   | 1049 | Alt screen | `alt_screen()` |
   | 2026 | Synchronized update | always `2` (reset) — matches alacritty, which never reports it set, even mid-sync |
   | everything else | — | `0` (not recognised) |
+
+  1000/1002/1003 and 1005/1006 are each per-bit fields (so DECRQM reports every mode
+  individually) but are mutually exclusive **on SET** — see the mouse-mode model above.
 
 ## Verification
 
