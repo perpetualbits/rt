@@ -4,9 +4,9 @@
 //! divergences — a strict regression guard, run on x86_64 and riscv64 via ci/verify.sh.
 //!
 //! Scope note: the query pool is the set of modes vt-term and the oracle represent
-//! identically (see docs/superpowers/plans Task 3 design note). Modes where they
-//! legitimately differ (ANSI IRM/LNM, private 12/1005/1042, and the 1000/1002/1003 mouse
-//! trio) are deliberately excluded until their own coverage slice.
+//! identically (see docs/superpowers/plans Task 3 design note). ANSI IRM/LNM, private
+//! 12/1005/1042, and the 1000/1002/1003 mouse trio (observable-state-edges slice) are
+//! now covered below; no modes remain excluded from this list.
 
 use vt_conformance::{reports_match, VtEngine};
 
@@ -30,6 +30,14 @@ const QUERIES: &[&[u8]] = &[
     b"\x1b[?3$p",     // DECRQM column mode (not supported)
     b"\x1b[?9999$p",  // DECRQM unknown private
     b"\x1b[99$p",     // DECRQM unknown ANSI
+    b"\x1b[4$p",      // DECRQM IRM (ANSI)
+    b"\x1b[20$p",     // DECRQM LNM (ANSI)
+    b"\x1b[?12$p",    // DECRQM cursor blink
+    b"\x1b[?1000$p",  // DECRQM mouse click
+    b"\x1b[?1002$p",  // DECRQM mouse drag
+    b"\x1b[?1003$p",  // DECRQM mouse any-motion
+    b"\x1b[?1005$p",  // DECRQM utf8 mouse
+    b"\x1b[?1042$p",  // DECRQM urgency hints
 ];
 
 // Mode-changing / cursor-moving input, to vary the state the queries observe.
@@ -41,6 +49,10 @@ const MUTATORS: &[&[u8]] = &[
     b"\x1b[?2004h", b"\x1b[?1049h",    // bracketed paste / alt screen on
     b"\x1b[?1049l",                    // alt screen off
     b"\x1b[5;10H", b"\x1b[H", b"hello", b"\r\n", b"\x1b[2J",
+    b"\x1b[4h", b"\x1b[4l", b"\x1b[20h", b"\x1b[20l",
+    b"\x1b[?12h", b"\x1b[?12l", b"\x1b[1 q", b"\x1b[2 q",
+    b"\x1b[?1000h", b"\x1b[?1002h", b"\x1b[?1003h", b"\x1b[?1003l",
+    b"\x1b[?1005h", b"\x1b[?1042h",
 ];
 
 // Tiny dependency-free xorshift, seeded per-iteration (matches the crate's RNG style;
