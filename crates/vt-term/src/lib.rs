@@ -465,7 +465,9 @@ pub struct Term {
     /// Urgency-hint window signalling (DECSET 1042). Term-global. Defaults to set,
     /// matching the oracle's `TermMode::default()` (which includes `URGENCY_HINTS`).
     urgency_hints: bool,
-    /// ANSI newline mode (SM/RM 20): when set, LF/VT/FF also carriage-return.
+    /// ANSI newline mode (SM/RM 20). Tracked for DECRQM 20 reporting only — a
+    /// print-stream no-op (`line_feed` deliberately ignores it), matching the oracle,
+    /// whose parser never calls the LNM-aware `newline()`.
     newline_mode: bool,
     /// ANSI insert mode (SM/RM 4, IRM): when set, printing a character inserts at the
     /// cursor (shifting the row right, dropping the rightmost) instead of overwriting.
