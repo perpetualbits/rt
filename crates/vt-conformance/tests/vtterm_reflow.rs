@@ -40,6 +40,7 @@ fn curated_reflow_matches_oracle() {
 /// end size, diff. The divergence rate must not exceed the ceiling. Lowering this ceiling
 /// as the ledgered reflow edges are closed is the metric for reflow's remaining work.
 #[test]
+#[allow(clippy::absurd_extreme_comparisons)] // see the CEILING note below
 fn reflow_fuzz_rate_within_ceiling() {
     const N: u64 = 3000;
     // Now 0/3000 (verified 0/20000 in a wider sweep) after making the wide-glyph overwrite
@@ -59,5 +60,8 @@ fn reflow_fuzz_rate_within_ceiling() {
             div += 1;
         }
     }
+    // CEILING is a deliberately tunable bound that currently sits at zero, so
+    // `<=` is the form we want here. Clippy only sees `x <= 0` on an unsigned
+    // type and flags it as always-true; raising CEILING would make it matter.
     assert!(div <= CEILING, "reflow divergence {div}/{N} exceeds ceiling {CEILING} — regression");
 }

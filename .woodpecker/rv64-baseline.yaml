@@ -1,0 +1,48 @@
+# Baseline conformance on riscv64.
+#
+# milkv is in-order with NO vector extension (isa rv64imafdc). It is the only
+# machine in the fleet that catches vector codegen leaking into code that is
+# supposed to run everywhere, which is why it gets its own workflow rather than
+# competing for generic riscv64 work.
+#
+# Scoped to the engine crates on purpose. rt itself is a Wayland/EGL application
+# and milkv is a slow X11-only board that will never display it — proving the GUI
+# links there costs a large dependency install and tells us nothing. What matters
+# is that the portable parsing/terminal code builds and passes on baseline
+# silicon.
+#
+# Advisory on push: a full build here takes minutes and must not gate the inner
+# loop. It becomes blocking in the tag pipeline (Stage 4).
+
+when:
+  - event: [push, pull_request, manual]
+
+labels:
+  board: milkv
+
+variables:
+  - &rust
+    CARGO_HOME: /var/cache/forge-ci/cargo
+    CARGO_TARGET_DIR: /var/cache/forge-ci/target
+    RUSTUP_HOME: /var/lib/woodpecker/.rustup
+    PATH: /var/lib/woodpecker/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+steps:
+  - name: verify-arch
+    image: bash
+    environment: *rust
+    # If a label is ever misconfigured and this lands on x86_64, fail loudly
+    # rather than quietly pass and give false confidence in riscv64 coverage.
+    commands:
+      - test "$(uname -m)" = "riscv64" || { echo "wrong arch"; uname -m; exit 1; }
+      - grep -m1 isa /proc/cpuinfo
+
+  - name: build-and-test
+    image: bash
+    environment: *rust
+    failure: ignore
+    # No -C target-cpu=native anywhere: a natively tuned binary would SIGILL on
+    # exactly the baseline hardware this cell exists to protect.
+    commands:
+      - cargo build --release -p vt-parser -p vt-term -p rt-core -p rt-config
+      - cargo test -p vt-parser -p vt-term -p rt-core -p rt-config

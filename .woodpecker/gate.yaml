@@ -1,0 +1,69 @@
+# Fast gate: fmt, clippy, tests and cross-compile checks on every push.
+#
+# Runs on apollo (x86_64). The riscv64 native workflow lives in its own file so
+# the slow board never gates this one.
+#
+# Scoping note: vendor/alacritty_terminal is not a workspace member, but Cargo
+# pulls it in as a path dependency, so --all reaches it. fmt and clippy are
+# therefore scoped to our own packages: reformatting a vendored fork would wreck
+# diffability against upstream, and failing our gate on upstream's lints would be
+# noise we cannot act on. Tests still run --all, since the vendored engine is a
+# useful oracle.
+#
+# Two things that are easy to get wrong here:
+#   - The agent runs with an isolated HOME, so $HOME is NOT the woodpecker user's
+#     home and $HOME/.cargo would miss the toolchain. Paths are absolute.
+#   - Never put a colon followed by a space inside an unquoted command; YAML then
+#     parses the list item as a mapping and the pipeline fails to compile.
+
+when:
+  - event: [push, pull_request, manual]
+
+labels:
+  arch: x86_64
+
+variables:
+  - &rust
+    CARGO_HOME: /var/lib/woodpecker/.cargo
+    RUSTUP_HOME: /var/lib/woodpecker/.rustup
+    PATH: /var/lib/woodpecker/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  - &own_pkgs >-
+    -p rt-core -p rt-engine -p rt-config -p rt-session -p rt -p rt-mux
+    -p vt-parser -p vt-term -p vt-conformance
+
+steps:
+  - name: fmt
+    image: bash
+    environment: *rust
+    # Advisory by choice: the codebase predates any fmt enforcement and a
+    # 66-file reformat would churn blame and conflict with in-flight branches.
+    # Visible in the UI, never blocking.
+    failure: ignore
+    commands:
+      - cargo fmt -p rt-core -p rt-engine -p rt-config -p rt-session -p rt -p rt-mux -p vt-parser -p vt-term -p vt-conformance -- --check
+
+  - name: clippy
+    image: bash
+    environment: *rust
+    # --no-deps is essential: without it clippy lints the vendored forks
+    # (vendor/vte, vendor/alacritty_terminal) and fails the gate on upstream's
+    # code. No -D warnings either — style lints are advisory like fmt, while
+    # clippy's deny-by-default lints still fail the build, which is the part
+    # actually worth gating on.
+    commands:
+      - cargo clippy --no-deps -p rt-core -p rt-engine -p rt-config -p rt-session -p rt -p rt-mux -p vt-parser -p vt-term -p vt-conformance --all-targets
+
+  - name: test
+    image: bash
+    environment: *rust
+    commands:
+      - cargo test --all
+
+  - name: cross-compile
+    image: bash
+    environment: *rust
+    # Explicit target triples, never -C target-cpu=native: a natively tuned
+    # binary SIGILLs on the baseline riscv64 hardware.
+    commands:
+      - cargo zigbuild --release --target aarch64-unknown-linux-gnu
+      - cargo zigbuild --release --target riscv64gc-unknown-linux-gnu
