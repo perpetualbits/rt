@@ -495,6 +495,12 @@ impl Keymap {
         map
     }
 
+    /// Every binding in priority order (user overrides first, then defaults).
+    /// Read-only; used by the manual's "every binding is documented" test.
+    pub fn bindings(&self) -> impl Iterator<Item = (&Chord, &Action)> {
+        self.bindings.iter().map(|(c, a)| (c, a))
+    }
+
     /// Register (or override) a binding. Inserted at the *front* so it shadows
     /// any earlier binding for the same chord — this is how user config
     /// overrides defaults.

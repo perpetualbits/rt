@@ -50,6 +50,9 @@ edges still being driven to zero.
 - **Panes & tabs** — split any way, keyboard- or mouse-driven, Terminator keybindings.
 - **Newspaper columns** — flow one pane's output into side-by-side columns so a wide screen shows *more rows at once*, newspaper-style (`Ctrl+.` / `Ctrl+,`). See below.
 - **Scrollback search** — `Ctrl+Shift+F`; configurable buffer up to 5M lines, held to a per-pane memory budget (oldest-first eviction) with a live memory meter.
+- **Selection tools** — drag, `Ctrl`+drag for a rectangular block, double-click word / triple-click line (both rejoin soft-wraps); drag past a pane edge and the auto-scroll *accelerates*. And **anchored selection**: `Shift`+click to drop a start, navigate with arrows / `PageUp` / `Ctrl+End` / the scrollbar across any amount of scrollback, `Shift`+click or `Enter` to finish with the text on the clipboard — no button held. See below.
+- **Clipboard history** — every copy rt makes lands in an in-memory ring of your last 20 clips; `Ctrl+Shift+H` or the `⎘ N` titlebar field lists them, pick one to paste it. Nothing touches disk.
+- **Hold-to-accelerate arrows** — tap = one move; hold = progressively faster, so a crawl through a long line or a `less` page takes a second. Same curve drives selection and drag auto-scroll.
 - **Broadcast** — type once, reach a pane group or every pane.
 - **Border instruments** — live gauges on each pane's edge: output flow, CPU heat (blackbody), render latency. Idle-throttled, so they cost nothing when nothing's happening.
 - **Patch-bay** — wire panes' stdin/stdout/stderr to each other via `$RT_OUT` / `$RT_ERR` / `$RT_IN` (real named pipes). The animated wires *are* the bytes.
@@ -72,6 +75,19 @@ how much scrollback you see at a glance; `Ctrl+,` folds it back.
 
 It's transparent to the program underneath — it just sees an ordinary scrollback
 scroll — so it works with anything: `man` pages, `cat` of a long file, logs, `vim`.
+
+### Anchored selection — select a screenful (or a thousand) without holding a button
+
+Selecting more than a screenful by dragging means holding the button while the
+pane crawls past the edge. rt decouples the two ends: `Shift`+click drops the
+*start* of a selection, the pane enters a selecting mode (the titlebar shows
+`◉ selecting · 42 lines`), and you move the *end* with the keyboard — arrows
+(accelerating when held), `Home`/`End`, `PageUp`/`PageDown`, `Ctrl+Home`/`Ctrl+End`
+for the top/bottom of the whole buffer — or just scroll the view with the wheel or
+scrollbar and `Shift`+click where it should end. `Enter` or that second `Shift`+click
+finishes and puts the text on both CLIPBOARD and PRIMARY; `Esc` or a plain click
+cancels. `Ctrl+Shift`+click starts a rectangular block instead. "Everything from
+here to the end of the build log" is `Shift`+click, `Ctrl+End`, `Enter`.
 
 ## Build & install
 
