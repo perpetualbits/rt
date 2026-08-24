@@ -77,6 +77,12 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   overlap in practice (each opens at its own placement), so this is a real
   but narrow edge case. Fixing it needs a stacking-order source rt doesn't
   have today (an X11 `_NET_CLIENT_LIST_STACKING` query, most plausibly).
+- ◐ **A release over another rt window's WM title bar / decoration tears out
+  a new window instead of dropping in.** rt only knows its own CONTENT rect
+  (`Window::inner_position()`/`inner_size()`); the window manager's title bar
+  and borders around that rect are invisible to it. Releasing there lands
+  outside every rt window's content rect, so it reads as "the desktop" and
+  tears out, even though visually the pointer was over the other rt window.
 
 ## Focus & menu targeting (2026-07-06)
 - ☑ **Focus stuck on last-created pane; no click-to-focus.** Focus only moved via

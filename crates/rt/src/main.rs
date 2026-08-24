@@ -2933,6 +2933,19 @@ fn opens_modal_overlay(action: rt_config::Action) -> bool {
     matches!(action, Action::Preferences | Action::Manual | Action::Search | Action::ClipHistory)
 }
 
+/// Can this action remove a pane out from under a live drag — the dragged pane
+/// itself (`CloseTerm`, `DetachPane`, `DetachTab`) or the whole source window
+/// it lives in (`CloseWindow`)? A drag holds onto pane ids and window cues
+/// across its whole gesture; if one of those ids or windows vanishes mid-drag
+/// the cues are left pointing at nothing until Escape cleans them up. Cancel
+/// the drag first (same as opening a modal overlay, see [`App::on_key_press`]),
+/// then let the action run normally. Splits, zoom, focus moves, broadcast, …
+/// stay ungated — they cannot remove a pane from the session.
+fn removes_pane_mid_drag(action: rt_config::Action) -> bool {
+    use rt_config::Action;
+    matches!(action, Action::CloseTerm | Action::DetachPane | Action::DetachTab | Action::CloseWindow)
+}
+
 impl App {
     /// Abandon any pane/tab drag: forget the App-level state and wipe the cue
     /// fields off the window that was showing them. Used by Escape, by a second
@@ -3109,10 +3122,7 @@ impl App {
             // cancel, in ANY window. Only a release over no rt window at all
             // tears out, and only where the platform can say where that was.
             None => match (drag.cued, self.tear_out_point(id)) {
-                (None, Some(at)) => {
-                    self.tear_out(event_loop, id, drag.payload, Some(at));
-                    true
-                }
+                (None, Some(at)) => self.tear_out(event_loop, id, drag.payload, Some(at)),
                 _ => false,
             },
         };
@@ -3333,14 +3343,34 @@ impl App {
             }
             return false;
         }
-        // Both trees now name the other's pane: hand the entries across to match.
-        let Some(src) = self.windows.get_mut(&source) else { return false };
+        // Both trees now name the other's pane: hand the entries across to
+        // match. The three window lookups below are provably unreachable in
+        // their failure arms: nothing between here and the end of this
+        // function can remove `source` or `dest` from `self.windows` — rt is
+        // single-threaded, and no code on this path re-enters the event loop
+        // or otherwise touches the window map (mirrors the same reasoning in
+        // `migrate_pane_extras`'s vanished-target comment). They stay guarded
+        // so a bug elsewhere can never turn a vanished window into a panic;
+        // `log::error!` them too so a future refactor that DOES make one
+        // reachable is loud about it instead of quietly losing a pane.
+        let Some(src) = self.windows.get_mut(&source) else {
+            log::error!("cross_window_swap: source window {source:?} vanished before eject (should be unreachable)");
+            return false;
+        };
         let from_src = src.session.eject_entries(&[dragged]);
-        let Some(dst) = self.windows.get_mut(&dest) else { return false };
+        let Some(dst) = self.windows.get_mut(&dest) else {
+            log::error!("cross_window_swap: dest window {dest:?} vanished before eject (should be unreachable)");
+            return false;
+        };
         let from_dst = dst.session.eject_entries(&[b]);
         dst.session.inject_entries(from_src);
         if let Some(src) = self.windows.get_mut(&source) {
             src.session.inject_entries(from_dst);
+        } else {
+            log::error!(
+                "cross_window_swap: source window {source:?} vanished before re-inject (should be unreachable) — dropped {} pane extras",
+                from_dst.panes.len()
+            );
         }
         // Jacks travel with their panes; wires that would cross windows are cut.
         self.migrate_pane_extras(source, dest, &[dragged]);
@@ -3503,7 +3533,13 @@ impl App {
     /// The package moves in memory: PTY, scrollback, title, group all survive,
     /// and so do the panes' jacks and their wholly-internal wires.
     ///
-    /// No-op when it would just recreate the same window (a lone pane).
+    /// No-op when it would just recreate the same window: not only a lone pane
+    /// in a lone tab, but any payload that happens to be EVERY pane the source
+    /// window has (e.g. `DetachTab` on a window whose only tab holds a split of
+    /// several panes) — either way nothing is left behind, so this would just
+    /// open an identical window and close the old one. Returns whether it
+    /// actually moved anything, so callers (the release-arm debug log among
+    /// them) can tell a real tear-out from this no-op.
     ///
     /// ORDER: the new window is built and INSERTED into the map BEFORE the
     /// payload leaves the source. That way [`App::migrate_pane_extras`] can
@@ -3516,14 +3552,18 @@ impl App {
         source: WindowId,
         payload: dragdrop::DragPayload,
         position: Option<winit::dpi::PhysicalPosition<i32>>,
-    ) {
-        let Some(active) = self.windows.get(&source) else { return };
-        // A lone pane in a lone tab: tearing out would just recreate this
-        // window. No-op (also covers the empty-tree case, defensively).
-        if active.session.tree().all_panes().len() <= 1 {
-            return;
+    ) -> bool {
+        let Some(active) = self.windows.get(&source) else { return false };
+        let payload_panes: Vec<rt_core::PaneId> = match payload {
+            dragdrop::DragPayload::Pane(p) => vec![p],
+            dragdrop::DragPayload::Tab { first_pane } => active.session.tab_panes(first_pane).unwrap_or_default(),
+        };
+        let all: std::collections::HashSet<_> = active.session.tree().all_panes().into_iter().collect();
+        let payload_set: std::collections::HashSet<_> = payload_panes.into_iter().collect();
+        if all == payload_set {
+            return false;
         }
-        let Some(mut new_active) = self.build_active(event_loop) else { return };
+        let Some(mut new_active) = self.build_active(event_loop) else { return false };
         if let Some(at) = position {
             new_active.window.set_outer_position(at); // land under the cursor (X11)
         }
@@ -3544,25 +3584,25 @@ impl App {
 
         // Now the payload can leave the source: from here on nothing can fail
         // in a way that would strand it.
-        let Some(src) = self.windows.get_mut(&source) else { return };
+        let Some(src) = self.windows.get_mut(&source) else { return false };
         let pkg = match payload {
             dragdrop::DragPayload::Pane(p) => src.session.extract_pane(p),
             dragdrop::DragPayload::Tab { first_pane } => src.session.extract_tab(first_pane),
         };
         let Some(pkg) = pkg else {
             self.close_window(new_id); // nothing to put in it
-            return;
+            return false;
         };
         let moved: Vec<rt_core::PaneId> = pkg.sub.panes();
         let src_became_empty = src.session.is_empty();
-        let Some(dst) = self.windows.get_mut(&new_id) else { return };
+        let Some(dst) = self.windows.get_mut(&new_id) else { return false };
         if let Err(pkg) = dst.session.adopt(pkg, rt_session::DropTarget::Root) {
             log::error!("tear_out: adopt into the new window failed"); // cannot happen: the tree is empty
             if let Some(src) = self.windows.get_mut(&source) {
                 src.session.readopt_root_edge(pkg.sub, pkg.entries); // never lose a pane
             }
             self.close_window(new_id);
-            return;
+            return false;
         }
         self.migrate_pane_extras(source, new_id, &moved);
         if let Some(a) = self.windows.get_mut(&new_id) {
@@ -3576,6 +3616,7 @@ impl App {
             a.force_full = true;
             a.window.request_redraw();
         }
+        true
     }
 
     /// Run a semantic [`Action`](rt_config::Action) against the live state. This
@@ -4429,15 +4470,17 @@ impl App {
         // event — including the mouse release that would finish a drag. Opening
         // one mid-gesture would strand the drag with its cues frozen under the
         // dialog, so abandon the gesture first; the action then runs normally.
-        // Only paid for while something is armed or dragging, and done here
-        // because `cancel_drag` needs `&mut self` (no `Active` borrowed yet).
+        // Same story for an action that can remove a pane out from under the
+        // drag (CloseTerm/DetachPane/DetachTab/CloseWindow): cancel first, then
+        // let it proceed — otherwise the drag's cues can outlive the pane or
+        // window they refer to until Escape is pressed. Only paid for while
+        // something is armed or dragging, and done here because `cancel_drag`
+        // needs `&mut self` (no `Active` borrowed yet).
         if self.drag.is_some() || self.armed_drag.is_some() {
-            let opens_overlay = self.windows.get(&id).is_some_and(|a| {
-                input::chord_from_winit(&key_event.logical_key, a.mods)
-                    .and_then(|c| a.keymap.action_for(&c))
-                    .is_some_and(opens_modal_overlay)
+            let action = self.windows.get(&id).and_then(|a| {
+                input::chord_from_winit(&key_event.logical_key, a.mods).and_then(|c| a.keymap.action_for(&c))
             });
-            if opens_overlay {
+            if action.is_some_and(opens_modal_overlay) || action.is_some_and(removes_pane_mid_drag) {
                 self.cancel_drag();
             }
         }
