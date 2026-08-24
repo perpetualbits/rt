@@ -3013,7 +3013,20 @@ impl App {
             .ok()
             .map(|p| (p.x as f64 + mouse.0 as f64, p.y as f64 + mouse.1 as f64));
         let (over, local) = match global {
-            None => (Some(id), mouse),
+            // Wayland: no globals, so the source is the only window we can
+            // recognise — but only while the cursor is actually IN it. Outside
+            // its bounds we are "over the desktop" exactly like X11's
+            // window_under_global-miss (this is what lets `cued` go None so a
+            // release out there tears out; leaving it Some(source) here was
+            // the bug that made a Wayland tear-out release a silent no-op).
+            None => {
+                let size = src.window.inner_size();
+                let inside = mouse.0 >= 0.0
+                    && mouse.1 >= 0.0
+                    && mouse.0 < size.width as f32
+                    && mouse.1 < size.height as f32;
+                (inside.then_some(id), mouse)
+            }
             Some(g) => match self.window_under_global(g) {
                 None => (None, mouse),           // the desktop
                 Some(w) if w == id => (Some(id), mouse),
