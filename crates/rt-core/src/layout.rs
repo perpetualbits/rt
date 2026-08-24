@@ -1248,6 +1248,54 @@ impl Tree {
             }
         }
     }
+
+    /// Rewrite the leaf `from` to carry id `to`. The building block for
+    /// cross-window swap (each tree rewrites one leaf; the sessions then exchange
+    /// the panes' side-table entries). Returns false if `from` isn't a leaf here.
+    pub fn replace_leaf(&mut self, from: PaneId, to: PaneId) -> bool {
+        fn walk(node: &mut Node, from: PaneId, to: PaneId) -> bool {
+            match node {
+                Node::Leaf(id) if *id == from => { *id = to; true }
+                Node::Leaf(_) => false,
+                Node::Split { children, .. } => children.iter_mut().any(|c| walk(&mut c.node, from, to)),
+                Node::Tabs { children, .. } => children.iter_mut().any(|c| walk(c, from, to)),
+            }
+        }
+        walk(&mut self.root, from, to)
+    }
+
+    /// Exchange two leaves of THIS tree (the centre-drop "swap panes" gesture).
+    /// Pure id rewrites — weights, splits and tab structure stay put.
+    pub fn swap(&mut self, a: PaneId, b: PaneId) -> bool {
+        // The placeholder id is reserved: the global mint never reaches u64::MAX-1.
+        const TMP: PaneId = PaneId(u64::MAX - 1);
+        if a == b || !Self::contains(&self.root, a) || !Self::contains(&self.root, b) {
+            return false;
+        }
+        self.replace_leaf(a, TMP) && self.replace_leaf(b, a) && self.replace_leaf(TMP, b)
+    }
+
+    /// Move the tab whose first leaf is `first_pane` to index `to` (clamped) in
+    /// its own group; the moved tab remains the active one.
+    pub fn reorder_tab(&mut self, first_pane: PaneId, to: usize) -> bool {
+        fn walk(node: &mut Node, first: PaneId, to: usize) -> bool {
+            match node {
+                Node::Leaf(_) => false,
+                Node::Split { children, .. } => children.iter_mut().any(|c| walk(&mut c.node, first, to)),
+                Node::Tabs { children, active } => {
+                    if let Some(i) = children.iter().position(|c| Tree::first_leaf(c) == Some(first)) {
+                        let to = to.min(children.len() - 1);
+                        let page = children.remove(i);
+                        children.insert(to, page);
+                        *active = to; // focus follows the moved tab
+                        return true;
+                    }
+                    children.iter_mut().any(|c| walk(c, first, to))
+                }
+            }
+        }
+        walk(&mut self.root, first_pane, to)
+    }
 }
 
 /// A detached fragment of a layout tree — the payload of a pane/tab move.
@@ -1534,5 +1582,45 @@ mod tests {
         t.insert_root_edge(sub, Orientation::TopBottom, true);
         assert!(!t.is_empty());
         assert_eq!(t.all_panes(), vec![a]);
+    }
+
+    #[test]
+    fn swap_exchanges_two_leaves_in_place() {
+        let (mut t, a) = Tree::new();
+        let b = t.split(a, Orientation::LeftRight).unwrap();
+        let c = t.split(b, Orientation::TopBottom).unwrap();
+        assert!(t.swap(a, c));
+        let bounds = Rect::new(0.0, 0.0, 806.0, 606.0);
+        let rects = t.rects(bounds);
+        assert_eq!(rects[0].0, c, "c took a's slot (left)");
+        assert_eq!(rects.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![c, b, a]);
+        assert!(!t.swap(a, a), "self-swap is a no-op");
+        assert!(!t.swap(a, PaneId(9999)), "stale id is a no-op");
+    }
+
+    #[test]
+    fn replace_leaf_rewrites_one_id() {
+        let (mut t, a) = Tree::new();
+        let b = t.split(a, Orientation::LeftRight).unwrap();
+        assert!(t.replace_leaf(a, PaneId(4242)));
+        assert_eq!(t.all_panes(), vec![PaneId(4242), b]);
+        assert!(!t.replace_leaf(a, PaneId(1)), "old id is gone");
+    }
+
+    #[test]
+    fn reorder_tab_moves_and_follows_focus() {
+        let (mut t, a) = Tree::new();
+        let b = t.new_tab(a).unwrap();
+        let c = t.new_tab(b).unwrap(); // tabs [a, b, c], c active
+        assert!(t.reorder_tab(c, 0));
+        let bounds = Rect::new(0.0, 0.0, 900.0, 600.0);
+        let bar = &t.tab_bars(bounds)[0];
+        let order: Vec<_> = bar.tabs.iter().map(|tb| tb.first_pane).collect();
+        assert_eq!(order, vec![c, a, b]);
+        assert!(bar.tabs[0].active, "the moved tab stays the active one");
+        assert!(t.reorder_tab(a, 99), "index clamps to the end");
+        let order2: Vec<_> = t.tab_bars(bounds)[0].tabs.iter().map(|tb| tb.first_pane).collect();
+        assert_eq!(order2, vec![c, b, a]);
+        assert!(!t.reorder_tab(PaneId(9999), 0), "stale id is a no-op");
     }
 }
