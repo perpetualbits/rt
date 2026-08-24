@@ -108,6 +108,13 @@ enum Node {
     },
 }
 
+impl Node {
+    /// Whether this page's first leaf is `id` (tab identity test).
+    fn has_first_leaf(node: &Node, id: PaneId) -> bool {
+        Tree::first_leaf(node) == Some(id)
+    }
+}
+
 /// The whole layout for one window: a root node. PaneIds are allocated from a
 /// process-global counter so they are unique across all trees — this allows panes
 /// to move between windows without remapping their ids or side-table entries.
@@ -395,6 +402,231 @@ impl Tree {
                 }
             }
         }
+    }
+
+    /// Remove the pane `target` (collapsing like [`Tree::close`]) and return it
+    /// as a movable [`Subtree`]. `None` if the id is stale.
+    pub fn take(&mut self, target: PaneId) -> Option<Subtree> {
+        if self.close(target) {
+            Some(Subtree(Node::Leaf(target))) // a leaf payload IS just the leaf
+        } else {
+            None
+        }
+    }
+
+    /// Remove the whole tab page whose FIRST leaf is `first_pane` (the id
+    /// `Tab::first_pane` carries) and return it. Collapses a 1-page group.
+    pub fn take_tab(&mut self, first_pane: PaneId) -> Option<Subtree> {
+        let root = std::mem::replace(&mut self.root, Node::Leaf(PaneId(u64::MAX)));
+        match Self::take_tab_from(root, first_pane) {
+            (rest, Some(taken)) => {
+                self.root = rest.unwrap_or(Node::Leaf(PaneId(u64::MAX)));
+                Some(Subtree(taken))
+            }
+            (rest, None) => {
+                self.root = rest.expect("nothing was removed, the node survives");
+                None
+            }
+        }
+    }
+
+    /// Worker for take_tab: returns (what this node becomes, the removed page).
+    fn take_tab_from(node: Node, first: PaneId) -> (Option<Node>, Option<Node>) {
+        match node {
+            Node::Leaf(id) => (Some(Node::Leaf(id)), None),
+            Node::Split { orient, mut children } => {
+                let mut i = 0;
+                let mut taken_out = None;
+                while i < children.len() {
+                    let child = std::mem::replace(&mut children[i].node, Node::Leaf(PaneId(u64::MAX)));
+                    let (rest, taken) = Self::take_tab_from(child, first);
+                    match rest {
+                        Some(n) => children[i].node = n,
+                        None => {
+                            children.remove(i);
+                        }
+                    }
+                    if taken.is_some() {
+                        taken_out = taken;
+                        break;
+                    }
+                    i += 1;
+                }
+                if taken_out.is_some() {
+                    let rest = match children.len() {
+                        0 => None,
+                        1 => Some(children.pop().unwrap().node),
+                        _ => Some(Node::Split { orient, children }),
+                    };
+                    return (rest, taken_out);
+                }
+                (Some(Node::Split { orient, children }), None)
+            }
+            Node::Tabs { mut children, mut active } => {
+                // Is one of OUR pages the wanted tab?
+                if let Some(i) = children.iter().position(|c| Self::first_leaf(c) == Some(first)) {
+                    let taken = children.remove(i);
+                    if active >= i && active > 0 {
+                        active -= 1;
+                    }
+                    let rest = match children.len() {
+                        0 => None,
+                        1 => Some(children.pop().unwrap()),
+                        _ => {
+                            if active >= children.len() { active = children.len() - 1; }
+                            Some(Node::Tabs { children, active })
+                        }
+                    };
+                    return (rest, Some(taken));
+                }
+                // Otherwise recurse into the pages (nested Tabs).
+                let mut i = 0;
+                let mut taken_out = None;
+                while i < children.len() {
+                    let child = std::mem::replace(&mut children[i], Node::Leaf(PaneId(u64::MAX)));
+                    let (rest, taken) = Self::take_tab_from(child, first);
+                    match rest {
+                        Some(n) => children[i] = n,
+                        None => {
+                            children.remove(i);
+                            if active >= i && active > 0 { active -= 1; }
+                        }
+                    }
+                    if taken.is_some() {
+                        taken_out = taken;
+                        break;
+                    }
+                    i += 1;
+                }
+                if taken_out.is_some() {
+                    let rest = match children.len() {
+                        0 => None,
+                        1 => Some(children.pop().unwrap()),
+                        _ => {
+                            if active >= children.len() { active = children.len() - 1; }
+                            Some(Node::Tabs { children, active })
+                        }
+                    };
+                    return (rest, taken_out);
+                }
+                (Some(Node::Tabs { children, active }), None)
+            }
+        }
+    }
+
+    /// Split `target`, placing `sub` on the chosen side, 50/50 — the drag-and-drop
+    /// insert. On a stale target the subtree is handed back (never dropped).
+    pub fn insert_beside(
+        &mut self,
+        target: PaneId,
+        sub: Subtree,
+        orient: Orientation,
+        before: bool,
+    ) -> Result<(), Subtree> {
+        fn walk(node: &mut Node, target: PaneId, incoming: &mut Option<Node>, orient: Orientation, before: bool) -> bool {
+            match node {
+                Node::Leaf(id) if *id == target => {
+                    let original = *id;
+                    let new = incoming.take().expect("incoming consumed once");
+                    let (first, second) = if before {
+                        (new, Node::Leaf(original))
+                    } else {
+                        (Node::Leaf(original), new)
+                    };
+                    *node = Node::Split {
+                        orient,
+                        children: vec![
+                            Child { weight: 1.0, node: first },
+                            Child { weight: 1.0, node: second },
+                        ],
+                    };
+                    true
+                }
+                Node::Leaf(_) => false,
+                Node::Split { children, .. } => children
+                    .iter_mut()
+                    .any(|c| walk(&mut c.node, target, incoming, orient, before)),
+                Node::Tabs { children, .. } => children
+                    .iter_mut()
+                    .any(|c| walk(c, target, incoming, orient, before)),
+            }
+        }
+        let mut incoming = Some(sub.0);
+        if walk(&mut self.root, target, &mut incoming, orient, before) {
+            Ok(())
+        } else {
+            Err(Subtree(incoming.take().expect("unconsumed on miss")))
+        }
+    }
+
+    /// Full-width/height split at the very top of the tree (the window-edge drop).
+    /// On an empty tree the subtree simply becomes the root.
+    pub fn insert_root_edge(&mut self, sub: Subtree, orient: Orientation, before: bool) {
+        if self.is_empty() {
+            self.root = sub.0;
+            return;
+        }
+        let old = std::mem::replace(&mut self.root, Node::Leaf(PaneId(u64::MAX)));
+        let (first, second) = if before { (sub.0, old) } else { (old, sub.0) };
+        self.root = Node::Split {
+            orient,
+            children: vec![
+                Child { weight: 1.0, node: first },
+                Child { weight: 1.0, node: second },
+            ],
+        };
+    }
+
+    /// Insert `sub` as a tab at `index` in the group that has `anchor` as one of
+    /// its pages' first leaves; wraps a bare `anchor` leaf in a fresh group when
+    /// no strip exists (mirroring `new_tab`). The inserted tab becomes active.
+    pub fn insert_tab_at(&mut self, anchor: PaneId, sub: Subtree, index: usize) -> Result<(), Subtree> {
+        fn walk(node: &mut Node, anchor: PaneId, incoming: &mut Option<Node>, index: usize) -> bool {
+            match node {
+                Node::Leaf(id) if *id == anchor => {
+                    // No strip yet: wrap the leaf, honouring index 0 vs 1+.
+                    let original = *id;
+                    let new = incoming.take().expect("consumed once");
+                    let (children, active) = if index == 0 {
+                        (vec![new, Node::Leaf(original)], 0)
+                    } else {
+                        (vec![Node::Leaf(original), new], 1)
+                    };
+                    *node = Node::Tabs { children, active };
+                    true
+                }
+                Node::Leaf(_) => false,
+                Node::Split { children, .. } => children
+                    .iter_mut()
+                    .any(|c| walk(&mut c.node, anchor, incoming, index)),
+                Node::Tabs { children, active } => {
+                    if children.iter().any(|c| Node::has_first_leaf(c, anchor)) {
+                        let i = index.min(children.len());
+                        children.insert(i, incoming.take().expect("consumed once"));
+                        *active = i; // reveal the arriving tab
+                        return true;
+                    }
+                    children.iter_mut().any(|c| walk(c, anchor, incoming, index))
+                }
+            }
+        }
+        let mut incoming = Some(sub.0);
+        if walk(&mut self.root, anchor, &mut incoming, index) {
+            Ok(())
+        } else {
+            Err(Subtree(incoming.take().expect("unconsumed on miss")))
+        }
+    }
+
+    /// Install `sub` as the root of an emptied tree (a tear-out landing in a fresh
+    /// window). Refuses — handing the subtree back — when the tree still has
+    /// content, so live panes can never be dropped by a mis-aimed adopt.
+    pub fn adopt_root(&mut self, sub: Subtree) -> Result<(), Subtree> {
+        if !self.is_empty() {
+            return Err(sub);
+        }
+        self.root = sub.0;
+        Ok(())
     }
 
     /// Collect every pane and its pixel rectangle for the given window
@@ -1018,6 +1250,26 @@ impl Tree {
     }
 }
 
+/// A detached fragment of a layout tree — the payload of a pane/tab move.
+/// Opaque on purpose: the tree's `Node` stays private, so the only way to make
+/// one is `Tree::take`/`take_tab` and the only way to use one is the insert
+/// ops, which keeps every pane accounted for.
+#[derive(Debug)]
+pub struct Subtree(Node);
+
+impl Subtree {
+    /// Every pane id inside this fragment, in traversal order.
+    pub fn panes(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        Tree::collect_panes(&self.0, &mut out);
+        out
+    }
+    /// The first leaf (used as the arriving focus / tab identity).
+    pub fn first_pane(&self) -> Option<PaneId> {
+        Tree::first_leaf(&self.0)
+    }
+}
+
 /// Result of removing a pane from a subtree, used by [`Tree::remove_from`].
 ///
 /// * `NotFound(node)` — the target was not in this subtree; the node is handed
@@ -1127,5 +1379,102 @@ mod tests {
                 assert_ne!(x, y, "ids collide across trees");
             }
         }
+    }
+
+    /// take() must collapse exactly like close() and hand the leaf back.
+    #[test]
+    fn take_collapses_and_returns_the_leaf() {
+        let (mut t, a) = Tree::new();
+        let b = t.split(a, Orientation::LeftRight).unwrap();
+        let sub = t.take(b).expect("b exists");
+        assert_eq!(sub.panes(), vec![b]);
+        assert_eq!(sub.first_pane(), Some(b));
+        // The 1-child split collapsed: the tree is a lone leaf `a` again.
+        assert_eq!(t.all_panes(), vec![a]);
+        assert!(t.take(b).is_none(), "stale id degrades to None");
+    }
+
+    /// Taking the last pane empties the tree; adopt_root refills it.
+    #[test]
+    fn take_last_pane_then_adopt_root() {
+        let (mut t, a) = Tree::new();
+        let sub = t.take(a).unwrap();
+        assert!(t.is_empty());
+        assert!(t.adopt_root(sub).is_ok());
+        assert_eq!(t.all_panes(), vec![a]);
+        let (mut full, _) = Tree::new();
+        let again = full.take(full.all_panes()[0]).unwrap();
+        let refused = t.adopt_root(again).expect_err("adopt_root refuses a non-empty tree");
+        assert_eq!(refused.panes().len(), 1, "the subtree is handed back, not dropped");
+    }
+
+    /// take_tab removes the whole page (a nested split) and collapses a
+    /// now-single-tab group into its lone page.
+    #[test]
+    fn take_tab_removes_the_whole_page_and_collapses() {
+        let (mut t, a) = Tree::new();
+        let b = t.new_tab(a).unwrap();               // tabs: [a, b], b active
+        let c = t.split(b, Orientation::LeftRight).unwrap(); // page 2 = split(b, c)
+        let sub = t.take_tab(b).expect("page's first leaf");
+        assert_eq!(sub.panes(), vec![b, c], "the whole page travels");
+        // One tab left → the Tabs wrapper unwraps to the bare leaf `a`.
+        assert_eq!(t.all_panes(), vec![a]);
+        assert!(t.tab_bars(Rect::new(0.0, 0.0, 800.0, 600.0)).is_empty(), "no strip for a single pane");
+    }
+
+    /// insert_beside splits the target 50/50 with the subtree on the asked side.
+    #[test]
+    fn insert_beside_places_before_or_after() {
+        let (mut t, a) = Tree::new();
+        let (mut src, x) = Tree::new();
+        let sub = src.take(x).unwrap();
+        t.insert_beside(a, sub, Orientation::LeftRight, true).unwrap();
+        let rects = t.rects(Rect::new(0.0, 0.0, 806.0, 600.0)); // 800 + DIVIDER
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].0, x, "before=true → subtree is the left child");
+        assert_eq!(rects[1].0, a);
+        assert!((rects[0].1.w - rects[1].1.w).abs() < 1.0, "50/50 split");
+        // Stale target hands the subtree back instead of dropping panes.
+        let (mut src2, y) = Tree::new();
+        let sub2 = src2.take(y).unwrap();
+        let returned = t.insert_beside(PaneId(u64::MAX - 5), sub2, Orientation::TopBottom, false)
+            .expect_err("stale target");
+        assert_eq!(returned.panes(), vec![y]);
+    }
+
+    /// insert_root_edge wraps the whole tree; before=true puts the newcomer first.
+    #[test]
+    fn insert_root_edge_wraps_the_root() {
+        let (mut t, a) = Tree::new();
+        let b = t.split(a, Orientation::LeftRight).unwrap();
+        let (mut src, x) = Tree::new();
+        t.insert_root_edge(src.take(x).unwrap(), Orientation::TopBottom, true);
+        let rects = t.rects(Rect::new(0.0, 0.0, 800.0, 606.0));
+        assert_eq!(rects[0].0, x, "newcomer is the top band");
+        assert_eq!(rects.len(), 3);
+        assert!(t.all_panes() == vec![x, a, b]);
+    }
+
+    /// insert_tab_at drops into an existing group at the index (and activates it),
+    /// and wraps a bare leaf into a fresh Tabs group when there is no strip yet.
+    #[test]
+    fn insert_tab_at_inserts_and_wraps() {
+        // Existing group: [a, b]; insert x at index 1 → [a, x, b], x active.
+        let (mut t, a) = Tree::new();
+        let b = t.new_tab(a).unwrap();
+        let (mut src, x) = Tree::new();
+        t.insert_tab_at(a, src.take(x).unwrap(), 1).unwrap();
+        let bounds = Rect::new(0.0, 0.0, 900.0, 600.0);
+        let bar = &t.tab_bars(bounds)[0];
+        let order: Vec<_> = bar.tabs.iter().map(|tb| tb.first_pane).collect();
+        assert_eq!(order, vec![a, x, b]);
+        assert!(bar.tabs[1].active, "inserted tab becomes active");
+        // No strip: wrapping a lone leaf. index 0 puts the newcomer first.
+        let (mut t2, p) = Tree::new();
+        let (mut src2, q) = Tree::new();
+        t2.insert_tab_at(p, src2.take(q).unwrap(), 0).unwrap();
+        let bar2 = &t2.tab_bars(bounds)[0];
+        let order2: Vec<_> = bar2.tabs.iter().map(|tb| tb.first_pane).collect();
+        assert_eq!(order2, vec![q, p]);
     }
 }
