@@ -3628,6 +3628,11 @@ impl App {
         if active.surface_pending.is_some() {
             return;
         }
+        // Multi-window: target THIS window's GL context before any backend work
+        // this frame (no-op on XRender; is_current-guarded on GL). The GL
+        // backend also self-arms at every context-dependent entry point, so
+        // this is belt-and-braces at the frame chokepoint.
+        active.backend.make_current();
         // Terminal colours (a dark theme): near-black bg, light-grey fg.
         // The background carries the user's opacity in its alpha channel, so a
         // value < 1.0 makes empty areas translucent (the window(s) behind show
