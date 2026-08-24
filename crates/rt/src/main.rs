@@ -1270,18 +1270,44 @@ impl ApplicationHandler for App {
     /// Handle a window event: close, resize, key input, redraw. Routed to the
     /// window it belongs to via `id`.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        // A mouse BUTTON event arriving in a window that is NOT where the drag
-        // gesture began can only happen if the pointer grab were re-targeted
-        // (X11's implicit grab keeps the press window today). Never let it
-        // commit into the wrong session, and never clear the cue fields on the
-        // wrong window: abandon the gesture at its SOURCE (`cancel_drag` routes
-        // there), then let this window handle the event as it always would.
-        // Done before `active` is borrowed, since `cancel_drag` needs `&mut self`.
+        // Two ways a mouse BUTTON event abandons a live pane/tab drag:
+        //
+        //  - it arrived in a window that is NOT where the gesture began, which
+        //    can only happen if the pointer grab were re-targeted (X11's
+        //    implicit grab keeps the press window today). Never let it commit
+        //    into the wrong session.
+        //  - it is a RIGHT or MIDDLE press, wherever it landed: the context
+        //    menu swallows motion AND Escape while open, so a drag left running
+        //    under it could neither be finished nor cancelled.
+        //
+        // Either way the cues may be sitting on a window other than this one
+        // (cross-window hover puts the cue and ghost chip in the HOVERED
+        // window), and only `cancel_drag` reaches every window showing them —
+        // which needs `&mut self`, hence before `active` is borrowed. Leaving
+        // them behind would strand a zone highlight, a ghost chip and a wedged
+        // Grabbing cursor in that window for the rest of the session.
+        //
+        // `drag_abandoned` tells the button arms below that the press was
+        // consumed by abandoning THIS window's drag, so they skip their own
+        // action (no menu, no paste) exactly as they did when they cancelled
+        // the drag inline. A press that abandoned a FOREIGN window's drag is
+        // not consumed: this window handles it as it always would.
+        let mut drag_abandoned = false;
         if matches!(event, WindowEvent::MouseInput { .. }) {
-            if matches!(self.armed_drag.as_ref(), Some(a) if a.window != id) {
-                self.armed_drag = None; // a stale arm: no click action anywhere
+            let second_button = matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Right | MouseButton::Middle,
+                    ..
+                }
+            );
+            if second_button || matches!(self.armed_drag.as_ref(), Some(a) if a.window != id) {
+                self.armed_drag = None; // a stale or abandoned arm: no click action anywhere
             }
-            if matches!(self.drag.as_ref(), Some(d) if d.source != id) {
+            let foreign = matches!(self.drag.as_ref(), Some(d) if d.source != id);
+            if self.drag.is_some() && (foreign || second_button) {
+                drag_abandoned = !foreign;
                 self.cancel_drag();
             }
         }
@@ -2017,14 +2043,10 @@ impl ApplicationHandler for App {
             // starts/ends a text selection; middle pastes the PRIMARY selection.
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
                 (ElementState::Pressed, MouseButton::Right) => {
-                    // A second button during a pane/tab drag abandons the gesture.
-                    // It must not merely fall through: the context menu swallows
-                    // motion AND Escape while open, so a drag left running under
-                    // it could neither be finished nor cancelled.
-                    self.armed_drag = None;
-                    if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
-                        self.drag = None;
-                        Self::clear_drag_cues(active); // this window IS the source
+                    // This press abandoned a pane/tab drag of ours (done at the
+                    // top of `window_event`, where every window showing cues is
+                    // reachable): it is consumed — no menu on it.
+                    if drag_abandoned {
                         return;
                     }
                     // Right-click cancels a pending wire, or disconnects the output
@@ -2406,12 +2428,10 @@ impl ApplicationHandler for App {
                     active.shift_press = false; // consumed
                 }
                 (ElementState::Pressed, MouseButton::Middle) => {
-                    // As for the right button: a middle-click during a drag
-                    // abandons it instead of pasting into a moving pane.
-                    self.armed_drag = None;
-                    if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
-                        self.drag = None;
-                        Self::clear_drag_cues(active); // this window IS the source
+                    // As for the right button: a middle-click that abandoned a
+                    // drag is consumed by it — it does not also paste into the
+                    // pane that was moving.
+                    if drag_abandoned {
                         return;
                     }
                     // A mouse-reporting app gets the middle-press; otherwise (or
@@ -2875,9 +2895,10 @@ fn opens_modal_overlay(action: rt_config::Action) -> bool {
 
 impl App {
     /// Abandon any pane/tab drag: forget the App-level state and wipe the cue
-    /// fields off the window that was showing them. Used by Escape, by a payload
-    /// pane dying mid-drag, and by the source window closing under the gesture —
-    /// every one of which must leave a clean window behind, never a stuck ghost.
+    /// fields off the window that was showing them. Used by Escape, by a second
+    /// mouse button pressed mid-drag, by a payload pane dying mid-drag, and by
+    /// the source window closing under the gesture — every one of which must
+    /// leave a clean window behind, never a stuck ghost.
     /// Safe to call with nothing armed or dragging.
     fn cancel_drag(&mut self) {
         self.armed_drag = None;
