@@ -1264,6 +1264,21 @@ impl ApplicationHandler for App {
     /// Handle a window event: close, resize, key input, redraw. Routed to the
     /// window it belongs to via `id`.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // A mouse BUTTON event arriving in a window that is NOT where the drag
+        // gesture began can only happen if the pointer grab were re-targeted
+        // (X11's implicit grab keeps the press window today). Never let it
+        // commit into the wrong session, and never clear the cue fields on the
+        // wrong window: abandon the gesture at its SOURCE (`cancel_drag` routes
+        // there), then let this window handle the event as it always would.
+        // Done before `active` is borrowed, since `cancel_drag` needs `&mut self`.
+        if matches!(event, WindowEvent::MouseInput { .. }) {
+            if matches!(self.armed_drag.as_ref(), Some(a) if a.window != id) {
+                self.armed_drag = None; // a stale arm: no click action anywhere
+            }
+            if matches!(self.drag.as_ref(), Some(d) if d.source != id) {
+                self.cancel_drag();
+            }
+        }
         // Everything here needs this window's state; ignore events before
         // resume and events for a window that has already closed.
         let Some(active) = self.windows.get_mut(&id) else { return };
@@ -2013,8 +2028,9 @@ impl ApplicationHandler for App {
                     // motion AND Escape while open, so a drag left running under
                     // it could neither be finished nor cancelled.
                     self.armed_drag = None;
-                    if self.drag.take().is_some() {
-                        Self::clear_drag_cues(active);
+                    if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+                        self.drag = None;
+                        Self::clear_drag_cues(active); // this window IS the source
                         return;
                     }
                     // Right-click cancels a pending wire, or disconnects the output
@@ -2115,6 +2131,10 @@ impl ApplicationHandler for App {
                         let size = active.window.inner_size();
                         let bounds = content_bounds(size);
                         let (mx, my) = active.mouse;
+                        // A second press must never arm a second gesture on top of
+                        // a live one: the first would be orphaned (its cues stuck
+                        // on, its release stolen by the newcomer).
+                        let can_arm = self.drag.is_none() && self.armed_drag.is_none();
                         // A press on the clipboard-history titlebar affordance opens
                         // the overlay. Checked first (like the jack/divider/scrollbar
                         // hit-tests below) so it wins over click-to-focus/selection —
@@ -2169,7 +2189,7 @@ impl ApplicationHandler for App {
                         // clipboard affordance that also lives there already
                         // returned above, so it can't be stolen here.
                         let tb_h = active.session.titlebar_h();
-                        if tb_h > 0.0 {
+                        if tb_h > 0.0 && can_arm {
                             let hit = active
                                 .session
                                 .visible_rects(bounds)
@@ -2200,11 +2220,15 @@ impl ApplicationHandler for App {
                             .find(|t| t.rect.contains(mx, my))
                             .map(|t| t.first_pane);
                         if let Some(first_pane) = clicked_tab {
-                            self.armed_drag = Some(ArmedDrag {
-                                window: id,
-                                payload: dragdrop::DragPayload::Tab { first_pane },
-                                press: (mx, my),
-                            });
+                            if can_arm {
+                                self.armed_drag = Some(ArmedDrag {
+                                    window: id,
+                                    payload: dragdrop::DragPayload::Tab { first_pane },
+                                    press: (mx, my),
+                                });
+                            }
+                            // (`!can_arm`: a gesture is already live — swallow the
+                            // press rather than switching tabs under it.)
                         } else {
                             active.session.focus_at(mx, my); // click-to-focus
                             // Ctrl+click on a URL opens it in the default handler
@@ -2313,7 +2337,11 @@ impl ApplicationHandler for App {
                     // the switch the press used to do, moved here so the label can
                     // also be dragged. For a titlebar it means nothing extra (the
                     // press already focused the pane).
-                    if let Some(armed) = self.armed_drag.take() {
+                    // Only ever act on a gesture that belongs to THIS window (a
+                    // foreign one was already abandoned at the top of
+                    // `window_event`; the guard keeps that invariant local).
+                    if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
+                        let armed = self.armed_drag.take().expect("just matched");
                         if let dragdrop::DragPayload::Tab { first_pane } = armed.payload {
                             active.session.focus_tab(first_pane);
                             // The visible pane set changes but the newly-shown panes
@@ -2327,7 +2355,10 @@ impl ApplicationHandler for App {
                     }
                     // A real drag: commit it where the pointer is (or cancel, if
                     // that is nothing — a gutter/dead zone resolves to `None`).
-                    if let Some(drag) = self.drag.take() {
+                    if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+                        let drag = self.drag.take().expect("just matched");
+                        // `drag.source == id`, so `active` IS the window whose cue
+                        // fields are set: clearing them below clears the right ones.
                         let target = drag.hover.as_ref().map(|(_, r)| r.target); // for the log below
                         let committed = match (drag.payload, drag.hover) {
                             (dragdrop::DragPayload::Pane(p), Some((_w, r))) => active.session.move_pane(p, r.target),
@@ -2407,8 +2438,9 @@ impl ApplicationHandler for App {
                     // As for the right button: a middle-click during a drag
                     // abandons it instead of pasting into a moving pane.
                     self.armed_drag = None;
-                    if self.drag.take().is_some() {
-                        Self::clear_drag_cues(active);
+                    if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+                        self.drag = None;
+                        Self::clear_drag_cues(active); // this window IS the source
                         return;
                     }
                     // A mouse-reporting app gets the middle-press; otherwise (or
