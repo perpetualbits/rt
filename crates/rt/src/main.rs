@@ -23,6 +23,7 @@ mod xrender_backend; // mechanism C: XRender backend
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 mod damage; // pure pixel-rect damage accumulator
+mod dragdrop; // pure drop-target resolver for cross-window pane/tab drag-and-drop
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
