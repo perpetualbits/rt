@@ -4686,6 +4686,26 @@ impl App {
     /// draw + `end_frame`, over the current framebuffer (inside the cleared
     /// scissor bbox on the partial path).
     fn paint_overlays_or_instruments(active: &mut Active) {
+        // Drag-and-drop cues, before everything else this function draws: they
+        // must land above pane content (already painted before this function
+        // runs) but a drag can't coexist with prefs/menu/manual/search being
+        // open, so drawing them first (under those) is equivalent in practice.
+        if active.drag_cue.is_some() || active.drag_ghost.is_some() {
+            let dim = active.drag_dim.and_then(|p| {
+                let bounds = content_bounds(active.window.inner_size());
+                active.session.visible_rects(bounds).into_iter().find(|(id, _)| *id == p).map(|(_, r)| r)
+            });
+            let size = active.window.inner_size();
+            let cell = active.backend.cell_size();
+            chrome::dragdrop::draw(
+                &mut *active.backend,
+                active.drag_cue.as_ref(),
+                active.drag_ghost.as_ref(),
+                dim,
+                cell,
+                (size.width as f32, size.height as f32),
+            );
+        }
         // Preferences (and the colour picker over it): a native dialog on BOTH
         // backends. Checked before the per-backend split below, which only governs
         // how the instruments are drawn (inline on GL vs a persistent layer on
