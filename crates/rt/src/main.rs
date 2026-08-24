@@ -2883,6 +2883,25 @@ enum WindowCmd {
     DetachTab,            // tear the current tab out to a new window
 }
 
+/// Does this action open a MODAL overlay — one whose input shim (near the top of
+/// `window_event`) swallows every later event until it is dismissed?
+///
+/// These four are the complete set reachable from a key binding: they are the
+/// only `apply_action` arms that set `prefs_open` / `manual_open` /
+/// `search_open` / `clip_overlay`. The context menu (`active.menu`) opens only
+/// from a right-press, which abandons a drag itself; the colour picker opens
+/// only from inside the preferences dialog; the `RT_*` demo hooks open overlays
+/// at startup, before any gesture can exist.
+///
+/// A live pane/tab drag must be cancelled before any of them runs, or the
+/// overlay would eat the mouse release that finishes the drag (see
+/// [`App::on_key_press`]). Actions that DON'T open an overlay (splits, focus
+/// moves, broadcast, zoom, …) keep dispatching mid-drag as before.
+fn opens_modal_overlay(action: rt_config::Action) -> bool {
+    use rt_config::Action;
+    matches!(action, Action::Preferences | Action::Manual | Action::Search | Action::ClipHistory)
+}
+
 impl App {
     /// Abandon any pane/tab drag: forget the App-level state and wipe the cue
     /// fields off the window that was showing them. Used by Escape, by a payload
@@ -2892,6 +2911,7 @@ impl App {
     fn cancel_drag(&mut self) {
         self.armed_drag = None;
         let Some(drag) = self.drag.take() else { return };
+        log::debug!("drag cancelled: payload={:?}", drag.payload);
         // The window may already be gone (that is one of the reasons we cancel).
         let Some(active) = self.windows.get_mut(&drag.source) else { return };
         Self::clear_drag_cues(active);
@@ -3907,6 +3927,23 @@ impl App {
         }
         if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
             self.armed_drag = None;
+        }
+        // A bound action that opens a MODAL overlay (preferences, manual, search,
+        // clipboard history) installs an input shim that swallows every later
+        // event — including the mouse release that would finish a drag. Opening
+        // one mid-gesture would strand the drag with its cues frozen under the
+        // dialog, so abandon the gesture first; the action then runs normally.
+        // Only paid for while something is armed or dragging, and done here
+        // because `cancel_drag` needs `&mut self` (no `Active` borrowed yet).
+        if self.drag.is_some() || self.armed_drag.is_some() {
+            let opens_overlay = self.windows.get(&id).is_some_and(|a| {
+                input::chord_from_winit(&key_event.logical_key, a.mods)
+                    .and_then(|c| a.keymap.action_for(&c))
+                    .is_some_and(opens_modal_overlay)
+            });
+            if opens_overlay {
+                self.cancel_drag();
+            }
         }
         let Some(active) = self.windows.get_mut(&id) else { return };
         // While an IME/dead-key composition is in progress, swallow key presses:
