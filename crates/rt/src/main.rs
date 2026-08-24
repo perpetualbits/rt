@@ -609,6 +609,14 @@ struct DragState {
     // cue fields are set, so a motion into another window (or off all of them)
     // knows which stale cues to wipe.
     cued: Option<WindowId>,
+    // The held-pane cursor card, or None if the platform refused the image
+    // (BadImage) — then the plain `CursorIcon::Grabbing` set at promote time
+    // stands in for the whole drag. Not read within this task: carried
+    // forward so a later "carry mode" task (re-applying the card cursor as
+    // the pointer crosses between windows) can consume it without another
+    // plumbing pass.
+    #[allow(dead_code)]
+    card: Option<winit::window::CustomCursor>,
 }
 
 /// Build the system font database (scans the usual font directories).
@@ -1971,8 +1979,13 @@ impl ApplicationHandler for App {
                                 (panes, label)
                             }
                         };
-                        active.window.set_cursor(CursorIcon::Grabbing);
-                        active.cursor_icon = Some(CursorIcon::Grabbing);
+                        let card = Self::make_payload_card(event_loop, active, armed.payload);
+                        match &card {
+                            Some(c) => active.window.set_cursor(winit::window::Cursor::Custom(c.clone())),
+                            None => active.window.set_cursor(CursorIcon::Grabbing),
+                        }
+                        active.cursor_icon = Some(CursorIcon::Grabbing); // proxy: update_cursor's change
+                        // detection only needs to see "not default" so it restores properly later.
                         self.drag = Some(DragState {
                             source: id,
                             payload: armed.payload,
@@ -1981,6 +1994,7 @@ impl ApplicationHandler for App {
                             hover: None,
                             cursor: active.mouse,
                             cued: None,
+                            card,
                         });
                     }
                 }
@@ -3475,6 +3489,36 @@ impl App {
         Self::update_cursor(active); // drop Grabbing
         active.force_full = true; // the cues are off the damage-tracked path
         active.window.request_redraw();
+    }
+
+    /// The held-pane cursor card for a drag/carry payload, or None (fall back to
+    /// CursorIcon::Grabbing) if the platform refuses the image. Cursor problems
+    /// must never affect gesture logic.
+    fn make_payload_card(
+        event_loop: &ActiveEventLoop,
+        active: &Active,
+        payload: dragdrop::DragPayload,
+    ) -> Option<winit::window::CustomCursor> {
+        let bounds = content_bounds(active.window.inner_size());
+        let rect = match payload {
+            dragdrop::DragPayload::Pane(p) => active
+                .session
+                .visible_rects(bounds)
+                .into_iter()
+                .find(|(id, _)| *id == p)
+                .map(|(_, r)| r),
+            dragdrop::DragPayload::Tab { .. } => None, // a tab page fills the content area
+        };
+        let (w, h) = rect.map(|r| (r.w, r.h)).unwrap_or((bounds.w, bounds.h));
+        let aspect = if h > 0.0 { w / h } else { 1.0 };
+        let (rgba, cw, ch) = carry_card::build_card_rgba(aspect, active.settings.background);
+        match winit::window::CustomCursor::from_rgba(rgba, cw, ch, carry_card::CARD_HOTSPOT.0, carry_card::CARD_HOTSPOT.1) {
+            Ok(src) => Some(event_loop.create_custom_cursor(src)),
+            Err(e) => {
+                log::warn!("held-pane cursor unavailable ({e}); falling back to Grabbing");
+                None
+            }
+        }
     }
 
     /// Close ONE window. The LAST window exits the process via `exit_clean()`
