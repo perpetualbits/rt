@@ -36,8 +36,19 @@ PANES
 TABS  &  COLUMNS
   Ctrl+Shift+T    new tab beside the focused pane
   Ctrl+PageUp/Dn  previous / next tab
+  Ctrl+Shift+PageUp/Dn   move the focused tab left / right
   Ctrl+.  /  Ctrl+,   more / fewer newspaper columns (text flows column to
                       column; vim/less/etc. just see a taller, narrower screen)
+
+
+WINDOWS  &  DRAG-AND-DROP
+  Ctrl+Shift+I    open a new, empty rt window
+  Ctrl+Shift+D    detach the focused pane into a new window of its own
+  Ctrl+Shift+J    detach the focused tab into a new window of its own
+  Drag & drop     drag a pane by its titlebar, or a tab by its label, to
+                  reorder it; drop it onto another rt window (X11) to move
+                  the pane/tab there, or drop it on bare desktop to tear it
+                  out into a brand-new window. The keys above do the same.
 
 
 SELECTING TEXT

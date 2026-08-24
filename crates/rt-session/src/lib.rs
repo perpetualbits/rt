@@ -543,7 +543,15 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
             | Action::PipeInto
             | Action::Manual
             | Action::ClipHistory
-            | Action::ClearClipHistory => None,
+            | Action::ClearClipHistory
+            // Multi-window pane/tab drag-and-drop: the GUI shell owns window
+            // creation/destruction, so it intercepts these before dispatch too.
+            // Behaviour lands in Tasks 6-8; this arm just keeps `apply` total.
+            | Action::NewWindow
+            | Action::DetachPane
+            | Action::DetachTab
+            | Action::MoveTabLeft
+            | Action::MoveTabRight => None,
         }
     }
 

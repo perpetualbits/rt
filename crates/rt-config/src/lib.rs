@@ -101,6 +101,16 @@ pub enum Action {
     ClipHistory,
     /// Empty the clipboard history.
     ClearClipHistory,
+    /// rt-specific: open a new empty rt window (same process).
+    NewWindow,
+    /// rt-specific: pull the focused pane out of its window into a new window.
+    DetachPane,
+    /// rt-specific: pull the focused tab out of its window into a new window.
+    DetachTab,
+    /// rt-specific: move the focused tab one position toward the start.
+    MoveTabLeft,
+    /// rt-specific: move the focused tab one position toward the end.
+    MoveTabRight,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -483,6 +493,12 @@ impl Keymap {
             ("<Shift><Control>k", Action::Unwire),       // disconnect focused pane
             ("<Shift><Control>p", Action::PipeInto),     // split + pipe stdout in
             ("F1", Action::Manual),                      // built-in manual
+            // Multi-window pane/tab drag-and-drop keyboard equivalents.
+            ("<Shift><Control>i", Action::NewWindow),    // new_window (Terminator)
+            ("<Shift><Control>d", Action::DetachPane),   // detach pane to its own window
+            ("<Shift><Control>j", Action::DetachTab),    // detach tab to its own window
+            ("<Shift><Control>Page_Up", Action::MoveTabLeft),  // move_tab (Terminator)
+            ("<Shift><Control>Page_Down", Action::MoveTabRight), // move_tab (Terminator)
         ];
         let mut map = Keymap { bindings: Vec::new() }; // empty binding list
         for (accel, action) in defaults {
@@ -556,5 +572,21 @@ mod config_tests {
         let km = Keymap::default();
         let chord = keys::Chord::parse("<Shift><Control>h").expect("valid chord");
         assert_eq!(km.action_for(&chord), Some(Action::ClipHistory));
+    }
+
+    #[test]
+    fn window_and_tab_move_actions_have_default_chords() {
+        let km = Keymap::default();
+        let expect = [
+            ("<Shift><Control>i", Action::NewWindow),
+            ("<Shift><Control>d", Action::DetachPane),
+            ("<Shift><Control>j", Action::DetachTab),
+            ("<Shift><Control>Page_Up", Action::MoveTabLeft),
+            ("<Shift><Control>Page_Down", Action::MoveTabRight),
+        ];
+        for (accel, action) in expect {
+            let chord = keys::Chord::parse(accel).expect("valid chord");
+            assert_eq!(km.action_for(&chord), Some(action), "{accel}");
+        }
     }
 }
