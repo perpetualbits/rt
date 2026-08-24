@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-08-24"
+    updated: "2026-08-25"
   },
 
   statuses: {
@@ -96,7 +96,7 @@ window.PROJECT_MAP = {
     {
       id: "multiwindow", label: "Multi-window & drag-and-drop", layer: "frontend", status: "done",
       tags: ["Phase 3", "X11 + Wayland"],
-      desc: "One rt process, any number of windows (App::windows keyed by WindowId; Ctrl+Shift+I opens one, each closes independently, rt exits with the last). A pane or tab tears out with a key (Ctrl+Shift+D / Ctrl+Shift+J) or by dragging it to bare desktop. In-window drag (pane by titlebar, tab by label) gives live cues — half-pane split fill, whole-pane swap, tab-insert caret, window-edge root-split band, a ghost chip, source dim — on both backends. Cross-window drag-with-cues and drag tear-out are X11-only (gated on winit's inner_position, which Wayland never answers); Wayland reaches another window through the right-click 'Move Pane to N: title' menu instead. A cross-window move or tear-out cuts any patch-bay wire that would end up spanning two windows; a wire wholly inside the moved payload travels with it.",
+      desc: "One rt process, any number of windows (App::windows keyed by WindowId; Ctrl+Shift+I opens one, each closes independently, rt exits with the last). A pane or tab tears out with a key (Ctrl+Shift+D / Ctrl+Shift+J) or by dragging it to bare desktop. In-window drag (pane by titlebar, tab by label) gives live cues — half-pane split fill, whole-pane swap, tab-insert caret, window-edge root-split band, a ghost chip, source dim — on both backends. Cross-window drag-with-cues is X11-only (gated on winit's inner_position, which Wayland never answers); drag tear-out works on Wayland too (surface-local out-of-bounds release, compositor-placed — verified on cosmic-comp), and Wayland reaches another window through the right-click 'Move Pane to N: title' menu. A cross-window move or tear-out cuts any patch-bay wire that would end up spanning two windows; a wire wholly inside the moved payload travels with it.",
       files: ["crates/rt/src/main.rs", "crates/rt/src/dragdrop.rs", "crates/rt/src/chrome/dragdrop.rs", "crates/rt-session/src/lib.rs", "crates/rt-core/src/layout.rs"],
       specs: [
         { label: "Pane drag-and-drop + multi-window design", href: "docs/superpowers/specs/2026-08-24-pane-dragdrop-multiwindow-design.md" },

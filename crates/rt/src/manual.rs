@@ -58,16 +58,19 @@ WINDOWS  &  DRAG-AND-DROP
                   back. Pane drag needs its titlebar (Preferences, on
                   by default) to grab — with titlebars off, drag the
                   tab instead, or use the keys above.
+                  Drop OUTSIDE the window — on bare desktop — to tear
+                  the pane/tab out into a brand-new window. On X11 the
+                  new window lands at the drop point; on Wayland the
+                  compositor places it (a client has no screen
+                  coordinates there — and cannot see other windows
+                  mid-drag, so a release over another rt window also
+                  tears out rather than dropping in).
                   X11 only (ssh -X included): drop onto ANOTHER rt
                   window to move the pane/tab there — its CENTRE swaps
-                  the two panes, an edge splits, both across windows —
-                  or drop on bare desktop to tear it out into a
-                  brand-new window. Wayland gives a client no window
-                  position, so there a drag always stays inside its own
-                  window (reorder / split / swap still work); reach for
-                  the keys above to tear a pane out, or the right-click
-                  menu's "Move Pane to N: title" row to send it straight
-                  to another open window.
+                  the two panes, an edge splits, both across windows.
+                  On Wayland use the right-click menu's "Move Pane to
+                  N: title" row to send a pane straight to another
+                  open window, or the detach keys above.
                   A cross-window move or tear-out CUTS any patch-bay
                   wire that would end up spanning two windows — a wire
                   wholly inside what moved travels with it.

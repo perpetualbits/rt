@@ -3088,20 +3088,36 @@ impl App {
         }
     }
 
-    /// The screen point a drag was released at, when it landed OUTSIDE the
-    /// source window — the tear-out gesture. `None` means "not a tear-out":
-    /// either the release was inside the source (a gutter: cancel), or the
-    /// platform cannot say where windows are (Wayland), where tear-out is
-    /// gated off and keyboard detach is the path.
-    fn tear_out_point(&self, source: WindowId) -> Option<winit::dpi::PhysicalPosition<i32>> {
+    /// Did a drag release land OUTSIDE the source window — the tear-out
+    /// gesture? `None` means "not a tear-out" (the release was inside the
+    /// source: a gutter, a margin — a cancel). `Some(pos)` means tear out,
+    /// where the inner `Option` is the global screen point to place the new
+    /// window at: `Some` on X11 (`inner_position()` works), `None` on Wayland,
+    /// where a client has no global coordinates and the compositor places the
+    /// window instead.
+    ///
+    /// "Outside the source" needs only SURFACE-LOCAL coordinates, and the
+    /// implicit grab keeps delivering motion past the surface edge on both
+    /// platforms — measured on cosmic-comp (2026-08-25): 366 out-of-bounds
+    /// motion events during a 12s button-hold, coords from -407 to +1139
+    /// against a 1056px window, zero cursor-left, and the release itself
+    /// delivered while outside. So the tear-out gesture works on Wayland too;
+    /// only the drop-point placement stays X11-only.
+    fn tear_out_release(&self, source: WindowId) -> Option<Option<winit::dpi::PhysicalPosition<i32>>> {
         let a = self.windows.get(&source)?;
-        let Ok(pos) = a.window.inner_position() else { return None }; // Wayland: no global coords
         let size = a.window.inner_size();
         let (mx, my) = a.mouse;
         if mx >= 0.0 && my >= 0.0 && mx < size.width as f32 && my < size.height as f32 {
-            return None; // still inside the source window
+            return None; // still inside the source window: not a tear-out
         }
-        Some(winit::dpi::PhysicalPosition::new(pos.x + mx as i32, pos.y + my as i32))
+        // Outside: tear out. Place at the drop point where the platform can
+        // say where that is (X11); let the compositor place it elsewhere.
+        Some(
+            a.window
+                .inner_position()
+                .ok()
+                .map(|pos| winit::dpi::PhysicalPosition::new(pos.x + mx as i32, pos.y + my as i32)),
+        )
     }
 
     /// Commit (or cancel) the live drag on release. `id` is the source window,
@@ -3119,10 +3135,14 @@ impl App {
             Some((w, r)) => self.cross_window_drop(id, drag.payload, w, r),
             // Nothing resolved under the pointer. Over an rt window (`cued`)
             // that is a dead zone — a gutter, a margin — and a dead zone is a
-            // cancel, in ANY window. Only a release over no rt window at all
-            // tears out, and only where the platform can say where that was.
-            None => match (drag.cued, self.tear_out_point(id)) {
-                (None, Some(at)) => self.tear_out(event_loop, id, drag.payload, Some(at)),
+            // cancel, in ANY window. A release outside the source with no rt
+            // window cued tears out. On X11 the new window lands at the drop
+            // point; on Wayland the compositor places it (no global coords) —
+            // and since Wayland also can't SEE other rt windows during a drag
+            // (`cued` is always None off-source there), a release over another
+            // rt window tears out too, on top of it. Documented limitation.
+            None => match (drag.cued, self.tear_out_release(id)) {
+                (None, Some(at)) => self.tear_out(event_loop, id, drag.payload, at),
                 _ => false,
             },
         };

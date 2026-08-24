@@ -54,20 +54,25 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   startup for inspection.
 
 ## Pane drag-and-drop (2026-08-24)
-- ◐ **Cross-window drag and drag tear-out are X11-only.** Dragging a pane/tab
-  into ANOTHER rt window, and dropping one on bare desktop to tear it out into
-  a new window, both need the pointer in SCREEN coordinates: rt asks winit for
-  `Window::inner_position()`, which Wayland has no answer for (a client is never
-  told where its surface is, and `set_outer_position` is a no-op). Both gestures
-  are therefore gated on `inner_position().is_ok()` — on Wayland a drag simply
-  stays inside the window it started in (reorder/split/swap/tab-drop all work
-  there), and the keyboard/menu path is how a pane moves out: `Ctrl+Shift+D`
-  (pane) / `Ctrl+Shift+J` (tab) detach into a new window. Wayland's own pointer
-  behaviour is not the blocker — its implicit grab does keep delivering
-  surface-local motion past the surface edge — the missing global coordinates
-  are. Lifting this needs a compositor-side protocol (an actual XDG drag-and-drop
-  session, `wlr-foreign-toplevel`-style placement, or KDE's plasma-window
-  management), which is a separate piece of work.
+- ◐ **Cross-window DRAG is X11-only; drag TEAR-OUT works everywhere.** Dragging
+  a pane/tab into ANOTHER rt window needs the pointer in SCREEN coordinates: rt
+  asks winit for `Window::inner_position()`, which Wayland has no answer for (a
+  client is never told where its surface is, and `set_outer_position` is a
+  no-op), so that gesture is gated on `inner_position().is_ok()`. On Wayland use
+  the right-click menu's "Move Pane to N: title" row, or `Ctrl+Shift+D` (pane) /
+  `Ctrl+Shift+J` (tab) to detach into a new window. Dropping OUTSIDE the source
+  window to tear out, however, needs only surface-local coordinates, and the
+  Wayland implicit grab keeps delivering motion past the surface edge — measured
+  on cosmic-comp (2026-08-25, instrumented run: 366 out-of-bounds motion events
+  during a 12s hold, release delivered outside, zero cursor-left) — so drag
+  tear-out is enabled on Wayland too, with the compositor choosing the new
+  window's placement (X11 places it at the drop point). Wayland caveat: rt
+  cannot see other windows mid-drag, so a release over ANOTHER rt window also
+  tears out (on top of it) instead of dropping in. Lifting the cross-window gap
+  needs a compositor-mediated protocol — a real data-device drag-and-drop
+  session with a custom mime type would work on every compositor incl.
+  cosmic-comp (probed 2026-08-25: `wl_data_device_manager` v3 present,
+  `xdg_toplevel_drag_v1` absent) — a separate piece of work.
 - ◐ **Overlapping rt windows: hover target picked by map order, not stacking
   order.** `App::window_under_global` (X11 only, see above) walks every open
   window's `inner_position()`/`inner_size()` and returns the first whose
