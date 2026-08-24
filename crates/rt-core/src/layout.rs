@@ -24,6 +24,18 @@
 //!   visible/laid-out.
 
 use crate::geom::Rect;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-global PaneId allocator. Panes can move between windows (trees), so
+/// ids must be unique across the whole process, not per-tree — that is what
+/// lets a moved subtree keep its side-table entries with zero remapping.
+/// u64::MAX stays the empty-tree sentinel and u64::MAX-1 the swap placeholder;
+/// a monotonically increasing counter can never reach either.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn mint_global() -> PaneId {
+    PaneId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Width in logical pixels of the draggable gutter drawn between split
 /// children. Subtracted from the available space before dividing it, so panes
@@ -96,15 +108,12 @@ enum Node {
     },
 }
 
-/// The whole layout for one window: a root node plus a monotonically increasing
-/// id counter used to mint fresh `PaneId`s.
-///
-/// `next_id` lives here (not globally) so each window's ids are independent and
-/// a saved/restored layout can renumber cleanly.
+/// The whole layout for one window: a root node. PaneIds are allocated from a
+/// process-global counter so they are unique across all trees — this allows panes
+/// to move between windows without remapping their ids or side-table entries.
 #[derive(Clone, Debug)]
 pub struct Tree {
-    root: Node,   // the current arrangement
-    next_id: u64, // next PaneId to hand out; monotonic, never reused
+    root: Node, // the current arrangement
 }
 
 impl Tree {
@@ -114,10 +123,9 @@ impl Tree {
     /// Every window starts life as a single full-window terminal, exactly like
     /// Terminator opening a bare window before any split.
     pub fn new() -> (Self, PaneId) {
-        let first = PaneId(0); // the very first pane always gets id 0
+        let first = mint_global();
         let tree = Tree {
             root: Node::Leaf(first), // root starts as a lone leaf
-            next_id: 1,              // 0 is taken; hand out 1 next
         };
         (tree, first)
     }
@@ -129,9 +137,7 @@ impl Tree {
     /// accidentally alias a live pane (the same discipline that makes
     /// `deregister` idempotent in rt vs. Terminator's double-remove crash, #3).
     fn mint(&mut self) -> PaneId {
-        let id = PaneId(self.next_id); // take the current counter value
-        self.next_id += 1;             // advance so the next call differs
-        id
+        mint_global()
     }
 
     /// Split the pane `target` in two, inserting a fresh pane beside it.
@@ -1060,7 +1066,7 @@ mod tests {
                 (1.0, split(Orientation::LeftRight, vec![(1.0, Node::Leaf(bl)), (1.0, Node::Leaf(br))])),
             ],
         );
-        let mut tree = Tree { root, next_id: 4 };
+        let mut tree = Tree { root };
 
         // Focusing TOP (a direct child of root) rotates the whole window.
         assert!(tree.rotate(top));
@@ -1099,11 +1105,27 @@ mod tests {
                 ),
             ],
         );
-        let mut tree = Tree { root, next_id: 5 };
+        let mut tree = Tree { root };
         let before = format!("{:?}", tree.root);
         for _ in 0..4 {
             assert!(tree.rotate(a)); // `a` stays a direct child of the rotating root
         }
         assert_eq!(format!("{:?}", tree.root), before, "four quarter-turns must equal the identity");
+    }
+
+    /// Two trees must never hand out the same PaneId — panes move between
+    /// windows, so ids are process-global (spec: multi-window, zero remapping).
+    #[test]
+    fn pane_ids_are_unique_across_trees() {
+        let (mut t1, a) = Tree::new();
+        let (mut t2, b) = Tree::new();
+        let c = t1.split(a, Orientation::LeftRight).unwrap();
+        let d = t2.split(b, Orientation::TopBottom).unwrap();
+        let ids = [a, b, c, d];
+        for (i, x) in ids.iter().enumerate() {
+            for y in &ids[i + 1..] {
+                assert_ne!(x, y, "ids collide across trees");
+            }
+        }
     }
 }
