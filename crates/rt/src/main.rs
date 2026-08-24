@@ -2677,14 +2677,115 @@ impl App {
                 active.window.request_redraw(); // first paint
                 self.windows.insert(active.window.id(), active);
             }
-            WindowCmd::DetachPane => {
-                // Task 7: tear the focused pane out into a new window.
-                log::debug!("DetachPane: not implemented yet (Task 7)");
+            WindowCmd::DetachPane => self.detach(event_loop, id, false),
+            WindowCmd::DetachTab => self.detach(event_loop, id, true),
+        }
+    }
+
+    /// Tear the focused pane (or its whole tab, when `tab` is set) out of
+    /// window `id` into a fresh OS window. The package moves in memory: PTY,
+    /// scrollback, title, group all survive. No-op when it would just recreate
+    /// the same window (a lone pane, or `tab` with no tab strip). Also used by
+    /// drag tear-out (Task 11).
+    fn detach(&mut self, event_loop: &ActiveEventLoop, id: WindowId, tab: bool) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
+        // A lone pane in a lone tab: tearing out would just recreate this
+        // window. No-op (also covers the empty-tree case, defensively).
+        if active.session.tree().all_panes().len() <= 1 {
+            return;
+        }
+        let focus = active.session.focus();
+        let bounds = content_bounds(active.window.inner_size());
+        let pkg = if tab {
+            // The focused pane's tab: find its strip's active entry (first_pane
+            // identity), same "first strip with an active tab" convention as
+            // `move_focused_tab`.
+            let first = active
+                .session
+                .tab_bars(bounds)
+                .iter()
+                .flat_map(|b| b.tabs.iter())
+                .find(|t| t.active)
+                .map(|t| t.first_pane);
+            let Some(first) = first else { return }; // no tab strip → nothing to detach
+            active.session.extract_tab(first)
+        } else {
+            active.session.extract_pane(focus)
+        };
+        let Some(pkg) = pkg else { return };
+
+        // Move the panes' patch-bay jacks with them; cut wires that would
+        // cross between the source and the new window (exactly one end
+        // moved), and carry wires with BOTH ends moved along with the panes.
+        let moved: Vec<rt_core::PaneId> = pkg.sub.panes();
+        let mut moved_jacks = Vec::new();
+        for pid in &moved {
+            if let Some(j) = active.jacks.borrow_mut().remove(pid) {
+                moved_jacks.push((*pid, j));
             }
-            WindowCmd::DetachTab => {
-                // Task 7: tear the current tab out into a new window.
-                log::debug!("DetachTab: not implemented yet (Task 7)");
+        }
+        // A plain `.partition()` only ever produces two groups covering every
+        // element — it can't also DROP the cross wires, so a naive
+        // `partition(|w| both ends moved)` would leave a one-end-moved wire
+        // sitting in `staying`, dangling a reference to a pane that just left
+        // this window. Classify in one pass instead: both ends moved travels,
+        // neither end moved stays, exactly one end moved is cut (dropped).
+        let mut travelling = Vec::new();
+        let mut staying = Vec::new();
+        for w in active.wires.drain(..) {
+            match (moved.contains(&w.src), moved.contains(&w.dst)) {
+                (true, true) => travelling.push(w),
+                (false, false) => staying.push(w),
+                _ => {} // exactly one end moved: cut, not carried either way
             }
+        }
+        active.wires = staying;
+        let src_became_empty = active.session.is_empty();
+
+        let Some(mut new_active) = self.build_active(event_loop) else {
+            // Window creation failed: put the package back beside the focus.
+            if let Some(a) = self.windows.get_mut(&id) {
+                let _ = a.session.adopt(
+                    pkg,
+                    rt_session::DropTarget::RootEdge { orient: rt_core::Orientation::LeftRight, before: false },
+                );
+                for (pid, j) in moved_jacks {
+                    a.jacks.borrow_mut().insert(pid, j);
+                }
+                a.wires.extend(travelling);
+            }
+            return;
+        };
+        // The fresh window spawned one pane of its own; drop it before
+        // adopting the moved panes into the (now empty) tree, so the new
+        // window's shell doesn't linger as an orphan tab/split. Its shell
+        // gets SIGHUP via Drop, like a closed pane; drop its jack entry too
+        // so the fifo files are cleaned up by `Jacks`' Drop.
+        let seed = new_active.session.focus();
+        if let Some(seed_pkg) = new_active.session.extract_pane(seed) {
+            for pid in seed_pkg.sub.panes() {
+                new_active.jacks.borrow_mut().remove(&pid);
+            }
+            drop(seed_pkg);
+        }
+        if new_active.session.adopt(pkg, rt_session::DropTarget::Root).is_err() {
+            log::error!("detach: adopt into the new window failed"); // cannot happen: the tree is empty
+            return;
+        }
+        for (pid, j) in moved_jacks {
+            new_active.jacks.borrow_mut().insert(pid, j);
+        }
+        new_active.wires = travelling;
+        new_active.force_full = true;
+        new_active.window.request_redraw();
+        let new_id = new_active.window.id();
+        self.windows.insert(new_id, new_active);
+
+        if src_became_empty {
+            self.close_window(id); // moved the last pane away → the source shell is gone
+        } else if let Some(a) = self.windows.get_mut(&id) {
+            a.force_full = true;
+            a.window.request_redraw();
         }
     }
 
