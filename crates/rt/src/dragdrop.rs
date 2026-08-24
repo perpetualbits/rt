@@ -67,6 +67,23 @@ pub fn resolve_drop(
     resolve_pane_zone(payload, payload_panes, panes, cx, cy)
 }
 
+/// Turn a caret insertion slot into the index [`rt_session::Session::reorder_tab`]
+/// wants, for a tab dropped on the strip it already lives in.
+///
+/// `TabAt.index` counts insertion slots in the CURRENT strip — including the
+/// dragged tab's own position. `reorder_tab` moves within a strip the tab has
+/// already been removed from conceptually, so every slot to the right of the
+/// tab's current index has shifted one place left: subtract one there. Slots at
+/// or left of it are unaffected. Dropping onto its own two adjacent slots
+/// (`current` and `current + 1`) is the identity, as it should be.
+pub fn index_for_reorder(current: usize, insertion: usize) -> usize {
+    if insertion > current {
+        insertion - 1
+    } else {
+        insertion
+    }
+}
+
 fn resolve_tab_strip(
     payload: DragPayload,
     payload_panes: &[rt_core::PaneId],
@@ -329,6 +346,21 @@ mod tests {
         let panes = vec![(PaneId(2), Rect::new(0.0, 24.0, 806.0, 576.0))];
         let r = resolve_drop(DragPayload::Tab { first_pane: PaneId(2) }, &[PaneId(2)], &panes, &[bar], bounds(), (10.0, 12.0)).unwrap();
         assert_eq!(r.target, DropTarget::TabAt { anchor: PaneId(1), index: 0 });
+    }
+
+    #[test]
+    fn dropping_a_tab_right_on_its_own_strip_subtracts_the_gap_it_leaves() {
+        // Strip [a, b, c]; drag `a` (current index 0) to the caret AFTER b —
+        // the insertion slot between b and c is 2. Removing `a` first shifts b
+        // and c left, so the resulting order [b, a, c] is reorder_tab(a, 1).
+        assert_eq!(index_for_reorder(0, 2), 1);
+        // Its own two adjacent slots are no-ops.
+        assert_eq!(index_for_reorder(1, 1), 1);
+        assert_eq!(index_for_reorder(1, 2), 1);
+        // Moving left keeps the slot as-is (nothing before it shifted).
+        assert_eq!(index_for_reorder(2, 0), 0);
+        // Past the end of a 3-tab strip → the last position.
+        assert_eq!(index_for_reorder(0, 3), 2);
     }
 
     // --- extra edge-case coverage beyond the brief's tests ---

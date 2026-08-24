@@ -398,6 +398,13 @@ struct Active {
     last_instr_tick: Instant,             // when the instrument animation last advanced
     last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
     autoscroll_accel: (isize, u32), // drag auto-scroll ramp: (last_dir, ticks held in the edge zone)
+    // Per-frame drag-and-drop cues. The App owns the drag itself (see
+    // `App::drag`); these are what it writes into the window under the pointer
+    // before asking for a frame, and what the overlay pass paints. All three are
+    // cleared when the drag commits or cancels.
+    drag_cue: Option<dragdrop::ResolvedDrop>, // where a release would land the payload (+ its highlight rect)
+    drag_ghost: Option<((f32, f32), String)>, // the chip that follows the pointer: (position, label)
+    drag_dim: Option<rt_core::PaneId>,        // the pane being dragged, drawn dimmed at its old place
     window: Window, // the OS window — LAST so it outlives everything that references it on Drop
 }
 
@@ -560,6 +567,33 @@ struct App {
     mono_families: Vec<String>,                // monospace family names for the preferences combo
     cli: Cli,                                  // command-line overrides (grid/font)
     windows: std::collections::HashMap<WindowId, Active>, // every open window's live state
+    // Pane/tab drag-and-drop. It lives on the App (not on an `Active`) because a
+    // drag that starts in one window can end in another: only the App sees them
+    // all. `armed_drag` is a press that MIGHT become a drag; `drag` is one that
+    // passed the movement threshold.
+    armed_drag: Option<ArmedDrag>,
+    drag: Option<DragState>,
+}
+
+/// A left-press on a pane titlebar or a tab label. It is not a drag yet — it
+/// becomes one only if the pointer moves past [`dragdrop::DRAG_THRESHOLD`]
+/// before the button comes up; otherwise the release treats it as a plain click.
+struct ArmedDrag {
+    window: WindowId,               // the window the press happened in
+    payload: dragdrop::DragPayload, // what would travel (a pane, or a whole tab page)
+    press: (f32, f32),              // press position (physical px) the threshold measures from
+}
+
+/// A drag in flight: what is travelling, where it came from, and what the
+/// pointer is currently over. `hover` is re-resolved on every motion and is what
+/// the release commits (`None` = over a gutter/dead zone: releasing cancels).
+struct DragState {
+    source: WindowId,                                   // window the payload was picked up in
+    payload: dragdrop::DragPayload,                     // pane or tab page
+    payload_panes: Vec<rt_core::PaneId>,                // every pane inside it (never drop onto itself)
+    label: String,                                      // ghost chip text (pane title / "Tab N")
+    hover: Option<(WindowId, dragdrop::ResolvedDrop)>,  // resolved target under the pointer
+    cursor: (f32, f32),                                 // pointer in the hovered window's coords
 }
 
 /// Build the system font database (scans the usual font directories).
@@ -1092,6 +1126,9 @@ impl App {
             last_instr_tick: Instant::now(),
             last_autoscroll: Instant::now(),
             autoscroll_accel: (0, 0),
+            drag_cue: None,
+            drag_ghost: None,
+            drag_dim: None,
         })
     }
 
@@ -1816,6 +1853,73 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
+                // --- pane/tab drag-and-drop owns the pointer while it lasts ---
+                // An armed press becomes a drag once the pointer has moved far
+                // enough that it clearly isn't a click. (`self.armed_drag` /
+                // `self.drag` are fields disjoint from `self.windows`, so they are
+                // reachable while `active` is borrowed out of the map.)
+                if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
+                    let armed = self.armed_drag.as_ref().expect("just matched");
+                    let (dx, dy) = (active.mouse.0 - armed.press.0, active.mouse.1 - armed.press.1);
+                    if (dx * dx + dy * dy).sqrt() > dragdrop::DRAG_THRESHOLD {
+                        let armed = self.armed_drag.take().expect("just matched");
+                        // Zones are computed from the REAL layout, so a zoomed
+                        // pane must be restored before anything can be resolved.
+                        if active.session.is_zoomed() {
+                            active.session.toggle_zoom();
+                        }
+                        let (payload_panes, label) = match armed.payload {
+                            dragdrop::DragPayload::Pane(p) => (
+                                vec![p],
+                                active.session.title_of(p).unwrap_or("Pane").to_string(),
+                            ),
+                            dragdrop::DragPayload::Tab { first_pane } => {
+                                let panes = active.session.tab_panes(first_pane).unwrap_or_else(|| vec![first_pane]);
+                                let label = active
+                                    .session
+                                    .tab_bars(content_bounds(active.window.inner_size()))
+                                    .into_iter()
+                                    .flat_map(|bar| bar.tabs)
+                                    .find(|t| t.first_pane == first_pane)
+                                    .map(|t| format!("Tab {}", t.number))
+                                    .unwrap_or_else(|| "Tab".to_string());
+                                (panes, label)
+                            }
+                        };
+                        active.window.set_cursor(CursorIcon::Grabbing);
+                        active.cursor_icon = Some(CursorIcon::Grabbing);
+                        self.drag = Some(DragState {
+                            source: id,
+                            payload: armed.payload,
+                            payload_panes,
+                            label,
+                            hover: None,
+                            cursor: active.mouse,
+                        });
+                    }
+                }
+                // A live drag: re-resolve what the pointer is over and refresh this
+                // window's cue fields (Task 10 paints them). Every motion forces a
+                // full frame — the cues are chrome the damage tracker knows nothing
+                // about — but nothing relayouts until the release commits.
+                if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+                    let bounds = content_bounds(active.window.inner_size());
+                    let (panes, bars) = (active.session.visible_rects(bounds), active.session.tab_bars(bounds));
+                    let drag = self.drag.as_mut().expect("just matched");
+                    drag.cursor = active.mouse;
+                    let resolved =
+                        dragdrop::resolve_drop(drag.payload, &drag.payload_panes, &panes, &bars, bounds, active.mouse);
+                    drag.hover = resolved.clone().map(|r| (id, r));
+                    active.drag_cue = resolved;
+                    active.drag_ghost = Some((active.mouse, drag.label.clone()));
+                    active.drag_dim = match drag.payload {
+                        dragdrop::DragPayload::Pane(p) => Some(p),
+                        dragdrop::DragPayload::Tab { .. } => None,
+                    };
+                    active.force_full = true; // cues span arbitrary pixels
+                    active.window.request_redraw();
+                    return; // the drag owns the pointer: no hover/select/wire work
+                }
                 // A divider should say it can be dragged. Only while nothing else
                 // owns the pointer, and only re-issued when the shape actually
                 // changes — set_cursor is an X round trip, and motion events
@@ -1904,6 +2008,15 @@ impl ApplicationHandler for App {
             // starts/ends a text selection; middle pastes the PRIMARY selection.
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
                 (ElementState::Pressed, MouseButton::Right) => {
+                    // A second button during a pane/tab drag abandons the gesture.
+                    // It must not merely fall through: the context menu swallows
+                    // motion AND Escape while open, so a drag left running under
+                    // it could neither be finished nor cancelled.
+                    self.armed_drag = None;
+                    if self.drag.take().is_some() {
+                        Self::clear_drag_cues(active);
+                        return;
+                    }
                     // Right-click cancels a pending wire, or disconnects the output
                     // jack under the cursor (before falling through to the menu).
                     if active.wiring_from.take().is_some() {
@@ -2049,8 +2162,36 @@ impl ApplicationHandler for App {
                             active.window.request_redraw();
                             return;
                         }
-                        // A tab label click switches tabs; else focus the pane and
-                        // begin a text selection at the clicked cell.
+                        // A press on a pane's titlebar strip ARMS a pane drag: it
+                        // may still turn out to be a plain click (the movement
+                        // threshold decides at the next motion, see CursorMoved).
+                        // The band is the top `titlebar_h` of the pane's rect; the
+                        // clipboard affordance that also lives there already
+                        // returned above, so it can't be stolen here.
+                        let tb_h = active.session.titlebar_h();
+                        if tb_h > 0.0 {
+                            let hit = active
+                                .session
+                                .visible_rects(bounds)
+                                .into_iter()
+                                .find(|(_, r)| r.contains(mx, my) && my < r.y + tb_h);
+                            if let Some((pid, _)) = hit {
+                                active.session.focus_at(mx, my); // a titlebar click still focuses
+                                active.window.request_redraw();
+                                // Disjoint field of `self` from `self.windows`, so
+                                // this is fine while `active` is borrowed.
+                                self.armed_drag = Some(ArmedDrag {
+                                    window: id,
+                                    payload: dragdrop::DragPayload::Pane(pid),
+                                    press: (mx, my),
+                                });
+                                return;
+                            }
+                        }
+                        // A tab label press ARMS a tab drag; the tab SWITCH happens
+                        // on the release (below the threshold), so a plain click
+                        // behaves exactly as it always did while a drag off the
+                        // label can still pick the whole page up.
                         let clicked_tab = active
                             .session
                             .tab_bars(bounds)
@@ -2059,15 +2200,11 @@ impl ApplicationHandler for App {
                             .find(|t| t.rect.contains(mx, my))
                             .map(|t| t.first_pane);
                         if let Some(first_pane) = clicked_tab {
-                            active.session.focus_tab(first_pane);
-                            // The visible pane set changes but the newly-shown
-                            // panes have no engine damage (their content didn't
-                            // change), so force a full redraw — otherwise the
-                            // XRender back buffer keeps the previous tab's pixels
-                            // (stale content, and re-switching to an already-drawn
-                            // tab shows nothing new). Matches the keyboard path.
-                            active.force_full = true;
-                            active.window.request_redraw();
+                            self.armed_drag = Some(ArmedDrag {
+                                window: id,
+                                payload: dragdrop::DragPayload::Tab { first_pane },
+                                press: (mx, my),
+                            });
                         } else {
                             active.session.focus_at(mx, my); // click-to-focus
                             // Ctrl+click on a URL opens it in the default handler
@@ -2171,6 +2308,52 @@ impl ApplicationHandler for App {
                     }
                 }
                 (ElementState::Released, MouseButton::Left) => {
+                    // A press that never passed the movement threshold was a plain
+                    // click after all. For a tab label that means "switch tabs" —
+                    // the switch the press used to do, moved here so the label can
+                    // also be dragged. For a titlebar it means nothing extra (the
+                    // press already focused the pane).
+                    if let Some(armed) = self.armed_drag.take() {
+                        if let dragdrop::DragPayload::Tab { first_pane } = armed.payload {
+                            active.session.focus_tab(first_pane);
+                            // The visible pane set changes but the newly-shown panes
+                            // have no engine damage (their content didn't change), so
+                            // force a full redraw — otherwise the XRender back buffer
+                            // keeps the previous tab's pixels. Matches the keyboard path.
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        return;
+                    }
+                    // A real drag: commit it where the pointer is (or cancel, if
+                    // that is nothing — a gutter/dead zone resolves to `None`).
+                    if let Some(drag) = self.drag.take() {
+                        let target = drag.hover.as_ref().map(|(_, r)| r.target); // for the log below
+                        let committed = match (drag.payload, drag.hover) {
+                            (dragdrop::DragPayload::Pane(p), Some((_w, r))) => active.session.move_pane(p, r.target),
+                            (dragdrop::DragPayload::Tab { first_pane }, Some((_w, r))) => match r.target {
+                                // A tab dropped on the strip it already lives in is
+                                // a REORDER, not a move (a move would extract the
+                                // page and re-insert it, dissolving a two-tab
+                                // group on the way out). Any OTHER strip — no
+                                // current index for us there — is a genuine move.
+                                rt_session::DropTarget::TabAt { anchor, index } => {
+                                    let bounds = content_bounds(active.window.inner_size());
+                                    match Self::tab_index_in_bar(active, bounds, anchor, first_pane) {
+                                        Some(current) => active
+                                            .session
+                                            .reorder_tab(first_pane, dragdrop::index_for_reorder(current, index)),
+                                        None => active.session.move_tab(first_pane, r.target),
+                                    }
+                                }
+                                other => active.session.move_tab(first_pane, other),
+                            },
+                            (_, None) => false, // released over nothing: cancel
+                        };
+                        log::debug!("drag release: payload={:?} target={target:?} committed={committed}", drag.payload);
+                        Self::clear_drag_cues(active); // + force_full: the layout may have changed
+                        return;
+                    }
                     // If the matching press was forwarded to an app, forward the
                     // release too and we're done.
                     if Self::end_mouse_report(active) {
@@ -2221,6 +2404,13 @@ impl ApplicationHandler for App {
                     active.shift_press = false; // consumed
                 }
                 (ElementState::Pressed, MouseButton::Middle) => {
+                    // As for the right button: a middle-click during a drag
+                    // abandons it instead of pasting into a moving pane.
+                    self.armed_drag = None;
+                    if self.drag.take().is_some() {
+                        Self::clear_drag_cues(active);
+                        return;
+                    }
                     // A mouse-reporting app gets the middle-press; otherwise (or
                     // with Shift held) middle-click pastes the PRIMARY selection.
                     if !active.mods.shift_key()
@@ -2264,8 +2454,16 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let mut to_close: Vec<WindowId> = Vec::new();
         let mut min_interval: Option<Duration> = None;
+        // A pane inside the payload of a live drag can exit under the gesture
+        // (its shell finished); the drag must then be abandoned rather than
+        // committed against a dead id. Snapshot the ids here — the loop below
+        // borrows `self.windows` and can't reach `self.drag` through a method.
+        let drag_panes: Vec<rt_core::PaneId> =
+            self.drag.as_ref().map(|d| d.payload_panes.clone()).unwrap_or_default();
+        let mut drag_payload_died = false;
         for (&wid, active) in self.windows.iter_mut() {
-            let (close, interval) = Self::tick_active(active);
+            let (close, interval, died) = Self::tick_active(active, &drag_panes);
+            drag_payload_died |= died;
             if close {
                 to_close.push(wid);
             }
@@ -2273,6 +2471,9 @@ impl ApplicationHandler for App {
                 None => interval,
                 Some(m) => m.min(interval),
             });
+        }
+        if drag_payload_died {
+            self.cancel_drag(); // what was being dragged no longer exists
         }
         for wid in to_close {
             self.close_window(wid);
@@ -2286,10 +2487,13 @@ impl ApplicationHandler for App {
 impl App {
     /// One `about_to_wait` tick for a single window: drain its panes' events,
     /// settle deferred resizes and prefs edits, advance the animated chrome,
-    /// and schedule a redraw when anything changed. Returns `(close, interval)`:
-    /// `close` when the window's last pane exited (the caller then closes the
-    /// whole window), plus the wake interval this window wants.
-    fn tick_active(active: &mut Active) -> (bool, Duration) {
+    /// and schedule a redraw when anything changed. Returns
+    /// `(close, interval, drag_payload_died)`: `close` when the window's last
+    /// pane exited (the caller then closes the whole window), the wake interval
+    /// this window wants, and whether a pane listed in `drag_panes` (the live
+    /// drag's payload, empty when nothing is being dragged) exited this tick —
+    /// which tells the caller to abandon that drag.
+    fn tick_active(active: &mut Active, drag_panes: &[rt_core::PaneId]) -> (bool, Duration, bool) {
         // Latency instrument: the loop is scheduled to wake ~every 16ms; a wake
         // that arrives much later means a CPU hogger stole the frame. Measure the
         // overrun, flare the frame proportionally, and breathe the undulation.
@@ -2414,7 +2618,11 @@ impl App {
         // the caller to close the whole window — never exit the process here:
         // other windows may still be open (close_window exits on the last one).
         let mut window_emptied = false;
+        let mut drag_payload_died = false;
         for id in exited {
+            // Dragging a pane whose shell just exited: the caller cancels the
+            // gesture (committing it would move a corpse).
+            drag_payload_died |= drag_panes.contains(&id);
             match active.session.close_pane(id) {
                 Some(SessionEvent::CloseWindow) => {
                     window_emptied = true;
@@ -2433,7 +2641,7 @@ impl App {
             }
         }
         if window_emptied {
-            return (true, ACTIVE_POLL); // caller closes this window promptly
+            return (true, ACTIVE_POLL, drag_payload_died); // caller closes this window promptly
         }
         // A resize drag owes us exactly one reflow. Pay it once the size has held
         // still for RESIZE_SETTLE — never per configure event (see the Resized
@@ -2598,7 +2806,7 @@ impl App {
             IDLE_POLL
         };
         active.poll_ms = interval.as_millis() as u64;
-        (false, interval)
+        (false, interval, drag_payload_died)
     }
 }
 
@@ -2644,6 +2852,31 @@ enum WindowCmd {
 }
 
 impl App {
+    /// Abandon any pane/tab drag: forget the App-level state and wipe the cue
+    /// fields off the window that was showing them. Used by Escape, by a payload
+    /// pane dying mid-drag, and by the source window closing under the gesture —
+    /// every one of which must leave a clean window behind, never a stuck ghost.
+    /// Safe to call with nothing armed or dragging.
+    fn cancel_drag(&mut self) {
+        self.armed_drag = None;
+        let Some(drag) = self.drag.take() else { return };
+        // The window may already be gone (that is one of the reasons we cancel).
+        let Some(active) = self.windows.get_mut(&drag.source) else { return };
+        Self::clear_drag_cues(active);
+    }
+
+    /// Wipe one window's per-frame drag cues and repaint it. Only the window's
+    /// half of a cancel — the App-level `drag`/`armed_drag` are the caller's to
+    /// clear (they are unreachable through `&mut Active`).
+    fn clear_drag_cues(active: &mut Active) {
+        active.drag_cue = None;
+        active.drag_ghost = None;
+        active.drag_dim = None;
+        Self::update_cursor(active); // drop Grabbing
+        active.force_full = true; // the cues are off the damage-tracked path
+        active.window.request_redraw();
+    }
+
     /// Close ONE window. The LAST window exits the process via `exit_clean()`
     /// WITHOUT ever dropping its `Active` — dropping the GL context / Wayland
     /// blur objects at process teardown faults (a segfault on Wayland, an X11
@@ -2656,6 +2889,13 @@ impl App {
     fn close_window(&mut self, id: WindowId) {
         if !self.windows.contains_key(&id) {
             return; // already closed (double CloseRequested etc.)
+        }
+        // A drag picked up in this window has nowhere to land any more.
+        if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+            self.cancel_drag();
+        }
+        if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
+            self.armed_drag = None;
         }
         if self.windows.len() == 1 {
             // Last window: leave it in the map (its Drop never runs) and exit.
@@ -3162,6 +3402,20 @@ impl App {
         true
     }
 
+    /// The current position of the tab anchored at `tab` within the strip whose
+    /// FIRST tab is `anchor` (the id a resolved `TabAt` carries), or `None` when
+    /// that strip doesn't hold the tab — which is exactly the test for "is this
+    /// drop a reorder within my own strip, or a move into someone else's".
+    /// Read from the LIVE geometry at release time, never from the press.
+    fn tab_index_in_bar(active: &Active, bounds: Rect, anchor: rt_core::PaneId, tab: rt_core::PaneId) -> Option<usize> {
+        active
+            .session
+            .tab_bars(bounds)
+            .into_iter()
+            .find(|bar| bar.tabs.first().map(|t| t.first_pane) == Some(anchor))
+            .and_then(|bar| bar.tabs.iter().position(|t| t.first_pane == tab))
+    }
+
     fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
         let size = active.window.inner_size();
         let bounds = content_bounds(size);
@@ -3611,6 +3865,17 @@ impl App {
     /// to a chord and either run the bound action or type the key into the
     /// focused PTY(s).
     fn on_key_press(&mut self, event_loop: &ActiveEventLoop, id: WindowId, key_event: winit::event::KeyEvent) {
+        // Escape aborts a pane/tab drag before anything else looks at the key —
+        // the universal "get me out of this gesture". A drag in flight swallows
+        // it; a merely ARMED press (no movement yet) is disarmed but the key
+        // still travels on to the shell, which is where a bare Escape belongs.
+        if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) && self.drag.is_some() {
+            self.cancel_drag();
+            return;
+        }
+        if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
+            self.armed_drag = None;
+        }
         let Some(active) = self.windows.get_mut(&id) else { return };
         // While an IME/dead-key composition is in progress, swallow key presses:
         // the composed result arrives via WindowEvent::Ime(Commit) instead. This
@@ -4703,6 +4968,12 @@ impl App {
             || active.mouse_report.is_some()
             || active.wiring_from.is_some()
             || active.selecting
+            // A pane/tab drag owns the pointer: it set Grabbing and keeps it
+            // until the drop, cue or no cue (over a gutter there is no cue but
+            // the drag is still on). An ARMED press is NOT a drag — the cursor
+            // keeps behaving normally until the threshold is passed.
+            || active.drag_ghost.is_some()
+            || active.drag_cue.is_some()
         {
             return;
         }
@@ -5590,7 +5861,14 @@ fn main() {
     sweep_stale_jacks();
     // Build the winit event loop and hand it our application.
     let event_loop = build_event_loop();
-    let mut app = App { font_db, mono_families, cli, windows: std::collections::HashMap::new() };
+    let mut app = App {
+        font_db,
+        mono_families,
+        cli,
+        windows: std::collections::HashMap::new(),
+        armed_drag: None,
+        drag: None,
+    };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);

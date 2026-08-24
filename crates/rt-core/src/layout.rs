@@ -430,6 +430,32 @@ impl Tree {
         }
     }
 
+    /// Every pane inside the tab page whose FIRST leaf is `first_pane` — the
+    /// read-only twin of [`Tree::take_tab`] (same search, nothing removed).
+    /// `None` if no tab page is anchored at that id (a stale id, or a pane that
+    /// isn't a page anchor). Drag-and-drop uses it to know which panes belong to
+    /// the tab being dragged, so the resolver can refuse a drop onto itself.
+    pub fn tab_panes(&self, first_pane: PaneId) -> Option<Vec<PaneId>> {
+        let page = Self::find_tab_page(&self.root, first_pane)?;
+        let mut out = Vec::new();
+        Self::collect_panes(page, &mut out);
+        Some(out)
+    }
+
+    /// Recursive worker for [`Tree::tab_panes`]: the tab page anchored at
+    /// `first`, if any. Mirrors `take_tab_from`'s search order — a group's own
+    /// pages first, then a recursion into them (nested tab groups).
+    fn find_tab_page(node: &Node, first: PaneId) -> Option<&Node> {
+        match node {
+            Node::Leaf(_) => None,
+            Node::Split { children, .. } => children.iter().find_map(|c| Self::find_tab_page(&c.node, first)),
+            Node::Tabs { children, .. } => children
+                .iter()
+                .find(|c| Self::first_leaf(c) == Some(first))
+                .or_else(|| children.iter().find_map(|c| Self::find_tab_page(c, first))),
+        }
+    }
+
     /// Worker for take_tab: returns (what this node becomes, the removed page).
     fn take_tab_from(node: Node, first: PaneId) -> (Option<Node>, Option<Node>) {
         match node {
@@ -1468,6 +1494,19 @@ mod tests {
         // One tab left → the Tabs wrapper unwraps to the bare leaf `a`.
         assert_eq!(t.all_panes(), vec![a]);
         assert!(t.tab_bars(Rect::new(0.0, 0.0, 800.0, 600.0)).is_empty(), "no strip for a single pane");
+    }
+
+    /// tab_panes reports a page's panes WITHOUT removing it (take_tab's twin).
+    #[test]
+    fn tab_panes_lists_a_page_without_removing_it() {
+        let (mut t, a) = Tree::new();
+        let b = t.new_tab(a).unwrap();                       // tabs: [a, b]
+        let c = t.split(b, Orientation::LeftRight).unwrap(); // page 2 = split(b, c)
+        assert_eq!(t.tab_panes(b), Some(vec![b, c]), "the whole page's panes");
+        assert_eq!(t.tab_panes(a), Some(vec![a]), "a single-leaf page");
+        assert_eq!(t.tab_panes(c), None, "not a page anchor");
+        assert_eq!(t.tab_panes(PaneId(u64::MAX - 3)), None, "stale id");
+        assert_eq!(t.all_panes(), vec![a, b, c], "nothing was removed");
     }
 
     /// insert_beside splits the target 50/50 with the subtree on the asked side.

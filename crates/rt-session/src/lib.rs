@@ -281,6 +281,13 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
         &self.tree
     }
 
+    /// Every pane inside the tab page anchored at `first_pane` (the id a
+    /// [`rt_core::Tab`] carries), or `None` if no page is anchored there. Drag
+    /// -and-drop asks this so a dragged tab knows its own panes.
+    pub fn tab_panes(&self, first_pane: PaneId) -> Option<Vec<PaneId>> {
+        self.tree.tab_panes(first_pane)
+    }
+
     /// Whether a pane is currently maximised (zoomed to fill the window).
     pub fn is_zoomed(&self) -> bool {
         self.zoomed.is_some()
