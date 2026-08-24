@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-07-26"
+    updated: "2026-08-24"
   },
 
   statuses: {
@@ -92,6 +92,24 @@ window.PROJECT_MAP = {
       specs: [{ label: "rt-mux design", href: "docs/rt-mux.md" }],
       parts: [],
       deps: ["rt-engine"]
+    },
+    {
+      id: "multiwindow", label: "Multi-window & drag-and-drop", layer: "frontend", status: "done",
+      tags: ["Phase 3", "X11 + Wayland"],
+      desc: "One rt process, any number of windows (App::windows keyed by WindowId; Ctrl+Shift+I opens one, each closes independently, rt exits with the last). A pane or tab tears out with a key (Ctrl+Shift+D / Ctrl+Shift+J) or by dragging it to bare desktop. In-window drag (pane by titlebar, tab by label) gives live cues — half-pane split fill, whole-pane swap, tab-insert caret, window-edge root-split band, a ghost chip, source dim — on both backends. Cross-window drag-with-cues and drag tear-out are X11-only (gated on winit's inner_position, which Wayland never answers); Wayland reaches another window through the right-click 'Move Pane to N: title' menu instead. A cross-window move or tear-out cuts any patch-bay wire that would end up spanning two windows; a wire wholly inside the moved payload travels with it.",
+      files: ["crates/rt/src/main.rs", "crates/rt/src/dragdrop.rs", "crates/rt/src/chrome/dragdrop.rs", "crates/rt-session/src/lib.rs", "crates/rt-core/src/layout.rs"],
+      specs: [
+        { label: "Pane drag-and-drop + multi-window design", href: "docs/superpowers/specs/2026-08-24-pane-dragdrop-multiwindow-design.md" },
+        { label: "Pane drag-and-drop + multi-window plan", href: "docs/superpowers/plans/2026-08-24-pane-dragdrop-multiwindow.md" }
+      ],
+      parts: [
+        { label: "One process, many windows", status: "done", desc: "App::windows map, WindowId routing, per-window close, process-global PaneId allocation." },
+        { label: "Keyboard tear-out", status: "done", desc: "DetachPane/DetachTab (Ctrl+Shift+D/J) into a new window; MoveTabLeft/Right for in-tab-strip reorder." },
+        { label: "In-window drag + cues", status: "done", desc: "Pure drop-target resolver + native cue rendering; needs the pane titlebar for pane payloads." },
+        { label: "Cross-window drag & tear-out (X11)", status: "done", desc: "Live cross-window cues and drop, gated on inner_position(); wire-cutting on any cross-window move." },
+        { label: "Move-to-window menu (Wayland parity)", status: "done", desc: "\"Move Pane to N: title\" context-menu rows send a pane to another open window without drag." }
+      ],
+      deps: ["rt-session"]
     },
 
     /* ---- Chrome & Interaction ---- */
@@ -178,11 +196,16 @@ window.PROJECT_MAP = {
     {
       id: "tabs-adv", label: "Tabs & layouts UX", layer: "chrome", status: "planned",
       tags: ["Phase 3"],
-      desc: "The remaining tab and layout polish from the roadmap: drag-reorder, per-tab close, detach-to-new-window, tab position (bottom/left/right), and a launcher for saved layouts.",
+      desc: "The remaining tab and layout polish from the roadmap. Drag-reorder and detach-to-new-window shipped with multi-window (see Multi-window & drag-and-drop); still open: per-tab close button, tab position (bottom/left/right), switch_to_tab_N, and a launcher for saved layouts.",
       files: ["docs/ROADMAP.md"],
       specs: [{ label: "Roadmap · Phase 3", href: "docs/ROADMAP.md" }],
-      parts: [],
-      deps: ["rt-session", "layouts"]
+      parts: [
+        { label: "Drag-reorder + detach-to-new-window", status: "done", desc: "Shipped with multi-window/drag-and-drop; see that node." },
+        { label: "Per-tab close button", status: "planned", desc: "Close a tab from its label without focusing it first." },
+        { label: "Tab position (bottom/left/right)", status: "planned", desc: "Terminator lets the tab bar move off the top edge." },
+        { label: "switch_to_tab_N", status: "planned", desc: "Direct jump to tab N by number." }
+      ],
+      deps: ["rt-session", "layouts", "multiwindow"]
     },
     {
       id: "plugins", label: "Plugins", layer: "chrome", status: "planned",

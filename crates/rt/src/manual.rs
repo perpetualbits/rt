@@ -45,14 +45,32 @@ WINDOWS  &  DRAG-AND-DROP
   Ctrl+Shift+I    open a new, empty rt window
   Ctrl+Shift+D    detach the focused pane into a new window of its own
   Ctrl+Shift+J    detach the focused tab into a new window of its own
-  Drag & drop     drag a pane by its titlebar, or a tab by its label, to
-                  reorder it; drop it onto another rt window (X11) to move
-                  the pane/tab there, or drop it on bare desktop to tear it
-                  out into a brand-new window. The keys above do the same.
-                  Dropping on a pane's CENTRE swaps the two panes — across
-                  windows too. Wayland gives a client no window positions,
-                  so there a drag stays inside its own window: use the keys
-                  above to send a pane to a window of its own.
+  One rt process serves every window (see them all in the right-click
+  menu's "Move Pane to ..." rows); closing a window just closes it, and
+  rt exits once the last one is gone.
+  Drag & drop     drag a pane by its titlebar, or a tab by its label.
+                  Cues while you hover: a half-pane fill previews a
+                  split, the whole pane lit up previews a swap, a 3px
+                  caret previews where a tab would land, and a band
+                  along a window's edge previews a new root split; a
+                  ghost chip rides the cursor and the dragged pane/tab
+                  dims at its old spot. Esc cancels and puts everything
+                  back. Pane drag needs its titlebar (Preferences, on
+                  by default) to grab — with titlebars off, drag the
+                  tab instead, or use the keys above.
+                  X11 only (ssh -X included): drop onto ANOTHER rt
+                  window to move the pane/tab there — its CENTRE swaps
+                  the two panes, an edge splits, both across windows —
+                  or drop on bare desktop to tear it out into a
+                  brand-new window. Wayland gives a client no window
+                  position, so there a drag always stays inside its own
+                  window (reorder / split / swap still work); reach for
+                  the keys above to tear a pane out, or the right-click
+                  menu's "Move Pane to N: title" row to send it straight
+                  to another open window.
+                  A cross-window move or tear-out CUTS any patch-bay
+                  wire that would end up spanning two windows — a wire
+                  wholly inside what moved travels with it.
 
 
 SELECTING TEXT

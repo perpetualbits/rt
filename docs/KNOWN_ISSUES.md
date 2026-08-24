@@ -68,6 +68,15 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   are. Lifting this needs a compositor-side protocol (an actual XDG drag-and-drop
   session, `wlr-foreign-toplevel`-style placement, or KDE's plasma-window
   management), which is a separate piece of work.
+- ◐ **Overlapping rt windows: hover target picked by map order, not stacking
+  order.** `App::window_under_global` (X11 only, see above) walks every open
+  window's `inner_position()`/`inner_size()` and returns the first whose
+  content rect contains the pointer; when two rt windows overlap on screen,
+  winit exposes no window-stacking order to consult, so the pick can be the
+  occluded window instead of the one actually on top. rt windows rarely
+  overlap in practice (each opens at its own placement), so this is a real
+  but narrow edge case. Fixing it needs a stacking-order source rt doesn't
+  have today (an X11 `_NET_CLIENT_LIST_STACKING` query, most plausibly).
 
 ## Focus & menu targeting (2026-07-06)
 - ☑ **Focus stuck on last-created pane; no click-to-focus.** Focus only moved via

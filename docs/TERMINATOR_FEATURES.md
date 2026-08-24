@@ -40,7 +40,7 @@ Legend for rt status is applied in `ROADMAP.md`; this file is the raw catalogue.
 | `case_sensitive`/`invert_search` | — | search options | ☐ |
 | `link_single_click` | False | single-click open links | ☐ |
 | `title_at_bottom` | False | titlebar below terminal | ☐ |
-| `detachable_tabs` | True | drag-detach tabs to new windows | ☐ |
+| `detachable_tabs` | True | drag-detach tabs to new windows | ☑ (drag, X11; keyboard `Ctrl+Shift+J` everywhere) |
 | `new_tab_after_current_tab` | False | insert new tab beside current | ☐ |
 
 ## 2. Profile settings (`DEFAULTS['profiles']['default']`)
@@ -84,9 +84,9 @@ Legend for rt status is applied in `ROADMAP.md`; this file is the raw catalogue.
 - **Pane navigation:** go_up/down/left/right (Alt+Arrows ☑), go_next/prev,
   cycle_next/prev (Ctrl+Tab). — rt ◐ (directional done; cycle ☐).
 - **Tabs:** new_tab ☑, next_tab/prev_tab ☑ (Ctrl+PgUp/PgDn), move_tab_left/right
-  ☐, switch_to_tab_1..10 ☐.
-- **Close/windows:** close_term ☑, close_window ☑, new_window ☐, new_terminator
-  ☐, hide_window ☐.
+  ☑ (Shift+Ctrl+PgUp/PgDn), switch_to_tab_1..10 ☐.
+- **Close/windows:** close_term ☑, close_window ☑, new_window ☑ (Ctrl+Shift+I,
+  one process/many windows), new_terminator ☐, hide_window ☐.
 - **Clipboard:** copy ☐, paste ☐ (**essential gap**), paste_selection ☐,
   send_newline ☐.
 - **Scrollback:** toggle_scrollbar, page_up/down(_half), line_up/down. — rt ☐.
@@ -105,10 +105,14 @@ Legend for rt status is applied in `ROADMAP.md`; this file is the raw catalogue.
 - **Recursive split tree** (H/V/auto, adjustable + persisted ratios). — rt ◐
   (H/V + weighted ratios; auto-split ☐; drag-resize ☐).
 - **Tabs** (reorder, editable labels, per-tab close, scroll-to-switch, side-tab
-  rotated text, detach to window). — rt ◐ (strip + switch + click done; titles/
-  reorder/close-button/detach ☐).
+  rotated text, detach to window). — rt ◐ (strip + switch + click + titles +
+  drag-reorder + detach-to-new-window done; per-tab close button, tab
+  position and scroll-to-switch/side-tab rotated text ☐).
 - **Drag-and-drop** terminals (titlebar drag → drop-zone split; drag preview;
-  text/URI drop paste; detach tabs). — rt ☐.
+  text/URI drop paste; detach tabs). — rt ☑ in-window and cross-window on X11
+  (split/swap/reorder cues, ghost chip, drag tear-out to a new window);
+  Wayland is in-window drag only, cross-window via the "Move Pane to N" menu
+  and keyboard detach. Text/URI drop paste still ☐.
 - **Zoom/maximise a pane** (`toggle_zoom`, `scaled_zoom`). — rt ☐.
 - **Rotate splits** (H↔V). — rt ☐.
 - **Resize splits** via keys. — rt ☐.

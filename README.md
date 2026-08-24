@@ -48,6 +48,8 @@ edges still being driven to zero.
 ## Features
 
 - **Panes & tabs** — split any way, keyboard- or mouse-driven, Terminator keybindings.
+- **Multi-window** — one rt process, any number of windows (`Ctrl+Shift+I`); tear a pane or tab out into a window of its own with a key (`Ctrl+Shift+D` / `Ctrl+Shift+J`) or by dragging it onto bare desktop.
+- **Drag-and-drop** — drag a pane by its titlebar or a tab by its label, with live drop cues (split fill, swap highlight, tab-insert caret, ghost chip); drop on another rt window to move it there or its centre to swap (X11, incl. `ssh -X` — Wayland drags stay in-window, with a "Move Pane to..." menu for the rest).
 - **Newspaper columns** — flow one pane's output into side-by-side columns so a wide screen shows *more rows at once*, newspaper-style (`Ctrl+.` / `Ctrl+,`). See below.
 - **Scrollback search** — `Ctrl+Shift+F`; configurable buffer up to 5M lines, held to a per-pane memory budget (oldest-first eviction) with a live memory meter.
 - **Selection tools** — drag, `Ctrl`+drag for a rectangular block, double-click word / triple-click line (both rejoin soft-wraps); drag past a pane edge and the auto-scroll *accelerates*. And **anchored selection**: `Shift`+click to drop a start, navigate with arrows / `PageUp` / `Ctrl+End` / the scrollbar across any amount of scrollback, `Shift`+click or `Enter` to finish with the text on the clipboard — no button held. See below.

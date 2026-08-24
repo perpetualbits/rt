@@ -72,9 +72,11 @@ Where the widget toolkit pays off.
 16. **Scrollbar UI** + scrollback config (position, infinite). (cat. §2)
 
 ## Phase 3 — Tabs, layouts, grouping polish
-17. **Tabs:** reorder (drag), per-tab close button, detach-to-new-window,
-    tab position (bottom/left/right), move_tab_left/right, switch_to_tab_N.
-    (cat. §4)
+17. **Tabs:** reorder (drag) ✅, detach-to-new-window ✅ (keyboard `Ctrl+Shift+D`/
+    `Ctrl+Shift+J`, drag to another window or bare desktop — X11; Wayland via
+    the "Move Pane to N" menu), move_tab_left/right ✅ (`Ctrl+Shift+PageUp/Dn`).
+    Remaining: per-tab close button, tab position (bottom/left/right),
+    switch_to_tab_N. (cat. §4)
 18. **Saved layouts:** serialize the tree (serde) + save/load + a launcher; `-l`
     CLI option. The RT_SPLIT/RT_COLUMNS/RT_TABS hooks become the format seed.
     (cat. §8)
@@ -89,7 +91,9 @@ Where the widget toolkit pays off.
     profile; profile switch. (cat. §2)
 21. **IPC / remotinator:** a scripting surface (zbus/DBus `net.tenshu`-style, or a
     Unix socket) — new_window/tab, hsplit/vsplit, get/set titles, switch_profile,
-    reload_config. + matching CLI opts. (cat. §10)
+    reload_config. + matching CLI opts. (cat. §10) — `new_window` itself now
+    exists in-process (`Ctrl+Shift+I`, one App serving many windows); the IPC
+    surface to drive it from outside the process is still what's planned here.
 22. **Plugins:** a plugin mechanism, or built-in equivalents of the useful ones
     (logger, custom-commands menu, activity/silence watch, terminalshot,
     command-finish notify). (cat. §11)
