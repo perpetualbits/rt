@@ -156,7 +156,7 @@ impl Tree {
         if Self::split_node(&mut self.root, target, orient, new_id) {
             Some(new_id) // surgery succeeded
         } else {
-            // Target wasn't found: we already advanced next_id, which is fine —
+            // Target wasn't found: we already advanced the global id counter, which is fine —
             // ids are allowed to have gaps; correctness only needs uniqueness.
             None
         }
