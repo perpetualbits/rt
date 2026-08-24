@@ -317,6 +317,14 @@ struct Active {
     mouse: (f32, f32),                    // last cursor position in physical pixels
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
+    // "Move Pane to <window>" targets, snapshotted when the menu opened: every
+    // OTHER window at that moment, sorted by `WindowId` for a stable 1-based
+    // enumeration. Built together in the same pass (`App::menu_move_targets`)
+    // so the labels and ids can never skew; `menu_windows[i]` is what
+    // `MenuPick::MoveToWindow(i)` (built from `menu_move_labels[i]`) resolves
+    // against. Both cleared whenever `menu` closes.
+    menu_windows: Vec<WindowId>,
+    menu_move_labels: Vec<String>,
     clip_overlay: Option<usize>,          // clipboard-history overlay open, carrying the selected row
     clip_affordance: Option<chrome::Recti>, // titlebar "⎘ N" hit-rect for the focused pane this frame, if drawn
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
@@ -1055,6 +1063,8 @@ impl App {
             mouse: (0.0, 0.0),
             menu: None,
             menu_hover: None,
+            menu_windows: Vec::new(),
+            menu_move_labels: Vec::new(),
             clip_overlay: None,
             clip_affordance: None,
             ime_preedit: false,
@@ -1592,7 +1602,7 @@ impl ApplicationHandler for App {
             let url = Self::cell_at(active, pos.0, pos.1)
                 .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
             let has_sel = Self::selected_text(active).is_some();
-            let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
+            let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
             let size = active.window.inner_size();
             let (cw, ch) = active.backend.cell_size();
             let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
@@ -1610,6 +1620,8 @@ impl ApplicationHandler for App {
                     if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
                         active.menu = None;
                         active.menu_hover = None;
+                        active.menu_windows.clear();
+                        active.menu_move_labels.clear();
                         active.window.request_redraw();
                     }
                     return;
@@ -1643,7 +1655,30 @@ impl ApplicationHandler for App {
                                                 }
                                                 WindowCmd::None
                                             }
+                                            // Index into the snapshot taken when the
+                                            // menu opened — stale-safe: an out-of-
+                                            // range index (shouldn't happen; rows and
+                                            // menu_windows are built from the same
+                                            // pass) is a logged no-op. A target that
+                                            // has since CLOSED still resolves here
+                                            // (its id just sits in the Vec); that case
+                                            // is caught by `move_pane_to_window`.
+                                            menu::MenuPick::MoveToWindow(i) => {
+                                                match active.menu_windows.get(i).copied() {
+                                                    Some(target) => WindowCmd::MoveToWindow(target),
+                                                    None => {
+                                                        log::debug!(
+                                                            "move-to-window: menu index {i} out of range ({} targets)",
+                                                            active.menu_windows.len()
+                                                        );
+                                                        WindowCmd::None
+                                                    }
+                                                }
+                                            }
                                         };
+                                        // The menu's snapshot is done with either way.
+                                        active.menu_windows.clear();
+                                        active.menu_move_labels.clear();
                                         // The `active` borrow ends here; window-
                                         // level commands re-borrow via &mut self.
                                         self.run_window_cmd(event_loop, id, cmd);
@@ -1657,6 +1692,8 @@ impl ApplicationHandler for App {
                     // A press outside the panel dismisses the menu.
                     active.menu = None;
                     active.menu_hover = None;
+                    active.menu_windows.clear();
+                    active.menu_move_labels.clear();
                     active.window.request_redraw();
                     return;
                 }
@@ -2078,9 +2115,11 @@ impl ApplicationHandler for App {
                     // actions apply to the pane you right-clicked. The native menu
                     // is anchored here and clamped on-screen by `chrome::menu`.
                     active.session.focus_at(active.mouse.0, active.mouse.1);
-                    active.menu = Some(active.mouse);
-                    active.menu_hover = None; // no row highlighted until the pointer moves
-                    active.window.request_redraw();
+                    let pos = active.mouse;
+                    // `active`'s borrow ends here: opening the menu needs a read
+                    // of every OTHER window (their focused-pane titles), which
+                    // `open_menu` takes as `&mut self`.
+                    self.open_menu(id, pos);
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
                     // While composing an anchored selection, a click finishes or
@@ -2872,6 +2911,7 @@ enum WindowCmd {
     NewWindow,            // open an empty extra window
     DetachPane,           // tear the focused pane out to a new window
     DetachTab,            // tear the current tab out to a new window
+    MoveToWindow(WindowId), // "Move Pane to <window>" menu pick: send the focus pane there
 }
 
 /// Does this action open a MODAL overlay — one whose input shim (near the top of
@@ -3179,6 +3219,86 @@ impl App {
         true
     }
 
+    /// Commit a "Move Pane to <window>" menu pick (`WindowCmd::MoveToWindow`):
+    /// the source's FOCUSED pane joins `dest`, split beside `dest`'s own focus
+    /// (left-right, after) — exactly the drop a drag released on `dest`'s
+    /// focused pane would produce. Reuses [`App::cross_window_move`] for the
+    /// extract/adopt/jack-and-wire-migration/failure-restoration machinery
+    /// (a refused adopt puts the pane straight back — never lost), then repeats
+    /// [`App::cross_window_drop`]'s tail: `dest` was already repainted by
+    /// `cross_window_move`; `source` is force-repainted, or closed if that was
+    /// its last pane.
+    ///
+    /// Stale-safe: `dest` may have closed while the menu was sitting open (its
+    /// id was snapshotted at open time and doesn't get revalidated until now).
+    /// Checked up front — and logged — so a stale target never even extracts
+    /// the pane from `source`.
+    fn move_pane_to_window(&mut self, source: WindowId, dest: WindowId) {
+        let Some(target_focus) = self.windows.get(&dest).map(|a| a.session.focus()) else {
+            log::debug!("move-to-window: target {dest:?} closed before the pick landed");
+            return;
+        };
+        let Some(src) = self.windows.get(&source) else { return };
+        let focus = src.session.focus();
+        let at = rt_session::DropTarget::SplitBeside {
+            pane: target_focus,
+            orient: rt_core::Orientation::LeftRight,
+            before: false,
+        };
+        self.cross_window_move(source, dragdrop::DragPayload::Pane(focus), dest, at);
+        // Source tail from `cross_window_drop`: its layout changed under it
+        // either way, and if that was its last pane the window is now empty.
+        if self.windows.get(&source).is_some_and(|a| a.session.is_empty()) {
+            self.close_window(source);
+        } else if let Some(a) = self.windows.get_mut(&source) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+    }
+
+    /// Open the context menu at `pos` (window-local physical px) for window
+    /// `id`. Snapshots the "Move Pane to <window>" targets first (every OTHER
+    /// window as of THIS moment) via [`App::menu_move_targets`], so `active`'s
+    /// mutable borrow — needed to actually set `menu`/`menu_hover` — never has
+    /// to coexist with a read of the rest of `self.windows`.
+    fn open_menu(&mut self, id: WindowId, pos: (f32, f32)) {
+        let (menu_windows, menu_move_labels) = self.menu_move_targets(id);
+        let Some(active) = self.windows.get_mut(&id) else { return };
+        active.menu = Some(pos);
+        active.menu_hover = None; // no row highlighted until the pointer moves
+        active.menu_windows = menu_windows;
+        active.menu_move_labels = menu_move_labels;
+        active.window.request_redraw();
+    }
+
+    /// Build the "Move Pane to <window>" targets for a menu about to open in
+    /// window `exclude`: every OTHER window, sorted by `WindowId`'s `Ord` impl
+    /// (winit exposes no creation-order or on-screen-stacking API, so this is
+    /// simply a STABLE, deterministic order — not meaningful otherwise) and
+    /// numbered from 1 in that order. Each label is `"{n}: {title}"`, `title`
+    /// being that window's focused pane's title (`title_of`), or `"rt"` if it
+    /// has none. Returns the ids and labels built in the SAME pass, in the
+    /// SAME order, so a caller storing both (as `Active::menu_windows` /
+    /// `menu_move_labels`) can never have them skew relative to each other.
+    fn menu_move_targets(&self, exclude: WindowId) -> (Vec<WindowId>, Vec<String>) {
+        let mut ids: Vec<WindowId> = self.windows.keys().filter(|w| **w != exclude).copied().collect();
+        ids.sort();
+        let labels = ids
+            .iter()
+            .enumerate()
+            .map(|(n, w)| {
+                let title = self
+                    .windows
+                    .get(w)
+                    .and_then(|a| a.session.title_of(a.session.focus()))
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("rt");
+                format!("{}: {title}", n + 1)
+            })
+            .collect();
+        (ids, labels)
+    }
+
     /// Exchange the dragged pane with pane `b` in another window: one leaf
     /// rewrite in each tree, then the two panes' side-table entries (backend,
     /// title, group, columns) cross over. Each keeps its own window's slot
@@ -3347,6 +3467,7 @@ impl App {
             }
             WindowCmd::DetachPane => self.detach(event_loop, id, false),
             WindowCmd::DetachTab => self.detach(event_loop, id, true),
+            WindowCmd::MoveToWindow(dest) => self.move_pane_to_window(id, dest),
         }
     }
 
@@ -5178,7 +5299,7 @@ impl App {
             let url = Self::cell_at(active, pos.0, pos.1)
                 .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
             let has_sel = Self::selected_text(active).is_some();
-            let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
+            let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
             let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
             let hover = active.menu_hover;
             chrome::menu::draw(&mut *active.backend, &g, &rows, hover, cw, ch);

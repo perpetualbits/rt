@@ -53,10 +53,14 @@ fn items() -> Vec<Item> {
 
 /// What the user picked. Most rows map to an [`Action`] (run like the matching
 /// keybinding); the URL rows carry the dynamic address they act on.
+/// `MoveToWindow(i)` is an index into the CALLER's parallel `Vec<WindowId>`
+/// (built alongside the labels passed as `move_targets`, so the index always
+/// lines up) — `menu.rs` has no notion of a window id itself.
 pub enum MenuPick {
     Do(Action),
     OpenUrl(String),
     CopyUrl(String),
+    MoveToWindow(usize),
 }
 
 /// A native-menu action (backend-agnostic). Maps to a [`MenuPick`] on click.
@@ -66,6 +70,7 @@ pub enum RowAction {
     CopyUrl(String),
     Copy,
     Paste,
+    MoveToWindow(usize),
 }
 
 impl RowAction {
@@ -77,6 +82,7 @@ impl RowAction {
             RowAction::Paste => MenuPick::Do(Action::Paste),
             RowAction::OpenUrl(u) => MenuPick::OpenUrl(u),
             RowAction::CopyUrl(u) => MenuPick::CopyUrl(u),
+            RowAction::MoveToWindow(i) => MenuPick::MoveToWindow(i),
         }
     }
 }
@@ -92,7 +98,13 @@ pub struct Row {
 /// The full menu for this frame, top to bottom — the single source of truth for
 /// both the egui menu and the native (XRender) menu. `has_selection` gates Copy;
 /// `url` adds the link rows at the top; `keymap` supplies accelerators.
-pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>) -> Vec<Row> {
+/// `move_targets` is the Wayland substitute for cross-window drag: one
+/// "Move Pane to <label>" row per entry, inserted right after the Detach rows,
+/// each carrying its position in `move_targets` as `RowAction::MoveToWindow`
+/// (the caller resolves that index against the parallel `Vec<WindowId>` it
+/// built `move_targets` from). Empty in the common single-window case, so no
+/// rows appear at all.
+pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>, move_targets: &[String]) -> Vec<Row> {
     let mut out = Vec::new();
     let sep = || Row { label: String::new(), accel: None, action: None, enabled: false };
     // `shortcut_for` already renders the chord via `Chord`'s `Display` impl (the
@@ -108,12 +120,27 @@ pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>) -> Vec<Row>
     out.push(sep());
     for it in items() {
         match it {
-            Item::Action(label, action) => out.push(Row {
-                label: label.to_string(),
-                accel: accel(action),
-                action: Some(RowAction::Do(action)),
-                enabled: true,
-            }),
+            Item::Action(label, action) => {
+                out.push(Row {
+                    label: label.to_string(),
+                    accel: accel(action),
+                    action: Some(RowAction::Do(action)),
+                    enabled: true,
+                });
+                // The Wayland substitute for cross-window drag, right after
+                // Detach — the two are the "send this pane somewhere else"
+                // family of actions.
+                if label == "Detach Tab to New Window" {
+                    for (i, t) in move_targets.iter().enumerate() {
+                        out.push(Row {
+                            label: format!("Move Pane to {t}"),
+                            accel: None,
+                            action: Some(RowAction::MoveToWindow(i)),
+                            enabled: true,
+                        });
+                    }
+                }
+            }
             Item::Separator => out.push(sep()),
         }
     }
@@ -133,31 +160,41 @@ mod tests {
     #[test]
     fn url_rows_present_only_with_a_url() {
         let km = Keymap::default();
-        let without = rows(&km, false, None);
+        let without = rows(&km, false, None, &[]);
         assert!(!without.iter().any(|r| r.label == "Open Link"));
-        let with = rows(&km, false, Some("https://x"));
+        let with = rows(&km, false, Some("https://x"), &[]);
         assert!(with.iter().any(|r| r.label == "Open Link"));
     }
 
     #[test]
     fn copy_disabled_without_selection() {
         let km = Keymap::default();
-        let r = rows(&km, false, None);
+        let r = rows(&km, false, None, &[]);
         let copy = r.iter().find(|r| r.label == "Copy").unwrap();
         assert!(!copy.enabled, "Copy needs a selection");
-        let r2 = rows(&km, true, None);
+        let r2 = rows(&km, true, None, &[]);
         assert!(r2.iter().find(|r| r.label == "Copy").unwrap().enabled);
     }
 
     #[test]
     fn separators_have_no_action() {
-        let r = rows(&Keymap::default(), false, None);
+        let r = rows(&Keymap::default(), false, None, &[]);
         assert!(r.iter().any(|r| r.action.is_none()), "at least one separator");
     }
 
     #[test]
+    fn move_to_window_rows_appear_per_target() {
+        let km = Keymap::default();
+        let none = rows(&km, false, None, &[]);
+        assert!(!none.iter().any(|r| r.label.starts_with("Move Pane to ")));
+        let some = rows(&km, false, None, &["2: htop".into(), "3: logs".into()]);
+        let labels: Vec<_> = some.iter().filter(|r| r.label.starts_with("Move Pane to ")).map(|r| r.label.clone()).collect();
+        assert_eq!(labels, vec!["Move Pane to 2: htop", "Move Pane to 3: logs"]);
+    }
+
+    #[test]
     fn version_row_is_a_disabled_info_footer() {
-        let r = rows(&Keymap::default(), false, None);
+        let r = rows(&Keymap::default(), false, None, &[]);
         let v = r.iter().find(|r| r.label.starts_with("rt ")).expect("a version row");
         assert!(v.label.contains(env!("CARGO_PKG_VERSION")), "shows the crate version");
         assert!(!v.enabled, "the version row is informational, not clickable");

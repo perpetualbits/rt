@@ -110,7 +110,7 @@ mod tests {
     use rt_config::Keymap;
 
     fn sample() -> Vec<Row> {
-        menu::rows(&Keymap::default(), true, None)
+        menu::rows(&Keymap::default(), true, None, &[])
     }
 
     #[test]
