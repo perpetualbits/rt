@@ -1477,4 +1477,62 @@ mod tests {
         let order2: Vec<_> = bar2.tabs.iter().map(|tb| tb.first_pane).collect();
         assert_eq!(order2, vec![q, p]);
     }
+
+    /// Removing a tab from a group of 3+ leaves the group intact (no collapse):
+    /// the remaining pages keep their order and `active` shifts left to keep
+    /// tracking the same page it pointed at before the removal.
+    #[test]
+    fn take_tab_from_group_of_three_survives_and_shifts_active() {
+        let (mut t, a) = Tree::new();
+        let b = t.new_tab(a).unwrap(); // tabs [a, b], b active (index 1)
+        let c = t.new_tab(b).unwrap(); // tabs [a, b, c], c active (index 2)
+        let sub = t.take_tab(b).expect("b's page (a bare leaf)");
+        assert_eq!(sub.panes(), vec![b]);
+        assert_eq!(t.all_panes(), vec![a, c], "group survives with the other two pages");
+        let bar = &t.tab_bars(Rect::new(0.0, 0.0, 900.0, 600.0))[0];
+        let order: Vec<_> = bar.tabs.iter().map(|tb| tb.first_pane).collect();
+        assert_eq!(order, vec![a, c], "remaining tab order preserved");
+        assert!(bar.tabs[1].active, "active shifted left but still points at c, active before the removal");
+        assert!(!bar.tabs[0].active);
+    }
+
+    /// A `Tabs` group nested inside another `Tabs` page: taking one of the
+    /// INNER tabs must fall through the outer group's "recurse into pages"
+    /// branch (the outer group's own pages don't match by first-leaf) and
+    /// collapse only the inner group, leaving the outer structure otherwise
+    /// intact.
+    #[test]
+    fn take_tab_recurses_through_nested_tabs_and_collapses_inner_group() {
+        let (mut t, a) = Tree::new();
+        let b = t.new_tab(a).unwrap(); // root Tabs [a, b], b active
+        let c = t.split(b, Orientation::LeftRight).unwrap(); // page 2 = split(b, c)
+        let d = t.new_tab(b).unwrap(); // wraps b (inside the split) into inner Tabs [b, d], d active
+        let bounds = Rect::new(0.0, 0.0, 900.0, 600.0);
+        assert_eq!(t.tab_bars(bounds).len(), 2, "outer strip + inner strip nested in page 2");
+
+        let sub = t.take_tab(b).expect("inner tab's first leaf");
+        assert_eq!(sub.panes(), vec![b]);
+        // Outer group's shape is untouched: still 2 pages, [a, page2]. Page 2's
+        // inner Tabs had 1 child left, so it collapsed into a bare leaf `d`.
+        assert_eq!(t.all_panes(), vec![a, d, c]);
+        let bars = t.tab_bars(bounds);
+        assert_eq!(bars.len(), 1, "inner strip is gone: only the outer remains");
+        let order: Vec<_> = bars[0].tabs.iter().map(|tb| tb.first_pane).collect();
+        assert_eq!(order, vec![a, d], "outer pages: a, then page2 (now identified by d)");
+        assert!(bars[0].tabs[1].active, "page 2 (the split) is still the active outer tab");
+        assert!(!bars[0].tabs[0].active);
+    }
+
+    /// insert_root_edge on an emptied tree installs the subtree as the root
+    /// directly, rather than wrapping a (nonexistent) old root in a Split.
+    #[test]
+    fn insert_root_edge_into_empty_tree_becomes_the_root() {
+        let (mut t, a) = Tree::new();
+        let sub = t.take(a).unwrap();
+        assert!(t.is_empty());
+        assert_eq!(sub.panes(), vec![a]);
+        t.insert_root_edge(sub, Orientation::TopBottom, true);
+        assert!(!t.is_empty());
+        assert_eq!(t.all_panes(), vec![a]);
+    }
 }
