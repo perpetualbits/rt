@@ -993,6 +993,43 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
         }
     }
 
+    /// Rewrite one leaf of this session's TREE from `from` to `to`, leaving
+    /// the layout (weights, splits, tab structure) exactly as it was.
+    ///
+    /// This is the tree half of a CROSS-window swap: no single session owns
+    /// both panes, so [`Session::move_pane`]'s `Swap` arm cannot serve it. The
+    /// App rewrites one leaf in each of the two trees and then exchanges the
+    /// two panes' side-table entries with [`Session::eject_entries`] /
+    /// [`Session::inject_entries`]. `false` if `from` is not a leaf here (a
+    /// stale target — the caller must undo the other tree's rewrite).
+    pub fn tree_replace(&mut self, from: PaneId, to: PaneId) -> bool {
+        self.tree.replace_leaf(from, to)
+    }
+
+    /// Take back a package this session handed out that nobody adopted (a
+    /// cross-window drop onto a stale target), re-inserting it as a root-edge
+    /// split. The failure path of every cross-window move: a live pane must
+    /// never be lost, and the source window is the one place guaranteed to
+    /// still exist.
+    pub fn readopt_root_edge(&mut self, sub: rt_core::Subtree, entries: PaneEntries<B>) {
+        self.tree.insert_root_edge(sub, Orientation::LeftRight, false);
+        self.inject_entries(entries);
+        self.relayout(self.bounds);
+    }
+
+    /// Focus pane `id` if this session owns it, else leave focus alone
+    /// (returning `false`). The cross-window swap needs it: a session whose
+    /// focused pane just left for another window must not keep pointing at a
+    /// pane it no longer owns.
+    pub fn focus_pane(&mut self, id: PaneId) -> bool {
+        if self.panes.contains_key(&id) {
+            self.focus = id;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Move pane `id` to `at` within/into this session, committing
     /// immediately (no package survives the call — same-window drag-and-drop
     /// and `Swap`). Returns `false` on a no-op or stale target; a pane is
@@ -1019,10 +1056,7 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
                     Ok(()) => true,
                     Err(pkg) => {
                         // Put it back where the tree will take it: as a root edge (never lose a pane).
-                        let PanePackage { sub, entries } = pkg;
-                        self.tree.insert_root_edge(sub, Orientation::LeftRight, false);
-                        self.inject_entries(entries);
-                        self.relayout(self.bounds);
+                        self.readopt_root_edge(pkg.sub, pkg.entries);
                         false
                     }
                 }
@@ -1047,10 +1081,7 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
         match self.adopt(pkg, at) {
             Ok(()) => true,
             Err(pkg) => {
-                let PanePackage { sub, entries } = pkg;
-                self.tree.insert_root_edge(sub, Orientation::LeftRight, false);
-                self.inject_entries(entries);
-                self.relayout(self.bounds);
+                self.readopt_root_edge(pkg.sub, pkg.entries);
                 false
             }
         }
@@ -1229,6 +1260,53 @@ mod tests {
         assert_eq!(dst.title_of(b), Some("worker"));
         assert_eq!(dst.group_of(b), Some(2));
         assert_eq!(dst.columns_of(b), 2);
+    }
+
+    /// A CROSS-window swap at the session level: rewrite one leaf in each
+    /// tree, then exchange the two panes' side-table entries. Both panes stay
+    /// alive, each lands in the other session complete with title/group, and
+    /// each tree keeps its own shape (the swap is a pure id rewrite).
+    #[test]
+    fn cross_session_swap_exchanges_entries() {
+        let mut left = mock_session();
+        let a = left.focus();
+        left.set_title(a, "left-pane".into());
+        left.set_group(3); // focus (a) joins group 3
+        left.apply(Action::SplitVert); // a second pane so `left` keeps a shape
+        let keep = left.focus();
+
+        let mut right = mock_session();
+        let b = right.focus();
+        right.set_title(b, "right-pane".into());
+        right.set_group(4);
+
+        // The App's cross-window swap, verbatim: tree rewrite on both sides…
+        assert!(left.tree_replace(a, b), "a is a leaf of left");
+        assert!(right.tree_replace(b, a), "b is a leaf of right");
+        // …then the side tables cross over.
+        let from_left = left.eject_entries(&[a]);
+        let from_right = right.eject_entries(&[b]);
+        left.inject_entries(from_right);
+        right.inject_entries(from_left);
+        let bounds = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+        left.relayout(bounds);
+        right.relayout(bounds);
+
+        // b now lives in `left` with everything it owned; a in `right`.
+        assert!(left.pane(b).is_some() && left.pane(a).is_none(), "b moved into left");
+        assert!(right.pane(a).is_some() && right.pane(b).is_none(), "a moved into right");
+        assert_eq!(left.title_of(b), Some("right-pane"));
+        assert_eq!(right.title_of(a), Some("left-pane"));
+        assert_eq!(left.group_of(b), Some(4));
+        assert_eq!(right.group_of(a), Some(3));
+        // Shapes are untouched: left still has its two panes, right one.
+        assert_eq!(left.tree().all_panes().len(), 2);
+        assert_eq!(right.tree().all_panes(), vec![a]);
+        assert!(left.visible_rects(bounds).iter().any(|(id, _)| *id == keep));
+        // Focus repair: `left`'s focus was `keep`, `right`'s was b (departed).
+        assert!(right.focus_pane(a), "the arrival can take focus");
+        assert_eq!(right.focus(), a);
+        assert!(!right.focus_pane(b), "a pane that left cannot be focused");
     }
 
     /// Extracting the last pane leaves an empty session (the App closes it);

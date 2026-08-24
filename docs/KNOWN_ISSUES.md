@@ -53,6 +53,22 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   open-on-right-click is confirmed by construction; `RT_MENU=1` opens it at
   startup for inspection.
 
+## Pane drag-and-drop (2026-08-24)
+- ◐ **Cross-window drag and drag tear-out are X11-only.** Dragging a pane/tab
+  into ANOTHER rt window, and dropping one on bare desktop to tear it out into
+  a new window, both need the pointer in SCREEN coordinates: rt asks winit for
+  `Window::inner_position()`, which Wayland has no answer for (a client is never
+  told where its surface is, and `set_outer_position` is a no-op). Both gestures
+  are therefore gated on `inner_position().is_ok()` — on Wayland a drag simply
+  stays inside the window it started in (reorder/split/swap/tab-drop all work
+  there), and the keyboard/menu path is how a pane moves out: `Ctrl+Shift+D`
+  (pane) / `Ctrl+Shift+J` (tab) detach into a new window. Wayland's own pointer
+  behaviour is not the blocker — its implicit grab does keep delivering
+  surface-local motion past the surface edge — the missing global coordinates
+  are. Lifting this needs a compositor-side protocol (an actual XDG drag-and-drop
+  session, `wlr-foreign-toplevel`-style placement, or KDE's plasma-window
+  management), which is a separate piece of work.
+
 ## Focus & menu targeting (2026-07-06)
 - ☑ **Focus stuck on last-created pane; no click-to-focus.** Focus only moved via
   Alt+arrows. Added `Session::focus_at(px,py)`: **left-click focuses the pane

@@ -594,6 +594,12 @@ struct DragState {
     label: String,                                      // ghost chip text (pane title / "Tab N")
     hover: Option<(WindowId, dragdrop::ResolvedDrop)>,  // resolved target under the pointer
     cursor: (f32, f32),                                 // pointer in the hovered window's coords
+    // The window the pointer is currently OVER (`None` = the desktop, i.e. a
+    // release there tears out). Distinct from `hover`, which is `None` whenever
+    // the pointer is over a dead zone — this field still names the window whose
+    // cue fields are set, so a motion into another window (or off all of them)
+    // knows which stale cues to wipe.
+    cued: Option<WindowId>,
 }
 
 /// Build the system font database (scans the usual font directories).
@@ -1910,29 +1916,17 @@ impl ApplicationHandler for App {
                             label,
                             hover: None,
                             cursor: active.mouse,
+                            cued: None,
                         });
                     }
                 }
-                // A live drag: re-resolve what the pointer is over and refresh this
-                // window's cue fields (Task 10 paints them). Every motion forces a
-                // full frame — the cues are chrome the damage tracker knows nothing
-                // about — but nothing relayouts until the release commits.
+                // A live drag: re-resolve what the pointer is over — in THIS
+                // window or, on X11, in whatever other rt window the global
+                // point lands in — and refresh the cue fields there. `active`
+                // is dead past this point (the branch returns), so the whole
+                // job can take `&mut self` and reach the other windows.
                 if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
-                    let bounds = content_bounds(active.window.inner_size());
-                    let (panes, bars) = (active.session.visible_rects(bounds), active.session.tab_bars(bounds));
-                    let drag = self.drag.as_mut().expect("just matched");
-                    drag.cursor = active.mouse;
-                    let resolved =
-                        dragdrop::resolve_drop(drag.payload, &drag.payload_panes, &panes, &bars, bounds, active.mouse);
-                    drag.hover = resolved.clone().map(|r| (id, r));
-                    active.drag_cue = resolved;
-                    active.drag_ghost = Some((active.mouse, drag.label.clone()));
-                    active.drag_dim = match drag.payload {
-                        dragdrop::DragPayload::Pane(p) => Some(p),
-                        dragdrop::DragPayload::Tab { .. } => None,
-                    };
-                    active.force_full = true; // cues span arbitrary pixels
-                    active.window.request_redraw();
+                    self.drag_motion(id);
                     return; // the drag owns the pointer: no hover/select/wire work
                 }
                 // A divider should say it can be dragged. Only while nothing else
@@ -2353,36 +2347,13 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
-                    // A real drag: commit it where the pointer is (or cancel, if
-                    // that is nothing — a gutter/dead zone resolves to `None`).
+                    // A real drag: commit it where the pointer is — in this
+                    // window, in another one, or (released on the desktop) into
+                    // a brand-new one. A release over nothing cancels. Like the
+                    // motion path this needs every window, so `active` ends
+                    // here (the branch returns).
                     if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
-                        let drag = self.drag.take().expect("just matched");
-                        // `drag.source == id`, so `active` IS the window whose cue
-                        // fields are set: clearing them below clears the right ones.
-                        let target = drag.hover.as_ref().map(|(_, r)| r.target); // for the log below
-                        let committed = match (drag.payload, drag.hover) {
-                            (dragdrop::DragPayload::Pane(p), Some((_w, r))) => active.session.move_pane(p, r.target),
-                            (dragdrop::DragPayload::Tab { first_pane }, Some((_w, r))) => match r.target {
-                                // A tab dropped on the strip it already lives in is
-                                // a REORDER, not a move (a move would extract the
-                                // page and re-insert it, dissolving a two-tab
-                                // group on the way out). Any OTHER strip — no
-                                // current index for us there — is a genuine move.
-                                rt_session::DropTarget::TabAt { anchor, index } => {
-                                    let bounds = content_bounds(active.window.inner_size());
-                                    match Self::tab_index_in_bar(active, bounds, anchor, first_pane) {
-                                        Some(current) => active
-                                            .session
-                                            .reorder_tab(first_pane, dragdrop::index_for_reorder(current, index)),
-                                        None => active.session.move_tab(first_pane, r.target),
-                                    }
-                                }
-                                other => active.session.move_tab(first_pane, other),
-                            },
-                            (_, None) => false, // released over nothing: cancel
-                        };
-                        log::debug!("drag release: payload={:?} target={target:?} committed={committed}", drag.payload);
-                        Self::clear_drag_cues(active); // + force_full: the layout may have changed
+                        self.commit_drag(event_loop, id);
                         return;
                     }
                     // If the matching press was forwarded to an app, forward the
@@ -2912,9 +2883,381 @@ impl App {
         self.armed_drag = None;
         let Some(drag) = self.drag.take() else { return };
         log::debug!("drag cancelled: payload={:?}", drag.payload);
-        // The window may already be gone (that is one of the reasons we cancel).
-        let Some(active) = self.windows.get_mut(&drag.source) else { return };
+        // Both ends: the source carries the dimmed pane and (usually) the cues,
+        // but with cross-window hover the cue/ghost may be sitting in ANOTHER
+        // window — Escape must leave that one clean too. Either may already be
+        // gone (a window closing under the gesture is one reason we cancel).
+        self.clear_cues_on(drag.source);
+        if let Some(w) = drag.cued.filter(|w| *w != drag.source) {
+            self.clear_cues_on(w);
+        }
+    }
+
+    /// Wipe the drag cues off ONE window by id, if it is still open.
+    fn clear_cues_on(&mut self, id: WindowId) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
         Self::clear_drag_cues(active);
+    }
+
+    /// The rt window whose CONTENT rect contains the global (screen) point.
+    ///
+    /// X11 only: on Wayland `inner_position()` errs for every window, so this
+    /// returns `None` throughout, which cleanly disables cross-window hover
+    /// there (the spec's Wayland stance — keyboard detach is that platform's
+    /// path). Windows rarely overlap; if two do, the map's iteration order
+    /// decides, because winit exposes no stacking order to consult.
+    fn window_under_global(&self, global: (f64, f64)) -> Option<WindowId> {
+        for (&wid, a) in self.windows.iter() {
+            let Ok(pos) = a.window.inner_position() else { continue };
+            let size = a.window.inner_size();
+            let (lx, ly) = (global.0 - pos.x as f64, global.1 - pos.y as f64);
+            if lx >= 0.0 && ly >= 0.0 && lx < size.width as f64 && ly < size.height as f64 {
+                return Some(wid);
+            }
+        }
+        None
+    }
+
+    /// One pointer motion while a drag is live (`id` is the drag's source, the
+    /// window that owns the pointer grab). Works out which rt window the
+    /// pointer is over — this one, another one (X11), or none at all (the
+    /// desktop: a release there tears out) — re-resolves the drop target in
+    /// THAT window's session, and moves the cues there.
+    ///
+    /// All reads: nothing relayouts until the release commits. Every window
+    /// whose cues change gets `force_full` (the cues are chrome the damage
+    /// tracker knows nothing about) plus a redraw request.
+    fn drag_motion(&mut self, id: WindowId) {
+        let Some(src) = self.windows.get(&id) else { return };
+        let mouse = src.mouse; // source-window-local, from the CursorMoved that got us here
+        // The pointer in screen coordinates. `None` on Wayland, where there is
+        // no such thing for a client — the implicit grab still delivers
+        // source-local coords, so the source stays the only resolvable window.
+        let global = src
+            .window
+            .inner_position()
+            .ok()
+            .map(|p| (p.x as f64 + mouse.0 as f64, p.y as f64 + mouse.1 as f64));
+        let (over, local) = match global {
+            None => (Some(id), mouse),
+            Some(g) => match self.window_under_global(g) {
+                None => (None, mouse),           // the desktop
+                Some(w) if w == id => (Some(id), mouse),
+                Some(w) => {
+                    // Another rt window: re-express the point in ITS coords.
+                    let Some(a) = self.windows.get(&w) else { return };
+                    let Ok(p) = a.window.inner_position() else { return };
+                    (Some(w), ((g.0 - p.x as f64) as f32, (g.1 - p.y as f64) as f32))
+                }
+            },
+        };
+        // Resolve inside the hovered window's layout (pure reads).
+        let resolved = match over {
+            None => None,
+            Some(w) => {
+                let (Some(a), Some(drag)) = (self.windows.get(&w), self.drag.as_ref()) else { return };
+                let bounds = content_bounds(a.window.inner_size());
+                let (panes, bars) = (a.session.visible_rects(bounds), a.session.tab_bars(bounds));
+                // `payload_panes` only ever matches in the SOURCE window (pane
+                // ids are process-global); passing it elsewhere is harmless.
+                dragdrop::resolve_drop(drag.payload, &drag.payload_panes, &panes, &bars, bounds, local)
+            }
+        };
+
+        let Some(drag) = self.drag.as_mut() else { return };
+        drag.cursor = local;
+        drag.hover = over.zip(resolved.clone());
+        let prev = drag.cued;
+        drag.cued = over;
+        if prev != over {
+            // Once per window crossing, not per motion: cheap enough to keep.
+            log::debug!("drag hover: {prev:?} -> {over:?} (source={id:?})");
+        }
+        let label = drag.label.clone();
+        let dim = match drag.payload {
+            dragdrop::DragPayload::Pane(p) => Some(p),
+            dragdrop::DragPayload::Tab { .. } => None,
+        };
+
+        // The window that was showing cues and no longer is (a leave event in
+        // all but name — winit sends none during a grab).
+        if let Some(p) = prev.filter(|p| Some(*p) != over && *p != id) {
+            if let Some(a) = self.windows.get_mut(&p) {
+                a.drag_cue = None;
+                a.drag_ghost = None;
+                a.drag_dim = None;
+                a.force_full = true;
+                a.window.request_redraw();
+            }
+        }
+        // The source always keeps the payload dimmed where it still sits; the
+        // cue and the ghost chip follow the pointer wherever it went.
+        let here = over == Some(id);
+        if let Some(a) = self.windows.get_mut(&id) {
+            // Skip the repaint when nothing about the source's cues moved —
+            // otherwise every motion over ANOTHER window would repaint this one.
+            if here || a.drag_cue.is_some() || a.drag_ghost.is_some() || a.drag_dim != dim {
+                a.drag_cue = if here { resolved.clone() } else { None };
+                a.drag_ghost = if here { Some((local, label.clone())) } else { None };
+                a.drag_dim = dim;
+                a.force_full = true;
+                a.window.request_redraw();
+            }
+        }
+        if let Some(w) = over.filter(|w| *w != id) {
+            let Some(a) = self.windows.get_mut(&w) else { return };
+            a.drag_cue = resolved;
+            a.drag_ghost = Some((local, label));
+            a.drag_dim = None; // the payload's old place is in the OTHER window
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+    }
+
+    /// The screen point a drag was released at, when it landed OUTSIDE the
+    /// source window — the tear-out gesture. `None` means "not a tear-out":
+    /// either the release was inside the source (a gutter: cancel), or the
+    /// platform cannot say where windows are (Wayland), where tear-out is
+    /// gated off and keyboard detach is the path.
+    fn tear_out_point(&self, source: WindowId) -> Option<winit::dpi::PhysicalPosition<i32>> {
+        let a = self.windows.get(&source)?;
+        let Ok(pos) = a.window.inner_position() else { return None }; // Wayland: no global coords
+        let size = a.window.inner_size();
+        let (mx, my) = a.mouse;
+        if mx >= 0.0 && my >= 0.0 && mx < size.width as f32 && my < size.height as f32 {
+            return None; // still inside the source window
+        }
+        Some(winit::dpi::PhysicalPosition::new(pos.x + mx as i32, pos.y + my as i32))
+    }
+
+    /// Commit (or cancel) the live drag on release. `id` is the source window,
+    /// which is where the button came up: winit's implicit grab keeps every
+    /// pointer event with the window the press happened in, so this is the ONE
+    /// place a drag can end, whichever window it is hovering.
+    fn commit_drag(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
+        let Some(drag) = self.drag.take() else { return };
+        let target = drag.hover.as_ref().map(|(_, r)| r.target); // for the log below
+        let hover_window = drag.hover.as_ref().map(|(w, _)| *w);
+        let committed = match drag.hover {
+            // Same window: the plain in-session move/reorder.
+            Some((w, r)) if w == id => self.same_window_drop(id, drag.payload, r),
+            // Another window: extract here, adopt there (or swap across).
+            Some((w, r)) => self.cross_window_drop(id, drag.payload, w, r),
+            // Nothing resolved under the pointer. Over an rt window (`cued`)
+            // that is a dead zone — a gutter, a margin — and a dead zone is a
+            // cancel, in ANY window. Only a release over no rt window at all
+            // tears out, and only where the platform can say where that was.
+            None => match (drag.cued, self.tear_out_point(id)) {
+                (None, Some(at)) => {
+                    self.tear_out(event_loop, id, drag.payload, Some(at));
+                    true
+                }
+                _ => false,
+            },
+        };
+        log::debug!(
+            "drag release: payload={:?} source={id:?} over={hover_window:?} target={target:?} committed={committed}",
+            drag.payload
+        );
+        // Both ends get their cues wiped (+ force_full: layouts may have
+        // changed). Either window may have just closed — `clear_cues_on` is a
+        // no-op then.
+        self.clear_cues_on(id);
+        if let Some(w) = drag.cued.filter(|w| *w != id) {
+            self.clear_cues_on(w);
+        }
+    }
+
+    /// A drop inside the window the drag started in: a move within one session
+    /// (or a REORDER, when a tab lands back on its own strip).
+    fn same_window_drop(&mut self, id: WindowId, payload: dragdrop::DragPayload, r: dragdrop::ResolvedDrop) -> bool {
+        let Some(active) = self.windows.get_mut(&id) else { return false };
+        match payload {
+            dragdrop::DragPayload::Pane(p) => active.session.move_pane(p, r.target),
+            dragdrop::DragPayload::Tab { first_pane } => match r.target {
+                // A tab dropped on the strip it already lives in is a REORDER,
+                // not a move (a move would extract the page and re-insert it,
+                // dissolving a two-tab group on the way out). Any OTHER strip —
+                // no current index for us there — is a genuine move.
+                rt_session::DropTarget::TabAt { anchor, index } => {
+                    let bounds = content_bounds(active.window.inner_size());
+                    match Self::tab_index_in_bar(active, bounds, anchor, first_pane) {
+                        Some(current) => {
+                            active.session.reorder_tab(first_pane, dragdrop::index_for_reorder(current, index))
+                        }
+                        None => active.session.move_tab(first_pane, r.target),
+                    }
+                }
+                other => active.session.move_tab(first_pane, other),
+            },
+        }
+    }
+
+    /// A drop into a DIFFERENT window: the payload leaves `source`'s session
+    /// and joins `dest`'s, jacks and wholly-internal wires in tow. Returns
+    /// whether anything committed. A refused adopt puts the package straight
+    /// back into the source — a live pane is never lost on any path.
+    fn cross_window_drop(
+        &mut self,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        dest: WindowId,
+        r: dragdrop::ResolvedDrop,
+    ) -> bool {
+        let committed = match r.target {
+            rt_session::DropTarget::Swap { pane: b } => self.cross_window_swap(source, payload, dest, b),
+            other => self.cross_window_move(source, payload, dest, other),
+        };
+        // The source's layout changed under it either way; and if its LAST pane
+        // just left, the window has nothing to show any more.
+        if self.windows.get(&source).is_some_and(|a| a.session.is_empty()) {
+            self.close_window(source);
+        } else if let Some(a) = self.windows.get_mut(&source) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+        committed
+    }
+
+    /// The non-swap half of [`App::cross_window_drop`]: extract the payload from
+    /// `source`'s session and adopt it into `dest`'s at `at`. Every failure path
+    /// hands the package back to the source, so a live pane is never lost.
+    fn cross_window_move(
+        &mut self,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        dest: WindowId,
+        at: rt_session::DropTarget,
+    ) -> bool {
+        let Some(src) = self.windows.get_mut(&source) else { return false };
+        let pkg = match payload {
+            dragdrop::DragPayload::Pane(p) => src.session.extract_pane(p),
+            dragdrop::DragPayload::Tab { first_pane } => src.session.extract_tab(first_pane),
+        };
+        let Some(pkg) = pkg else { return false }; // stale payload: nothing left this window
+        let moved: Vec<rt_core::PaneId> = pkg.sub.panes();
+        // The target window may have closed between hover and release, and the
+        // target LAYOUT may have changed under the drag (a stale `at`): both put
+        // the package straight back into the source as a root-edge split.
+        let refused = match self.windows.get_mut(&dest) {
+            None => Some(pkg),
+            Some(dst) => dst.session.adopt(pkg, at).err(),
+        };
+        if let Some(pkg) = refused {
+            let Some(src) = self.windows.get_mut(&source) else { return false };
+            src.session.readopt_root_edge(pkg.sub, pkg.entries);
+            return false;
+        }
+        // Jacks and wholly-internal wires follow their panes; wires that would
+        // now cross windows are cut.
+        self.migrate_pane_extras(source, dest, &moved);
+        if let Some(a) = self.windows.get_mut(&dest) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+        true
+    }
+
+    /// Exchange the dragged pane with pane `b` in another window: one leaf
+    /// rewrite in each tree, then the two panes' side-table entries (backend,
+    /// title, group, columns) cross over. Each keeps its own window's slot
+    /// geometry — a swap moves ids, never shapes.
+    ///
+    /// WIRES: each swapped pane is treated exactly as a one-pane move would be.
+    /// Its jack travels with it, and every wire touching it in its OLD window
+    /// is CUT — a wire whose other end stayed behind would otherwise span two
+    /// windows, which rt has no concept of. (The one wire that survives is a
+    /// self-wire, both of whose ends move together.)
+    fn cross_window_swap(
+        &mut self,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        dest: WindowId,
+        b: rt_core::PaneId,
+    ) -> bool {
+        // The resolver never offers Swap for a tab payload; refuse defensively.
+        let dragdrop::DragPayload::Pane(dragged) = payload else { return false };
+        let Some(src) = self.windows.get_mut(&source) else { return false };
+        if !src.session.tree_replace(dragged, b) {
+            return false;
+        }
+        let dst_ok = match self.windows.get_mut(&dest) {
+            Some(dst) => dst.session.tree_replace(b, dragged),
+            None => false, // the target window closed between hover and release
+        };
+        if !dst_ok {
+            // Undo the source's rewrite: its tree must keep naming its own pane.
+            if let Some(src) = self.windows.get_mut(&source) {
+                src.session.tree_replace(b, dragged);
+            }
+            return false;
+        }
+        // Both trees now name the other's pane: hand the entries across to match.
+        let Some(src) = self.windows.get_mut(&source) else { return false };
+        let from_src = src.session.eject_entries(&[dragged]);
+        let Some(dst) = self.windows.get_mut(&dest) else { return false };
+        let from_dst = dst.session.eject_entries(&[b]);
+        dst.session.inject_entries(from_src);
+        if let Some(src) = self.windows.get_mut(&source) {
+            src.session.inject_entries(from_dst);
+        }
+        // Jacks travel with their panes; wires that would cross windows are cut.
+        self.migrate_pane_extras(source, dest, &[dragged]);
+        self.migrate_pane_extras(dest, source, &[b]);
+        for (wid, departed, arrival) in [(source, dragged, b), (dest, b, dragged)] {
+            let Some(a) = self.windows.get_mut(&wid) else { continue };
+            // A session whose focused pane just left must not keep pointing at
+            // it; the arrival takes its place (and its slot). A session focused
+            // on some THIRD pane keeps that focus — a swap elsewhere in the
+            // window is no reason to move it.
+            if a.session.focus() == departed {
+                a.session.focus_pane(arrival);
+            }
+            a.session.relayout(content_bounds(a.window.inner_size()));
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+        true
+    }
+
+    /// Move the patch-bay extras of the panes in `moved` from window `from` to
+    /// window `to`: their jacks go with them, wires with BOTH ends moved travel
+    /// too, wires with NEITHER end moved stay put, and a wire with exactly ONE
+    /// end moved is CUT — carried either way it would dangle across two
+    /// windows, which rt has no concept of. Shared by keyboard detach, drag
+    /// tear-out and every cross-window drop.
+    fn migrate_pane_extras(&mut self, from: WindowId, to: WindowId, moved: &[rt_core::PaneId]) {
+        let mut moved_jacks = Vec::new();
+        let mut travelling = Vec::new();
+        {
+            let Some(a) = self.windows.get_mut(&from) else { return };
+            for pid in moved {
+                if let Some(j) = a.jacks.borrow_mut().remove(pid) {
+                    moved_jacks.push((*pid, j));
+                }
+            }
+            // A plain `.partition()` only ever produces two groups covering
+            // every element — it can't also DROP the cross wires, so a naive
+            // `partition(|w| both ends moved)` would leave a one-end-moved wire
+            // sitting in `staying`, dangling a reference to a pane that just
+            // left this window. Classify in one pass instead.
+            let mut staying = Vec::new();
+            for w in a.wires.drain(..) {
+                match (moved.contains(&w.src), moved.contains(&w.dst)) {
+                    (true, true) => travelling.push(w),
+                    (false, false) => staying.push(w),
+                    _ => {} // exactly one end moved: cut, not carried either way
+                }
+            }
+            a.wires = staying;
+        }
+        // Unreachable in practice (every caller has just touched `to`), but a
+        // vanished target must not panic: the extras die with their window.
+        let Some(t) = self.windows.get_mut(&to) else { return };
+        for (pid, j) in moved_jacks {
+            t.jacks.borrow_mut().insert(pid, j);
+        }
+        t.wires.extend(travelling);
     }
 
     /// Wipe one window's per-frame drag cues and repaint it. Only the window's
@@ -2946,6 +3289,17 @@ impl App {
         if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
             self.cancel_drag();
         }
+        // A drag merely HOVERING this window survives — it just has nothing
+        // under the pointer any more. Forget the stale target so the release
+        // cannot commit into a window that is gone (the cues die with it).
+        if let Some(d) = self.drag.as_mut() {
+            if d.cued == Some(id) {
+                d.cued = None;
+            }
+            if matches!(d.hover.as_ref(), Some((w, _)) if *w == id) {
+                d.hover = None;
+            }
+        }
         if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
             self.armed_drag = None;
         }
@@ -2976,23 +3330,16 @@ impl App {
     }
 
     /// Tear the focused pane (or its whole tab, when `tab` is set) out of
-    /// window `id` into a fresh OS window. The package moves in memory: PTY,
-    /// scrollback, title, group all survive. No-op when it would just recreate
-    /// the same window (a lone pane, or `tab` with no tab strip). Also used by
-    /// drag tear-out (Task 11).
+    /// window `id` into a fresh OS window — the keyboard/menu gesture. Picks
+    /// the payload, then hands it to [`App::tear_out`], which is also what a
+    /// drag released on the desktop calls.
     fn detach(&mut self, event_loop: &ActiveEventLoop, id: WindowId, tab: bool) {
-        let Some(active) = self.windows.get_mut(&id) else { return };
-        // A lone pane in a lone tab: tearing out would just recreate this
-        // window. No-op (also covers the empty-tree case, defensively).
-        if active.session.tree().all_panes().len() <= 1 {
-            return;
-        }
-        let focus = active.session.focus();
-        let bounds = content_bounds(active.window.inner_size());
-        let pkg = if tab {
+        let Some(active) = self.windows.get(&id) else { return };
+        let payload = if tab {
             // The focused pane's tab: find its strip's active entry (first_pane
             // identity), same "first strip with an active tab" convention as
             // `move_focused_tab`.
+            let bounds = content_bounds(active.window.inner_size());
             let first = active
                 .session
                 .tab_bars(bounds)
@@ -3001,54 +3348,43 @@ impl App {
                 .find(|t| t.active)
                 .map(|t| t.first_pane);
             let Some(first) = first else { return }; // no tab strip → nothing to detach
-            active.session.extract_tab(first)
+            dragdrop::DragPayload::Tab { first_pane: first }
         } else {
-            active.session.extract_pane(focus)
+            dragdrop::DragPayload::Pane(active.session.focus())
         };
-        let Some(pkg) = pkg else { return };
+        self.tear_out(event_loop, id, payload, None);
+    }
 
-        // Move the panes' patch-bay jacks with them; cut wires that would
-        // cross between the source and the new window (exactly one end
-        // moved), and carry wires with BOTH ends moved along with the panes.
-        let moved: Vec<rt_core::PaneId> = pkg.sub.panes();
-        let mut moved_jacks = Vec::new();
-        for pid in &moved {
-            if let Some(j) = active.jacks.borrow_mut().remove(pid) {
-                moved_jacks.push((*pid, j));
-            }
-        }
-        // A plain `.partition()` only ever produces two groups covering every
-        // element — it can't also DROP the cross wires, so a naive
-        // `partition(|w| both ends moved)` would leave a one-end-moved wire
-        // sitting in `staying`, dangling a reference to a pane that just left
-        // this window. Classify in one pass instead: both ends moved travels,
-        // neither end moved stays, exactly one end moved is cut (dropped).
-        let mut travelling = Vec::new();
-        let mut staying = Vec::new();
-        for w in active.wires.drain(..) {
-            match (moved.contains(&w.src), moved.contains(&w.dst)) {
-                (true, true) => travelling.push(w),
-                (false, false) => staying.push(w),
-                _ => {} // exactly one end moved: cut, not carried either way
-            }
-        }
-        active.wires = staying;
-        let src_became_empty = active.session.is_empty();
-
-        let Some(mut new_active) = self.build_active(event_loop) else {
-            // Window creation failed: put the package back beside the focus.
-            if let Some(a) = self.windows.get_mut(&id) {
-                let _ = a.session.adopt(
-                    pkg,
-                    rt_session::DropTarget::RootEdge { orient: rt_core::Orientation::LeftRight, before: false },
-                );
-                for (pid, j) in moved_jacks {
-                    a.jacks.borrow_mut().insert(pid, j);
-                }
-                a.wires.extend(travelling);
-            }
+    /// Move `payload` out of window `source` into a fresh OS window, optionally
+    /// placed with its top-left at `position` (the drag's drop point on X11;
+    /// `None` — keyboard detach, or Wayland — lets the compositor place it).
+    /// The package moves in memory: PTY, scrollback, title, group all survive,
+    /// and so do the panes' jacks and their wholly-internal wires.
+    ///
+    /// No-op when it would just recreate the same window (a lone pane).
+    ///
+    /// ORDER: the new window is built and INSERTED into the map BEFORE the
+    /// payload leaves the source. That way [`App::migrate_pane_extras`] can
+    /// find both windows by id like every other caller, and — better — a
+    /// failed window build is a clean no-op instead of a path that has to
+    /// re-adopt a package it already tore out.
+    fn tear_out(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        position: Option<winit::dpi::PhysicalPosition<i32>>,
+    ) {
+        let Some(active) = self.windows.get(&source) else { return };
+        // A lone pane in a lone tab: tearing out would just recreate this
+        // window. No-op (also covers the empty-tree case, defensively).
+        if active.session.tree().all_panes().len() <= 1 {
             return;
-        };
+        }
+        let Some(mut new_active) = self.build_active(event_loop) else { return };
+        if let Some(at) = position {
+            new_active.window.set_outer_position(at); // land under the cursor (X11)
+        }
         // The fresh window spawned one pane of its own; drop it before
         // adopting the moved panes into the (now empty) tree, so the new
         // window's shell doesn't linger as an orphan tab/split. Its shell
@@ -3061,22 +3397,40 @@ impl App {
             }
             drop(seed_pkg);
         }
-        if new_active.session.adopt(pkg, rt_session::DropTarget::Root).is_err() {
-            log::error!("detach: adopt into the new window failed"); // cannot happen: the tree is empty
-            return;
-        }
-        for (pid, j) in moved_jacks {
-            new_active.jacks.borrow_mut().insert(pid, j);
-        }
-        new_active.wires = travelling;
-        new_active.force_full = true;
-        new_active.window.request_redraw();
         let new_id = new_active.window.id();
         self.windows.insert(new_id, new_active);
 
+        // Now the payload can leave the source: from here on nothing can fail
+        // in a way that would strand it.
+        let Some(src) = self.windows.get_mut(&source) else { return };
+        let pkg = match payload {
+            dragdrop::DragPayload::Pane(p) => src.session.extract_pane(p),
+            dragdrop::DragPayload::Tab { first_pane } => src.session.extract_tab(first_pane),
+        };
+        let Some(pkg) = pkg else {
+            self.close_window(new_id); // nothing to put in it
+            return;
+        };
+        let moved: Vec<rt_core::PaneId> = pkg.sub.panes();
+        let src_became_empty = src.session.is_empty();
+        let Some(dst) = self.windows.get_mut(&new_id) else { return };
+        if let Err(pkg) = dst.session.adopt(pkg, rt_session::DropTarget::Root) {
+            log::error!("tear_out: adopt into the new window failed"); // cannot happen: the tree is empty
+            if let Some(src) = self.windows.get_mut(&source) {
+                src.session.readopt_root_edge(pkg.sub, pkg.entries); // never lose a pane
+            }
+            self.close_window(new_id);
+            return;
+        }
+        self.migrate_pane_extras(source, new_id, &moved);
+        if let Some(a) = self.windows.get_mut(&new_id) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+
         if src_became_empty {
-            self.close_window(id); // moved the last pane away → the source shell is gone
-        } else if let Some(a) = self.windows.get_mut(&id) {
+            self.close_window(source); // moved the last pane away → the source shell is gone
+        } else if let Some(a) = self.windows.get_mut(&source) {
             a.force_full = true;
             a.window.request_redraw();
         }
@@ -4727,7 +5081,10 @@ impl App {
         // must land above pane content (already painted before this function
         // runs) but a drag can't coexist with prefs/menu/manual/search being
         // open, so drawing them first (under those) is equivalent in practice.
-        if active.drag_cue.is_some() || active.drag_ghost.is_some() {
+        // `drag_dim` alone is enough: while the pointer is hovering ANOTHER
+        // window, the source keeps only the dim (its cue and ghost went with
+        // the pointer) and must still paint it.
+        if active.drag_cue.is_some() || active.drag_ghost.is_some() || active.drag_dim.is_some() {
             let dim = active.drag_dim.and_then(|p| {
                 let bounds = content_bounds(active.window.inner_size());
                 active.session.visible_rects(bounds).into_iter().find(|(id, _)| *id == p).map(|(_, r)| r)
@@ -5063,6 +5420,10 @@ impl App {
             // keeps behaving normally until the threshold is passed.
             || active.drag_ghost.is_some()
             || active.drag_cue.is_some()
+            // …including while the pointer is over ANOTHER window: this one is
+            // the drag's source (only it dims a pane) and must keep Grabbing
+            // until the drop, or the shape would flicker back at the border.
+            || active.drag_dim.is_some()
         {
             return;
         }

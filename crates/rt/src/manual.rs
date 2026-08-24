@@ -49,6 +49,10 @@ WINDOWS  &  DRAG-AND-DROP
                   reorder it; drop it onto another rt window (X11) to move
                   the pane/tab there, or drop it on bare desktop to tear it
                   out into a brand-new window. The keys above do the same.
+                  Dropping on a pane's CENTRE swaps the two panes — across
+                  windows too. Wayland gives a client no window positions,
+                  so there a drag stays inside its own window: use the keys
+                  above to send a pane to a window of its own.
 
 
 SELECTING TEXT
