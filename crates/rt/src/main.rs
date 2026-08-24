@@ -302,7 +302,12 @@ const CLIP_PREVIEW_COLS: usize = 44;
 /// happens on the first `resumed`). Kept in an `Option` on the `App` so we can
 /// build it lazily and tear it down on suspend.
 struct Active {
-    window: Window,                       // the OS window
+    // FIELD ORDER IS LOAD-BEARING for Drop: `backend` (GL surface/context —
+    // glXDestroyWindow et al.) MUST be declared before `window`, which lives at
+    // the END of this struct so every window-referencing resource is torn down
+    // while the X/Wayland window still exists. With `window` first, closing a
+    // non-last window generated an async GLXBadWindow that poisoned winit's
+    // next checked X call (IME unfocus) and panicked the process.
     backend: Box<dyn backend::Backend>,   // rendering backend (GL renderer + present resources)
     session: AppSession,                  // layout + panes + focus + broadcast
     keymap: Keymap,                       // Terminator-style bindings
@@ -392,6 +397,7 @@ struct Active {
     last_instr_tick: Instant,             // when the instrument animation last advanced
     last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
     autoscroll_accel: (isize, u32), // drag auto-scroll ramp: (last_dir, ticks held in the edge zone)
+    window: Window, // the OS window — LAST so it outlives everything that references it on Drop
 }
 
 /// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
@@ -546,12 +552,13 @@ fn parse_f32(s: &str, flag: &str) -> f32 {
 }
 
 /// The winit application object. Holds only the font bytes until `resumed`
-/// builds the `Active` state.
+/// builds the first window; every open window's state lives in `windows`,
+/// keyed by its `WindowId` so events route to the window they belong to.
 struct App {
     font_db: std::sync::Arc<fontdb::Database>, // system fonts, for family lookup + the picker
     mono_families: Vec<String>,                // monospace family names for the preferences combo
     cli: Cli,                                  // command-line overrides (grid/font)
-    active: Option<Active>,                    // populated on first resume
+    windows: std::collections::HashMap<WindowId, Active>, // every open window's live state
 }
 
 /// Build the system font database (scans the usual font directories).
@@ -692,15 +699,17 @@ fn load_fonts() -> Option<render::FontBlobs> {
     Some(render::FontBlobs { regular, bold, italic, bold_italic })
 }
 
-impl ApplicationHandler for App {
-    /// Called when the app is (re)activated. On the first call we build the
-    /// window, GL context, renderer, and session. Subsequent calls (after a
-    /// suspend) are no-ops here because we keep the state alive.
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.active.is_some() {
-            return; // already initialised; nothing to do on re-resume
-        }
-
+impl App {
+    /// Build one complete window's state: settings, winit window, GL context and
+    /// surface, renderer/backend, clipboard, and a session with real PTY panes.
+    /// This is the whole body of the old single-window `resumed`, reusable for
+    /// every extra window (`WindowCmd::NewWindow`). Returns `None` on failure —
+    /// fatal (the event loop is stopped) only while no window exists yet, see
+    /// [`App::fail_build`]. CLI `--cols/--rows` pre-sizing applies only to the
+    /// FIRST window. The patch-bay dir is process-scoped (`rt-<pid>`) and
+    /// `ensure_jacks_dir` is idempotent, so every window shares the same dir
+    /// while keeping its own `SharedJacks` map + spawn closure.
+    fn build_active(&mut self, event_loop: &ActiveEventLoop) -> Option<Active> {
         // Load persisted settings (before the renderer, so fonts/colours come
         // from the config). Env vars override for demos/screenshots. Loaded here
         // — ahead of the window — so `--cols`/`--rows` can pre-size it from the
@@ -733,8 +742,10 @@ impl ApplicationHandler for App {
         // apples benchmarking against terminals launched with `--geometry=COLSxROWS`.
         // Without them, keep a sensible default. `cell_size_for` measures the
         // cell without a GL context (the renderer doesn't exist yet).
+        // Only the FIRST window: an extra window opened at runtime should get
+        // the default size, not re-apply a benchmark harness's exact grid.
         let initial_size: winit::dpi::Size = match (self.cli.cols, self.cli.rows) {
-            (Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
+            (Some(cols), Some(rows)) if self.windows.is_empty() && cols > 0 && rows > 0 => {
                 let cell = render::cell_size_for(&font_blobs, settings.font_size);
                 window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
             }
@@ -788,13 +799,11 @@ impl ApplicationHandler for App {
             Ok((Some(window), config)) => (window, config), // got a window + config
             Ok((None, _)) => {
                 log::error!("window creation returned no window");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
             Err(e) => {
                 log::error!("failed to create window/GL config: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
 
@@ -808,8 +817,7 @@ impl ApplicationHandler for App {
             Ok(c) => c,
             Err(e) => {
                 log::error!("GL context creation failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         // Build the window surface at the window's current size.
@@ -818,16 +826,14 @@ impl ApplicationHandler for App {
             Ok(a) => a,
             Err(e) => {
                 log::error!("surface attributes failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         let surface = match unsafe { gl_display.create_window_surface(&gl_config, &attrs) } {
             Ok(s) => s,
             Err(e) => {
                 log::error!("GL surface creation failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         // Make the context current on the surface so GL calls target it.
@@ -835,8 +841,7 @@ impl ApplicationHandler for App {
             Ok(c) => c,
             Err(e) => {
                 log::error!("make_current failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
 
@@ -851,8 +856,7 @@ impl ApplicationHandler for App {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         // Ask KWin to blur behind us (true background blur on KDE). No-op
@@ -960,55 +964,8 @@ impl ApplicationHandler for App {
         session.set_show_titlebar(settings.show_titlebar);
         session.relayout(bounds);
 
-        // Dev/demo startup layout (seed of the future saved-layouts feature):
-        //   RT_SPLIT=h|v    → perform one split at startup
-        //   RT_COLUMNS=N    → put the initial pane into N-column newspaper mode
-        if let Ok(v) = std::env::var("RT_SPLIT") {
-            let _ = match v.as_str() {
-                "h" => session.apply(rt_config::Action::SplitHoriz), // stacked split
-                "v" => session.apply(rt_config::Action::SplitVert),  // side-by-side split
-                _ => None,
-            };
-        }
-        if let Ok(v) = std::env::var("RT_COLUMNS") {
-            if let Ok(n) = v.parse::<u16>() {
-                // Each ColumnsMore adds one column; go from 1 up to N.
-                for _ in 1..n.max(1) {
-                    session.apply(rt_config::Action::ColumnsMore);
-                }
-            }
-        }
-        if let Ok(v) = std::env::var("RT_TABS") {
-            if let Ok(n) = v.parse::<u16>() {
-                // Open N tabs total (each NewTab adds one beside the current).
-                for _ in 1..n.max(1) {
-                    session.apply(rt_config::Action::NewTab);
-                }
-            }
-        }
-        if std::env::var("RT_ZOOM").is_ok() {
-            session.apply(rt_config::Action::ToggleZoom); // maximise the focused pane at startup
-        }
-        // Debug/verification hook: build three panes each in a different input
-        // group so the corner group markers can be screenshotted.
-        if std::env::var("RT_DEMO_GROUPS").is_ok() {
-            use rt_config::Action::*;
-            session.apply(GroupCycle); // pane0 → group 1
-            session.apply(SplitVert); // → pane1 focused
-            session.apply(GroupCycle);
-            session.apply(GroupCycle); // pane1 → group 2
-            session.apply(SplitHoriz); // → pane2 focused
-            session.apply(GroupCycle);
-            session.apply(GroupCycle);
-            session.apply(GroupCycle); // pane2 → group 3
-        }
-        if let Ok(v) = std::env::var("RT_BROADCAST") {
-            let _ = match v.as_str() {
-                "all" => session.apply(rt_config::Action::BroadcastAll),
-                "group" => session.apply(rt_config::Action::BroadcastGroup),
-                _ => None,
-            };
-        }
+        // (The RT_* demo/startup-layout hooks run in `resumed` — first window
+        // only, so an extra window opened at runtime never re-applies them.)
 
         // Store the fully-initialised state and paint once.
         let low_power = renderer.is_software(); // read before `renderer` is moved in
@@ -1047,7 +1004,7 @@ impl ApplicationHandler for App {
             xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window)))
         };
         let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
-        self.active = Some(Active {
+        Some(Active {
             window,
             backend,
             session,
@@ -1134,84 +1091,144 @@ impl ApplicationHandler for App {
             last_instr_tick: Instant::now(),
             last_autoscroll: Instant::now(),
             autoscroll_accel: (0, 0),
-        });
+        })
+    }
+
+    /// A window build failed. Fatal — stop the event loop — only while no
+    /// window exists yet (the first window IS the app); a failed EXTRA window
+    /// just doesn't open, and the existing windows keep running.
+    fn fail_build(&self, event_loop: &ActiveEventLoop) -> Option<Active> {
+        if self.windows.is_empty() {
+            event_loop.exit();
+        }
+        None
+    }
+}
+
+impl ApplicationHandler for App {
+    /// Called when the app is (re)activated. On the first call we build the
+    /// first window (window, GL context, renderer, session) and apply the RT_*
+    /// demo/startup hooks. Subsequent calls (after a suspend) are no-ops here
+    /// because we keep the state alive. Extra windows are opened at runtime via
+    /// `WindowCmd::NewWindow`, which reuses [`App::build_active`] without hooks.
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.windows.is_empty() {
+            return; // already initialised; nothing to do on re-resume
+        }
+        let Some(mut active) = self.build_active(event_loop) else { return };
+        // Dev/demo startup layout (seed of the future saved-layouts feature):
+        //   RT_SPLIT=h|v    → perform one split at startup
+        //   RT_COLUMNS=N    → put the initial pane into N-column newspaper mode
+        if let Ok(v) = std::env::var("RT_SPLIT") {
+            let _ = match v.as_str() {
+                "h" => active.session.apply(rt_config::Action::SplitHoriz), // stacked split
+                "v" => active.session.apply(rt_config::Action::SplitVert),  // side-by-side split
+                _ => None,
+            };
+        }
+        if let Ok(v) = std::env::var("RT_COLUMNS") {
+            if let Ok(n) = v.parse::<u16>() {
+                // Each ColumnsMore adds one column; go from 1 up to N.
+                for _ in 1..n.max(1) {
+                    active.session.apply(rt_config::Action::ColumnsMore);
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("RT_TABS") {
+            if let Ok(n) = v.parse::<u16>() {
+                // Open N tabs total (each NewTab adds one beside the current).
+                for _ in 1..n.max(1) {
+                    active.session.apply(rt_config::Action::NewTab);
+                }
+            }
+        }
+        if std::env::var("RT_ZOOM").is_ok() {
+            active.session.apply(rt_config::Action::ToggleZoom); // maximise the focused pane at startup
+        }
+        // Debug/verification hook: build three panes each in a different input
+        // group so the corner group markers can be screenshotted.
+        if std::env::var("RT_DEMO_GROUPS").is_ok() {
+            use rt_config::Action::*;
+            active.session.apply(GroupCycle); // pane0 → group 1
+            active.session.apply(SplitVert); // → pane1 focused
+            active.session.apply(GroupCycle);
+            active.session.apply(GroupCycle); // pane1 → group 2
+            active.session.apply(SplitHoriz); // → pane2 focused
+            active.session.apply(GroupCycle);
+            active.session.apply(GroupCycle);
+            active.session.apply(GroupCycle); // pane2 → group 3
+        }
+        if let Ok(v) = std::env::var("RT_BROADCAST") {
+            let _ = match v.as_str() {
+                "all" => active.session.apply(rt_config::Action::BroadcastAll),
+                "group" => active.session.apply(rt_config::Action::BroadcastGroup),
+                _ => None,
+            };
+        }
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so it can be screenshotted without synthetic input.
         if std::env::var("RT_PREFS").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                Self::open_prefs(active);
-            }
+            Self::open_prefs(&mut active);
         }
         // Debug/verification hook: RT_MANUAL opens the manual overlay at startup.
         if std::env::var("RT_MANUAL").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                active.manual_open = true;
-            }
+            active.manual_open = true;
         }
         // Debug/verification hook: RT_MENU opens the context menu at startup so
         // its rendering can be screenshotted without synthetic mouse input.
         if std::env::var("RT_MENU").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                active.menu = Some((200.0, 150.0)); // fixed, visible spot
-            }
+            active.menu = Some((200.0, 150.0)); // fixed, visible spot
         }
         // Debug/verification hook: RT_SEARCH opens the search bar at startup with
         // a pre-filled query so its rendering + highlighting can be screenshotted
         // without synthetic keyboard input.
         if let Ok(q) = std::env::var("RT_SEARCH") {
-            if let Some(active) = self.active.as_mut() {
-                active.search_open = true;
-                active.search_query = q; // e.g. RT_SEARCH=echo
-                Self::run_search(active, true); // populate matches + highlight
-            }
+            active.search_open = true;
+            active.search_query = q; // e.g. RT_SEARCH=echo
+            Self::run_search(&mut active, true); // populate matches + highlight
         }
         // Test-only hook (undocumented): RT_OPEN_MANUAL opens the manual overlay
         // at startup so the xtrace commands-only regression can drive a native
         // overlay without synthetic input. Fires once, at construction.
         if std::env::var_os("RT_OPEN_MANUAL").is_some() {
-            if let Some(active) = self.active.as_mut() {
-                active.manual_open = true;
-            }
+            active.manual_open = true;
         }
         // Debug/verification hook: RT_OPEN_PREFS opens the preferences dialog at
         // startup so the Xvfb gate can screenshot it without synthetic input
         // (mirrors RT_OPEN_MANUAL).
         if std::env::var_os("RT_OPEN_PREFS").is_some() {
-            if let Some(active) = self.active.as_mut() {
-                Self::open_prefs(active);
-            }
+            Self::open_prefs(&mut active);
         }
         // Debug/verification hook: RT_WIRE_DEMO builds a live patch-bay scene —
         // split, wire pane1.stdout → pane2.stdin, and run a producer + reader — so
         // the wiring can be verified/screenshotted without synthetic input.
         if std::env::var("RT_WIRE_DEMO").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                let p1 = active.session.focus();
-                active.session.apply(rt_config::Action::SplitVert); // → pane2
-                active.session.apply(rt_config::Action::SplitVert); // → pane3 (focused)
-                let p3 = active.session.focus();
-                // Wire the leftmost pane's stdout to the rightmost pane's stdin so
-                // the bezier arcs over the middle pane.
-                Self::connect_wire(active, p1, Stream::Stdout, p3);
-                if let Some(pane) = active.session.pane(p1) {
-                    pane.write(b"while true; do echo tick $(date +%T); sleep 0.4; done | tee $RT_OUT\n");
-                }
-                if let Some(pane) = active.session.pane(p3) {
-                    pane.write(b"cat $RT_IN\n");
-                }
+            let p1 = active.session.focus();
+            active.session.apply(rt_config::Action::SplitVert); // → pane2
+            active.session.apply(rt_config::Action::SplitVert); // → pane3 (focused)
+            let p3 = active.session.focus();
+            // Wire the leftmost pane's stdout to the rightmost pane's stdin so
+            // the bezier arcs over the middle pane.
+            Self::connect_wire(&mut active, p1, Stream::Stdout, p3);
+            if let Some(pane) = active.session.pane(p1) {
+                pane.write(b"while true; do echo tick $(date +%T); sleep 0.4; done | tee $RT_OUT\n");
+            }
+            if let Some(pane) = active.session.pane(p3) {
+                pane.write(b"cat $RT_IN\n");
             }
         }
         // Poll so we keep re-checking PTYs for async output even without input.
         event_loop.set_control_flow(ControlFlow::Poll);
-        if let Some(active) = &self.active {
-            active.window.request_redraw(); // first paint
-        }
+        active.window.request_redraw(); // first paint
+        self.windows.insert(active.window.id(), active);
     }
 
-    /// Handle a window event: close, resize, key input, redraw.
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Everything here needs the active state; ignore events before resume.
-        let Some(active) = self.active.as_mut() else { return };
+    /// Handle a window event: close, resize, key input, redraw. Routed to the
+    /// window it belongs to via `id`.
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Everything here needs this window's state; ignore events before
+        // resume and events for a window that has already closed.
+        let Some(active) = self.windows.get_mut(&id) else { return };
         if active.ld_on && matches!(&event, WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed) {
             active.ld_keys += 1; // RT_XDIAG: key presses actually delivered to rt this second
         }
@@ -1527,17 +1544,24 @@ impl ApplicationHandler for App {
                                     if let Some(a) =
                                         rows.into_iter().nth(i).and_then(|r| r.action)
                                     {
-                                        match a.into_pick() {
+                                        let cmd = match a.into_pick() {
                                             menu::MenuPick::Do(act) => {
                                                 Self::apply_action(active, act)
                                             }
-                                            menu::MenuPick::OpenUrl(u) => Self::open_url(&u),
+                                            menu::MenuPick::OpenUrl(u) => {
+                                                Self::open_url(&u);
+                                                WindowCmd::None
+                                            }
                                             menu::MenuPick::CopyUrl(u) => {
                                                 if let Some(cb) = &active.clipboard {
                                                     cb.store(u);
                                                 }
+                                                WindowCmd::None
                                             }
-                                        }
+                                        };
+                                        // The `active` borrow ends here; window-
+                                        // level commands re-borrow via &mut self.
+                                        self.run_window_cmd(event_loop, id, cmd);
                                     }
                                 }
                             }
@@ -1674,14 +1698,14 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            // The user closed the window (title-bar button / compositor). Exit
-            // the same way the last-pane-closed path does — `process::exit`,
-            // NOT `event_loop.exit()`. The latter unwinds and Drops the GL
-            // context and Wayland blur objects, whose teardown ordering faults (a
-            // segfault on Wayland, an X11 GetGeometry panic on the x11 dev build).
-            // The OS reclaims everything; the PTY children get SIGHUP. This matches
-            // SessionEvent::CloseWindow below.
-            WindowEvent::CloseRequested => exit_clean(),
+            // The user closed the window (title-bar button / compositor). Close
+            // ONLY this window; `close_window` exits the process (via
+            // `exit_clean`, never `event_loop.exit()` — see its doc for the
+            // teardown-fault avoidance) when this was the last one.
+            WindowEvent::CloseRequested => {
+                self.close_window(id);
+                return;
+            }
 
             // Track modifier state so key events can build correct chords.
             WindowEvent::ModifiersChanged(new_mods) => {
@@ -1746,7 +1770,7 @@ impl ApplicationHandler for App {
                 if key_event.state != ElementState::Pressed {
                     return;
                 }
-                self.on_key_press(key_event);
+                self.on_key_press(event_loop, id, key_event);
             }
 
             // Mouse wheel scrolls the focused pane's newspaper-column view
@@ -2223,18 +2247,48 @@ impl ApplicationHandler for App {
 
             // Time to paint.
             WindowEvent::RedrawRequested => {
-                self.redraw();
+                self.redraw(id);
             }
 
             _ => {} // ignore the many other window events for now
         }
     }
 
-    /// Called whenever the loop is about to block. We use it to poll each pane
-    /// for asynchronous PTY output and request a redraw when anything changed,
-    /// so terminal output appears without the user touching the keyboard.
+    /// Called whenever the loop is about to block. We use it to poll every
+    /// window's panes for asynchronous PTY output and request redraws when
+    /// anything changed, so terminal output appears without the user touching
+    /// the keyboard. Windows whose last pane exited are closed AFTER the
+    /// iteration (`close_window` mutates the map — and exits the process when
+    /// it was the last window); the next wake is the fastest any window wants.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(active) = self.active.as_mut() else { return };
+        let mut to_close: Vec<WindowId> = Vec::new();
+        let mut min_interval: Option<Duration> = None;
+        for (&wid, active) in self.windows.iter_mut() {
+            let (close, interval) = Self::tick_active(active);
+            if close {
+                to_close.push(wid);
+            }
+            min_interval = Some(match min_interval {
+                None => interval,
+                Some(m) => m.min(interval),
+            });
+        }
+        for wid in to_close {
+            self.close_window(wid);
+        }
+        if let Some(interval) = min_interval {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
+        }
+    }
+}
+
+impl App {
+    /// One `about_to_wait` tick for a single window: drain its panes' events,
+    /// settle deferred resizes and prefs edits, advance the animated chrome,
+    /// and schedule a redraw when anything changed. Returns `(close, interval)`:
+    /// `close` when the window's last pane exited (the caller then closes the
+    /// whole window), plus the wake interval this window wants.
+    fn tick_active(active: &mut Active) -> (bool, Duration) {
         // Latency instrument: the loop is scheduled to wake ~every 16ms; a wake
         // that arrives much later means a CPU hogger stole the frame. Measure the
         // overrun, flare the frame proportionally, and breathe the undulation.
@@ -2355,12 +2409,15 @@ impl ApplicationHandler for App {
                 active.session.set_title(id, badged);
             }
         }
-        // Close every pane whose child exited. If that empties the window, quit.
+        // Close every pane whose child exited. If that empties the window, tell
+        // the caller to close the whole window — never exit the process here:
+        // other windows may still be open (close_window exits on the last one).
+        let mut window_emptied = false;
         for id in exited {
             match active.session.close_pane(id) {
                 Some(SessionEvent::CloseWindow) => {
-                    self.active = None; // drop everything (PTYs shut down on Drop)
-                    exit_clean(); // remove our patch-bay dir, then exit
+                    window_emptied = true;
+                    break; // the window goes; per-pane cleanup no longer matters
                 }
                 _ => dirty = true, // a pane closed; repaint the survivors
             }
@@ -2373,6 +2430,9 @@ impl ApplicationHandler for App {
             if matches!(active.wiring_from, Some((s, _)) if s == id) {
                 active.wiring_from = None;
             }
+        }
+        if window_emptied {
+            return (true, ACTIVE_POLL); // caller closes this window promptly
         }
         // A resize drag owes us exactly one reflow. Pay it once the size has held
         // still for RESIZE_SETTLE — never per configure event (see the Resized
@@ -2537,7 +2597,7 @@ impl ApplicationHandler for App {
             IDLE_POLL
         };
         active.poll_ms = interval.as_millis() as u64;
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
+        (false, interval)
     }
 }
 
@@ -2571,14 +2631,72 @@ enum FramePlan {
 /// How many past frames' damage we retain to satisfy an EGL buffer age > 1.
 const HISTORY_DEPTH: u32 = 2;
 
+/// What an action needs the App (window-owner) level to do afterwards.
+/// Active-level code can't create or close OS windows — it has no event loop.
+#[derive(Clone, Copy, PartialEq)]
+enum WindowCmd {
+    None,
+    CloseWindow,          // this window should close (last pane gone / close_window action)
+    NewWindow,            // open an empty extra window
+    DetachPane,           // tear the focused pane out to a new window
+    DetachTab,            // tear the current tab out to a new window
+}
+
 impl App {
+    /// Close ONE window. The LAST window exits the process via `exit_clean()`
+    /// WITHOUT ever dropping its `Active` — dropping the GL context / Wayland
+    /// blur objects at process teardown faults (a segfault on Wayland, an X11
+    /// GetGeometry panic on the x11 dev build), so the historical single-window
+    /// behaviour (`process::exit`, let the OS reclaim everything and SIGHUP the
+    /// PTY children) is preserved for the final window. A NON-last window IS
+    /// really dropped: its PTYs shut down on Drop and its GL/window resources
+    /// are released while the process lives on (the `Active` field order drops
+    /// the backend before the window it renders into).
+    fn close_window(&mut self, id: WindowId) {
+        if !self.windows.contains_key(&id) {
+            return; // already closed (double CloseRequested etc.)
+        }
+        if self.windows.len() == 1 {
+            // Last window: leave it in the map (its Drop never runs) and exit.
+            exit_clean();
+        }
+        let active = self.windows.remove(&id);
+        drop(active); // real teardown: PTYs, GL context, window
+    }
+
+    /// Execute what an [`Action`] asked the window-owner level to do — the part
+    /// [`App::apply_action`] cannot: it only holds one window's `Active`, and
+    /// creating or closing OS windows needs the event loop + the window map.
+    fn run_window_cmd(&mut self, event_loop: &ActiveEventLoop, id: WindowId, cmd: WindowCmd) {
+        match cmd {
+            WindowCmd::None => {}
+            WindowCmd::CloseWindow => self.close_window(id),
+            WindowCmd::NewWindow => {
+                // Open an empty extra window (fresh session, one shell pane).
+                let Some(active) = self.build_active(event_loop) else { return };
+                active.window.request_redraw(); // first paint
+                self.windows.insert(active.window.id(), active);
+            }
+            WindowCmd::DetachPane => {
+                // Task 7: tear the focused pane out into a new window.
+                log::debug!("DetachPane: not implemented yet (Task 7)");
+            }
+            WindowCmd::DetachTab => {
+                // Task 7: tear the current tab out into a new window.
+                log::debug!("DetachTab: not implemented yet (Task 7)");
+            }
+        }
+    }
+
     /// Run a semantic [`Action`](rt_config::Action) against the live state. This
     /// is the single place actions are executed, called both by keybindings and
     /// by the context menu, so the two can never drift apart.
     ///
     /// Window-level appearance actions (opacity) are handled here because
     /// the session owns no window handle; everything else goes to the session.
-    /// A `CloseWindow` result exits the process (the OS reaps the child PTYs).
+    /// Returns a [`WindowCmd`] for anything the App (window-owner) level must
+    /// do afterwards — close this window, open a new one, detach — because this
+    /// function only holds one window's `Active` and cannot touch the map.
     /// Keyboard wire gesture: with nothing armed, arm from the focused pane's
     /// `stream` jack; with something armed, complete to the focused pane's input.
     fn wire_gesture(active: &mut Active, stream: Stream) {
@@ -2631,9 +2749,17 @@ impl App {
         }
     }
 
-    fn apply_action(active: &mut Active, action: rt_config::Action) {
+    fn apply_action(active: &mut Active, action: rt_config::Action) -> WindowCmd {
         use rt_config::Action;
         match action {
+            // Window-owner level actions: this window's Active can't create or
+            // close OS windows, so hand the request up to run_window_cmd.
+            Action::NewWindow => return WindowCmd::NewWindow,
+            Action::DetachPane => return WindowCmd::DetachPane,
+            Action::DetachTab => return WindowCmd::DetachTab,
+            // Reorder the focused tab within its strip (Terminator's move_tab).
+            Action::MoveTabLeft => Self::move_focused_tab(active, -1),
+            Action::MoveTabRight => Self::move_focused_tab(active, 1),
             Action::OpacityUp => {
                 let v = active.settings.adjust_opacity(0.05); // +5% opaque
                 log::info!("background opacity = {v:.2}");
@@ -2746,7 +2872,10 @@ impl App {
             }
             // Everything else is a session action.
             other => match active.session.apply(other) {
-                Some(SessionEvent::CloseWindow) => exit_clean(), // last pane closed; clean up first
+                // Last pane closed: the whole window goes. The App level
+                // decides whether that ends the process (last window) or just
+                // drops this window (close_window).
+                Some(SessionEvent::CloseWindow) => return WindowCmd::CloseWindow,
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
                 Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
                 Some(SessionEvent::Redraw) => {
@@ -2762,6 +2891,28 @@ impl App {
                 }
                 None => {}
             },
+        }
+        WindowCmd::None
+    }
+
+    /// Move the focused tab one slot left/right within its strip (`delta` = ±1,
+    /// clamped at the ends). The focused tab is the ACTIVE tab of its strip;
+    /// with no tab strip (or a single tab) this is a no-op.
+    fn move_focused_tab(active: &mut Active, delta: isize) {
+        let size = active.window.inner_size();
+        let bounds = content_bounds(size);
+        for bar in active.session.tab_bars(bounds) {
+            if let Some(idx) = bar.tabs.iter().position(|t| t.active) {
+                let last = bar.tabs.len() as isize - 1;
+                let to = (idx as isize + delta).clamp(0, last) as usize;
+                if to != idx && active.session.reorder_tab(bar.tabs[idx].first_pane, to) {
+                    // Tab order changed: the strip redraws, and the visible
+                    // panes carry no engine cell-damage → full frame.
+                    active.force_full = true;
+                    active.window.request_redraw();
+                }
+                break; // one strip acted on (the first with an active tab)
+            }
         }
     }
 
@@ -3357,8 +3508,8 @@ impl App {
     /// Handle one key *press*: close an open menu on Escape, otherwise translate
     /// to a chord and either run the bound action or type the key into the
     /// focused PTY(s).
-    fn on_key_press(&mut self, key_event: winit::event::KeyEvent) {
-        let Some(active) = self.active.as_mut() else { return };
+    fn on_key_press(&mut self, event_loop: &ActiveEventLoop, id: WindowId, key_event: winit::event::KeyEvent) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
         // While an IME/dead-key composition is in progress, swallow key presses:
         // the composed result arrives via WindowEvent::Ime(Commit) instead. This
         // is what prevents the dead key (´) and its result (ó) both being sent.
@@ -3392,7 +3543,10 @@ impl App {
         // Is this chord bound to an rt action?
         if let Some(chord) = input::chord_from_winit(&key_event.logical_key, mods) {
             if let Some(action) = active.keymap.action_for(&chord) {
-                Self::apply_action(active, action); // shared with the menu
+                let cmd = Self::apply_action(active, action); // shared with the menu
+                // The `active` borrow ends here; window-level commands (close/
+                // new window/detach) re-borrow the map via &mut self.
+                self.run_window_cmd(event_loop, id, cmd);
                 return; // consumed
             }
         }
@@ -3463,10 +3617,10 @@ impl App {
         }
     }
 
-    /// Repaint the whole window: fill each pane's background, draw its visible
+    /// Repaint one window: fill each pane's background, draw its visible
     /// grid, then outline the focused pane. Finally swap buffers.
-    fn redraw(&mut self) {
-        let Some(active) = self.active.as_mut() else { return };
+    fn redraw(&mut self, id: WindowId) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
         // A window resize is in flight: the backend surface is still the old size
         // and every frame drawn now is discarded by the settle frame. Painting
         // here is what produced the 5-12 visible intermediate steps; skip it and
@@ -3620,17 +3774,17 @@ impl App {
 
         let force_next = match plan {
             FramePlan::Full => {
-                self.redraw_full(bg, bounds, snapshots); // today's exact path
+                self.redraw_full(id, bg, bounds, snapshots); // today's exact path
                 false
             }
             FramePlan::Partial(bbox, hint_rects) => {
-                self.redraw_scissored(bg, bounds, snapshots, bbox, &hint_rects)
+                self.redraw_scissored(id, bg, bounds, snapshots, bbox, &hint_rects)
             }
         };
         // Clear the per-frame force flag. An overlay visible this frame (its
         // pixels must be cleared when it closes) or a failed partial swap arms a
         // full redraw next frame; specific handlers also re-arm it.
-        if let Some(active) = self.active.as_mut() {
+        if let Some(active) = self.windows.get_mut(&id) {
             active.force_full = overlay_open || force_next;
             active.last_focus = active.session.focus(); // record the focus this frame painted, so the next focus move is detected
         }
@@ -4283,8 +4437,8 @@ impl App {
 
     /// Today's exact full-window path: clear everything, draw all panes + chrome,
     /// egui, full swap. Byte-for-byte the pre-damage behaviour.
-    fn redraw_full(&mut self, bg: Color, bounds: Rect, snapshots: Vec<(rt_core::PaneId, PxRectSnap)>) {
-        let Some(active) = self.active.as_mut() else { return };
+    fn redraw_full(&mut self, id: WindowId, bg: Color, bounds: Rect, snapshots: Vec<(rt_core::PaneId, PxRectSnap)>) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
         active.backend.begin_frame(bg); // translucent clear
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame(); // upload + draw call
@@ -4306,13 +4460,14 @@ impl App {
     /// unavailable this frame, so we fell back to a full redraw + full swap here).
     fn redraw_scissored(
         &mut self,
+        id: WindowId,
         bg: Color,
         bounds: Rect,
         snapshots: Vec<(rt_core::PaneId, PxRectSnap)>,
         bbox: crate::damage::PxRect,
         hint_rects: &[crate::damage::PxRect],
     ) -> bool {
-        let Some(active) = self.active.as_mut() else { return false };
+        let Some(active) = self.windows.get_mut(&id) else { return false };
         active.backend.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame();
@@ -5328,7 +5483,7 @@ fn main() {
     sweep_stale_jacks();
     // Build the winit event loop and hand it our application.
     let event_loop = build_event_loop();
-    let mut app = App { font_db, mono_families, cli, active: None };
+    let mut app = App { font_db, mono_families, cli, windows: std::collections::HashMap::new() };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
