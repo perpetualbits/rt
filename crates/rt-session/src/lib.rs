@@ -139,6 +139,53 @@ pub struct Session<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> {
     spawn: F,                          // factory that creates a new backend
 }
 
+/// The side-table entries (backend + group/columns/title metadata) for a set
+/// of panes, ejected from one `Session` and injected into another (or the
+/// same one) alongside their `Subtree`. Kept separate from `Subtree` because
+/// the tree shape lives in `rt-core` and knows nothing about backends.
+pub struct PaneEntries<B> {
+    pub panes: Vec<(PaneId, B)>,
+    pub groups: Vec<(PaneId, u32)>,
+    pub columns: Vec<(PaneId, u16)>,
+    pub titles: Vec<(PaneId, String)>,
+}
+
+/// A self-contained bundle of layout (`Subtree`) plus every side-table entry
+/// for the panes it contains — the unit that moves between windows (or within
+/// one) on a pane/tab drag. Never dropped on a failed adopt: a failure hands
+/// the whole package back so the pane is never lost.
+pub struct PanePackage<B> {
+    pub sub: rt_core::Subtree,
+    pub entries: PaneEntries<B>,
+}
+
+// Manual (not derived) so `Result<(), PanePackage<B>>::unwrap()`/`expect_err()`
+// works in tests without requiring `B: Debug` — the real backend (a live PTY
+// wrapper) has no meaningful Debug representation anyway.
+impl<B> std::fmt::Debug for PanePackage<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PanePackage")
+            .field("sub", &self.sub)
+            .field("panes", &self.entries.panes.len())
+            .finish()
+    }
+}
+
+/// Where a `PanePackage` (or a same-window pane/tab) lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DropTarget {
+    /// Empty window (tear-out landing).
+    Root,
+    /// Split beside an existing pane.
+    SplitBeside { pane: PaneId, orient: Orientation, before: bool },
+    /// Swap slots with an existing pane. `move_pane` only, same window.
+    Swap { pane: PaneId },
+    /// Insert as a tab at `index` within the tab group anchored at `anchor`.
+    TabAt { anchor: PaneId, index: usize },
+    /// Insert as a new top-level split at the root's edge.
+    RootEdge { orient: Orientation, before: bool },
+}
+
 /// Vertical padding added to the cell height to size a per-pane titlebar strip.
 const TITLEBAR_PAD: f32 = 4.0;
 
@@ -817,6 +864,195 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
         }
         cells_in(self.content_rect(self.bounds), self.cell) // fallback: full-window sizing
     }
+
+    // ----- PanePackage extract/adopt (pane drag-and-drop) -------------------
+
+    /// Whether this session holds no panes at all (the App closes a window
+    /// once its session goes empty).
+    pub fn is_empty(&self) -> bool {
+        self.tree.is_empty()
+    }
+
+    /// Pull every side-table entry (backend, group, columns, title) for `ids`
+    /// out of this session's maps, clearing zoom on any of them that was
+    /// zoomed. Public because a cross-window swap ejects both sides before
+    /// injecting them back into each other's session.
+    pub fn eject_entries(&mut self, ids: &[PaneId]) -> PaneEntries<B> {
+        let mut e = PaneEntries { panes: Vec::new(), groups: Vec::new(), columns: Vec::new(), titles: Vec::new() };
+        for &id in ids {
+            if let Some(b) = self.panes.remove(&id) {
+                e.panes.push((id, b));
+            }
+            if let Some(g) = self.groups.remove(&id) {
+                e.groups.push((id, g));
+            }
+            if let Some(c) = self.columns.remove(&id) {
+                e.columns.push((id, c));
+            }
+            if let Some(t) = self.titles.remove(&id) {
+                e.titles.push((id, t));
+            }
+            if self.zoomed == Some(id) {
+                self.zoomed = None;
+            }
+        }
+        e
+    }
+
+    /// Merge previously-ejected side-table entries back into this session's
+    /// maps (the counterpart to [`Session::eject_entries`]).
+    pub fn inject_entries(&mut self, e: PaneEntries<B>) {
+        for (id, b) in e.panes {
+            self.panes.insert(id, b);
+        }
+        for (id, g) in e.groups {
+            self.groups.insert(id, g);
+        }
+        for (id, c) in e.columns {
+            self.columns.insert(id, c);
+        }
+        for (id, t) in e.titles {
+            self.titles.insert(id, t);
+        }
+    }
+
+    /// Shared tail of `extract_pane`/`extract_tab`: eject the side tables for
+    /// every pane in `sub`, re-seat focus if it was inside the extracted
+    /// subtree, and reflow the survivors (they may have grown).
+    fn finish_extract(&mut self, sub: rt_core::Subtree) -> PanePackage<B> {
+        let ids = sub.panes();
+        let entries = self.eject_entries(&ids);
+        if ids.contains(&self.focus) {
+            if let Some((id, _)) = self.tree.rects(self.bounds).into_iter().next() {
+                self.focus = id;
+            }
+        }
+        self.relayout(self.bounds); // survivors grew
+        PanePackage { sub, entries }
+    }
+
+    /// Remove pane `id` (and everything it carries) from this session's tree,
+    /// returning a self-contained package for adoption elsewhere. `None` if
+    /// `id` is not in this session's tree.
+    pub fn extract_pane(&mut self, id: PaneId) -> Option<PanePackage<B>> {
+        let sub = self.tree.take(id)?;
+        Some(self.finish_extract(sub))
+    }
+
+    /// Remove the whole tab group anchored at `first_pane` from this
+    /// session's tree, returning a self-contained package for adoption
+    /// elsewhere. `None` if `first_pane` is not a tab group anchor.
+    pub fn extract_tab(&mut self, first_pane: PaneId) -> Option<PanePackage<B>> {
+        let sub = self.tree.take_tab(first_pane)?;
+        Some(self.finish_extract(sub))
+    }
+
+    /// Insert a previously-extracted package into this session's tree at
+    /// `at`, restoring its side-table entries and focusing the arrival. On
+    /// failure (a stale/nonexistent target) the package is handed back intact
+    /// — a live pane is never dropped.
+    pub fn adopt(&mut self, pkg: PanePackage<B>, at: DropTarget) -> Result<(), PanePackage<B>> {
+        let PanePackage { sub, entries } = pkg;
+        let arriving = sub.first_pane();
+        let placed = match at {
+            DropTarget::Root => self.tree.adopt_root(sub),
+            DropTarget::SplitBeside { pane, orient, before } => self.tree.insert_beside(pane, sub, orient, before),
+            DropTarget::TabAt { anchor, index } => self.tree.insert_tab_at(anchor, sub, index),
+            DropTarget::RootEdge { orient, before } => {
+                self.tree.insert_root_edge(sub, orient, before);
+                Ok(())
+            }
+            DropTarget::Swap { .. } => Err(sub), // swap is not an adopt — refuse
+        };
+        match placed {
+            Ok(()) => {
+                self.inject_entries(entries);
+                self.zoomed = None; // the new layout must be visible
+                if let Some(f) = arriving {
+                    self.focus = f;
+                }
+                self.relayout(self.bounds);
+                Ok(())
+            }
+            Err(sub) => Err(PanePackage { sub, entries }),
+        }
+    }
+
+    /// Move pane `id` to `at` within/into this session, committing
+    /// immediately (no package survives the call — same-window drag-and-drop
+    /// and `Swap`). Returns `false` on a no-op or stale target; a pane is
+    /// never lost even on the fallback path.
+    pub fn move_pane(&mut self, id: PaneId, at: DropTarget) -> bool {
+        // Guard: the drop target must not name a pane inside the payload.
+        match at {
+            DropTarget::SplitBeside { pane, .. } if pane == id => return false,
+            DropTarget::TabAt { anchor, .. } if anchor == id => return false,
+            _ => {}
+        }
+        match at {
+            DropTarget::Swap { pane } => {
+                if self.tree.swap(id, pane) {
+                    self.relayout(self.bounds);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                let Some(pkg) = self.extract_pane(id) else { return false };
+                match self.adopt(pkg, at) {
+                    Ok(()) => true,
+                    Err(pkg) => {
+                        // Put it back where the tree will take it: as a root edge (never lose a pane).
+                        let PanePackage { sub, entries } = pkg;
+                        self.tree.insert_root_edge(sub, Orientation::LeftRight, false);
+                        self.inject_entries(entries);
+                        self.relayout(self.bounds);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the tab group anchored at `first_pane` to `at` within/into this
+    /// session, committing immediately. A tab payload never `Swap`s (the
+    /// resolver never offers it); refused defensively here too.
+    pub fn move_tab(&mut self, first_pane: PaneId, at: DropTarget) -> bool {
+        if matches!(at, DropTarget::Swap { .. }) {
+            return false;
+        }
+        // Guard: the drop target must not name a pane inside the payload.
+        match at {
+            DropTarget::SplitBeside { pane, .. } if pane == first_pane => return false,
+            DropTarget::TabAt { anchor, .. } if anchor == first_pane => return false,
+            _ => {}
+        }
+        let Some(pkg) = self.extract_tab(first_pane) else { return false };
+        match self.adopt(pkg, at) {
+            Ok(()) => true,
+            Err(pkg) => {
+                let PanePackage { sub, entries } = pkg;
+                self.tree.insert_root_edge(sub, Orientation::LeftRight, false);
+                self.inject_entries(entries);
+                self.relayout(self.bounds);
+                false
+            }
+        }
+    }
+
+    /// Reorder the tab group anchored at `first_pane` to position `to` within
+    /// its tab strip, focusing it (it becomes the active tab). Returns
+    /// `false` if `first_pane` is not a tab group anchor.
+    pub fn reorder_tab(&mut self, first_pane: PaneId, to: usize) -> bool {
+        if self.tree.reorder_tab(first_pane, to) {
+            self.focus = first_pane; // follow the moved tab (it is active now)
+            self.relayout(self.bounds);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Convert a pixel rectangle and a cell size into a (cols, rows) pair, clamped
@@ -915,8 +1151,12 @@ mod tests {
             (8.0, 16.0),
             move |_id, _c, _r| Some(MockPane { writes: b0.clone(), bracketed: false }),
         );
-        let id0 = s.focus(); // PaneId(0), bracketed OFF (the focused pane)
-        let id1 = PaneId(1);
+        let id0 = s.focus(); // bracketed OFF (the focused pane)
+        // A high sentinel, not PaneId(1): PaneId is now a process-global counter
+        // (shared across every test in this binary, run in parallel), so a small
+        // hardcoded id can collide with one a concurrently-running test just
+        // allocated. Mirrors the stale-id sentinel used in the adopt tests below.
+        let id1 = PaneId(u64::MAX - 1000);
         s.panes.insert(id1, MockPane { writes: buf1.clone(), bracketed: true });
         s.groups.insert(id0, 1);
         s.groups.insert(id1, 1);
@@ -930,5 +1170,117 @@ mod tests {
             b"\x1b[200~line1\nline2\x1b[201~",
             "grouped pane (ON) must get its OWN bracketed wrap",
         );
+    }
+
+    // ----- PanePackage extract/adopt (Task 4) -------------------------------
+
+    fn mock_session() -> Session<MockPane, impl FnMut(PaneId, usize, usize) -> Option<MockPane>> {
+        Session::new(
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            (8.0, 16.0),
+            |_id, _c, _r| Some(MockPane { writes: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())), bracketed: false }),
+        )
+    }
+
+    /// extract_pane carries the backend AND every side-table entry; adopt puts
+    /// them all back and focuses the arrival.
+    #[test]
+    fn extract_then_adopt_moves_everything() {
+        let mut src = mock_session();
+        let a = src.focus();
+        src.apply(Action::SplitVert);
+        let b = src.focus();
+        src.set_title(b, "worker".into());
+        src.set_group(2); // focus (b) joins group 2
+        src.apply(Action::ColumnsMore); // b gets 2 columns
+
+        let pkg = src.extract_pane(b).expect("b exists");
+        assert_eq!(pkg.sub.panes(), vec![b]);
+        assert_eq!(pkg.entries.panes.len(), 1);
+        assert_eq!(pkg.entries.titles, vec![(b, "worker".to_string())]);
+        assert_eq!(pkg.entries.groups, vec![(b, 2)]);
+        assert_eq!(pkg.entries.columns, vec![(b, 2)]);
+        // Source: b is gone everywhere, focus re-seated on a survivor.
+        assert!(src.pane(b).is_none());
+        assert_eq!(src.focus(), a);
+        assert_eq!(src.title_of(b), None);
+
+        let mut dst = mock_session();
+        let d = dst.focus();
+        dst.adopt(pkg, DropTarget::SplitBeside { pane: d, orient: Orientation::LeftRight, before: false })
+            .unwrap();
+        assert!(dst.pane(b).is_some(), "the backend arrived");
+        assert_eq!(dst.focus(), b, "focus lands on the arrival");
+        assert_eq!(dst.title_of(b), Some("worker"));
+        assert_eq!(dst.group_of(b), Some(2));
+        assert_eq!(dst.columns_of(b), 2);
+    }
+
+    /// Extracting the last pane leaves an empty session (the App closes it);
+    /// adopting at Root refills an empty one (the tear-out landing).
+    #[test]
+    fn extract_last_pane_empties_adopt_root_refills() {
+        let mut s = mock_session();
+        let a = s.focus();
+        let pkg = s.extract_pane(a).expect("only pane");
+        assert!(s.is_empty());
+        let mut w = mock_session();
+        let first = w.focus();
+        let seed = w.extract_pane(first).unwrap(); // empty the new window
+        drop(seed);
+        assert!(w.is_empty());
+        w.adopt(pkg, DropTarget::Root).unwrap();
+        assert!(!w.is_empty());
+        assert_eq!(w.focus(), a);
+    }
+
+    /// A failed adopt (stale target) hands the package back — panes never vanish.
+    #[test]
+    fn failed_adopt_returns_the_package() {
+        let mut src = mock_session();
+        src.apply(Action::SplitVert);
+        let b = src.focus();
+        let pkg = src.extract_pane(b).unwrap();
+        let mut dst = mock_session();
+        let pkg = dst
+            .adopt(pkg, DropTarget::SplitBeside { pane: PaneId(u64::MAX - 7), orient: Orientation::LeftRight, before: true })
+            .expect_err("stale target");
+        assert_eq!(pkg.sub.panes(), vec![b], "package intact for retry/cancel");
+        assert!(dst.pane(b).is_none());
+    }
+
+    /// move_pane: Swap keeps both panes alive and exchanges their slots;
+    /// SplitBeside re-homes a pane within the same window.
+    #[test]
+    fn move_pane_swap_and_split_within_one_window() {
+        let mut s = mock_session();
+        let a = s.focus();
+        s.apply(Action::SplitVert);
+        let b = s.focus();
+        assert!(s.move_pane(a, DropTarget::Swap { pane: b }));
+        let bounds = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+        let rects = s.visible_rects(bounds);
+        assert_eq!(rects[0].0, b, "b now sits left");
+        assert!(s.move_pane(b, DropTarget::SplitBeside { pane: a, orient: Orientation::TopBottom, before: true }));
+        assert!(s.pane(a).is_some() && s.pane(b).is_some(), "nothing lost");
+        assert!(!s.move_pane(a, DropTarget::Swap { pane: a }), "self-target no-op");
+    }
+
+    /// Zoom never travels: extracting a zoomed pane clears zoom on the source,
+    /// and adopting into a zoomed session unzooms it (the layout must be visible).
+    #[test]
+    fn zoom_is_cleared_on_both_sides() {
+        let mut src = mock_session();
+        src.apply(Action::SplitVert);
+        let b = src.focus();
+        src.apply(Action::ToggleZoom);
+        assert!(src.is_zoomed());
+        let pkg = src.extract_pane(b).unwrap();
+        assert!(!src.is_zoomed(), "extracting the zoomed pane unzooms the source");
+        let mut dst = mock_session();
+        dst.apply(Action::ToggleZoom);
+        let d = dst.focus();
+        dst.adopt(pkg, DropTarget::SplitBeside { pane: d, orient: Orientation::LeftRight, before: false }).unwrap();
+        assert!(!dst.is_zoomed(), "adopting unzooms the target");
     }
 }
