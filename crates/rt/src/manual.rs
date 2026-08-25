@@ -47,6 +47,7 @@ WINDOWS  &  DRAG-AND-DROP
   Ctrl+Shift+J    detach the focused tab into a new window of its own
   Ctrl+Shift+M    pick up the focused pane (carry it: aim, then click to drop)
   Ctrl+Shift+N    pick up the focused tab (carry it: aim, then click to drop)
+  middle-click    a titlebar or tab label picks it up (carry mode below)
   One rt process serves every window (see them all in the right-click
   menu's "Move Pane to ..." rows); closing a window just closes it, and
   rt exits once the last one is gone.
@@ -67,6 +68,8 @@ WINDOWS  &  DRAG-AND-DROP
                   coordinates there — and cannot see other windows
                   mid-drag, so a release over another rt window also
                   tears out rather than dropping in).
+                  Hold Ctrl as you release to CARRY instead of tearing
+                  out — see Carry below.
                   X11 only (ssh -X included): drop onto ANOTHER rt
                   window to move the pane/tab there — its CENTRE swaps
                   the two panes, an edge splits, both across windows.
@@ -77,22 +80,24 @@ WINDOWS  &  DRAG-AND-DROP
                   wire that would end up spanning two windows — a wire
                   wholly inside what moved travels with it.
   Carry           picks the pane/tab up (Ctrl+Shift+M/N above, the
-                  "Pick Up Pane"/"Pick Up Tab" menu rows, or holding
-                  Ctrl while releasing a drag outside the window)
-                  instead of dropping it right away. Aim at ANY rt
-                  window — this one or another — for the SAME drop
-                  cues a live drag shows; left-click commits with the
-                  same target semantics (split, swap, tab-insert,
-                  cross-window move) on Wayland and X11 alike. Esc, or
-                  a right/middle-click in any window, cancels and
-                  puts it back. The pointer wears the same held-pane
-                  card (outline, translucent body, titlebar band) the
-                  whole time; it reverts to the normal cursor over a
-                  foreign app or bare desktop (rt only owns the
-                  cursor on its own windows), and falls back to a
-                  plain grab cursor if the compositor refuses custom
-                  cursor images. Works with titlebars off — pick-up
-                  needs no titlebar to grab.
+                  "Pick Up Pane"/"Pick Up Tab" menu rows, holding
+                  Ctrl while releasing a drag outside the window, or
+                  middle-click on a titlebar or tab label) instead of
+                  dropping it right away. Aim at ANY rt window — this
+                  one or another — for the SAME drop cues a live drag
+                  shows; left-click commits with the same target
+                  semantics (split, swap, tab-insert, cross-window
+                  move) on Wayland and X11 alike. Esc, or a right- or
+                  middle-click while carrying cancels and puts it
+                  back (middle-click is symmetric: it picks up, and
+                  puts back down). The pointer wears the same
+                  held-pane card (outline, translucent body, titlebar
+                  band) the whole time; it reverts to the normal
+                  cursor over a foreign app or bare desktop (rt only
+                  owns the cursor on its own windows), and falls back
+                  to a plain grab cursor if the compositor refuses
+                  custom cursor images. Works with titlebars off —
+                  pick-up needs no titlebar to grab.
 
 
 SELECTING TEXT

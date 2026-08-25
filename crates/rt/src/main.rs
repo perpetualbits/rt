@@ -2614,6 +2614,57 @@ impl ApplicationHandler for App {
                     if drag_abandoned {
                         return;
                     }
+                    // A middle-click on a pane's titlebar band or a tab label
+                    // picks that pane/tab up into carry mode — the one-handed
+                    // twin of Ctrl+Shift+M/N and the "Pick Up Pane"/"Pick Up
+                    // Tab" menu rows. Only when nothing is already live: a
+                    // second middle-click while carrying is the PUT-BACK
+                    // cancel, handled above (top of `window_event`) via
+                    // `drag_abandoned`/`cancel_carry` before `active` is even
+                    // borrowed, so it never reaches here. Note this wins over
+                    // the clip-history ⎘ affordance that also lives on the
+                    // titlebar — that's a left-click-only target, so a middle
+                    // press there is fair game for pick-up.
+                    //
+                    // Stage the hit-test results into locals so the borrow of
+                    // `active` (part of `self.windows`) ends before calling
+                    // `self.enter_carry`, which needs `&mut self` — the same
+                    // staging the left-press titlebar/tab arms rely on.
+                    if self.carry.is_none() && self.drag.is_none() && self.armed_drag.is_none() {
+                        let bounds = content_bounds(active.window.inner_size());
+                        let (mx, my) = active.mouse;
+                        let tb_h = active.session.titlebar_h();
+                        let pane_hit = if tb_h > 0.0 {
+                            active
+                                .session
+                                .visible_rects(bounds)
+                                .into_iter()
+                                .find(|(_, r)| r.contains(mx, my) && my < r.y + tb_h)
+                                .map(|(pid, _)| pid)
+                        } else {
+                            None
+                        };
+                        if let Some(pid) = pane_hit {
+                            self.enter_carry(event_loop, id, dragdrop::DragPayload::Pane(pid), None);
+                            return;
+                        }
+                        let tab_hit = active
+                            .session
+                            .tab_bars(bounds)
+                            .into_iter()
+                            .flat_map(|bar| bar.tabs)
+                            .find(|t| t.rect.contains(mx, my))
+                            .map(|t| t.first_pane);
+                        if let Some(first_pane) = tab_hit {
+                            self.enter_carry(
+                                event_loop,
+                                id,
+                                dragdrop::DragPayload::Tab { first_pane },
+                                None,
+                            );
+                            return;
+                        }
+                    }
                     // A mouse-reporting app gets the middle-press; otherwise (or
                     // with Shift held) middle-click pastes the PRIMARY selection.
                     if !active.mods.shift_key()
