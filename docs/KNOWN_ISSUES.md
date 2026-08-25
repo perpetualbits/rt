@@ -54,25 +54,36 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   startup for inspection.
 
 ## Pane drag-and-drop (2026-08-24)
-- ◐ **Cross-window DRAG is X11-only; drag TEAR-OUT works everywhere.** Dragging
-  a pane/tab into ANOTHER rt window needs the pointer in SCREEN coordinates: rt
-  asks winit for `Window::inner_position()`, which Wayland has no answer for (a
+- ◐ **Cross-window DRAG-WITH-CUES (the single fluid button-held gesture) is
+  X11-only; carry mode covers cross-window drops everywhere; drag TEAR-OUT
+  also works everywhere.** Dragging a pane/tab into ANOTHER rt window as one
+  unbroken button-held motion needs the pointer in SCREEN coordinates: rt asks
+  winit for `Window::inner_position()`, which Wayland has no answer for (a
   client is never told where its surface is, and `set_outer_position` is a
-  no-op), so that gesture is gated on `inner_position().is_ok()`. On Wayland use
-  the right-click menu's "Move Pane to N: title" row, or `Ctrl+Shift+D` (pane) /
-  `Ctrl+Shift+J` (tab) to detach into a new window. Dropping OUTSIDE the source
-  window to tear out, however, needs only surface-local coordinates, and the
-  Wayland implicit grab keeps delivering motion past the surface edge — measured
-  on cosmic-comp (2026-08-25, instrumented run: 366 out-of-bounds motion events
-  during a 12s hold, release delivered outside, zero cursor-left) — so drag
-  tear-out is enabled on Wayland too, with the compositor choosing the new
-  window's placement (X11 places it at the drop point). Wayland caveat: rt
-  cannot see other windows mid-drag, so a release over ANOTHER rt window also
-  tears out (on top of it) instead of dropping in. Lifting the cross-window gap
-  needs a compositor-mediated protocol — a real data-device drag-and-drop
-  session with a custom mime type would work on every compositor incl.
-  cosmic-comp (probed 2026-08-25: `wl_data_device_manager` v3 present,
-  `xdg_toplevel_drag_v1` absent) — a separate piece of work.
+  no-op), so that gesture is gated on `inner_position().is_ok()`. On Wayland
+  reach for **carry mode** instead (2026-08-25): `Ctrl+Shift+M` picks up the
+  focused pane, `Ctrl+Shift+N` its tab (same as the "Pick Up Pane"/"Pick Up
+  Tab" menu rows), or hold Ctrl while releasing a drag outside the window —
+  then hover ANY rt window for the full drop-cue set and left-click to drop
+  (Escape or right/middle-click cancels). Carry needs no `inner_position()`
+  because each window resolves its own hover locally once the button is up,
+  so it works identically on Wayland and X11. The right-click menu's "Move
+  Pane to N: title" row and `Ctrl+Shift+D`/`Ctrl+Shift+J` detach remain
+  available too. Dropping OUTSIDE the source window to tear out needs only
+  surface-local coordinates, and the Wayland implicit grab keeps delivering
+  motion past the surface edge — measured on cosmic-comp (2026-08-25,
+  instrumented run: 366 out-of-bounds motion events during a 12s hold, release
+  delivered outside, zero cursor-left) — so drag tear-out is enabled on
+  Wayland too, with the compositor choosing the new window's placement (X11
+  places it at the drop point). Wayland caveat: a live (non-carry) drag still
+  cannot see other windows mid-drag, so a plain release over ANOTHER rt window
+  during a button-held drag still tears out (on top of it) instead of dropping
+  in — Ctrl-holding at release turns that same gesture into a carry pick-up
+  instead. Lifting this remaining single-gesture gap needs a
+  compositor-mediated protocol — a real data-device drag-and-drop session with
+  a custom mime type would work on every compositor incl. cosmic-comp (probed
+  2026-08-25: `wl_data_device_manager` v3 present, `xdg_toplevel_drag_v1`
+  absent) — a separate piece of work.
 - ◐ **Overlapping rt windows: hover target picked by map order, not stacking
   order.** `App::window_under_global` (X11 only, see above) walks every open
   window's `inner_position()`/`inner_size()` and returns the first whose
@@ -88,6 +99,35 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   and borders around that rect are invisible to it. Releasing there lands
   outside every rt window's content rect, so it reads as "the desktop" and
   tears out, even though visually the pointer was over the other rt window.
+
+## Carry mode + held-pane cursor (2026-08-25)
+- ☑ **Cross-window pane/tab drops on Wayland (and X11), without a live drag.**
+  `Ctrl+Shift+M`/`Ctrl+Shift+N` (or the "Pick Up Pane"/"Pick Up Tab" menu
+  rows) pick the focused pane/tab up into a modal carry; holding Ctrl while
+  releasing a drag outside the window enters the same state instead of
+  tearing out. While carrying, every rt window resolves its own hover and
+  shows the same drop cues a live drag would (split fill, swap highlight,
+  tab caret, edge band, ghost chip); a left-click commits with the same
+  target semantics as a same-window/cross-window drag drop, Escape or a
+  right/middle-click anywhere cancels. Also closes the old "moving a pane
+  needs its titlebar" gap for titlebar-off setups: pick-up is a keyboard/menu
+  action, so it needs no titlebar to grab (in-window drag-to-REARRANGE by
+  mouse still does).
+- ☑ **A held-pane cursor card** (accent outline, translucent body, opaque
+  titlebar band, pane aspect ratio; `crates/rt/src/carry_card.rs`) rides the
+  pointer as a custom cursor during any button-held drag and throughout a
+  carry, on every rt window. It reverts to the normal cursor over a foreign
+  app or the bare desktop — rt only owns the cursor on its own surfaces — and
+  falls back to plain `CursorIcon::Grabbing` if the compositor/platform
+  refuses custom cursor images.
+- ◐ **The right-click context menu can overflow a short window; no scrolling
+  yet.** With the pick-up rows added, the full menu is now roughly 622px
+  tall; on a window shorter than that the tail rows (Preferences, Manual,
+  etc.) fall off the bottom and are unreachable by mouse — the panel clamps
+  to the top edge (`panel_taller_than_the_window_pins_to_the_top`) so at
+  least the head rows stay reachable, but there is no menu scrolling. Use a
+  keybinding for anything that falls off, or resize the window. Follow-up
+  filed to add scrolling.
 
 ## Focus & menu targeting (2026-07-06)
 - ☑ **Focus stuck on last-created pane; no click-to-focus.** Focus only moved via
