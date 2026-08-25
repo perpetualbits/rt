@@ -640,10 +640,8 @@ struct CarryState {
     payload_panes: Vec<rt_core::PaneId>, // every pane inside it
     source: WindowId,                    // window it was picked up in (its home while carried)
     // Ghost chip text (pane title / "Tab: title"), snapshotted at pick-up so it
-    // survives the title changing under the carry. Written here, read by the
-    // carry's cue/ghost painting — the next task in this series; the annotation
-    // goes away with it.
-    #[allow(dead_code)]
+    // survives the title changing under the carry. Read by the hover block in
+    // `CursorMoved`, which puts it into the aimed window's `drag_ghost`.
     label: String,
     // The held-pane cursor card, or None if the platform refused the image —
     // then plain `CursorIcon::Grabbing` stands in for the whole carry.
@@ -2049,6 +2047,64 @@ impl ApplicationHandler for App {
                     self.drag_motion(id);
                     return; // the drag owns the pointer: no hover/select/wire work
                 }
+                // --- a carry owns plain motion in EVERY rt window ---
+                // A drag has one window's pointer grab, so one function
+                // (`drag_motion`) has to work out where the pointer went. A
+                // carry holds no button: motion is delivered to whichever
+                // window the pointer is actually in, and THAT window resolves
+                // the drop in its own session from its own local coords. No
+                // global-coordinate maths, and it works on Wayland too. All
+                // reads — nothing relayouts until the click commits (Step 2).
+                if let Some(carry) = self.carry.as_ref() {
+                    // A window with a modal overlay up is not aimable: the
+                    // overlay owns the pointer there. (Most overlays already
+                    // returned above; the search bar is the one that lets
+                    // motion through.) Clear its cue and ghost — but not the
+                    // source's dim, the payload still sits there — and fall
+                    // through to the normal motion handling below.
+                    let overlay_up = active.prefs_open
+                        || active.manual_open
+                        || active.search_open
+                        || active.clip_overlay.is_some()
+                        || active.menu.is_some()
+                        || active.picker.is_some();
+                    // What THIS window should be dimming: the carried pane,
+                    // and only in the window it was picked up in (a tab page
+                    // dims nothing — its panes aren't visible while another
+                    // tab is shown).
+                    let dim = (carry.source == id)
+                        .then(|| match carry.payload {
+                            dragdrop::DragPayload::Pane(p) => Some(p),
+                            dragdrop::DragPayload::Tab { .. } => None,
+                        })
+                        .flatten();
+                    if overlay_up {
+                        Self::clear_carry_cue(active, dim);
+                    } else {
+                        let bounds = content_bounds(active.window.inner_size());
+                        let (panes, bars) =
+                            (active.session.visible_rects(bounds), active.session.tab_bars(bounds));
+                        // `payload_panes` only ever matches in the SOURCE
+                        // window (pane ids are process-global); passing it
+                        // elsewhere is harmless.
+                        let resolved = dragdrop::resolve_drop(
+                            carry.payload,
+                            &carry.payload_panes,
+                            &panes,
+                            &bars,
+                            bounds,
+                            active.mouse,
+                        );
+                        active.drag_cue = resolved;
+                        active.drag_ghost = Some((active.mouse, carry.label.clone()));
+                        active.drag_dim = dim;
+                        // The cues are chrome the damage tracker knows nothing
+                        // about, and the ghost chip moves with every sample.
+                        active.force_full = true;
+                        active.window.request_redraw();
+                        return; // a carry owns plain motion in rt windows
+                    }
+                }
                 // A divider should say it can be dragged. Only while nothing else
                 // owns the pointer, and only re-issued when the shape actually
                 // changes — set_cursor is an X round trip, and motion events
@@ -2133,6 +2189,23 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // The pointer left this window. Only a carry cares: this window is
+            // no longer being aimed at, so its cue and ghost chip go (the card
+            // cursor keeps "holding" the payload across the gap, and the source
+            // keeps dimming the payload at home). A no-op with nothing carried,
+            // which is exactly what the event did before this arm existed.
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(carry) = self.carry.as_ref() {
+                    let dim = (carry.source == id)
+                        .then(|| match carry.payload {
+                            dragdrop::DragPayload::Pane(p) => Some(p),
+                            dragdrop::DragPayload::Tab { .. } => None,
+                        })
+                        .flatten();
+                    Self::clear_carry_cue(active, dim);
+                }
+            }
+
             // Mouse buttons: right opens the menu; left drives menu/tab/focus and
             // starts/ends a text selection; middle pastes the PRIMARY selection.
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
@@ -2179,6 +2252,17 @@ impl ApplicationHandler for App {
                     self.open_menu(id, pos);
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
+                    // A carry DROPS on this press. First of everything — before
+                    // compose, before the clip affordance / jack / divider /
+                    // scrollbar / titlebar / tab hit-tests — so a drop can never
+                    // also end a compose, start a selection, focus a pane, arm a
+                    // drag or open the clipboard overlay. `active` is dead on
+                    // this path (it returns), so the drop can take `&mut self`
+                    // and reach both windows.
+                    if self.carry.is_some() {
+                        self.carry_drop(id);
+                        return;
+                    }
                     // While composing an anchored selection, a click finishes or
                     // aborts it — it never starts a new selection. EXCEPT: a
                     // Shift+double/triple-click is two press/release pairs, and the
@@ -3068,6 +3152,13 @@ impl App {
         if matches!(payload, dragdrop::DragPayload::Pane(p) if active.session.pane(p).is_none()) {
             return false; // stale pane id
         }
+        // Drop zones are resolved from the REAL layout, so a zoomed pane must be
+        // restored before the carry starts aiming — the same reason the drag
+        // path unzooms when a press becomes a drag. Done ONCE here, at pick-up:
+        // the per-motion hover block only ever reads.
+        if active.session.is_zoomed() {
+            active.session.toggle_zoom();
+        }
         let label = match payload {
             dragdrop::DragPayload::Pane(p) => active.session.title_of(p).unwrap_or("Pane").to_string(),
             dragdrop::DragPayload::Tab { first_pane } => active
@@ -3119,6 +3210,75 @@ impl App {
         for a in self.windows.values_mut() {
             a.carry_cursor = false; // release the cursor BEFORE update_cursor runs
             Self::clear_drag_cues(a); // cue/ghost/dim wipe + update_cursor + force_full + redraw
+        }
+    }
+
+    /// Take the carry's hover cue and ghost chip off ONE window, leaving it
+    /// dimming `want_dim` (the carried pane, in the source window; `None`
+    /// anywhere else). Called per pointer sample from the paths where a window
+    /// stops being aimed at — a cursor-leave, or an overlay coming up over it —
+    /// so it repaints only when something was actually showing.
+    fn clear_carry_cue(active: &mut Active, want_dim: Option<rt_core::PaneId>) {
+        if active.drag_cue.is_none() && active.drag_ghost.is_none() && active.drag_dim == want_dim {
+            return; // already clean: no frame owed
+        }
+        active.drag_cue = None;
+        active.drag_ghost = None;
+        active.drag_dim = want_dim;
+        active.force_full = true; // cues are chrome, off the damage-tracked path
+        active.window.request_redraw();
+    }
+
+    /// A left-press in window `id` while a carry is live: put the payload down
+    /// where that window's cue says it would land.
+    ///
+    /// Every commit goes through the same two functions a drag release uses, so
+    /// a carried pane is no easier to lose than a dragged one — both hand a
+    /// refused package straight back to the source. A `false` return means
+    /// nothing moved, for one of two reasons, which end differently:
+    ///
+    ///  - the pointer was over a DEAD ZONE (a gutter, a margin — no cue): the
+    ///    aim simply missed, so the press is consumed and the carry continues.
+    ///  - the payload is STALE. A carry survives everything a drag cannot, and
+    ///    that includes a context menu left open in ANOTHER window, which can
+    ///    still dispatch "Detach Pane"/"Detach Tab" on the carried payload
+    ///    while the carry runs. The drop functions then find nothing to extract
+    ///    and change nothing (no crash, no lost pane) — but a carry whose
+    ///    payload has left its source can never be dropped or dimmed anywhere
+    ///    again, so it is cancelled here rather than left running as a zombie.
+    fn carry_drop(&mut self, id: WindowId) {
+        let Some(carry) = self.carry.as_ref() else { return };
+        let (payload, source) = (carry.payload, carry.source);
+        // The cue this window is SHOWING is the target — resolved by the motion
+        // block above from this window's own layout. Staged out of the map
+        // first: both drop functions take `&mut self`.
+        let cue = self.windows.get(&id).and_then(|a| a.drag_cue.clone());
+        let committed = match cue {
+            Some(r) if source == id => self.same_window_drop(id, payload, r),
+            Some(r) => self.cross_window_drop(source, payload, id, r),
+            None => false, // dead zone: the carry continues, the press is consumed
+        };
+        log::debug!("carry drop: payload={payload:?} source={source:?} into={id:?} committed={committed}");
+        if committed {
+            self.cancel_carry(); // clears every window's cues + cursors
+            return;
+        }
+        if self.carry_payload_gone() {
+            self.cancel_carry(); // nothing left to carry: don't strand the state
+        } else if let Some(a) = self.windows.get_mut(&id) {
+            a.window.request_redraw(); // missed: keep carrying, repaint as-is
+        }
+    }
+
+    /// Has the carried payload left its source window — detached, closed, or
+    /// moved out from under the carry by an action dispatched somewhere else?
+    /// False when nothing is carried.
+    fn carry_payload_gone(&self) -> bool {
+        let Some(carry) = self.carry.as_ref() else { return false };
+        let Some(src) = self.windows.get(&carry.source) else { return true }; // source window gone
+        match carry.payload {
+            dragdrop::DragPayload::Pane(p) => src.session.pane(p).is_none(),
+            dragdrop::DragPayload::Tab { first_pane } => src.session.tab_panes(first_pane).is_none(),
         }
     }
 
