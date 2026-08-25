@@ -107,9 +107,10 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
 ## Carry mode + held-pane cursor (2026-08-25)
 - ☑ **Cross-window pane/tab drops on Wayland (and X11), without a live drag.**
   `Ctrl+Shift+M`/`Ctrl+Shift+N` (or the "Pick Up Pane"/"Pick Up Tab" menu
-  rows) pick the focused pane/tab up into a modal carry; holding Ctrl while
-  releasing a drag outside the window enters the same state instead of
-  tearing out. While carrying, every rt window resolves its own hover and
+  rows, or a middle-click on a pane's titlebar band / a tab label) pick the
+  focused pane/tab up into a modal carry; holding Ctrl while releasing a
+  drag outside the window enters the same state instead of tearing out.
+  While carrying, every rt window resolves its own hover and
   shows the same drop cues a live drag would (split fill, swap highlight,
   tab caret, edge band, ghost chip); a left-click commits with the same
   target semantics as a same-window/cross-window drag drop, Escape or a

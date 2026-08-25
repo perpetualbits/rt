@@ -2645,9 +2645,18 @@ impl ApplicationHandler for App {
                             None
                         };
                         if let Some(pid) = pane_hit {
+                            active.session.focus_at(mx, my); // a titlebar click still focuses (parity with the left-press arm)
                             self.enter_carry(event_loop, id, dragdrop::DragPayload::Pane(pid), None);
                             return;
                         }
+                        // Tab label: NOT focus_tab(first_pane) here — that would switch
+                        // the visible tab (and so the layout under the pickup) rather
+                        // than just focusing, unlike a titlebar click. The left-press
+                        // tab arm defers its switch to the release; for middle-click
+                        // pick-up there is no release-time action to defer to, and
+                        // enter_carry itself does not focus, so this intentionally
+                        // leaves focus/visible-tab untouched — the carried tab's
+                        // identity, not the on-screen layout, is what pick-up needs.
                         let tab_hit = active
                             .session
                             .tab_bars(bounds)
