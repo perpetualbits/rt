@@ -73,7 +73,11 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   surface-local coordinates, and the Wayland implicit grab keeps delivering
   motion past the surface edge — measured on cosmic-comp (2026-08-25,
   instrumented run: 366 out-of-bounds motion events during a 12s hold, release
-  delivered outside, zero cursor-left) — so drag tear-out is enabled on
+  delivered outside, zero cursor-left). On a Wayland compositor that stops
+  delivering pointer motion at the surface edge during the implicit grab, the
+  release still reads as inside the window, so the gesture safely degrades to a
+  cancel (no tear-out, nothing lost) — verified on cosmic-comp only. Drag
+  tear-out is enabled on
   Wayland too, with the compositor choosing the new window's placement (X11
   places it at the drop point). Wayland caveat: a live (non-carry) drag still
   cannot see other windows mid-drag, so a plain release over ANOTHER rt window
