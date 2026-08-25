@@ -107,6 +107,12 @@ pub enum Action {
     DetachPane,
     /// rt-specific: pull the focused tab out of its window into a new window.
     DetachTab,
+    /// rt-specific: pick up the focused pane — carry mode: aim in any rt window,
+    /// click to drop.
+    PickUpPane,
+    /// rt-specific: pick up the focused tab — carry mode: aim in any rt window,
+    /// click to drop.
+    PickUpTab,
     /// rt-specific: move the focused tab one position toward the start.
     MoveTabLeft,
     /// rt-specific: move the focused tab one position toward the end.
@@ -497,6 +503,8 @@ impl Keymap {
             ("<Shift><Control>i", Action::NewWindow),    // new_window (Terminator)
             ("<Shift><Control>d", Action::DetachPane),   // detach pane to its own window
             ("<Shift><Control>j", Action::DetachTab),    // detach tab to its own window
+            ("<Shift><Control>m", Action::PickUpPane),   // carry the pane: aim, then click to drop
+            ("<Shift><Control>n", Action::PickUpTab),    // carry the tab: aim, then click to drop
             ("<Shift><Control>Page_Up", Action::MoveTabLeft),  // move_tab (Terminator)
             ("<Shift><Control>Page_Down", Action::MoveTabRight), // move_tab (Terminator)
         ];
@@ -585,6 +593,18 @@ mod config_tests {
             ("<Shift><Control>Page_Down", Action::MoveTabRight),
         ];
         for (accel, action) in expect {
+            let chord = keys::Chord::parse(accel).expect("valid chord");
+            assert_eq!(km.action_for(&chord), Some(action), "{accel}");
+        }
+    }
+
+    #[test]
+    fn pickup_actions_have_default_chords() {
+        let km = Keymap::default();
+        for (accel, action) in [
+            ("<Shift><Control>m", Action::PickUpPane),
+            ("<Shift><Control>n", Action::PickUpTab),
+        ] {
             let chord = keys::Chord::parse(accel).expect("valid chord");
             assert_eq!(km.action_for(&chord), Some(action), "{accel}");
         }

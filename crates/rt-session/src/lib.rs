@@ -557,6 +557,8 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
             | Action::NewWindow
             | Action::DetachPane
             | Action::DetachTab
+            | Action::PickUpPane
+            | Action::PickUpTab
             | Action::MoveTabLeft
             | Action::MoveTabRight => None,
         }

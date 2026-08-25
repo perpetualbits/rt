@@ -32,6 +32,8 @@ fn items() -> Vec<Item> {
         Item::Action("Maximise / Restore Pane", Action::ToggleZoom),
         Item::Action("Detach Pane to New Window", Action::DetachPane),
         Item::Action("Detach Tab to New Window", Action::DetachTab),
+        Item::Action("Pick Up Pane", Action::PickUpPane),
+        Item::Action("Pick Up Tab", Action::PickUpTab),
         Item::Action("Search Scrollback…", Action::Search),
         Item::Action("Clear Clipboard History", Action::ClearClipHistory),
         Item::Separator,

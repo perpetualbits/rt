@@ -117,9 +117,23 @@ mod tests {
     fn panel_clamps_onto_screen() {
         let rows = sample();
         // Anchor near the bottom-right corner: the panel must shift fully on-screen.
-        let g = layout(&rows, (795.0, 595.0), 8.0, 18.0, 800.0, 600.0);
+        let g = layout(&rows, (795.0, 795.0), 8.0, 18.0, 800.0, 800.0);
         assert!(g.panel.x + g.panel.w <= 800.0 + 0.01);
-        assert!(g.panel.y + g.panel.h <= 600.0 + 0.01);
+        assert!(g.panel.y + g.panel.h <= 800.0 + 0.01);
+    }
+
+    /// A menu TALLER than the window can't fit however it is placed (the full
+    /// row list in a short window; likewise any window once several "Move Pane
+    /// to N" rows are added). The clamp then pins it to the top so the panel
+    /// STARTS on-screen and its first rows stay reachable, rather than letting
+    /// the anchor push the top off the screen too.
+    #[test]
+    fn panel_taller_than_the_window_pins_to_the_top() {
+        let rows = sample();
+        let g = layout(&rows, (795.0, 595.0), 8.0, 18.0, 800.0, 300.0);
+        assert!(g.panel.h > 300.0, "this case only means anything when the menu overflows");
+        assert_eq!(g.panel.y, 0.0, "pinned to the top edge");
+        assert!(g.panel.x + g.panel.w <= 800.0 + 0.01, "still clamped horizontally");
     }
 
     #[test]

@@ -414,6 +414,11 @@ struct Active {
     drag_cue: Option<dragdrop::ResolvedDrop>, // where a release would land the payload (+ its highlight rect)
     drag_ghost: Option<((f32, f32), String)>, // the chip that follows the pointer: (position, label)
     drag_dim: Option<rt_core::PaneId>,        // the pane being dragged, drawn dimmed at its old place
+    // This window currently wears the carry cursor (the held-pane card, or
+    // Grabbing when the platform refused the image). While set, `update_cursor`
+    // stands down entirely: a carry outlives motion, so nothing may reset the
+    // shape until the carry ends. Cleared for every window by `cancel_carry`.
+    carry_cursor: bool,
     window: Window, // the OS window — LAST so it outlives everything that references it on Drop
 }
 
@@ -582,6 +587,11 @@ struct App {
     // passed the movement threshold.
     armed_drag: Option<ArmedDrag>,
     drag: Option<DragState>,
+    // The carry (see [`CarryState`]): the modal pick-up state. Also App-level —
+    // a carry is aimed in ANY window, not just the one it started in — and
+    // mutually exclusive with a drag (`enter_carry` cancels one to start the
+    // other).
+    carry: Option<CarryState>,
 }
 
 /// A left-press on a pane titlebar or a tab label. It is not a drag yet — it
@@ -611,11 +621,32 @@ struct DragState {
     cued: Option<WindowId>,
     // The held-pane cursor card, or None if the platform refused the image
     // (BadImage) — then the plain `CursorIcon::Grabbing` set at promote time
-    // stands in for the whole drag. Not read within this task: carried
-    // forward so a later "carry mode" task (re-applying the card cursor as
-    // the pointer crosses between windows) can consume it without another
-    // plumbing pass.
+    // stands in for the whole drag. Read back by `commit_drag` when a
+    // Ctrl-held release turns the drag into a CARRY: the card the pointer is
+    // already wearing is handed straight to `enter_carry` rather than rebuilt.
+    card: Option<winit::window::CustomCursor>,
+}
+
+/// A CARRY in progress: the modal "pick up, aim, click to drop" state, the
+/// keyboard/menu twin of a drag (and what a Ctrl-held drag release becomes).
+///
+/// Unlike a drag it holds no mouse button, so it survives motion, window
+/// switches and focus changes; it ends only on a drop, on Escape, on a second
+/// mouse button, on an action that would remove the payload, or when the
+/// payload dies. `payload_panes` is every pane inside the payload (so a pane
+/// exiting under the carry can cancel it, exactly as for a drag).
+struct CarryState {
+    payload: dragdrop::DragPayload,      // pane or tab page being carried
+    payload_panes: Vec<rt_core::PaneId>, // every pane inside it
+    source: WindowId,                    // window it was picked up in (its home while carried)
+    // Ghost chip text (pane title / "Tab: title"), snapshotted at pick-up so it
+    // survives the title changing under the carry. Written here, read by the
+    // carry's cue/ghost painting — the next task in this series; the annotation
+    // goes away with it.
     #[allow(dead_code)]
+    label: String,
+    // The held-pane cursor card, or None if the platform refused the image —
+    // then plain `CursorIcon::Grabbing` stands in for the whole carry.
     card: Option<winit::window::CustomCursor>,
 }
 
@@ -1154,6 +1185,7 @@ impl App {
             drag_cue: None,
             drag_ghost: None,
             drag_dim: None,
+            carry_cursor: false,
         })
     }
 
@@ -1307,10 +1339,11 @@ impl ApplicationHandler for App {
         // Grabbing cursor in that window for the rest of the session.
         //
         // `drag_abandoned` tells the button arms below that the press was
-        // consumed by abandoning THIS window's drag, so they skip their own
-        // action (no menu, no paste) exactly as they did when they cancelled
-        // the drag inline. A press that abandoned a FOREIGN window's drag is
-        // not consumed: this window handles it as it always would.
+        // consumed by abandoning THIS window's drag (or the app-wide carry), so
+        // they skip their own action (no menu, no paste) exactly as they did
+        // when they cancelled the drag inline. A press that abandoned a FOREIGN
+        // window's drag is not consumed: this window handles it as it always
+        // would.
         let mut drag_abandoned = false;
         if matches!(event, WindowEvent::MouseInput { .. }) {
             let second_button = matches!(
@@ -1328,6 +1361,15 @@ impl ApplicationHandler for App {
             if self.drag.is_some() && (foreign || second_button) {
                 drag_abandoned = !foreign;
                 self.cancel_drag();
+            }
+            // A carry is aimed with the pointer in ANY window, so "foreign" has
+            // no meaning for it: a second button ANYWHERE puts the payload back
+            // down. The press is consumed exactly as it is for a drag — the
+            // right-click that cancels does not also open the menu (nor does a
+            // middle-click that cancels also paste): one press, one meaning.
+            if second_button && self.carry.is_some() {
+                drag_abandoned = true;
+                self.cancel_carry();
             }
         }
         // Everything here needs this window's state; ignore events before
@@ -2535,8 +2577,19 @@ impl ApplicationHandler for App {
         // (its shell finished); the drag must then be abandoned rather than
         // committed against a dead id. Snapshot the ids here — the loop below
         // borrows `self.windows` and can't reach `self.drag` through a method.
-        let drag_panes: Vec<rt_core::PaneId> =
-            self.drag.as_ref().map(|d| d.payload_panes.clone()).unwrap_or_default();
+        // A CARRIED payload can die the same way, with the same consequence, so
+        // both sets of ids are watched in the one pass. `tick_active` only
+        // answers "did one of THESE die", so the cancels below are unconditional
+        // on both — each is a cheap no-op when that state isn't live. The one
+        // imprecise case is a drag and a carry live at once, where a death in
+        // either payload ends both; that errs towards the safe side (nothing is
+        // ever left pointing at a dead pane) and needs no id-by-id bookkeeping.
+        let drag_panes: Vec<rt_core::PaneId> = self
+            .drag
+            .iter()
+            .flat_map(|d| d.payload_panes.iter().copied())
+            .chain(self.carry.iter().flat_map(|c| c.payload_panes.iter().copied()))
+            .collect();
         let mut drag_payload_died = false;
         for (&wid, active) in self.windows.iter_mut() {
             let (close, interval, died) = Self::tick_active(active, &drag_panes);
@@ -2551,6 +2604,7 @@ impl ApplicationHandler for App {
         }
         if drag_payload_died {
             self.cancel_drag(); // what was being dragged no longer exists
+            self.cancel_carry(); // …or carried
         }
         for wid in to_close {
             self.close_window(wid);
@@ -2926,6 +2980,8 @@ enum WindowCmd {
     NewWindow,            // open an empty extra window
     DetachPane,           // tear the focused pane out to a new window
     DetachTab,            // tear the current tab out to a new window
+    PickUpPane,           // pick the focused pane up into carry mode
+    PickUpTab,            // pick the current tab up into carry mode
     MoveToWindow(WindowId), // "Move Pane to <window>" menu pick: send the focus pane there
 }
 
@@ -2979,6 +3035,90 @@ impl App {
         self.clear_cues_on(drag.source);
         if let Some(w) = drag.cued.filter(|w| *w != drag.source) {
             self.clear_cues_on(w);
+        }
+    }
+
+    /// Enter carry: the modal pick-up state (see [`CarryState`]). Cancels any
+    /// live drag or previous carry first — the three are mutually exclusive.
+    /// Returns false, having changed nothing, for a stale payload (a pane id or
+    /// tab that is no longer in the source window's session), so a caller can
+    /// tell "picked up" from "there was nothing to pick up".
+    ///
+    /// `reuse_card` is the already-built held-pane cursor when the caller has
+    /// one — a Ctrl-held drag release hands over the card the pointer is
+    /// already wearing instead of paying to rebuild an identical image.
+    /// `None` means "build one for this payload".
+    fn enter_carry(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        reuse_card: Option<winit::window::CustomCursor>,
+    ) -> bool {
+        self.cancel_drag();
+        self.cancel_carry();
+        let Some(active) = self.windows.get_mut(&source) else { return false };
+        let payload_panes = match payload {
+            dragdrop::DragPayload::Pane(p) => vec![p],
+            dragdrop::DragPayload::Tab { first_pane } => match active.session.tab_panes(first_pane) {
+                Some(v) if !v.is_empty() => v,
+                _ => return false, // no such tab any more
+            },
+        };
+        if matches!(payload, dragdrop::DragPayload::Pane(p) if active.session.pane(p).is_none()) {
+            return false; // stale pane id
+        }
+        let label = match payload {
+            dragdrop::DragPayload::Pane(p) => active.session.title_of(p).unwrap_or("Pane").to_string(),
+            dragdrop::DragPayload::Tab { first_pane } => active
+                .session
+                .title_of(first_pane)
+                .map(|t| format!("Tab: {t}"))
+                .unwrap_or_else(|| "Tab".to_string()),
+        };
+        let card = match reuse_card {
+            Some(c) => Some(c), // the drag's card: the pointer already wears it
+            None => Self::make_payload_card(event_loop, active, payload),
+        };
+        // The payload dims at home for the whole carry.
+        active.drag_dim = match payload {
+            dragdrop::DragPayload::Pane(p) => Some(p),
+            dragdrop::DragPayload::Tab { .. } => None,
+        };
+        active.force_full = true;
+        active.window.request_redraw();
+        log::debug!("carry picked up: payload={payload:?} source={source:?}");
+        self.carry = Some(CarryState { payload, payload_panes, source, label, card });
+        // Every window shows the card (or Grabbing) while the carry lasts.
+        self.apply_carry_cursor_all();
+        true
+    }
+
+    /// Show the carry cursor on every open window (also called for a window
+    /// created mid-carry, from `build_active`'s callers). A no-op when no carry
+    /// is live: the shape then stays whatever `update_cursor` last chose.
+    fn apply_carry_cursor_all(&mut self) {
+        let Some(card) = self.carry.as_ref().map(|c| c.card.clone()) else { return };
+        for a in self.windows.values_mut() {
+            match &card {
+                Some(c) => a.window.set_cursor(winit::window::Cursor::Custom(c.clone())),
+                None => a.window.set_cursor(CursorIcon::Grabbing),
+            }
+            // Proxy for "not the default shape", exactly as a drag does: what
+            // `update_cursor` compares against once the carry ends.
+            a.cursor_icon = Some(CursorIcon::Grabbing);
+            a.carry_cursor = true;
+        }
+    }
+
+    /// Leave carry: clear every window's cues/dim/cursor. Safe to call when
+    /// idle (and cheap — it returns at once with nothing carried).
+    fn cancel_carry(&mut self) {
+        let Some(carry) = self.carry.take() else { return };
+        log::debug!("carry cancelled: payload={:?}", carry.payload);
+        for a in self.windows.values_mut() {
+            a.carry_cursor = false; // release the cursor BEFORE update_cursor runs
+            Self::clear_drag_cues(a); // cue/ghost/dim wipe + update_cursor + force_full + redraw
         }
     }
 
@@ -3154,8 +3294,17 @@ impl App {
     /// place a drag can end, whichever window it is hovering.
     fn commit_drag(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
         let Some(drag) = self.drag.take() else { return };
+        // Ctrl held at the moment of release turns a tear-out into a PICK-UP:
+        // the payload stays where it is and the gesture becomes a carry (see
+        // [`CarryState`]). Read now, while the source window is easy to reach —
+        // the commit arms below re-borrow the map repeatedly.
+        let ctrl_held = self.windows.get(&id).is_some_and(|a| a.mods.control_key());
         let target = drag.hover.as_ref().map(|(_, r)| r.target); // for the log below
         let hover_window = drag.hover.as_ref().map(|(w, _)| *w);
+        // Set by the Ctrl-release arm below: the gesture did not END, it BECAME
+        // a carry, which owns the source window's dim and cursor from here on.
+        // The cue wipe at the bottom must then leave that window alone.
+        let mut entered_carry = false;
         let committed = match drag.hover {
             // Same window: the plain in-session move/reorder.
             Some((w, r)) if w == id => self.same_window_drop(id, drag.payload, r),
@@ -3170,14 +3319,28 @@ impl App {
             // (`cued` is always None off-source there), a release over another
             // rt window tears out too, on top of it. Documented limitation.
             None => match (drag.cued, self.tear_out_release(id)) {
-                (None, Some(at)) => self.tear_out(event_loop, id, drag.payload, at),
+                // A release out on the desktop: tear out — or, with Ctrl held,
+                // pick the payload UP instead and keep aiming. The card the
+                // pointer is already wearing is handed straight over, so the
+                // cursor never blinks between the two states.
+                (None, Some(at)) => {
+                    if ctrl_held {
+                        entered_carry = self.enter_carry(event_loop, id, drag.payload, drag.card.clone());
+                        entered_carry
+                    } else {
+                        self.tear_out(event_loop, id, drag.payload, at)
+                    }
+                }
                 _ => false,
             },
         };
         log::debug!(
-            "drag release: payload={:?} source={id:?} over={hover_window:?} target={target:?} committed={committed}",
+            "drag release: payload={:?} source={id:?} over={hover_window:?} target={target:?} committed={committed} carry={entered_carry}",
             drag.payload
         );
+        if entered_carry {
+            return; // the carry owns every window's cues/dim/cursor now
+        }
         // Both ends get their cues wiped (+ force_full: layouts may have
         // changed). Either window may have just closed — `clear_cues_on` is a
         // no-op then.
@@ -3538,6 +3701,11 @@ impl App {
         if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
             self.cancel_drag();
         }
+        // Same for a carry: its payload lives in this window (dimmed at home
+        // until it is dropped), so the window closing takes the payload with it.
+        if matches!(self.carry.as_ref(), Some(c) if c.source == id) {
+            self.cancel_carry();
+        }
         // A drag merely HOVERING this window survives — it just has nothing
         // under the pointer any more. Forget the stale target so the release
         // cannot commit into a window that is gone (the cues die with it).
@@ -3572,9 +3740,14 @@ impl App {
                 let Some(active) = self.build_active(event_loop) else { return };
                 active.window.request_redraw(); // first paint
                 self.windows.insert(active.window.id(), active);
+                // A window born mid-carry must wear the carry cursor too (no-op
+                // when nothing is being carried).
+                self.apply_carry_cursor_all();
             }
             WindowCmd::DetachPane => self.detach(event_loop, id, false),
             WindowCmd::DetachTab => self.detach(event_loop, id, true),
+            WindowCmd::PickUpPane => self.pick_up(event_loop, id, false),
+            WindowCmd::PickUpTab => self.pick_up(event_loop, id, true),
             WindowCmd::MoveToWindow(dest) => self.move_pane_to_window(id, dest),
         }
     }
@@ -3603,6 +3776,30 @@ impl App {
             dragdrop::DragPayload::Pane(active.session.focus())
         };
         self.tear_out(event_loop, id, payload, None);
+    }
+
+    /// Pick the focused pane (or its whole tab, when `tab` is set) UP into
+    /// carry mode — the keyboard/menu twin of [`App::detach`], picking the
+    /// payload exactly the same way. Nothing moves yet: the payload waits,
+    /// dimmed at home, until the carry is dropped or cancelled.
+    fn pick_up(&mut self, event_loop: &ActiveEventLoop, id: WindowId, tab: bool) {
+        let Some(active) = self.windows.get(&id) else { return };
+        let payload = if tab {
+            // Same "first strip with an active tab" convention as `detach`.
+            let bounds = content_bounds(active.window.inner_size());
+            let first = active
+                .session
+                .tab_bars(bounds)
+                .iter()
+                .flat_map(|b| b.tabs.iter())
+                .find(|t| t.active)
+                .map(|t| t.first_pane);
+            let Some(first) = first else { return }; // no tab strip → nothing to pick up
+            dragdrop::DragPayload::Tab { first_pane: first }
+        } else {
+            dragdrop::DragPayload::Pane(active.session.focus())
+        };
+        self.enter_carry(event_loop, id, payload, None);
     }
 
     /// Move `payload` out of window `source` into a fresh OS window, optionally
@@ -3659,6 +3856,9 @@ impl App {
         }
         let new_id = new_active.window.id();
         self.windows.insert(new_id, new_active);
+        // A window born mid-carry wears the carry cursor like every other
+        // (no-op when nothing is being carried).
+        self.apply_carry_cursor_all();
 
         // Now the payload can leave the source: from here on nothing can fail
         // in a way that would strand it.
@@ -3766,6 +3966,10 @@ impl App {
             Action::NewWindow => return WindowCmd::NewWindow,
             Action::DetachPane => return WindowCmd::DetachPane,
             Action::DetachTab => return WindowCmd::DetachTab,
+            // Carry mode: picking up needs the event loop (to build the cursor
+            // card) and every window (they all wear it), so it goes up too.
+            Action::PickUpPane => return WindowCmd::PickUpPane,
+            Action::PickUpTab => return WindowCmd::PickUpTab,
             // Reorder the focused tab within its strip (Terminator's move_tab).
             Action::MoveTabLeft => Self::move_focused_tab(active, -1),
             Action::MoveTabRight => Self::move_focused_tab(active, 1),
@@ -4540,6 +4744,12 @@ impl App {
             self.cancel_drag();
             return;
         }
+        // Same for a carry — it is just as modal, and (holding no button) it
+        // would otherwise outlive every other way out of the gesture.
+        if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) && self.carry.is_some() {
+            self.cancel_carry();
+            return;
+        }
         if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
             self.armed_drag = None;
         }
@@ -4554,12 +4764,16 @@ impl App {
         // window they refer to until Escape is pressed. Only paid for while
         // something is armed or dragging, and done here because `cancel_drag`
         // needs `&mut self` (no `Active` borrowed yet).
-        if self.drag.is_some() || self.armed_drag.is_some() {
+        // A live CARRY is gated by exactly the same two questions — it is just
+        // as modal as a drag and holds the same pane ids — so the lookup is
+        // shared and each state cancels itself when the answer is yes.
+        if self.drag.is_some() || self.armed_drag.is_some() || self.carry.is_some() {
             let action = self.windows.get(&id).and_then(|a| {
                 input::chord_from_winit(&key_event.logical_key, a.mods).and_then(|c| a.keymap.action_for(&c))
             });
             if action.is_some_and(opens_modal_overlay) || action.is_some_and(removes_pane_mid_drag) {
                 self.cancel_drag();
+                self.cancel_carry();
             }
         }
         let Some(active) = self.windows.get_mut(&id) else { return };
@@ -5687,6 +5901,12 @@ impl App {
             // the drag's source (only it dims a pane) and must keep Grabbing
             // until the drop, or the shape would flicker back at the border.
             || active.drag_dim.is_some()
+            // A CARRY owns the pointer in EVERY window (no button is held, so
+            // there is no grab to keep it in one): the card must survive
+            // arbitrary motion, over jacks and dividers included, until the
+            // carry drops or cancels. `cancel_carry` clears the flag first,
+            // which is what lets the very next call restore the real shape.
+            || active.carry_cursor
         {
             return;
         }
@@ -6581,6 +6801,7 @@ fn main() {
         windows: std::collections::HashMap::new(),
         armed_drag: None,
         drag: None,
+        carry: None,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure

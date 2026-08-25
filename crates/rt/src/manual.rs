@@ -45,6 +45,8 @@ WINDOWS  &  DRAG-AND-DROP
   Ctrl+Shift+I    open a new, empty rt window
   Ctrl+Shift+D    detach the focused pane into a new window of its own
   Ctrl+Shift+J    detach the focused tab into a new window of its own
+  Ctrl+Shift+M    pick up the focused pane (carry it: aim, then click to drop)
+  Ctrl+Shift+N    pick up the focused tab (carry it: aim, then click to drop)
   One rt process serves every window (see them all in the right-click
   menu's "Move Pane to ..." rows); closing a window just closes it, and
   rt exits once the last one is gone.
