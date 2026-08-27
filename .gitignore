@@ -24,3 +24,6 @@ Cargo.lock.orig
 /2
 /.cargo
 /resume
+
+# Session prompt scratch (epoch-named); real docs get real names.
+docs/prompt-*.md

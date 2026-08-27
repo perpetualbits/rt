@@ -1426,60 +1426,48 @@ impl Term {
     }
 
     // ── SGR ───────────────────────────────────────────────────────────────────
-    fn sgr(&mut self, p: &[u16]) {
-        let mut i = 0;
-        if p.is_empty() {
+    fn sgr(&mut self, params: &Params) {
+        if params.is_empty() {
             self.pen = Cell::default();
             return;
         }
-        while i < p.len() {
-            match p[i] {
-                0 => self.pen = Cell::default(),
-                1 => self.pen.flags |= BOLD,
-                2 => self.pen.flags |= DIM,
-                3 => self.pen.flags |= ITALIC,
-                4 => self.pen.flags |= UNDERLINE,
-                7 => self.pen.flags |= INVERSE,
-                8 => self.pen.flags |= HIDDEN,
-                9 => self.pen.flags |= STRIKEOUT,
-                22 => self.pen.flags &= !(BOLD | DIM),
-                23 => self.pen.flags &= !ITALIC,
-                24 => self.pen.flags &= !UNDERLINE,
-                27 => self.pen.flags &= !INVERSE,
-                28 => self.pen.flags &= !HIDDEN,
-                29 => self.pen.flags &= !STRIKEOUT,
-                30..=37 => self.pen.fg = Color::Indexed((p[i] - 30) as u8),
-                38 => i += self.sgr_color(p, i, true),
-                39 => self.pen.fg = Color::Default,
-                40..=47 => self.pen.bg = Color::Indexed((p[i] - 40) as u8),
-                48 => i += self.sgr_color(p, i, false),
-                49 => self.pen.bg = Color::Default,
-                90..=97 => self.pen.fg = Color::Indexed((p[i] - 90 + 8) as u8),
-                100..=107 => self.pen.bg = Color::Indexed((p[i] - 100 + 8) as u8),
-                _ => {}
+        let mut it = params.iter();
+        while let Some(g) = it.next() {
+            if g.len() >= 2 {
+                // Colon-grouped parameter: the whole attribute is in `g`.
+                match g[0] {
+                    38 => { if let Some(c) = decode_color(&g[1..]) { self.pen.fg = c; } }
+                    48 => { if let Some(c) = decode_color(&g[1..]) { self.pen.bg = c; } }
+                    // 4 (underline style) -> Task 2; 58 (underline colour) -> Task 3
+                    _ => {}
+                }
+            } else {
+                match g.first().copied().unwrap_or(0) {
+                    0 => self.pen = Cell::default(),
+                    1 => self.pen.flags |= BOLD,
+                    2 => self.pen.flags |= DIM,
+                    3 => self.pen.flags |= ITALIC,
+                    4 => self.pen.flags |= UNDERLINE,
+                    7 => self.pen.flags |= INVERSE,
+                    8 => self.pen.flags |= HIDDEN,
+                    9 => self.pen.flags |= STRIKEOUT,
+                    22 => self.pen.flags &= !(BOLD | DIM),
+                    23 => self.pen.flags &= !ITALIC,
+                    24 => self.pen.flags &= !UNDERLINE,
+                    27 => self.pen.flags &= !INVERSE,
+                    28 => self.pen.flags &= !HIDDEN,
+                    29 => self.pen.flags &= !STRIKEOUT,
+                    n @ 30..=37 => self.pen.fg = Color::Indexed((n - 30) as u8),
+                    38 => { if let Some(c) = decode_color_following(&mut it) { self.pen.fg = c; } }
+                    39 => self.pen.fg = Color::Default,
+                    n @ 40..=47 => self.pen.bg = Color::Indexed((n - 40) as u8),
+                    48 => { if let Some(c) = decode_color_following(&mut it) { self.pen.bg = c; } }
+                    49 => self.pen.bg = Color::Default,
+                    n @ 90..=97 => self.pen.fg = Color::Indexed((n - 90 + 8) as u8),
+                    n @ 100..=107 => self.pen.bg = Color::Indexed((n - 100 + 8) as u8),
+                    _ => {}
+                }
             }
-            i += 1;
-        }
-    }
-    /// Handle `38`/`48` extended colour (semicolon form). Returns how many EXTRA params
-    /// were consumed beyond the `38`/`48` itself.
-    fn sgr_color(&mut self, p: &[u16], i: usize, fg: bool) -> usize {
-        match p.get(i + 1) {
-            Some(2) => {
-                let r = p.get(i + 2).copied().unwrap_or(0) as u8;
-                let g = p.get(i + 3).copied().unwrap_or(0) as u8;
-                let b = p.get(i + 4).copied().unwrap_or(0) as u8;
-                let c = Color::Rgb(r, g, b);
-                if fg { self.pen.fg = c } else { self.pen.bg = c }
-                4
-            }
-            Some(5) => {
-                let idx = p.get(i + 2).copied().unwrap_or(0) as u8;
-                let c = Color::Indexed(idx);
-                if fg { self.pen.fg = c } else { self.pen.bg = c }
-                2
-            }
-            _ => 0,
         }
     }
 
@@ -1944,6 +1932,36 @@ fn count(p: &[u16], i: usize) -> usize {
     p.get(i).copied().unwrap_or(0).max(1) as usize
 }
 
+/// Decode an extended-colour subparam slice (colon form): the slice is everything AFTER
+/// the 38/48. `[2, r, g, b]` -> Rgb; `[2, cs, r, g, b]` (ISO colorspace-id, 5 elems) ->
+/// Rgb skipping the id; `[5, n]` -> Indexed. Returns None if unrecognised.
+fn decode_color(sub: &[u16]) -> Option<Color> {
+    match sub.first().copied()? {
+        2 => {
+            // 3 trailing values = r,g,b; 4 trailing = colorspace-id,r,g,b (skip id).
+            let rgb = if sub.len() >= 5 { &sub[2..5] } else { sub.get(1..4)? };
+            Some(Color::Rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8))
+        }
+        5 => Some(Color::Indexed(sub.get(1).copied().unwrap_or(0) as u8)),
+        _ => None,
+    }
+}
+
+/// Decode the semicolon form by consuming FOLLOWING single-value params from the iterator:
+/// after a bare `38`/`48`, the next param is `2` (then r,g,b) or `5` (then n).
+fn decode_color_following(it: &mut vt_parser::ParamsIter<'_>) -> Option<Color> {
+    match it.next().and_then(|g| g.first().copied())? {
+        2 => {
+            let r = it.next().and_then(|g| g.first().copied()).unwrap_or(0) as u8;
+            let g = it.next().and_then(|g| g.first().copied()).unwrap_or(0) as u8;
+            let b = it.next().and_then(|g| g.first().copied()).unwrap_or(0) as u8;
+            Some(Color::Rgb(r, g, b))
+        }
+        5 => Some(Color::Indexed(it.next().and_then(|g| g.first().copied()).unwrap_or(0) as u8)),
+        _ => None,
+    }
+}
+
 impl Perform for Term {
     fn print(&mut self, c: char) {
         self.put_char(c);
@@ -2117,7 +2135,7 @@ impl Perform for Term {
             'S' => self.scroll_up(count(&p, 0)),
             'T' => self.scroll_down(count(&p, 0)),
             'r' => self.set_scroll_region(&p),
-            'm' => self.sgr(&p),
+            'm' => self.sgr(params),
             'n' => self.device_status(p.first().copied().unwrap_or(0)),
             'c' if p.first().copied().unwrap_or(0) == 0 => self.device_attributes(false), // DA1
             'h' => self.set_ansi_mode(&p, true),
@@ -2631,5 +2649,43 @@ mod irm_tests {
         assert_eq!(t.cell(1, 0).c, '\u{4e16}');
         let (col, line) = t.cursor();
         assert_eq!((col, line), (2, 1));
+    }
+}
+
+#[cfg(test)]
+mod sgr_tests {
+    use super::*;
+
+    #[test]
+    fn sgr_colon_truecolor_fg_and_bg() {
+        let mut t = Term::new(20, 2);
+        t.feed(b"\x1b[38:2:10:20:30mX"); // colon truecolor fg
+        assert_eq!(t.cell(0, 0).fg, crate::Color::Rgb(10, 20, 30));
+        t.feed(b"\x1b[48:2:1:2:3mY"); // colon truecolor bg
+        assert_eq!(t.cell(0, 1).bg, crate::Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn sgr_colon_colorspace_id_is_skipped() {
+        let mut t = Term::new(20, 1);
+        // ISO form: 38:2:<colorspace-id>:r:g:b — the id (6-subparam variant) is ignored.
+        t.feed(b"\x1b[38:2:0:44:55:66mX");
+        assert_eq!(t.cell(0, 0).fg, crate::Color::Rgb(44, 55, 66));
+    }
+
+    #[test]
+    fn sgr_colon_indexed() {
+        let mut t = Term::new(20, 1);
+        t.feed(b"\x1b[38:5:200mX");
+        assert_eq!(t.cell(0, 0).fg, crate::Color::Indexed(200));
+    }
+
+    #[test]
+    fn sgr_semicolon_forms_unchanged() {
+        let mut t = Term::new(20, 2);
+        t.feed(b"\x1b[38;2;10;20;30mX");
+        assert_eq!(t.cell(0, 0).fg, crate::Color::Rgb(10, 20, 30));
+        t.feed(b"\x1b[38;5;200mY");
+        assert_eq!(t.cell(0, 1).fg, crate::Color::Indexed(200));
     }
 }
