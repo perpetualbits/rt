@@ -18,6 +18,17 @@ use crate::render::{Color, FontBlobs};
 /// The present/plumbing methods below fold in the swap/Route-1 logic that used to
 /// live inline in `redraw_full`/`redraw_scissored`.
 pub trait Backend {
+    // --- context ownership (multi-window) ---------------------------------
+    /// Make this backend's GL context current on ITS surface. With several
+    /// windows alive there are several GL contexts, and GL/EGL calls target
+    /// whatever context is current on the thread — without this, every window
+    /// would render into the most recently created window's context/surface.
+    /// `GlBackend` arms itself by calling this at the start of every
+    /// context-dependent entry point (`begin_frame*`, `resize`,
+    /// `resize_surface`, `reload_fonts`, `buffer_age`); the default is a no-op
+    /// for backends with no GL context (XRender issues X requests only).
+    fn make_current(&self) {}
+
     // --- geometry / fonts -------------------------------------------------
     fn cell_size(&self) -> (f32, f32);
     fn resize(&mut self, w: f32, h: f32);

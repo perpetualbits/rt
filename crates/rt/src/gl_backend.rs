@@ -53,6 +53,22 @@ impl GlBackend {
         &mut self.renderer
     }
 
+    /// Make OUR context current on OUR surface unless it already is. With one
+    /// window this is a cheap `is_current()` check and nothing else — identical
+    /// behaviour to before multi-window. With several windows it re-targets the
+    /// thread's GL state at this window before any GL/EGL work; every
+    /// context-dependent `Backend` entry point calls it first (see the trait
+    /// doc), and all other GL calls happen strictly between a `begin_frame*`
+    /// and the following `present` within one synchronous redraw, so nothing
+    /// can slip through on another window's context.
+    fn ensure_current(&self) {
+        if !self.context.is_current() {
+            if let Err(e) = self.context.make_current(&self.surface) {
+                log::error!("make_current failed: {e}"); // GL calls will mistarget; keep running
+            }
+        }
+    }
+
     /// Present a scissored frame via EGL `swap_buffers_with_damage`. Moved verbatim
     /// from the old `App::present_with_damage`. Returns `true` on a successful
     /// partial-damage swap; `false` if the surface is not EGL or the swap errored
@@ -86,20 +102,27 @@ impl GlBackend {
 }
 
 impl Backend for GlBackend {
+    fn make_current(&self) {
+        self.ensure_current()
+    }
     fn cell_size(&self) -> (f32, f32) {
         self.renderer.cell_size()
     }
     fn resize(&mut self, w: f32, h: f32) {
+        self.ensure_current(); // glViewport targets the current context
         self.renderer.resize(w, h)
     }
     fn reload_fonts(&mut self, blobs: &FontBlobs, font_px: f32) -> Result<(), String> {
+        self.ensure_current(); // atlas textures are rebuilt in THIS context
         self.renderer.reload_fonts(blobs, font_px)
     }
 
     fn begin_frame(&mut self, bg: Color) {
+        self.ensure_current(); // frame chokepoint: draw/end_frame/present follow synchronously
         self.renderer.begin_frame(bg)
     }
     fn begin_frame_scissored(&mut self, bg: Color, bbox: PxRect) {
+        self.ensure_current(); // frame chokepoint (partial path)
         self.renderer.begin_frame_scissored(bg, bbox)
     }
     fn clear_scissor(&mut self) {
@@ -147,6 +170,7 @@ impl Backend for GlBackend {
     }
 
     fn resize_surface(&mut self, w: NonZeroU32, h: NonZeroU32) {
+        self.ensure_current(); // resize OUR surface, not whichever context is current
         self.surface.resize(&self.context, w, h); // resize GL surface
     }
 
@@ -198,6 +222,10 @@ impl Backend for GlBackend {
     }
 
     fn buffer_age(&self) -> u32 {
+        // EGL_BUFFER_AGE can only be queried while the surface is current on
+        // the calling thread — and redraw() plans damage (calling this) BEFORE
+        // the begin_frame chokepoint runs.
+        self.ensure_current();
         self.surface.buffer_age()
     }
 

@@ -23,6 +23,8 @@ mod xrender_backend; // mechanism C: XRender backend
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 mod damage; // pure pixel-rect damage accumulator
+mod dragdrop; // pure drop-target resolver for cross-window pane/tab drag-and-drop
+mod carry_card; // pure RGBA held-pane card builder
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
@@ -302,7 +304,12 @@ const CLIP_PREVIEW_COLS: usize = 44;
 /// happens on the first `resumed`). Kept in an `Option` on the `App` so we can
 /// build it lazily and tear it down on suspend.
 struct Active {
-    window: Window,                       // the OS window
+    // FIELD ORDER IS LOAD-BEARING for Drop: `backend` (GL surface/context —
+    // glXDestroyWindow et al.) MUST be declared before `window`, which lives at
+    // the END of this struct so every window-referencing resource is torn down
+    // while the X/Wayland window still exists. With `window` first, closing a
+    // non-last window generated an async GLXBadWindow that poisoned winit's
+    // next checked X call (IME unfocus) and panicked the process.
     backend: Box<dyn backend::Backend>,   // rendering backend (GL renderer + present resources)
     session: AppSession,                  // layout + panes + focus + broadcast
     keymap: Keymap,                       // Terminator-style bindings
@@ -311,6 +318,14 @@ struct Active {
     mouse: (f32, f32),                    // last cursor position in physical pixels
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
+    // "Move Pane to <window>" targets, snapshotted when the menu opened: every
+    // OTHER window at that moment, sorted by `WindowId` for a stable 1-based
+    // enumeration. Built together in the same pass (`App::menu_move_targets`)
+    // so the labels and ids can never skew; `menu_windows[i]` is what
+    // `MenuPick::MoveToWindow(i)` (built from `menu_move_labels[i]`) resolves
+    // against. Both cleared whenever `menu` closes.
+    menu_windows: Vec<WindowId>,
+    menu_move_labels: Vec<String>,
     clip_overlay: Option<usize>,          // clipboard-history overlay open, carrying the selected row
     clip_affordance: Option<chrome::Recti>, // titlebar "⎘ N" hit-rect for the focused pane this frame, if drawn
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
@@ -392,6 +407,19 @@ struct Active {
     last_instr_tick: Instant,             // when the instrument animation last advanced
     last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
     autoscroll_accel: (isize, u32), // drag auto-scroll ramp: (last_dir, ticks held in the edge zone)
+    // Per-frame drag-and-drop cues. The App owns the drag itself (see
+    // `App::drag`); these are what it writes into the window under the pointer
+    // before asking for a frame, and what the overlay pass paints. All three are
+    // cleared when the drag commits or cancels.
+    drag_cue: Option<dragdrop::ResolvedDrop>, // where a release would land the payload (+ its highlight rect)
+    drag_ghost: Option<((f32, f32), String)>, // the chip that follows the pointer: (position, label)
+    drag_dim: Option<rt_core::PaneId>,        // the pane being dragged, drawn dimmed at its old place
+    // This window currently wears the carry cursor (the held-pane card, or
+    // Grabbing when the platform refused the image). While set, `update_cursor`
+    // stands down entirely: a carry outlives motion, so nothing may reset the
+    // shape until the carry ends. Cleared for every window by `cancel_carry`.
+    carry_cursor: bool,
+    window: Window, // the OS window — LAST so it outlives everything that references it on Drop
 }
 
 /// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
@@ -546,12 +574,78 @@ fn parse_f32(s: &str, flag: &str) -> f32 {
 }
 
 /// The winit application object. Holds only the font bytes until `resumed`
-/// builds the `Active` state.
+/// builds the first window; every open window's state lives in `windows`,
+/// keyed by its `WindowId` so events route to the window they belong to.
 struct App {
     font_db: std::sync::Arc<fontdb::Database>, // system fonts, for family lookup + the picker
     mono_families: Vec<String>,                // monospace family names for the preferences combo
     cli: Cli,                                  // command-line overrides (grid/font)
-    active: Option<Active>,                    // populated on first resume
+    windows: std::collections::HashMap<WindowId, Active>, // every open window's live state
+    // Pane/tab drag-and-drop. It lives on the App (not on an `Active`) because a
+    // drag that starts in one window can end in another: only the App sees them
+    // all. `armed_drag` is a press that MIGHT become a drag; `drag` is one that
+    // passed the movement threshold.
+    armed_drag: Option<ArmedDrag>,
+    drag: Option<DragState>,
+    // The carry (see [`CarryState`]): the modal pick-up state. Also App-level —
+    // a carry is aimed in ANY window, not just the one it started in — and
+    // mutually exclusive with a drag (`enter_carry` cancels one to start the
+    // other).
+    carry: Option<CarryState>,
+}
+
+/// A left-press on a pane titlebar or a tab label. It is not a drag yet — it
+/// becomes one only if the pointer moves past [`dragdrop::DRAG_THRESHOLD`]
+/// before the button comes up; otherwise the release treats it as a plain click.
+struct ArmedDrag {
+    window: WindowId,               // the window the press happened in
+    payload: dragdrop::DragPayload, // what would travel (a pane, or a whole tab page)
+    press: (f32, f32),              // press position (physical px) the threshold measures from
+}
+
+/// A drag in flight: what is travelling, where it came from, and what the
+/// pointer is currently over. `hover` is re-resolved on every motion and is what
+/// the release commits (`None` = over a gutter/dead zone: releasing cancels).
+struct DragState {
+    source: WindowId,                                   // window the payload was picked up in
+    payload: dragdrop::DragPayload,                     // pane or tab page
+    payload_panes: Vec<rt_core::PaneId>,                // every pane inside it (never drop onto itself)
+    label: String,                                      // ghost chip text (pane title / "Tab N")
+    hover: Option<(WindowId, dragdrop::ResolvedDrop)>,  // resolved target under the pointer
+    cursor: (f32, f32),                                 // pointer in the hovered window's coords
+    // The window the pointer is currently OVER (`None` = the desktop, i.e. a
+    // release there tears out). Distinct from `hover`, which is `None` whenever
+    // the pointer is over a dead zone — this field still names the window whose
+    // cue fields are set, so a motion into another window (or off all of them)
+    // knows which stale cues to wipe.
+    cued: Option<WindowId>,
+    // The held-pane cursor card, or None if the platform refused the image
+    // (BadImage) — then the plain `CursorIcon::Grabbing` set at promote time
+    // stands in for the whole drag. Read back by `commit_drag` when a
+    // Ctrl-held release turns the drag into a CARRY: the card the pointer is
+    // already wearing is handed straight to `enter_carry` rather than rebuilt.
+    card: Option<winit::window::CustomCursor>,
+}
+
+/// A CARRY in progress: the modal "pick up, aim, click to drop" state, the
+/// keyboard/menu twin of a drag (and what a Ctrl-held drag release becomes).
+///
+/// Unlike a drag it holds no mouse button, so it survives motion, window
+/// switches and focus changes; it ends only on a drop, on Escape, on a second
+/// mouse button, on an action that would remove the payload, or when the
+/// payload dies. `payload_panes` is every pane inside the payload (so a pane
+/// exiting under the carry can cancel it, exactly as for a drag).
+struct CarryState {
+    payload: dragdrop::DragPayload,      // pane or tab page being carried
+    payload_panes: Vec<rt_core::PaneId>, // every pane inside it
+    source: WindowId,                    // window it was picked up in (its home while carried)
+    // Ghost chip text (pane title / "Tab: title"), snapshotted at pick-up so it
+    // survives the title changing under the carry. Read by the hover block in
+    // `CursorMoved`, which puts it into the aimed window's `drag_ghost`.
+    label: String,
+    // The held-pane cursor card, or None if the platform refused the image —
+    // then plain `CursorIcon::Grabbing` stands in for the whole carry.
+    card: Option<winit::window::CustomCursor>,
 }
 
 /// Build the system font database (scans the usual font directories).
@@ -692,15 +786,17 @@ fn load_fonts() -> Option<render::FontBlobs> {
     Some(render::FontBlobs { regular, bold, italic, bold_italic })
 }
 
-impl ApplicationHandler for App {
-    /// Called when the app is (re)activated. On the first call we build the
-    /// window, GL context, renderer, and session. Subsequent calls (after a
-    /// suspend) are no-ops here because we keep the state alive.
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.active.is_some() {
-            return; // already initialised; nothing to do on re-resume
-        }
-
+impl App {
+    /// Build one complete window's state: settings, winit window, GL context and
+    /// surface, renderer/backend, clipboard, and a session with real PTY panes.
+    /// This is the whole body of the old single-window `resumed`, reusable for
+    /// every extra window (`WindowCmd::NewWindow`). Returns `None` on failure —
+    /// fatal (the event loop is stopped) only while no window exists yet, see
+    /// [`App::fail_build`]. CLI `--cols/--rows` pre-sizing applies only to the
+    /// FIRST window. The patch-bay dir is process-scoped (`rt-<pid>`) and
+    /// `ensure_jacks_dir` is idempotent, so every window shares the same dir
+    /// while keeping its own `SharedJacks` map + spawn closure.
+    fn build_active(&mut self, event_loop: &ActiveEventLoop) -> Option<Active> {
         // Load persisted settings (before the renderer, so fonts/colours come
         // from the config). Env vars override for demos/screenshots. Loaded here
         // — ahead of the window — so `--cols`/`--rows` can pre-size it from the
@@ -733,8 +829,10 @@ impl ApplicationHandler for App {
         // apples benchmarking against terminals launched with `--geometry=COLSxROWS`.
         // Without them, keep a sensible default. `cell_size_for` measures the
         // cell without a GL context (the renderer doesn't exist yet).
+        // Only the FIRST window: an extra window opened at runtime should get
+        // the default size, not re-apply a benchmark harness's exact grid.
         let initial_size: winit::dpi::Size = match (self.cli.cols, self.cli.rows) {
-            (Some(cols), Some(rows)) if cols > 0 && rows > 0 => {
+            (Some(cols), Some(rows)) if self.windows.is_empty() && cols > 0 && rows > 0 => {
                 let cell = render::cell_size_for(&font_blobs, settings.font_size);
                 window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
             }
@@ -788,13 +886,11 @@ impl ApplicationHandler for App {
             Ok((Some(window), config)) => (window, config), // got a window + config
             Ok((None, _)) => {
                 log::error!("window creation returned no window");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
             Err(e) => {
                 log::error!("failed to create window/GL config: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
 
@@ -808,8 +904,7 @@ impl ApplicationHandler for App {
             Ok(c) => c,
             Err(e) => {
                 log::error!("GL context creation failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         // Build the window surface at the window's current size.
@@ -818,16 +913,14 @@ impl ApplicationHandler for App {
             Ok(a) => a,
             Err(e) => {
                 log::error!("surface attributes failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         let surface = match unsafe { gl_display.create_window_surface(&gl_config, &attrs) } {
             Ok(s) => s,
             Err(e) => {
                 log::error!("GL surface creation failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         // Make the context current on the surface so GL calls target it.
@@ -835,8 +928,7 @@ impl ApplicationHandler for App {
             Ok(c) => c,
             Err(e) => {
                 log::error!("make_current failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
 
@@ -851,8 +943,7 @@ impl ApplicationHandler for App {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e}");
-                event_loop.exit();
-                return;
+                return self.fail_build(event_loop);
             }
         };
         // Ask KWin to blur behind us (true background blur on KDE). No-op
@@ -960,55 +1051,8 @@ impl ApplicationHandler for App {
         session.set_show_titlebar(settings.show_titlebar);
         session.relayout(bounds);
 
-        // Dev/demo startup layout (seed of the future saved-layouts feature):
-        //   RT_SPLIT=h|v    → perform one split at startup
-        //   RT_COLUMNS=N    → put the initial pane into N-column newspaper mode
-        if let Ok(v) = std::env::var("RT_SPLIT") {
-            let _ = match v.as_str() {
-                "h" => session.apply(rt_config::Action::SplitHoriz), // stacked split
-                "v" => session.apply(rt_config::Action::SplitVert),  // side-by-side split
-                _ => None,
-            };
-        }
-        if let Ok(v) = std::env::var("RT_COLUMNS") {
-            if let Ok(n) = v.parse::<u16>() {
-                // Each ColumnsMore adds one column; go from 1 up to N.
-                for _ in 1..n.max(1) {
-                    session.apply(rt_config::Action::ColumnsMore);
-                }
-            }
-        }
-        if let Ok(v) = std::env::var("RT_TABS") {
-            if let Ok(n) = v.parse::<u16>() {
-                // Open N tabs total (each NewTab adds one beside the current).
-                for _ in 1..n.max(1) {
-                    session.apply(rt_config::Action::NewTab);
-                }
-            }
-        }
-        if std::env::var("RT_ZOOM").is_ok() {
-            session.apply(rt_config::Action::ToggleZoom); // maximise the focused pane at startup
-        }
-        // Debug/verification hook: build three panes each in a different input
-        // group so the corner group markers can be screenshotted.
-        if std::env::var("RT_DEMO_GROUPS").is_ok() {
-            use rt_config::Action::*;
-            session.apply(GroupCycle); // pane0 → group 1
-            session.apply(SplitVert); // → pane1 focused
-            session.apply(GroupCycle);
-            session.apply(GroupCycle); // pane1 → group 2
-            session.apply(SplitHoriz); // → pane2 focused
-            session.apply(GroupCycle);
-            session.apply(GroupCycle);
-            session.apply(GroupCycle); // pane2 → group 3
-        }
-        if let Ok(v) = std::env::var("RT_BROADCAST") {
-            let _ = match v.as_str() {
-                "all" => session.apply(rt_config::Action::BroadcastAll),
-                "group" => session.apply(rt_config::Action::BroadcastGroup),
-                _ => None,
-            };
-        }
+        // (The RT_* demo/startup-layout hooks run in `resumed` — first window
+        // only, so an extra window opened at runtime never re-applies them.)
 
         // Store the fully-initialised state and paint once.
         let low_power = renderer.is_software(); // read before `renderer` is moved in
@@ -1047,7 +1091,7 @@ impl ApplicationHandler for App {
             xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window)))
         };
         let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
-        self.active = Some(Active {
+        Some(Active {
             window,
             backend,
             session,
@@ -1057,6 +1101,8 @@ impl ApplicationHandler for App {
             mouse: (0.0, 0.0),
             menu: None,
             menu_hover: None,
+            menu_windows: Vec::new(),
+            menu_move_labels: Vec::new(),
             clip_overlay: None,
             clip_affordance: None,
             ime_preedit: false,
@@ -1134,84 +1180,199 @@ impl ApplicationHandler for App {
             last_instr_tick: Instant::now(),
             last_autoscroll: Instant::now(),
             autoscroll_accel: (0, 0),
-        });
+            drag_cue: None,
+            drag_ghost: None,
+            drag_dim: None,
+            carry_cursor: false,
+        })
+    }
+
+    /// A window build failed. Fatal — stop the event loop — only while no
+    /// window exists yet (the first window IS the app); a failed EXTRA window
+    /// just doesn't open, and the existing windows keep running.
+    fn fail_build(&self, event_loop: &ActiveEventLoop) -> Option<Active> {
+        if self.windows.is_empty() {
+            event_loop.exit();
+        }
+        None
+    }
+}
+
+impl ApplicationHandler for App {
+    /// Called when the app is (re)activated. On the first call we build the
+    /// first window (window, GL context, renderer, session) and apply the RT_*
+    /// demo/startup hooks. Subsequent calls (after a suspend) are no-ops here
+    /// because we keep the state alive. Extra windows are opened at runtime via
+    /// `WindowCmd::NewWindow`, which reuses [`App::build_active`] without hooks.
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.windows.is_empty() {
+            return; // already initialised; nothing to do on re-resume
+        }
+        let Some(mut active) = self.build_active(event_loop) else { return };
+        // Dev/demo startup layout (seed of the future saved-layouts feature):
+        //   RT_SPLIT=h|v    → perform one split at startup
+        //   RT_COLUMNS=N    → put the initial pane into N-column newspaper mode
+        if let Ok(v) = std::env::var("RT_SPLIT") {
+            let _ = match v.as_str() {
+                "h" => active.session.apply(rt_config::Action::SplitHoriz), // stacked split
+                "v" => active.session.apply(rt_config::Action::SplitVert),  // side-by-side split
+                _ => None,
+            };
+        }
+        if let Ok(v) = std::env::var("RT_COLUMNS") {
+            if let Ok(n) = v.parse::<u16>() {
+                // Each ColumnsMore adds one column; go from 1 up to N.
+                for _ in 1..n.max(1) {
+                    active.session.apply(rt_config::Action::ColumnsMore);
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("RT_TABS") {
+            if let Ok(n) = v.parse::<u16>() {
+                // Open N tabs total (each NewTab adds one beside the current).
+                for _ in 1..n.max(1) {
+                    active.session.apply(rt_config::Action::NewTab);
+                }
+            }
+        }
+        if std::env::var("RT_ZOOM").is_ok() {
+            active.session.apply(rt_config::Action::ToggleZoom); // maximise the focused pane at startup
+        }
+        // Debug/verification hook: build three panes each in a different input
+        // group so the corner group markers can be screenshotted.
+        if std::env::var("RT_DEMO_GROUPS").is_ok() {
+            use rt_config::Action::*;
+            active.session.apply(GroupCycle); // pane0 → group 1
+            active.session.apply(SplitVert); // → pane1 focused
+            active.session.apply(GroupCycle);
+            active.session.apply(GroupCycle); // pane1 → group 2
+            active.session.apply(SplitHoriz); // → pane2 focused
+            active.session.apply(GroupCycle);
+            active.session.apply(GroupCycle);
+            active.session.apply(GroupCycle); // pane2 → group 3
+        }
+        if let Ok(v) = std::env::var("RT_BROADCAST") {
+            let _ = match v.as_str() {
+                "all" => active.session.apply(rt_config::Action::BroadcastAll),
+                "group" => active.session.apply(rt_config::Action::BroadcastGroup),
+                _ => None,
+            };
+        }
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so it can be screenshotted without synthetic input.
         if std::env::var("RT_PREFS").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                Self::open_prefs(active);
-            }
+            Self::open_prefs(&mut active);
         }
         // Debug/verification hook: RT_MANUAL opens the manual overlay at startup.
         if std::env::var("RT_MANUAL").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                active.manual_open = true;
-            }
+            active.manual_open = true;
         }
         // Debug/verification hook: RT_MENU opens the context menu at startup so
         // its rendering can be screenshotted without synthetic mouse input.
         if std::env::var("RT_MENU").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                active.menu = Some((200.0, 150.0)); // fixed, visible spot
-            }
+            active.menu = Some((200.0, 150.0)); // fixed, visible spot
         }
         // Debug/verification hook: RT_SEARCH opens the search bar at startup with
         // a pre-filled query so its rendering + highlighting can be screenshotted
         // without synthetic keyboard input.
         if let Ok(q) = std::env::var("RT_SEARCH") {
-            if let Some(active) = self.active.as_mut() {
-                active.search_open = true;
-                active.search_query = q; // e.g. RT_SEARCH=echo
-                Self::run_search(active, true); // populate matches + highlight
-            }
+            active.search_open = true;
+            active.search_query = q; // e.g. RT_SEARCH=echo
+            Self::run_search(&mut active, true); // populate matches + highlight
         }
         // Test-only hook (undocumented): RT_OPEN_MANUAL opens the manual overlay
         // at startup so the xtrace commands-only regression can drive a native
         // overlay without synthetic input. Fires once, at construction.
         if std::env::var_os("RT_OPEN_MANUAL").is_some() {
-            if let Some(active) = self.active.as_mut() {
-                active.manual_open = true;
-            }
+            active.manual_open = true;
         }
         // Debug/verification hook: RT_OPEN_PREFS opens the preferences dialog at
         // startup so the Xvfb gate can screenshot it without synthetic input
         // (mirrors RT_OPEN_MANUAL).
         if std::env::var_os("RT_OPEN_PREFS").is_some() {
-            if let Some(active) = self.active.as_mut() {
-                Self::open_prefs(active);
-            }
+            Self::open_prefs(&mut active);
         }
         // Debug/verification hook: RT_WIRE_DEMO builds a live patch-bay scene —
         // split, wire pane1.stdout → pane2.stdin, and run a producer + reader — so
         // the wiring can be verified/screenshotted without synthetic input.
         if std::env::var("RT_WIRE_DEMO").is_ok() {
-            if let Some(active) = self.active.as_mut() {
-                let p1 = active.session.focus();
-                active.session.apply(rt_config::Action::SplitVert); // → pane2
-                active.session.apply(rt_config::Action::SplitVert); // → pane3 (focused)
-                let p3 = active.session.focus();
-                // Wire the leftmost pane's stdout to the rightmost pane's stdin so
-                // the bezier arcs over the middle pane.
-                Self::connect_wire(active, p1, Stream::Stdout, p3);
-                if let Some(pane) = active.session.pane(p1) {
-                    pane.write(b"while true; do echo tick $(date +%T); sleep 0.4; done | tee $RT_OUT\n");
-                }
-                if let Some(pane) = active.session.pane(p3) {
-                    pane.write(b"cat $RT_IN\n");
-                }
+            let p1 = active.session.focus();
+            active.session.apply(rt_config::Action::SplitVert); // → pane2
+            active.session.apply(rt_config::Action::SplitVert); // → pane3 (focused)
+            let p3 = active.session.focus();
+            // Wire the leftmost pane's stdout to the rightmost pane's stdin so
+            // the bezier arcs over the middle pane.
+            Self::connect_wire(&mut active, p1, Stream::Stdout, p3);
+            if let Some(pane) = active.session.pane(p1) {
+                pane.write(b"while true; do echo tick $(date +%T); sleep 0.4; done | tee $RT_OUT\n");
+            }
+            if let Some(pane) = active.session.pane(p3) {
+                pane.write(b"cat $RT_IN\n");
             }
         }
         // Poll so we keep re-checking PTYs for async output even without input.
         event_loop.set_control_flow(ControlFlow::Poll);
-        if let Some(active) = &self.active {
-            active.window.request_redraw(); // first paint
-        }
+        active.window.request_redraw(); // first paint
+        self.windows.insert(active.window.id(), active);
     }
 
-    /// Handle a window event: close, resize, key input, redraw.
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Everything here needs the active state; ignore events before resume.
-        let Some(active) = self.active.as_mut() else { return };
+    /// Handle a window event: close, resize, key input, redraw. Routed to the
+    /// window it belongs to via `id`.
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Two ways a mouse BUTTON event abandons a live pane/tab drag:
+        //
+        //  - it arrived in a window that is NOT where the gesture began, which
+        //    can only happen if the pointer grab were re-targeted (X11's
+        //    implicit grab keeps the press window today). Never let it commit
+        //    into the wrong session.
+        //  - it is a RIGHT or MIDDLE press, wherever it landed: the context
+        //    menu swallows motion AND Escape while open, so a drag left running
+        //    under it could neither be finished nor cancelled.
+        //
+        // Either way the cues may be sitting on a window other than this one
+        // (cross-window hover puts the cue and ghost chip in the HOVERED
+        // window), and only `cancel_drag` reaches every window showing them —
+        // which needs `&mut self`, hence before `active` is borrowed. Leaving
+        // them behind would strand a zone highlight, a ghost chip and a wedged
+        // Grabbing cursor in that window for the rest of the session.
+        //
+        // `drag_abandoned` tells the button arms below that the press was
+        // consumed by abandoning THIS window's drag (or the app-wide carry), so
+        // they skip their own action (no menu, no paste) exactly as they did
+        // when they cancelled the drag inline. A press that abandoned a FOREIGN
+        // window's drag is not consumed: this window handles it as it always
+        // would.
+        let mut drag_abandoned = false;
+        if matches!(event, WindowEvent::MouseInput { .. }) {
+            let second_button = matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Right | MouseButton::Middle,
+                    ..
+                }
+            );
+            if second_button || matches!(self.armed_drag.as_ref(), Some(a) if a.window != id) {
+                self.armed_drag = None; // a stale or abandoned arm: no click action anywhere
+            }
+            let foreign = matches!(self.drag.as_ref(), Some(d) if d.source != id);
+            if self.drag.is_some() && (foreign || second_button) {
+                drag_abandoned = !foreign;
+                self.cancel_drag();
+            }
+            // A carry is aimed with the pointer in ANY window, so "foreign" has
+            // no meaning for it: a second button ANYWHERE puts the payload back
+            // down. The press is consumed exactly as it is for a drag — the
+            // right-click that cancels does not also open the menu (nor does a
+            // middle-click that cancels also paste): one press, one meaning.
+            if second_button && self.carry.is_some() {
+                drag_abandoned = true;
+                self.cancel_carry();
+            }
+        }
+        // Everything here needs this window's state; ignore events before
+        // resume and events for a window that has already closed.
+        let Some(active) = self.windows.get_mut(&id) else { return };
         if active.ld_on && matches!(&event, WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed) {
             active.ld_keys += 1; // RT_XDIAG: key presses actually delivered to rt this second
         }
@@ -1490,7 +1651,7 @@ impl ApplicationHandler for App {
             let url = Self::cell_at(active, pos.0, pos.1)
                 .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
             let has_sel = Self::selected_text(active).is_some();
-            let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
+            let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
             let size = active.window.inner_size();
             let (cw, ch) = active.backend.cell_size();
             let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
@@ -1508,6 +1669,8 @@ impl ApplicationHandler for App {
                     if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
                         active.menu = None;
                         active.menu_hover = None;
+                        active.menu_windows.clear();
+                        active.menu_move_labels.clear();
                         active.window.request_redraw();
                     }
                     return;
@@ -1527,17 +1690,47 @@ impl ApplicationHandler for App {
                                     if let Some(a) =
                                         rows.into_iter().nth(i).and_then(|r| r.action)
                                     {
-                                        match a.into_pick() {
+                                        let cmd = match a.into_pick() {
                                             menu::MenuPick::Do(act) => {
                                                 Self::apply_action(active, act)
                                             }
-                                            menu::MenuPick::OpenUrl(u) => Self::open_url(&u),
+                                            menu::MenuPick::OpenUrl(u) => {
+                                                Self::open_url(&u);
+                                                WindowCmd::None
+                                            }
                                             menu::MenuPick::CopyUrl(u) => {
                                                 if let Some(cb) = &active.clipboard {
                                                     cb.store(u);
                                                 }
+                                                WindowCmd::None
                                             }
-                                        }
+                                            // Index into the snapshot taken when the
+                                            // menu opened — stale-safe: an out-of-
+                                            // range index (shouldn't happen; rows and
+                                            // menu_windows are built from the same
+                                            // pass) is a logged no-op. A target that
+                                            // has since CLOSED still resolves here
+                                            // (its id just sits in the Vec); that case
+                                            // is caught by `move_pane_to_window`.
+                                            menu::MenuPick::MoveToWindow(i) => {
+                                                match active.menu_windows.get(i).copied() {
+                                                    Some(target) => WindowCmd::MoveToWindow(target),
+                                                    None => {
+                                                        log::debug!(
+                                                            "move-to-window: menu index {i} out of range ({} targets)",
+                                                            active.menu_windows.len()
+                                                        );
+                                                        WindowCmd::None
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        // The menu's snapshot is done with either way.
+                                        active.menu_windows.clear();
+                                        active.menu_move_labels.clear();
+                                        // The `active` borrow ends here; window-
+                                        // level commands re-borrow via &mut self.
+                                        self.run_window_cmd(event_loop, id, cmd);
                                     }
                                 }
                             }
@@ -1548,6 +1741,8 @@ impl ApplicationHandler for App {
                     // A press outside the panel dismisses the menu.
                     active.menu = None;
                     active.menu_hover = None;
+                    active.menu_windows.clear();
+                    active.menu_move_labels.clear();
                     active.window.request_redraw();
                     return;
                 }
@@ -1674,14 +1869,14 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            // The user closed the window (title-bar button / compositor). Exit
-            // the same way the last-pane-closed path does — `process::exit`,
-            // NOT `event_loop.exit()`. The latter unwinds and Drops the GL
-            // context and Wayland blur objects, whose teardown ordering faults (a
-            // segfault on Wayland, an X11 GetGeometry panic on the x11 dev build).
-            // The OS reclaims everything; the PTY children get SIGHUP. This matches
-            // SessionEvent::CloseWindow below.
-            WindowEvent::CloseRequested => exit_clean(),
+            // The user closed the window (title-bar button / compositor). Close
+            // ONLY this window; `close_window` exits the process (via
+            // `exit_clean`, never `event_loop.exit()` — see its doc for the
+            // teardown-fault avoidance) when this was the last one.
+            WindowEvent::CloseRequested => {
+                self.close_window(id);
+                return;
+            }
 
             // Track modifier state so key events can build correct chords.
             WindowEvent::ModifiersChanged(new_mods) => {
@@ -1746,7 +1941,7 @@ impl ApplicationHandler for App {
                 if key_event.state != ElementState::Pressed {
                     return;
                 }
-                self.on_key_press(key_event);
+                self.on_key_press(event_loop, id, key_event);
             }
 
             // Mouse wheel scrolls the focused pane's newspaper-column view
@@ -1791,6 +1986,125 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
+                // --- pane/tab drag-and-drop owns the pointer while it lasts ---
+                // An armed press becomes a drag once the pointer has moved far
+                // enough that it clearly isn't a click. (`self.armed_drag` /
+                // `self.drag` are fields disjoint from `self.windows`, so they are
+                // reachable while `active` is borrowed out of the map.)
+                if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
+                    let armed = self.armed_drag.as_ref().expect("just matched");
+                    let (dx, dy) = (active.mouse.0 - armed.press.0, active.mouse.1 - armed.press.1);
+                    if (dx * dx + dy * dy).sqrt() > dragdrop::DRAG_THRESHOLD {
+                        let armed = self.armed_drag.take().expect("just matched");
+                        // Zones are computed from the REAL layout, so a zoomed
+                        // pane must be restored before anything can be resolved.
+                        if active.session.is_zoomed() {
+                            active.session.toggle_zoom();
+                        }
+                        let (payload_panes, label) = match armed.payload {
+                            dragdrop::DragPayload::Pane(p) => (
+                                vec![p],
+                                active.session.title_of(p).unwrap_or("Pane").to_string(),
+                            ),
+                            dragdrop::DragPayload::Tab { first_pane } => {
+                                let panes = active.session.tab_panes(first_pane).unwrap_or_else(|| vec![first_pane]);
+                                let label = active
+                                    .session
+                                    .tab_bars(content_bounds(active.window.inner_size()))
+                                    .into_iter()
+                                    .flat_map(|bar| bar.tabs)
+                                    .find(|t| t.first_pane == first_pane)
+                                    .map(|t| format!("Tab {}", t.number))
+                                    .unwrap_or_else(|| "Tab".to_string());
+                                (panes, label)
+                            }
+                        };
+                        let card = Self::make_payload_card(event_loop, active, armed.payload);
+                        match &card {
+                            Some(c) => active.window.set_cursor(winit::window::Cursor::Custom(c.clone())),
+                            None => active.window.set_cursor(CursorIcon::Grabbing),
+                        }
+                        active.cursor_icon = Some(CursorIcon::Grabbing); // proxy: update_cursor's change
+                        // detection only needs to see "not default" so it restores properly later.
+                        self.drag = Some(DragState {
+                            source: id,
+                            payload: armed.payload,
+                            payload_panes,
+                            label,
+                            hover: None,
+                            cursor: active.mouse,
+                            cued: None,
+                            card,
+                        });
+                    }
+                }
+                // A live drag: re-resolve what the pointer is over — in THIS
+                // window or, on X11, in whatever other rt window the global
+                // point lands in — and refresh the cue fields there. `active`
+                // is dead past this point (the branch returns), so the whole
+                // job can take `&mut self` and reach the other windows.
+                if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+                    self.drag_motion(id);
+                    return; // the drag owns the pointer: no hover/select/wire work
+                }
+                // --- a carry owns plain motion in EVERY rt window ---
+                // A drag has one window's pointer grab, so one function
+                // (`drag_motion`) has to work out where the pointer went. A
+                // carry holds no button: motion is delivered to whichever
+                // window the pointer is actually in, and THAT window resolves
+                // the drop in its own session from its own local coords. No
+                // global-coordinate maths, and it works on Wayland too. All
+                // reads — nothing relayouts until the click commits (Step 2).
+                if let Some(carry) = self.carry.as_ref() {
+                    // A window with a modal overlay up is not aimable: the
+                    // overlay owns the pointer there. (Most overlays already
+                    // returned above; the search bar is the one that lets
+                    // motion through.) Clear its cue and ghost — but not the
+                    // source's dim, the payload still sits there — and fall
+                    // through to the normal motion handling below.
+                    let overlay_up = active.prefs_open
+                        || active.manual_open
+                        || active.search_open
+                        || active.clip_overlay.is_some()
+                        || active.menu.is_some()
+                        || active.picker.is_some();
+                    // What THIS window should be dimming: the carried pane,
+                    // and only in the window it was picked up in (a tab page
+                    // dims nothing — its panes aren't visible while another
+                    // tab is shown).
+                    let dim = (carry.source == id)
+                        .then(|| match carry.payload {
+                            dragdrop::DragPayload::Pane(p) => Some(p),
+                            dragdrop::DragPayload::Tab { .. } => None,
+                        })
+                        .flatten();
+                    if overlay_up {
+                        Self::clear_carry_cue(active, dim);
+                    } else {
+                        let bounds = content_bounds(active.window.inner_size());
+                        let (panes, bars) =
+                            (active.session.visible_rects(bounds), active.session.tab_bars(bounds));
+                        // `payload_panes` only ever matches in the SOURCE
+                        // window (pane ids are process-global); passing it
+                        // elsewhere is harmless.
+                        let resolved = dragdrop::resolve_drop(
+                            carry.payload,
+                            &carry.payload_panes,
+                            &panes,
+                            &bars,
+                            bounds,
+                            active.mouse,
+                        );
+                        active.drag_cue = resolved;
+                        active.drag_ghost = Some((active.mouse, carry.label.clone()));
+                        active.drag_dim = dim;
+                        // The cues are chrome the damage tracker knows nothing
+                        // about, and the ghost chip moves with every sample.
+                        active.force_full = true;
+                        active.window.request_redraw();
+                        return; // a carry owns plain motion in rt windows
+                    }
+                }
                 // A divider should say it can be dragged. Only while nothing else
                 // owns the pointer, and only re-issued when the shape actually
                 // changes — set_cursor is an X round trip, and motion events
@@ -1875,10 +2189,33 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // The pointer left this window. Only a carry cares: this window is
+            // no longer being aimed at, so its cue and ghost chip go (the card
+            // cursor keeps "holding" the payload across the gap, and the source
+            // keeps dimming the payload at home). A no-op with nothing carried,
+            // which is exactly what the event did before this arm existed.
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(carry) = self.carry.as_ref() {
+                    let dim = (carry.source == id)
+                        .then(|| match carry.payload {
+                            dragdrop::DragPayload::Pane(p) => Some(p),
+                            dragdrop::DragPayload::Tab { .. } => None,
+                        })
+                        .flatten();
+                    Self::clear_carry_cue(active, dim);
+                }
+            }
+
             // Mouse buttons: right opens the menu; left drives menu/tab/focus and
             // starts/ends a text selection; middle pastes the PRIMARY selection.
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
                 (ElementState::Pressed, MouseButton::Right) => {
+                    // This press abandoned a pane/tab drag of ours (done at the
+                    // top of `window_event`, where every window showing cues is
+                    // reachable): it is consumed — no menu on it.
+                    if drag_abandoned {
+                        return;
+                    }
                     // Right-click cancels a pending wire, or disconnects the output
                     // jack under the cursor (before falling through to the menu).
                     if active.wiring_from.take().is_some() {
@@ -1908,11 +2245,24 @@ impl ApplicationHandler for App {
                     // actions apply to the pane you right-clicked. The native menu
                     // is anchored here and clamped on-screen by `chrome::menu`.
                     active.session.focus_at(active.mouse.0, active.mouse.1);
-                    active.menu = Some(active.mouse);
-                    active.menu_hover = None; // no row highlighted until the pointer moves
-                    active.window.request_redraw();
+                    let pos = active.mouse;
+                    // `active`'s borrow ends here: opening the menu needs a read
+                    // of every OTHER window (their focused-pane titles), which
+                    // `open_menu` takes as `&mut self`.
+                    self.open_menu(id, pos);
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
+                    // A carry DROPS on this press. First of everything — before
+                    // compose, before the clip affordance / jack / divider /
+                    // scrollbar / titlebar / tab hit-tests — so a drop can never
+                    // also end a compose, start a selection, focus a pane, arm a
+                    // drag or open the clipboard overlay. `active` is dead on
+                    // this path (it returns), so the drop can take `&mut self`
+                    // and reach both windows.
+                    if self.carry.is_some() {
+                        self.carry_drop(id);
+                        return;
+                    }
                     // While composing an anchored selection, a click finishes or
                     // aborts it — it never starts a new selection. EXCEPT: a
                     // Shift+double/triple-click is two press/release pairs, and the
@@ -1977,6 +2327,10 @@ impl ApplicationHandler for App {
                         let size = active.window.inner_size();
                         let bounds = content_bounds(size);
                         let (mx, my) = active.mouse;
+                        // A second press must never arm a second gesture on top of
+                        // a live one: the first would be orphaned (its cues stuck
+                        // on, its release stolen by the newcomer).
+                        let can_arm = self.drag.is_none() && self.armed_drag.is_none();
                         // A press on the clipboard-history titlebar affordance opens
                         // the overlay. Checked first (like the jack/divider/scrollbar
                         // hit-tests below) so it wins over click-to-focus/selection —
@@ -2024,8 +2378,36 @@ impl ApplicationHandler for App {
                             active.window.request_redraw();
                             return;
                         }
-                        // A tab label click switches tabs; else focus the pane and
-                        // begin a text selection at the clicked cell.
+                        // A press on a pane's titlebar strip ARMS a pane drag: it
+                        // may still turn out to be a plain click (the movement
+                        // threshold decides at the next motion, see CursorMoved).
+                        // The band is the top `titlebar_h` of the pane's rect; the
+                        // clipboard affordance that also lives there already
+                        // returned above, so it can't be stolen here.
+                        let tb_h = active.session.titlebar_h();
+                        if tb_h > 0.0 && can_arm {
+                            let hit = active
+                                .session
+                                .visible_rects(bounds)
+                                .into_iter()
+                                .find(|(_, r)| r.contains(mx, my) && my < r.y + tb_h);
+                            if let Some((pid, _)) = hit {
+                                active.session.focus_at(mx, my); // a titlebar click still focuses
+                                active.window.request_redraw();
+                                // Disjoint field of `self` from `self.windows`, so
+                                // this is fine while `active` is borrowed.
+                                self.armed_drag = Some(ArmedDrag {
+                                    window: id,
+                                    payload: dragdrop::DragPayload::Pane(pid),
+                                    press: (mx, my),
+                                });
+                                return;
+                            }
+                        }
+                        // A tab label press ARMS a tab drag; the tab SWITCH happens
+                        // on the release (below the threshold), so a plain click
+                        // behaves exactly as it always did while a drag off the
+                        // label can still pick the whole page up.
                         let clicked_tab = active
                             .session
                             .tab_bars(bounds)
@@ -2034,15 +2416,15 @@ impl ApplicationHandler for App {
                             .find(|t| t.rect.contains(mx, my))
                             .map(|t| t.first_pane);
                         if let Some(first_pane) = clicked_tab {
-                            active.session.focus_tab(first_pane);
-                            // The visible pane set changes but the newly-shown
-                            // panes have no engine damage (their content didn't
-                            // change), so force a full redraw — otherwise the
-                            // XRender back buffer keeps the previous tab's pixels
-                            // (stale content, and re-switching to an already-drawn
-                            // tab shows nothing new). Matches the keyboard path.
-                            active.force_full = true;
-                            active.window.request_redraw();
+                            if can_arm {
+                                self.armed_drag = Some(ArmedDrag {
+                                    window: id,
+                                    payload: dragdrop::DragPayload::Tab { first_pane },
+                                    press: (mx, my),
+                                });
+                            }
+                            // (`!can_arm`: a gesture is already live — swallow the
+                            // press rather than switching tabs under it.)
                         } else {
                             active.session.focus_at(mx, my); // click-to-focus
                             // Ctrl+click on a URL opens it in the default handler
@@ -2146,6 +2528,36 @@ impl ApplicationHandler for App {
                     }
                 }
                 (ElementState::Released, MouseButton::Left) => {
+                    // A press that never passed the movement threshold was a plain
+                    // click after all. For a tab label that means "switch tabs" —
+                    // the switch the press used to do, moved here so the label can
+                    // also be dragged. For a titlebar it means nothing extra (the
+                    // press already focused the pane).
+                    // Only ever act on a gesture that belongs to THIS window (a
+                    // foreign one was already abandoned at the top of
+                    // `window_event`; the guard keeps that invariant local).
+                    if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
+                        let armed = self.armed_drag.take().expect("just matched");
+                        if let dragdrop::DragPayload::Tab { first_pane } = armed.payload {
+                            active.session.focus_tab(first_pane);
+                            // The visible pane set changes but the newly-shown panes
+                            // have no engine damage (their content didn't change), so
+                            // force a full redraw — otherwise the XRender back buffer
+                            // keeps the previous tab's pixels. Matches the keyboard path.
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        return;
+                    }
+                    // A real drag: commit it where the pointer is — in this
+                    // window, in another one, or (released on the desktop) into
+                    // a brand-new one. A release over nothing cancels. Like the
+                    // motion path this needs every window, so `active` ends
+                    // here (the branch returns).
+                    if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+                        self.commit_drag(event_loop, id);
+                        return;
+                    }
                     // If the matching press was forwarded to an app, forward the
                     // release too and we're done.
                     if Self::end_mouse_report(active) {
@@ -2196,6 +2608,72 @@ impl ApplicationHandler for App {
                     active.shift_press = false; // consumed
                 }
                 (ElementState::Pressed, MouseButton::Middle) => {
+                    // As for the right button: a middle-click that abandoned a
+                    // drag is consumed by it — it does not also paste into the
+                    // pane that was moving.
+                    if drag_abandoned {
+                        return;
+                    }
+                    // A middle-click on a pane's titlebar band or a tab label
+                    // picks that pane/tab up into carry mode — the one-handed
+                    // twin of Ctrl+Shift+M/N and the "Pick Up Pane"/"Pick Up
+                    // Tab" menu rows. Only when nothing is already live: a
+                    // second middle-click while carrying is the PUT-BACK
+                    // cancel, handled above (top of `window_event`) via
+                    // `drag_abandoned`/`cancel_carry` before `active` is even
+                    // borrowed, so it never reaches here. Note this wins over
+                    // the clip-history ⎘ affordance that also lives on the
+                    // titlebar — that's a left-click-only target, so a middle
+                    // press there is fair game for pick-up.
+                    //
+                    // Stage the hit-test results into locals so the borrow of
+                    // `active` (part of `self.windows`) ends before calling
+                    // `self.enter_carry`, which needs `&mut self` — the same
+                    // staging the left-press titlebar/tab arms rely on.
+                    if self.carry.is_none() && self.drag.is_none() && self.armed_drag.is_none() {
+                        let bounds = content_bounds(active.window.inner_size());
+                        let (mx, my) = active.mouse;
+                        let tb_h = active.session.titlebar_h();
+                        let pane_hit = if tb_h > 0.0 {
+                            active
+                                .session
+                                .visible_rects(bounds)
+                                .into_iter()
+                                .find(|(_, r)| r.contains(mx, my) && my < r.y + tb_h)
+                                .map(|(pid, _)| pid)
+                        } else {
+                            None
+                        };
+                        if let Some(pid) = pane_hit {
+                            active.session.focus_at(mx, my); // a titlebar click still focuses (parity with the left-press arm)
+                            self.enter_carry(event_loop, id, dragdrop::DragPayload::Pane(pid), None);
+                            return;
+                        }
+                        // Tab label: NOT focus_tab(first_pane) here — that would switch
+                        // the visible tab (and so the layout under the pickup) rather
+                        // than just focusing, unlike a titlebar click. The left-press
+                        // tab arm defers its switch to the release; for middle-click
+                        // pick-up there is no release-time action to defer to, and
+                        // enter_carry itself does not focus, so this intentionally
+                        // leaves focus/visible-tab untouched — the carried tab's
+                        // identity, not the on-screen layout, is what pick-up needs.
+                        let tab_hit = active
+                            .session
+                            .tab_bars(bounds)
+                            .into_iter()
+                            .flat_map(|bar| bar.tabs)
+                            .find(|t| t.rect.contains(mx, my))
+                            .map(|t| t.first_pane);
+                        if let Some(first_pane) = tab_hit {
+                            self.enter_carry(
+                                event_loop,
+                                id,
+                                dragdrop::DragPayload::Tab { first_pane },
+                                None,
+                            );
+                            return;
+                        }
+                    }
                     // A mouse-reporting app gets the middle-press; otherwise (or
                     // with Shift held) middle-click pastes the PRIMARY selection.
                     if !active.mods.shift_key()
@@ -2223,18 +2701,74 @@ impl ApplicationHandler for App {
 
             // Time to paint.
             WindowEvent::RedrawRequested => {
-                self.redraw();
+                self.redraw(id);
             }
 
             _ => {} // ignore the many other window events for now
         }
     }
 
-    /// Called whenever the loop is about to block. We use it to poll each pane
-    /// for asynchronous PTY output and request a redraw when anything changed,
-    /// so terminal output appears without the user touching the keyboard.
+    /// Called whenever the loop is about to block. We use it to poll every
+    /// window's panes for asynchronous PTY output and request redraws when
+    /// anything changed, so terminal output appears without the user touching
+    /// the keyboard. Windows whose last pane exited are closed AFTER the
+    /// iteration (`close_window` mutates the map — and exits the process when
+    /// it was the last window); the next wake is the fastest any window wants.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(active) = self.active.as_mut() else { return };
+        let mut to_close: Vec<WindowId> = Vec::new();
+        let mut min_interval: Option<Duration> = None;
+        // A pane inside the payload of a live drag can exit under the gesture
+        // (its shell finished); the drag must then be abandoned rather than
+        // committed against a dead id. Snapshot the ids here — the loop below
+        // borrows `self.windows` and can't reach `self.drag` through a method.
+        // A CARRIED payload can die the same way, with the same consequence, so
+        // both sets of ids are watched in the one pass. `tick_active` only
+        // answers "did one of THESE die", so the cancels below are unconditional
+        // on both — each is a cheap no-op when that state isn't live. The one
+        // imprecise case is a drag and a carry live at once, where a death in
+        // either payload ends both; that errs towards the safe side (nothing is
+        // ever left pointing at a dead pane) and needs no id-by-id bookkeeping.
+        let drag_panes: Vec<rt_core::PaneId> = self
+            .drag
+            .iter()
+            .flat_map(|d| d.payload_panes.iter().copied())
+            .chain(self.carry.iter().flat_map(|c| c.payload_panes.iter().copied()))
+            .collect();
+        let mut drag_payload_died = false;
+        for (&wid, active) in self.windows.iter_mut() {
+            let (close, interval, died) = Self::tick_active(active, &drag_panes);
+            drag_payload_died |= died;
+            if close {
+                to_close.push(wid);
+            }
+            min_interval = Some(match min_interval {
+                None => interval,
+                Some(m) => m.min(interval),
+            });
+        }
+        if drag_payload_died {
+            self.cancel_drag(); // what was being dragged no longer exists
+            self.cancel_carry(); // …or carried
+        }
+        for wid in to_close {
+            self.close_window(wid);
+        }
+        if let Some(interval) = min_interval {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
+        }
+    }
+}
+
+impl App {
+    /// One `about_to_wait` tick for a single window: drain its panes' events,
+    /// settle deferred resizes and prefs edits, advance the animated chrome,
+    /// and schedule a redraw when anything changed. Returns
+    /// `(close, interval, drag_payload_died)`: `close` when the window's last
+    /// pane exited (the caller then closes the whole window), the wake interval
+    /// this window wants, and whether a pane listed in `drag_panes` (the live
+    /// drag's payload, empty when nothing is being dragged) exited this tick —
+    /// which tells the caller to abandon that drag.
+    fn tick_active(active: &mut Active, drag_panes: &[rt_core::PaneId]) -> (bool, Duration, bool) {
         // Latency instrument: the loop is scheduled to wake ~every 16ms; a wake
         // that arrives much later means a CPU hogger stole the frame. Measure the
         // overrun, flare the frame proportionally, and breathe the undulation.
@@ -2355,12 +2889,19 @@ impl ApplicationHandler for App {
                 active.session.set_title(id, badged);
             }
         }
-        // Close every pane whose child exited. If that empties the window, quit.
+        // Close every pane whose child exited. If that empties the window, tell
+        // the caller to close the whole window — never exit the process here:
+        // other windows may still be open (close_window exits on the last one).
+        let mut window_emptied = false;
+        let mut drag_payload_died = false;
         for id in exited {
+            // Dragging a pane whose shell just exited: the caller cancels the
+            // gesture (committing it would move a corpse).
+            drag_payload_died |= drag_panes.contains(&id);
             match active.session.close_pane(id) {
                 Some(SessionEvent::CloseWindow) => {
-                    self.active = None; // drop everything (PTYs shut down on Drop)
-                    exit_clean(); // remove our patch-bay dir, then exit
+                    window_emptied = true;
+                    break; // the window goes; per-pane cleanup no longer matters
                 }
                 _ => dirty = true, // a pane closed; repaint the survivors
             }
@@ -2373,6 +2914,9 @@ impl ApplicationHandler for App {
             if matches!(active.wiring_from, Some((s, _)) if s == id) {
                 active.wiring_from = None;
             }
+        }
+        if window_emptied {
+            return (true, ACTIVE_POLL, drag_payload_died); // caller closes this window promptly
         }
         // A resize drag owes us exactly one reflow. Pay it once the size has held
         // still for RESIZE_SETTLE — never per configure event (see the Resized
@@ -2537,7 +3081,7 @@ impl ApplicationHandler for App {
             IDLE_POLL
         };
         active.poll_ms = interval.as_millis() as u64;
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
+        (false, interval, drag_payload_died)
     }
 }
 
@@ -2571,14 +3115,1017 @@ enum FramePlan {
 /// How many past frames' damage we retain to satisfy an EGL buffer age > 1.
 const HISTORY_DEPTH: u32 = 2;
 
+/// What an action needs the App (window-owner) level to do afterwards.
+/// Active-level code can't create or close OS windows — it has no event loop.
+#[derive(Clone, Copy, PartialEq)]
+enum WindowCmd {
+    None,
+    CloseWindow,          // this window should close (last pane gone / close_window action)
+    NewWindow,            // open an empty extra window
+    DetachPane,           // tear the focused pane out to a new window
+    DetachTab,            // tear the current tab out to a new window
+    PickUpPane,           // pick the focused pane up into carry mode
+    PickUpTab,            // pick the current tab up into carry mode
+    MoveToWindow(WindowId), // "Move Pane to <window>" menu pick: send the focus pane there
+}
+
+/// Does this action open a MODAL overlay — one whose input shim (near the top of
+/// `window_event`) swallows every later event until it is dismissed?
+///
+/// These four are the complete set reachable from a key binding: they are the
+/// only `apply_action` arms that set `prefs_open` / `manual_open` /
+/// `search_open` / `clip_overlay`. The context menu (`active.menu`) opens only
+/// from a right-press, which abandons a drag itself; the colour picker opens
+/// only from inside the preferences dialog; the `RT_*` demo hooks open overlays
+/// at startup, before any gesture can exist.
+///
+/// A live pane/tab drag must be cancelled before any of them runs, or the
+/// overlay would eat the mouse release that finishes the drag (see
+/// [`App::on_key_press`]). Actions that DON'T open an overlay (splits, focus
+/// moves, broadcast, zoom, …) keep dispatching mid-drag as before.
+fn opens_modal_overlay(action: rt_config::Action) -> bool {
+    use rt_config::Action;
+    matches!(action, Action::Preferences | Action::Manual | Action::Search | Action::ClipHistory)
+}
+
+/// Can this action remove a pane out from under a live drag — the dragged pane
+/// itself (`CloseTerm`, `DetachPane`, `DetachTab`) or the whole source window
+/// it lives in (`CloseWindow`)? A drag holds onto pane ids and window cues
+/// across its whole gesture; if one of those ids or windows vanishes mid-drag
+/// the cues are left pointing at nothing until Escape cleans them up. Cancel
+/// the drag first (same as opening a modal overlay, see [`App::on_key_press`]),
+/// then let the action run normally. Splits, zoom, focus moves, broadcast, …
+/// stay ungated — they cannot remove a pane from the session.
+fn removes_pane_mid_drag(action: rt_config::Action) -> bool {
+    use rt_config::Action;
+    matches!(action, Action::CloseTerm | Action::DetachPane | Action::DetachTab | Action::CloseWindow)
+}
+
 impl App {
+    /// Abandon any pane/tab drag: forget the App-level state and wipe the cue
+    /// fields off the window that was showing them. Used by Escape, by a second
+    /// mouse button pressed mid-drag, by a payload pane dying mid-drag, and by
+    /// the source window closing under the gesture — every one of which must
+    /// leave a clean window behind, never a stuck ghost.
+    /// Safe to call with nothing armed or dragging.
+    fn cancel_drag(&mut self) {
+        self.armed_drag = None;
+        let Some(drag) = self.drag.take() else { return };
+        log::debug!("drag cancelled: payload={:?}", drag.payload);
+        // Both ends: the source carries the dimmed pane and (usually) the cues,
+        // but with cross-window hover the cue/ghost may be sitting in ANOTHER
+        // window — Escape must leave that one clean too. Either may already be
+        // gone (a window closing under the gesture is one reason we cancel).
+        self.clear_cues_on(drag.source);
+        if let Some(w) = drag.cued.filter(|w| *w != drag.source) {
+            self.clear_cues_on(w);
+        }
+    }
+
+    /// Enter carry: the modal pick-up state (see [`CarryState`]). Cancels any
+    /// live drag or previous carry first — the three are mutually exclusive.
+    /// Returns false, having changed nothing, for a stale payload (a pane id or
+    /// tab that is no longer in the source window's session), so a caller can
+    /// tell "picked up" from "there was nothing to pick up".
+    ///
+    /// `reuse_card` is the already-built held-pane cursor when the caller has
+    /// one — a Ctrl-held drag release hands over the card the pointer is
+    /// already wearing instead of paying to rebuild an identical image.
+    /// `None` means "build one for this payload".
+    fn enter_carry(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        reuse_card: Option<winit::window::CustomCursor>,
+    ) -> bool {
+        self.cancel_drag();
+        self.cancel_carry();
+        let Some(active) = self.windows.get_mut(&source) else { return false };
+        let payload_panes = match payload {
+            dragdrop::DragPayload::Pane(p) => vec![p],
+            dragdrop::DragPayload::Tab { first_pane } => match active.session.tab_panes(first_pane) {
+                Some(v) if !v.is_empty() => v,
+                _ => return false, // no such tab any more
+            },
+        };
+        if matches!(payload, dragdrop::DragPayload::Pane(p) if active.session.pane(p).is_none()) {
+            return false; // stale pane id
+        }
+        // Drop zones are resolved from the REAL layout, so a zoomed pane must be
+        // restored before the carry starts aiming — the same reason the drag
+        // path unzooms when a press becomes a drag. Done ONCE here, at pick-up:
+        // the per-motion hover block only ever reads.
+        if active.session.is_zoomed() {
+            active.session.toggle_zoom();
+        }
+        let label = match payload {
+            dragdrop::DragPayload::Pane(p) => active.session.title_of(p).unwrap_or("Pane").to_string(),
+            dragdrop::DragPayload::Tab { first_pane } => active
+                .session
+                .title_of(first_pane)
+                .map(|t| format!("Tab: {t}"))
+                .unwrap_or_else(|| "Tab".to_string()),
+        };
+        let card = match reuse_card {
+            Some(c) => Some(c), // the drag's card: the pointer already wears it
+            None => Self::make_payload_card(event_loop, active, payload),
+        };
+        // The payload dims at home for the whole carry.
+        active.drag_dim = match payload {
+            dragdrop::DragPayload::Pane(p) => Some(p),
+            dragdrop::DragPayload::Tab { .. } => None,
+        };
+        active.force_full = true;
+        active.window.request_redraw();
+        log::debug!("carry picked up: payload={payload:?} source={source:?}");
+        self.carry = Some(CarryState { payload, payload_panes, source, label, card });
+        // Every window shows the card (or Grabbing) while the carry lasts.
+        self.apply_carry_cursor_all();
+        true
+    }
+
+    /// Show the carry cursor on every open window (also called for a window
+    /// created mid-carry, from `build_active`'s callers). A no-op when no carry
+    /// is live: the shape then stays whatever `update_cursor` last chose.
+    fn apply_carry_cursor_all(&mut self) {
+        let Some(card) = self.carry.as_ref().map(|c| c.card.clone()) else { return };
+        for a in self.windows.values_mut() {
+            match &card {
+                Some(c) => a.window.set_cursor(winit::window::Cursor::Custom(c.clone())),
+                None => a.window.set_cursor(CursorIcon::Grabbing),
+            }
+            // Proxy for "not the default shape", exactly as a drag does: what
+            // `update_cursor` compares against once the carry ends.
+            a.cursor_icon = Some(CursorIcon::Grabbing);
+            a.carry_cursor = true;
+        }
+    }
+
+    /// Leave carry: clear every window's cues/dim/cursor. Safe to call when
+    /// idle (and cheap — it returns at once with nothing carried).
+    fn cancel_carry(&mut self) {
+        let Some(carry) = self.carry.take() else { return };
+        log::debug!("carry cancelled: payload={:?}", carry.payload);
+        for a in self.windows.values_mut() {
+            a.carry_cursor = false; // release the cursor BEFORE update_cursor runs
+            Self::clear_drag_cues(a); // cue/ghost/dim wipe + update_cursor + force_full + redraw
+        }
+    }
+
+    /// Take the carry's hover cue and ghost chip off ONE window, leaving it
+    /// dimming `want_dim` (the carried pane, in the source window; `None`
+    /// anywhere else). Called per pointer sample from the paths where a window
+    /// stops being aimed at — a cursor-leave, or an overlay coming up over it —
+    /// so it repaints only when something was actually showing.
+    fn clear_carry_cue(active: &mut Active, want_dim: Option<rt_core::PaneId>) {
+        if active.drag_cue.is_none() && active.drag_ghost.is_none() && active.drag_dim == want_dim {
+            return; // already clean: no frame owed
+        }
+        active.drag_cue = None;
+        active.drag_ghost = None;
+        active.drag_dim = want_dim;
+        active.force_full = true; // cues are chrome, off the damage-tracked path
+        active.window.request_redraw();
+    }
+
+    /// A left-press in window `id` while a carry is live: put the payload down
+    /// where that window's cue says it would land.
+    ///
+    /// Every commit goes through the same two functions a drag release uses, so
+    /// a carried pane is no easier to lose than a dragged one — both hand a
+    /// refused package straight back to the source. A `false` return means
+    /// nothing moved, for one of two reasons, which end differently:
+    ///
+    ///  - the pointer was over a DEAD ZONE (a gutter, a margin — no cue): the
+    ///    aim simply missed, so the press is consumed and the carry continues.
+    ///  - the payload is STALE. A carry survives everything a drag cannot, and
+    ///    that includes a context menu left open in ANOTHER window, which can
+    ///    still dispatch "Detach Pane"/"Detach Tab" on the carried payload
+    ///    while the carry runs. The drop functions then find nothing to extract
+    ///    and change nothing (no crash, no lost pane) — but a carry whose
+    ///    payload has left its source can never be dropped or dimmed anywhere
+    ///    again, so it is cancelled here rather than left running as a zombie.
+    fn carry_drop(&mut self, id: WindowId) {
+        let Some(carry) = self.carry.as_ref() else { return };
+        let (payload, source) = (carry.payload, carry.source);
+        // The cue this window is SHOWING is the target — resolved by the motion
+        // block above from this window's own layout. Staged out of the map
+        // first: both drop functions take `&mut self`.
+        let cue = self.windows.get(&id).and_then(|a| a.drag_cue.clone());
+        let committed = match cue {
+            Some(r) if source == id => self.same_window_drop(id, payload, r),
+            Some(r) => self.cross_window_drop(source, payload, id, r),
+            None => false, // dead zone: the carry continues, the press is consumed
+        };
+        log::debug!("carry drop: payload={payload:?} source={source:?} into={id:?} committed={committed}");
+        if committed {
+            self.cancel_carry(); // clears every window's cues + cursors
+            return;
+        }
+        if self.carry_payload_gone() {
+            self.cancel_carry(); // nothing left to carry: don't strand the state
+        } else if let Some(a) = self.windows.get_mut(&id) {
+            a.window.request_redraw(); // missed: keep carrying, repaint as-is
+        }
+    }
+
+    /// Has the carried payload left its source window — detached, closed, or
+    /// moved out from under the carry by an action dispatched somewhere else?
+    /// False when nothing is carried.
+    fn carry_payload_gone(&self) -> bool {
+        let Some(carry) = self.carry.as_ref() else { return false };
+        let Some(src) = self.windows.get(&carry.source) else { return true }; // source window gone
+        match carry.payload {
+            dragdrop::DragPayload::Pane(p) => src.session.pane(p).is_none(),
+            dragdrop::DragPayload::Tab { first_pane } => src.session.tab_panes(first_pane).is_none(),
+        }
+    }
+
+    /// Wipe the drag cues off ONE window by id, if it is still open.
+    fn clear_cues_on(&mut self, id: WindowId) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
+        Self::clear_drag_cues(active);
+    }
+
+    /// The rt window whose CONTENT rect contains the global (screen) point.
+    ///
+    /// X11 only: on Wayland `inner_position()` errs for every window, so this
+    /// returns `None` throughout, which cleanly disables cross-window hover
+    /// there (the spec's Wayland stance — keyboard detach is that platform's
+    /// path). Windows rarely overlap; if two do, the map's iteration order
+    /// decides, because winit exposes no stacking order to consult.
+    fn window_under_global(&self, global: (f64, f64)) -> Option<WindowId> {
+        for (&wid, a) in self.windows.iter() {
+            let Ok(pos) = a.window.inner_position() else { continue };
+            let size = a.window.inner_size();
+            let (lx, ly) = (global.0 - pos.x as f64, global.1 - pos.y as f64);
+            if lx >= 0.0 && ly >= 0.0 && lx < size.width as f64 && ly < size.height as f64 {
+                return Some(wid);
+            }
+        }
+        None
+    }
+
+    /// One pointer motion while a drag is live (`id` is the drag's source, the
+    /// window that owns the pointer grab). Works out which rt window the
+    /// pointer is over — this one, another one (X11), or none at all (the
+    /// desktop: a release there tears out) — re-resolves the drop target in
+    /// THAT window's session, and moves the cues there.
+    ///
+    /// All reads: nothing relayouts until the release commits. Every window
+    /// whose cues change gets `force_full` (the cues are chrome the damage
+    /// tracker knows nothing about) plus a redraw request.
+    fn drag_motion(&mut self, id: WindowId) {
+        let Some(src) = self.windows.get(&id) else { return };
+        let mouse = src.mouse; // source-window-local, from the CursorMoved that got us here
+        // The pointer in screen coordinates. `None` on Wayland, where there is
+        // no such thing for a client — the implicit grab still delivers
+        // source-local coords, so the source stays the only resolvable window.
+        let global = src
+            .window
+            .inner_position()
+            .ok()
+            .map(|p| (p.x as f64 + mouse.0 as f64, p.y as f64 + mouse.1 as f64));
+        let (over, local) = match global {
+            // Wayland: no globals, so the source is the only window we can
+            // recognise — but only while the cursor is actually IN it. Outside
+            // its bounds we are "over the desktop" exactly like X11's
+            // window_under_global-miss (this is what lets `cued` go None so a
+            // release out there tears out; leaving it Some(source) here was
+            // the bug that made a Wayland tear-out release a silent no-op).
+            None => {
+                let size = src.window.inner_size();
+                let inside = mouse.0 >= 0.0
+                    && mouse.1 >= 0.0
+                    && mouse.0 < size.width as f32
+                    && mouse.1 < size.height as f32;
+                (inside.then_some(id), mouse)
+            }
+            Some(g) => match self.window_under_global(g) {
+                None => (None, mouse),           // the desktop
+                Some(w) if w == id => (Some(id), mouse),
+                Some(w) => {
+                    // Another rt window: re-express the point in ITS coords.
+                    let Some(a) = self.windows.get(&w) else { return };
+                    let Ok(p) = a.window.inner_position() else { return };
+                    (Some(w), ((g.0 - p.x as f64) as f32, (g.1 - p.y as f64) as f32))
+                }
+            },
+        };
+        // Resolve inside the hovered window's layout (pure reads).
+        let resolved = match over {
+            None => None,
+            Some(w) => {
+                let (Some(a), Some(drag)) = (self.windows.get(&w), self.drag.as_ref()) else { return };
+                let bounds = content_bounds(a.window.inner_size());
+                let (panes, bars) = (a.session.visible_rects(bounds), a.session.tab_bars(bounds));
+                // `payload_panes` only ever matches in the SOURCE window (pane
+                // ids are process-global); passing it elsewhere is harmless.
+                dragdrop::resolve_drop(drag.payload, &drag.payload_panes, &panes, &bars, bounds, local)
+            }
+        };
+
+        let Some(drag) = self.drag.as_mut() else { return };
+        drag.cursor = local;
+        drag.hover = over.zip(resolved.clone());
+        let prev = drag.cued;
+        drag.cued = over;
+        if prev != over {
+            // Once per window crossing, not per motion: cheap enough to keep.
+            log::debug!("drag hover: {prev:?} -> {over:?} (source={id:?})");
+        }
+        let label = drag.label.clone();
+        let dim = match drag.payload {
+            dragdrop::DragPayload::Pane(p) => Some(p),
+            dragdrop::DragPayload::Tab { .. } => None,
+        };
+
+        // The window that was showing cues and no longer is (a leave event in
+        // all but name — winit sends none during a grab).
+        if let Some(p) = prev.filter(|p| Some(*p) != over && *p != id) {
+            if let Some(a) = self.windows.get_mut(&p) {
+                a.drag_cue = None;
+                a.drag_ghost = None;
+                a.drag_dim = None;
+                a.force_full = true;
+                a.window.request_redraw();
+            }
+        }
+        // The source always keeps the payload dimmed where it still sits; the
+        // cue and the ghost chip follow the pointer wherever it went.
+        let here = over == Some(id);
+        if let Some(a) = self.windows.get_mut(&id) {
+            // Skip the repaint when nothing about the source's cues moved —
+            // otherwise every motion over ANOTHER window would repaint this one.
+            if here || a.drag_cue.is_some() || a.drag_ghost.is_some() || a.drag_dim != dim {
+                a.drag_cue = if here { resolved.clone() } else { None };
+                a.drag_ghost = if here { Some((local, label.clone())) } else { None };
+                a.drag_dim = dim;
+                a.force_full = true;
+                a.window.request_redraw();
+            }
+        }
+        if let Some(w) = over.filter(|w| *w != id) {
+            let Some(a) = self.windows.get_mut(&w) else { return };
+            a.drag_cue = resolved;
+            a.drag_ghost = Some((local, label));
+            a.drag_dim = None; // the payload's old place is in the OTHER window
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+    }
+
+    /// Did a drag release land OUTSIDE the source window — the tear-out
+    /// gesture? `None` means "not a tear-out" (the release was inside the
+    /// source: a gutter, a margin — a cancel). `Some(pos)` means tear out,
+    /// where the inner `Option` is the global screen point to place the new
+    /// window at: `Some` on X11 (`inner_position()` works), `None` on Wayland,
+    /// where a client has no global coordinates and the compositor places the
+    /// window instead.
+    ///
+    /// "Outside the source" needs only SURFACE-LOCAL coordinates, and the
+    /// implicit grab keeps delivering motion past the surface edge on both
+    /// platforms — measured on cosmic-comp (2026-08-25): 366 out-of-bounds
+    /// motion events during a 12s button-hold, coords from -407 to +1139
+    /// against a 1056px window, zero cursor-left, and the release itself
+    /// delivered while outside. So the tear-out gesture works on Wayland too;
+    /// only the drop-point placement stays X11-only.
+    fn tear_out_release(&self, source: WindowId) -> Option<Option<winit::dpi::PhysicalPosition<i32>>> {
+        let a = self.windows.get(&source)?;
+        let size = a.window.inner_size();
+        let (mx, my) = a.mouse;
+        if mx >= 0.0 && my >= 0.0 && mx < size.width as f32 && my < size.height as f32 {
+            return None; // still inside the source window: not a tear-out
+        }
+        // Outside: tear out. Place at the drop point where the platform can
+        // say where that is (X11); let the compositor place it elsewhere.
+        Some(
+            a.window
+                .inner_position()
+                .ok()
+                .map(|pos| winit::dpi::PhysicalPosition::new(pos.x + mx as i32, pos.y + my as i32)),
+        )
+    }
+
+    /// Commit (or cancel) the live drag on release. `id` is the source window,
+    /// which is where the button came up: winit's implicit grab keeps every
+    /// pointer event with the window the press happened in, so this is the ONE
+    /// place a drag can end, whichever window it is hovering.
+    fn commit_drag(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
+        let Some(drag) = self.drag.take() else { return };
+        // Ctrl held at the moment of release turns a tear-out into a PICK-UP:
+        // the payload stays where it is and the gesture becomes a carry (see
+        // [`CarryState`]). Read now, while the source window is easy to reach —
+        // the commit arms below re-borrow the map repeatedly.
+        let ctrl_held = self.windows.get(&id).is_some_and(|a| a.mods.control_key());
+        let target = drag.hover.as_ref().map(|(_, r)| r.target); // for the log below
+        let hover_window = drag.hover.as_ref().map(|(w, _)| *w);
+        // Set by the Ctrl-release arm below: the gesture did not END, it BECAME
+        // a carry, which owns the source window's dim and cursor from here on.
+        // The cue wipe at the bottom must then leave that window alone.
+        let mut entered_carry = false;
+        let committed = match drag.hover {
+            // Same window: the plain in-session move/reorder.
+            Some((w, r)) if w == id => self.same_window_drop(id, drag.payload, r),
+            // Another window: extract here, adopt there (or swap across).
+            Some((w, r)) => self.cross_window_drop(id, drag.payload, w, r),
+            // Nothing resolved under the pointer. Over an rt window (`cued`)
+            // that is a dead zone — a gutter, a margin — and a dead zone is a
+            // cancel, in ANY window. A release outside the source with no rt
+            // window cued tears out. On X11 the new window lands at the drop
+            // point; on Wayland the compositor places it (no global coords) —
+            // and since Wayland also can't SEE other rt windows during a drag
+            // (`cued` is always None off-source there), a release over another
+            // rt window tears out too, on top of it. Documented limitation.
+            None => match (drag.cued, self.tear_out_release(id)) {
+                // A release out on the desktop: tear out — or, with Ctrl held,
+                // pick the payload UP instead and keep aiming. The card the
+                // pointer is already wearing is handed straight over, so the
+                // cursor never blinks between the two states.
+                (None, Some(at)) => {
+                    if ctrl_held {
+                        entered_carry = self.enter_carry(event_loop, id, drag.payload, drag.card.clone());
+                        entered_carry
+                    } else {
+                        self.tear_out(event_loop, id, drag.payload, at)
+                    }
+                }
+                _ => false,
+            },
+        };
+        log::debug!(
+            "drag release: payload={:?} source={id:?} over={hover_window:?} target={target:?} committed={committed} carry={entered_carry}",
+            drag.payload
+        );
+        if entered_carry {
+            return; // the carry owns every window's cues/dim/cursor now
+        }
+        // Both ends get their cues wiped (+ force_full: layouts may have
+        // changed). Either window may have just closed — `clear_cues_on` is a
+        // no-op then.
+        self.clear_cues_on(id);
+        if let Some(w) = drag.cued.filter(|w| *w != id) {
+            self.clear_cues_on(w);
+        }
+    }
+
+    /// A drop inside the window the drag started in: a move within one session
+    /// (or a REORDER, when a tab lands back on its own strip).
+    fn same_window_drop(&mut self, id: WindowId, payload: dragdrop::DragPayload, r: dragdrop::ResolvedDrop) -> bool {
+        let Some(active) = self.windows.get_mut(&id) else { return false };
+        match payload {
+            dragdrop::DragPayload::Pane(p) => active.session.move_pane(p, r.target),
+            dragdrop::DragPayload::Tab { first_pane } => match r.target {
+                // A tab dropped on the strip it already lives in is a REORDER,
+                // not a move (a move would extract the page and re-insert it,
+                // dissolving a two-tab group on the way out). Any OTHER strip —
+                // no current index for us there — is a genuine move.
+                rt_session::DropTarget::TabAt { anchor, index } => {
+                    let bounds = content_bounds(active.window.inner_size());
+                    match Self::tab_index_in_bar(active, bounds, anchor, first_pane) {
+                        Some(current) => {
+                            active.session.reorder_tab(first_pane, dragdrop::index_for_reorder(current, index))
+                        }
+                        None => active.session.move_tab(first_pane, r.target),
+                    }
+                }
+                other => active.session.move_tab(first_pane, other),
+            },
+        }
+    }
+
+    /// A drop into a DIFFERENT window: the payload leaves `source`'s session
+    /// and joins `dest`'s, jacks and wholly-internal wires in tow. Returns
+    /// whether anything committed. A refused adopt puts the package straight
+    /// back into the source — a live pane is never lost on any path.
+    fn cross_window_drop(
+        &mut self,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        dest: WindowId,
+        r: dragdrop::ResolvedDrop,
+    ) -> bool {
+        let committed = match r.target {
+            rt_session::DropTarget::Swap { pane: b } => self.cross_window_swap(source, payload, dest, b),
+            other => self.cross_window_move(source, payload, dest, other),
+        };
+        // The source's layout changed under it either way; and if its LAST pane
+        // just left, the window has nothing to show any more.
+        if self.windows.get(&source).is_some_and(|a| a.session.is_empty()) {
+            self.close_window(source);
+        } else if let Some(a) = self.windows.get_mut(&source) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+        committed
+    }
+
+    /// The non-swap half of [`App::cross_window_drop`]: extract the payload from
+    /// `source`'s session and adopt it into `dest`'s at `at`. Every failure path
+    /// hands the package back to the source, so a live pane is never lost.
+    fn cross_window_move(
+        &mut self,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        dest: WindowId,
+        at: rt_session::DropTarget,
+    ) -> bool {
+        let Some(src) = self.windows.get_mut(&source) else { return false };
+        let pkg = match payload {
+            dragdrop::DragPayload::Pane(p) => src.session.extract_pane(p),
+            dragdrop::DragPayload::Tab { first_pane } => src.session.extract_tab(first_pane),
+        };
+        let Some(pkg) = pkg else { return false }; // stale payload: nothing left this window
+        let moved: Vec<rt_core::PaneId> = pkg.sub.panes();
+        // The target window may have closed between hover and release, and the
+        // target LAYOUT may have changed under the drag (a stale `at`): both put
+        // the package straight back into the source as a root-edge split.
+        let refused = match self.windows.get_mut(&dest) {
+            None => Some(pkg),
+            Some(dst) => dst.session.adopt(pkg, at).err(),
+        };
+        if let Some(pkg) = refused {
+            let Some(src) = self.windows.get_mut(&source) else { return false };
+            src.session.readopt_root_edge(pkg.sub, pkg.entries);
+            return false;
+        }
+        // Jacks and wholly-internal wires follow their panes; wires that would
+        // now cross windows are cut.
+        self.migrate_pane_extras(source, dest, &moved);
+        if let Some(a) = self.windows.get_mut(&dest) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+        true
+    }
+
+    /// Commit a "Move Pane to <window>" menu pick (`WindowCmd::MoveToWindow`):
+    /// the source's FOCUSED pane joins `dest`, split beside `dest`'s own focus
+    /// (left-right, after) — exactly the drop a drag released on `dest`'s
+    /// focused pane would produce. Reuses [`App::cross_window_move`] for the
+    /// extract/adopt/jack-and-wire-migration/failure-restoration machinery
+    /// (a refused adopt puts the pane straight back — never lost), then repeats
+    /// [`App::cross_window_drop`]'s tail: `dest` was already repainted by
+    /// `cross_window_move`; `source` is force-repainted, or closed if that was
+    /// its last pane.
+    ///
+    /// Stale-safe: `dest` may have closed while the menu was sitting open (its
+    /// id was snapshotted at open time and doesn't get revalidated until now).
+    /// Checked up front — and logged — so a stale target never even extracts
+    /// the pane from `source`.
+    fn move_pane_to_window(&mut self, source: WindowId, dest: WindowId) {
+        let Some(target_focus) = self.windows.get(&dest).map(|a| a.session.focus()) else {
+            log::debug!("move-to-window: target {dest:?} closed before the pick landed");
+            return;
+        };
+        let Some(src) = self.windows.get(&source) else { return };
+        let focus = src.session.focus();
+        let at = rt_session::DropTarget::SplitBeside {
+            pane: target_focus,
+            orient: rt_core::Orientation::LeftRight,
+            before: false,
+        };
+        self.cross_window_move(source, dragdrop::DragPayload::Pane(focus), dest, at);
+        // Source tail from `cross_window_drop`: its layout changed under it
+        // either way, and if that was its last pane the window is now empty.
+        if self.windows.get(&source).is_some_and(|a| a.session.is_empty()) {
+            self.close_window(source);
+        } else if let Some(a) = self.windows.get_mut(&source) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+    }
+
+    /// Open the context menu at `pos` (window-local physical px) for window
+    /// `id`. Snapshots the "Move Pane to <window>" targets first (every OTHER
+    /// window as of THIS moment) via [`App::menu_move_targets`], so `active`'s
+    /// mutable borrow — needed to actually set `menu`/`menu_hover` — never has
+    /// to coexist with a read of the rest of `self.windows`.
+    fn open_menu(&mut self, id: WindowId, pos: (f32, f32)) {
+        let (menu_windows, menu_move_labels) = self.menu_move_targets(id);
+        let Some(active) = self.windows.get_mut(&id) else { return };
+        active.menu = Some(pos);
+        active.menu_hover = None; // no row highlighted until the pointer moves
+        active.menu_windows = menu_windows;
+        active.menu_move_labels = menu_move_labels;
+        active.window.request_redraw();
+    }
+
+    /// Build the "Move Pane to <window>" targets for a menu about to open in
+    /// window `exclude`: every OTHER window, sorted by `WindowId`'s `Ord` impl
+    /// (winit exposes no creation-order or on-screen-stacking API, so this is
+    /// simply a STABLE, deterministic order — not meaningful otherwise) and
+    /// numbered from 1 in that order. Each label is `"{n}: {title}"`, `title`
+    /// being that window's focused pane's title (`title_of`), or `"rt"` if it
+    /// has none. Returns the ids and labels built in the SAME pass, in the
+    /// SAME order, so a caller storing both (as `Active::menu_windows` /
+    /// `menu_move_labels`) can never have them skew relative to each other.
+    fn menu_move_targets(&self, exclude: WindowId) -> (Vec<WindowId>, Vec<String>) {
+        let mut ids: Vec<WindowId> = self.windows.keys().filter(|w| **w != exclude).copied().collect();
+        ids.sort();
+        let labels = ids
+            .iter()
+            .enumerate()
+            .map(|(n, w)| {
+                let title = self
+                    .windows
+                    .get(w)
+                    .and_then(|a| a.session.title_of(a.session.focus()))
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("rt");
+                format!("{}: {title}", n + 1)
+            })
+            .collect();
+        (ids, labels)
+    }
+
+    /// Exchange the dragged pane with pane `b` in another window: one leaf
+    /// rewrite in each tree, then the two panes' side-table entries (backend,
+    /// title, group, columns) cross over. Each keeps its own window's slot
+    /// geometry — a swap moves ids, never shapes.
+    ///
+    /// WIRES: each swapped pane is treated exactly as a one-pane move would be.
+    /// Its jack travels with it, and every wire touching it in its OLD window
+    /// is CUT — a wire whose other end stayed behind would otherwise span two
+    /// windows, which rt has no concept of. (The one wire that survives is a
+    /// self-wire, both of whose ends move together.)
+    fn cross_window_swap(
+        &mut self,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        dest: WindowId,
+        b: rt_core::PaneId,
+    ) -> bool {
+        // The resolver never offers Swap for a tab payload; refuse defensively.
+        let dragdrop::DragPayload::Pane(dragged) = payload else { return false };
+        let Some(src) = self.windows.get_mut(&source) else { return false };
+        if !src.session.tree_replace(dragged, b) {
+            return false;
+        }
+        let dst_ok = match self.windows.get_mut(&dest) {
+            Some(dst) => dst.session.tree_replace(b, dragged),
+            None => false, // the target window closed between hover and release
+        };
+        if !dst_ok {
+            // Undo the source's rewrite: its tree must keep naming its own pane.
+            if let Some(src) = self.windows.get_mut(&source) {
+                src.session.tree_replace(b, dragged);
+            }
+            return false;
+        }
+        // Both trees now name the other's pane: hand the entries across to
+        // match. The three window lookups below are provably unreachable in
+        // their failure arms: nothing between here and the end of this
+        // function can remove `source` or `dest` from `self.windows` — rt is
+        // single-threaded, and no code on this path re-enters the event loop
+        // or otherwise touches the window map (mirrors the same reasoning in
+        // `migrate_pane_extras`'s vanished-target comment). They stay guarded
+        // so a bug elsewhere can never turn a vanished window into a panic;
+        // `log::error!` them too so a future refactor that DOES make one
+        // reachable is loud about it instead of quietly losing a pane.
+        let Some(src) = self.windows.get_mut(&source) else {
+            log::error!("cross_window_swap: source window {source:?} vanished before eject (should be unreachable)");
+            return false;
+        };
+        let from_src = src.session.eject_entries(&[dragged]);
+        let Some(dst) = self.windows.get_mut(&dest) else {
+            log::error!("cross_window_swap: dest window {dest:?} vanished before eject (should be unreachable)");
+            return false;
+        };
+        let from_dst = dst.session.eject_entries(&[b]);
+        dst.session.inject_entries(from_src);
+        if let Some(src) = self.windows.get_mut(&source) {
+            src.session.inject_entries(from_dst);
+        } else {
+            log::error!(
+                "cross_window_swap: source window {source:?} vanished before re-inject (should be unreachable) — dropped {} pane extras",
+                from_dst.panes.len()
+            );
+        }
+        // Jacks travel with their panes; wires that would cross windows are cut.
+        self.migrate_pane_extras(source, dest, &[dragged]);
+        self.migrate_pane_extras(dest, source, &[b]);
+        for (wid, departed, arrival) in [(source, dragged, b), (dest, b, dragged)] {
+            let Some(a) = self.windows.get_mut(&wid) else { continue };
+            // A session whose focused pane just left must not keep pointing at
+            // it; the arrival takes its place (and its slot). A session focused
+            // on some THIRD pane keeps that focus — a swap elsewhere in the
+            // window is no reason to move it.
+            if a.session.focus() == departed {
+                a.session.focus_pane(arrival);
+            }
+            a.session.relayout(content_bounds(a.window.inner_size()));
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+        true
+    }
+
+    /// Move the patch-bay extras of the panes in `moved` from window `from` to
+    /// window `to`: their jacks go with them, wires with BOTH ends moved travel
+    /// too, wires with NEITHER end moved stay put, and a wire with exactly ONE
+    /// end moved is CUT — carried either way it would dangle across two
+    /// windows, which rt has no concept of. Shared by keyboard detach, drag
+    /// tear-out and every cross-window drop.
+    fn migrate_pane_extras(&mut self, from: WindowId, to: WindowId, moved: &[rt_core::PaneId]) {
+        let mut moved_jacks = Vec::new();
+        let mut travelling = Vec::new();
+        {
+            let Some(a) = self.windows.get_mut(&from) else { return };
+            for pid in moved {
+                if let Some(j) = a.jacks.borrow_mut().remove(pid) {
+                    moved_jacks.push((*pid, j));
+                }
+            }
+            // A plain `.partition()` only ever produces two groups covering
+            // every element — it can't also DROP the cross wires, so a naive
+            // `partition(|w| both ends moved)` would leave a one-end-moved wire
+            // sitting in `staying`, dangling a reference to a pane that just
+            // left this window. Classify in one pass instead.
+            let mut staying = Vec::new();
+            for w in a.wires.drain(..) {
+                match (moved.contains(&w.src), moved.contains(&w.dst)) {
+                    (true, true) => travelling.push(w),
+                    (false, false) => staying.push(w),
+                    _ => {} // exactly one end moved: cut, not carried either way
+                }
+            }
+            a.wires = staying;
+        }
+        // Unreachable in practice (every caller has just touched `to`), but a
+        // vanished target must not panic: the extras die with their window.
+        let Some(t) = self.windows.get_mut(&to) else { return };
+        for (pid, j) in moved_jacks {
+            t.jacks.borrow_mut().insert(pid, j);
+        }
+        t.wires.extend(travelling);
+    }
+
+    /// Wipe one window's per-frame drag cues and repaint it. Only the window's
+    /// half of a cancel — the App-level `drag`/`armed_drag` are the caller's to
+    /// clear (they are unreachable through `&mut Active`).
+    fn clear_drag_cues(active: &mut Active) {
+        active.drag_cue = None;
+        active.drag_ghost = None;
+        active.drag_dim = None;
+        Self::update_cursor(active); // drop Grabbing
+        active.force_full = true; // the cues are off the damage-tracked path
+        active.window.request_redraw();
+    }
+
+    /// The held-pane cursor card for a drag/carry payload, or None (fall back to
+    /// CursorIcon::Grabbing) if the platform refuses the image. Cursor problems
+    /// must never affect gesture logic.
+    fn make_payload_card(
+        event_loop: &ActiveEventLoop,
+        active: &Active,
+        payload: dragdrop::DragPayload,
+    ) -> Option<winit::window::CustomCursor> {
+        let bounds = content_bounds(active.window.inner_size());
+        let rect = match payload {
+            dragdrop::DragPayload::Pane(p) => active
+                .session
+                .visible_rects(bounds)
+                .into_iter()
+                .find(|(id, _)| *id == p)
+                .map(|(_, r)| r),
+            dragdrop::DragPayload::Tab { .. } => None, // a tab page fills the content area
+        };
+        let (w, h) = rect.map(|r| (r.w, r.h)).unwrap_or((bounds.w, bounds.h));
+        let aspect = if h > 0.0 { w / h } else { 1.0 };
+        let (rgba, cw, ch) = carry_card::build_card_rgba(aspect, active.settings.background);
+        match winit::window::CustomCursor::from_rgba(rgba, cw, ch, carry_card::CARD_HOTSPOT.0, carry_card::CARD_HOTSPOT.1) {
+            Ok(src) => Some(event_loop.create_custom_cursor(src)),
+            Err(e) => {
+                log::warn!("held-pane cursor unavailable ({e}); falling back to Grabbing");
+                None
+            }
+        }
+    }
+
+    /// Close ONE window. The LAST window exits the process via `exit_clean()`
+    /// WITHOUT ever dropping its `Active` — dropping the GL context / Wayland
+    /// blur objects at process teardown faults (a segfault on Wayland, an X11
+    /// GetGeometry panic on the x11 dev build), so the historical single-window
+    /// behaviour (`process::exit`, let the OS reclaim everything and SIGHUP the
+    /// PTY children) is preserved for the final window. A NON-last window IS
+    /// really dropped: its PTYs shut down on Drop and its GL/window resources
+    /// are released while the process lives on (the `Active` field order drops
+    /// the backend before the window it renders into).
+    fn close_window(&mut self, id: WindowId) {
+        if !self.windows.contains_key(&id) {
+            return; // already closed (double CloseRequested etc.)
+        }
+        // A drag picked up in this window has nowhere to land any more.
+        if matches!(self.drag.as_ref(), Some(d) if d.source == id) {
+            self.cancel_drag();
+        }
+        // Same for a carry: its payload lives in this window (dimmed at home
+        // until it is dropped), so the window closing takes the payload with it.
+        if matches!(self.carry.as_ref(), Some(c) if c.source == id) {
+            self.cancel_carry();
+        }
+        // A drag merely HOVERING this window survives — it just has nothing
+        // under the pointer any more. Forget the stale target so the release
+        // cannot commit into a window that is gone (the cues die with it).
+        if let Some(d) = self.drag.as_mut() {
+            if d.cued == Some(id) {
+                d.cued = None;
+            }
+            if matches!(d.hover.as_ref(), Some((w, _)) if *w == id) {
+                d.hover = None;
+            }
+        }
+        if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
+            self.armed_drag = None;
+        }
+        if self.windows.len() == 1 {
+            // Last window: leave it in the map (its Drop never runs) and exit.
+            exit_clean();
+        }
+        let active = self.windows.remove(&id);
+        drop(active); // real teardown: PTYs, GL context, window
+    }
+
+    /// Execute what an [`Action`] asked the window-owner level to do — the part
+    /// [`App::apply_action`] cannot: it only holds one window's `Active`, and
+    /// creating or closing OS windows needs the event loop + the window map.
+    fn run_window_cmd(&mut self, event_loop: &ActiveEventLoop, id: WindowId, cmd: WindowCmd) {
+        match cmd {
+            WindowCmd::None => {}
+            WindowCmd::CloseWindow => self.close_window(id),
+            WindowCmd::NewWindow => {
+                // Open an empty extra window (fresh session, one shell pane).
+                let Some(active) = self.build_active(event_loop) else { return };
+                active.window.request_redraw(); // first paint
+                self.windows.insert(active.window.id(), active);
+                // A window born mid-carry must wear the carry cursor too (no-op
+                // when nothing is being carried).
+                self.apply_carry_cursor_all();
+            }
+            WindowCmd::DetachPane => self.detach(event_loop, id, false),
+            WindowCmd::DetachTab => self.detach(event_loop, id, true),
+            WindowCmd::PickUpPane => self.pick_up(event_loop, id, false),
+            WindowCmd::PickUpTab => self.pick_up(event_loop, id, true),
+            WindowCmd::MoveToWindow(dest) => self.move_pane_to_window(id, dest),
+        }
+    }
+
+    /// Tear the focused pane (or its whole tab, when `tab` is set) out of
+    /// window `id` into a fresh OS window — the keyboard/menu gesture. Picks
+    /// the payload, then hands it to [`App::tear_out`], which is also what a
+    /// drag released on the desktop calls.
+    fn detach(&mut self, event_loop: &ActiveEventLoop, id: WindowId, tab: bool) {
+        let Some(active) = self.windows.get(&id) else { return };
+        let payload = if tab {
+            // The focused pane's tab: find its strip's active entry (first_pane
+            // identity), same "first strip with an active tab" convention as
+            // `move_focused_tab`.
+            let bounds = content_bounds(active.window.inner_size());
+            let first = active
+                .session
+                .tab_bars(bounds)
+                .iter()
+                .flat_map(|b| b.tabs.iter())
+                .find(|t| t.active)
+                .map(|t| t.first_pane);
+            let Some(first) = first else { return }; // no tab strip → nothing to detach
+            dragdrop::DragPayload::Tab { first_pane: first }
+        } else {
+            dragdrop::DragPayload::Pane(active.session.focus())
+        };
+        self.tear_out(event_loop, id, payload, None);
+    }
+
+    /// Pick the focused pane (or its whole tab, when `tab` is set) UP into
+    /// carry mode — the keyboard/menu twin of [`App::detach`], picking the
+    /// payload exactly the same way. Nothing moves yet: the payload waits,
+    /// dimmed at home, until the carry is dropped or cancelled.
+    fn pick_up(&mut self, event_loop: &ActiveEventLoop, id: WindowId, tab: bool) {
+        let Some(active) = self.windows.get(&id) else { return };
+        let payload = if tab {
+            // Same "first strip with an active tab" convention as `detach`.
+            let bounds = content_bounds(active.window.inner_size());
+            let first = active
+                .session
+                .tab_bars(bounds)
+                .iter()
+                .flat_map(|b| b.tabs.iter())
+                .find(|t| t.active)
+                .map(|t| t.first_pane);
+            let Some(first) = first else { return }; // no tab strip → nothing to pick up
+            dragdrop::DragPayload::Tab { first_pane: first }
+        } else {
+            dragdrop::DragPayload::Pane(active.session.focus())
+        };
+        self.enter_carry(event_loop, id, payload, None);
+    }
+
+    /// Move `payload` out of window `source` into a fresh OS window, optionally
+    /// placed with its top-left at `position` (the drag's drop point on X11;
+    /// `None` — keyboard detach, or Wayland — lets the compositor place it).
+    /// The package moves in memory: PTY, scrollback, title, group all survive,
+    /// and so do the panes' jacks and their wholly-internal wires.
+    ///
+    /// No-op when it would just recreate the same window: not only a lone pane
+    /// in a lone tab, but any payload that happens to be EVERY pane the source
+    /// window has (e.g. `DetachTab` on a window whose only tab holds a split of
+    /// several panes) — either way nothing is left behind, so this would just
+    /// open an identical window and close the old one. Returns whether it
+    /// actually moved anything, so callers (the release-arm debug log among
+    /// them) can tell a real tear-out from this no-op.
+    ///
+    /// ORDER: the new window is built and INSERTED into the map BEFORE the
+    /// payload leaves the source. That way [`App::migrate_pane_extras`] can
+    /// find both windows by id like every other caller, and — better — a
+    /// failed window build is a clean no-op instead of a path that has to
+    /// re-adopt a package it already tore out.
+    fn tear_out(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source: WindowId,
+        payload: dragdrop::DragPayload,
+        position: Option<winit::dpi::PhysicalPosition<i32>>,
+    ) -> bool {
+        let Some(active) = self.windows.get(&source) else { return false };
+        let payload_panes: Vec<rt_core::PaneId> = match payload {
+            dragdrop::DragPayload::Pane(p) => vec![p],
+            dragdrop::DragPayload::Tab { first_pane } => active.session.tab_panes(first_pane).unwrap_or_default(),
+        };
+        let all: std::collections::HashSet<_> = active.session.tree().all_panes().into_iter().collect();
+        let payload_set: std::collections::HashSet<_> = payload_panes.into_iter().collect();
+        if all == payload_set {
+            return false;
+        }
+        let Some(mut new_active) = self.build_active(event_loop) else { return false };
+        if let Some(at) = position {
+            new_active.window.set_outer_position(at); // land under the cursor (X11)
+        }
+        // The fresh window spawned one pane of its own; drop it before
+        // adopting the moved panes into the (now empty) tree, so the new
+        // window's shell doesn't linger as an orphan tab/split. Its shell
+        // gets SIGHUP via Drop, like a closed pane; drop its jack entry too
+        // so the fifo files are cleaned up by `Jacks`' Drop.
+        let seed = new_active.session.focus();
+        if let Some(seed_pkg) = new_active.session.extract_pane(seed) {
+            for pid in seed_pkg.sub.panes() {
+                new_active.jacks.borrow_mut().remove(&pid);
+            }
+            drop(seed_pkg);
+        }
+        let new_id = new_active.window.id();
+        self.windows.insert(new_id, new_active);
+        // A window born mid-carry wears the carry cursor like every other
+        // (no-op when nothing is being carried).
+        self.apply_carry_cursor_all();
+
+        // Now the payload can leave the source: from here on nothing can fail
+        // in a way that would strand it.
+        let Some(src) = self.windows.get_mut(&source) else { return false };
+        let pkg = match payload {
+            dragdrop::DragPayload::Pane(p) => src.session.extract_pane(p),
+            dragdrop::DragPayload::Tab { first_pane } => src.session.extract_tab(first_pane),
+        };
+        let Some(pkg) = pkg else {
+            self.close_window(new_id); // nothing to put in it
+            return false;
+        };
+        let moved: Vec<rt_core::PaneId> = pkg.sub.panes();
+        let src_became_empty = src.session.is_empty();
+        let Some(dst) = self.windows.get_mut(&new_id) else { return false };
+        if let Err(pkg) = dst.session.adopt(pkg, rt_session::DropTarget::Root) {
+            log::error!("tear_out: adopt into the new window failed"); // cannot happen: the tree is empty
+            if let Some(src) = self.windows.get_mut(&source) {
+                src.session.readopt_root_edge(pkg.sub, pkg.entries); // never lose a pane
+            }
+            self.close_window(new_id);
+            return false;
+        }
+        self.migrate_pane_extras(source, new_id, &moved);
+        if let Some(a) = self.windows.get_mut(&new_id) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+
+        if src_became_empty {
+            self.close_window(source); // moved the last pane away → the source shell is gone
+        } else if let Some(a) = self.windows.get_mut(&source) {
+            a.force_full = true;
+            a.window.request_redraw();
+        }
+        true
+    }
+
     /// Run a semantic [`Action`](rt_config::Action) against the live state. This
     /// is the single place actions are executed, called both by keybindings and
     /// by the context menu, so the two can never drift apart.
     ///
     /// Window-level appearance actions (opacity) are handled here because
     /// the session owns no window handle; everything else goes to the session.
-    /// A `CloseWindow` result exits the process (the OS reaps the child PTYs).
+    /// Returns a [`WindowCmd`] for anything the App (window-owner) level must
+    /// do afterwards — close this window, open a new one, detach — because this
+    /// function only holds one window's `Active` and cannot touch the map.
     /// Keyboard wire gesture: with nothing armed, arm from the focused pane's
     /// `stream` jack; with something armed, complete to the focused pane's input.
     fn wire_gesture(active: &mut Active, stream: Stream) {
@@ -2631,9 +4178,21 @@ impl App {
         }
     }
 
-    fn apply_action(active: &mut Active, action: rt_config::Action) {
+    fn apply_action(active: &mut Active, action: rt_config::Action) -> WindowCmd {
         use rt_config::Action;
         match action {
+            // Window-owner level actions: this window's Active can't create or
+            // close OS windows, so hand the request up to run_window_cmd.
+            Action::NewWindow => return WindowCmd::NewWindow,
+            Action::DetachPane => return WindowCmd::DetachPane,
+            Action::DetachTab => return WindowCmd::DetachTab,
+            // Carry mode: picking up needs the event loop (to build the cursor
+            // card) and every window (they all wear it), so it goes up too.
+            Action::PickUpPane => return WindowCmd::PickUpPane,
+            Action::PickUpTab => return WindowCmd::PickUpTab,
+            // Reorder the focused tab within its strip (Terminator's move_tab).
+            Action::MoveTabLeft => Self::move_focused_tab(active, -1),
+            Action::MoveTabRight => Self::move_focused_tab(active, 1),
             Action::OpacityUp => {
                 let v = active.settings.adjust_opacity(0.05); // +5% opaque
                 log::info!("background opacity = {v:.2}");
@@ -2746,7 +4305,10 @@ impl App {
             }
             // Everything else is a session action.
             other => match active.session.apply(other) {
-                Some(SessionEvent::CloseWindow) => exit_clean(), // last pane closed; clean up first
+                // Last pane closed: the whole window goes. The App level
+                // decides whether that ends the process (last window) or just
+                // drops this window (close_window).
+                Some(SessionEvent::CloseWindow) => return WindowCmd::CloseWindow,
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
                 Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
                 Some(SessionEvent::Redraw) => {
@@ -2762,6 +4324,28 @@ impl App {
                 }
                 None => {}
             },
+        }
+        WindowCmd::None
+    }
+
+    /// Move the focused tab one slot left/right within its strip (`delta` = ±1,
+    /// clamped at the ends). The focused tab is the ACTIVE tab of its strip;
+    /// with no tab strip (or a single tab) this is a no-op.
+    fn move_focused_tab(active: &mut Active, delta: isize) {
+        let size = active.window.inner_size();
+        let bounds = content_bounds(size);
+        for bar in active.session.tab_bars(bounds) {
+            if let Some(idx) = bar.tabs.iter().position(|t| t.active) {
+                let last = bar.tabs.len() as isize - 1;
+                let to = (idx as isize + delta).clamp(0, last) as usize;
+                if to != idx && active.session.reorder_tab(bar.tabs[idx].first_pane, to) {
+                    // Tab order changed: the strip redraws, and the visible
+                    // panes carry no engine cell-damage → full frame.
+                    active.force_full = true;
+                    active.window.request_redraw();
+                }
+                break; // one strip acted on (the first with an active tab)
+            }
         }
     }
 
@@ -2907,6 +4491,20 @@ impl App {
         }
         active.force_full = true; // selection + scroll: not engine-tracked damage
         true
+    }
+
+    /// The current position of the tab anchored at `tab` within the strip whose
+    /// FIRST tab is `anchor` (the id a resolved `TabAt` carries), or `None` when
+    /// that strip doesn't hold the tab — which is exactly the test for "is this
+    /// drop a reorder within my own strip, or a move into someone else's".
+    /// Read from the LIVE geometry at release time, never from the press.
+    fn tab_index_in_bar(active: &Active, bounds: Rect, anchor: rt_core::PaneId, tab: rt_core::PaneId) -> Option<usize> {
+        active
+            .session
+            .tab_bars(bounds)
+            .into_iter()
+            .find(|bar| bar.tabs.first().map(|t| t.first_pane) == Some(anchor))
+            .and_then(|bar| bar.tabs.iter().position(|t| t.first_pane == tab))
     }
 
     fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
@@ -3357,8 +4955,48 @@ impl App {
     /// Handle one key *press*: close an open menu on Escape, otherwise translate
     /// to a chord and either run the bound action or type the key into the
     /// focused PTY(s).
-    fn on_key_press(&mut self, key_event: winit::event::KeyEvent) {
-        let Some(active) = self.active.as_mut() else { return };
+    fn on_key_press(&mut self, event_loop: &ActiveEventLoop, id: WindowId, key_event: winit::event::KeyEvent) {
+        // Escape aborts a pane/tab drag before anything else looks at the key —
+        // the universal "get me out of this gesture". A drag in flight swallows
+        // it; a merely ARMED press (no movement yet) is disarmed but the key
+        // still travels on to the shell, which is where a bare Escape belongs.
+        if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) && self.drag.is_some() {
+            self.cancel_drag();
+            return;
+        }
+        // Same for a carry — it is just as modal, and (holding no button) it
+        // would otherwise outlive every other way out of the gesture.
+        if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) && self.carry.is_some() {
+            self.cancel_carry();
+            return;
+        }
+        if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
+            self.armed_drag = None;
+        }
+        // A bound action that opens a MODAL overlay (preferences, manual, search,
+        // clipboard history) installs an input shim that swallows every later
+        // event — including the mouse release that would finish a drag. Opening
+        // one mid-gesture would strand the drag with its cues frozen under the
+        // dialog, so abandon the gesture first; the action then runs normally.
+        // Same story for an action that can remove a pane out from under the
+        // drag (CloseTerm/DetachPane/DetachTab/CloseWindow): cancel first, then
+        // let it proceed — otherwise the drag's cues can outlive the pane or
+        // window they refer to until Escape is pressed. Only paid for while
+        // something is armed or dragging, and done here because `cancel_drag`
+        // needs `&mut self` (no `Active` borrowed yet).
+        // A live CARRY is gated by exactly the same two questions — it is just
+        // as modal as a drag and holds the same pane ids — so the lookup is
+        // shared and each state cancels itself when the answer is yes.
+        if self.drag.is_some() || self.armed_drag.is_some() || self.carry.is_some() {
+            let action = self.windows.get(&id).and_then(|a| {
+                input::chord_from_winit(&key_event.logical_key, a.mods).and_then(|c| a.keymap.action_for(&c))
+            });
+            if action.is_some_and(opens_modal_overlay) || action.is_some_and(removes_pane_mid_drag) {
+                self.cancel_drag();
+                self.cancel_carry();
+            }
+        }
+        let Some(active) = self.windows.get_mut(&id) else { return };
         // While an IME/dead-key composition is in progress, swallow key presses:
         // the composed result arrives via WindowEvent::Ime(Commit) instead. This
         // is what prevents the dead key (´) and its result (ó) both being sent.
@@ -3392,7 +5030,10 @@ impl App {
         // Is this chord bound to an rt action?
         if let Some(chord) = input::chord_from_winit(&key_event.logical_key, mods) {
             if let Some(action) = active.keymap.action_for(&chord) {
-                Self::apply_action(active, action); // shared with the menu
+                let cmd = Self::apply_action(active, action); // shared with the menu
+                // The `active` borrow ends here; window-level commands (close/
+                // new window/detach) re-borrow the map via &mut self.
+                self.run_window_cmd(event_loop, id, cmd);
                 return; // consumed
             }
         }
@@ -3463,10 +5104,10 @@ impl App {
         }
     }
 
-    /// Repaint the whole window: fill each pane's background, draw its visible
+    /// Repaint one window: fill each pane's background, draw its visible
     /// grid, then outline the focused pane. Finally swap buffers.
-    fn redraw(&mut self) {
-        let Some(active) = self.active.as_mut() else { return };
+    fn redraw(&mut self, id: WindowId) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
         // A window resize is in flight: the backend surface is still the old size
         // and every frame drawn now is discarded by the settle frame. Painting
         // here is what produced the 5-12 visible intermediate steps; skip it and
@@ -3474,6 +5115,11 @@ impl App {
         if active.surface_pending.is_some() {
             return;
         }
+        // Multi-window: target THIS window's GL context before any backend work
+        // this frame (no-op on XRender; is_current-guarded on GL). The GL
+        // backend also self-arms at every context-dependent entry point, so
+        // this is belt-and-braces at the frame chokepoint.
+        active.backend.make_current();
         // Terminal colours (a dark theme): near-black bg, light-grey fg.
         // The background carries the user's opacity in its alpha channel, so a
         // value < 1.0 makes empty areas translucent (the window(s) behind show
@@ -3620,17 +5266,17 @@ impl App {
 
         let force_next = match plan {
             FramePlan::Full => {
-                self.redraw_full(bg, bounds, snapshots); // today's exact path
+                self.redraw_full(id, bg, bounds, snapshots); // today's exact path
                 false
             }
             FramePlan::Partial(bbox, hint_rects) => {
-                self.redraw_scissored(bg, bounds, snapshots, bbox, &hint_rects)
+                self.redraw_scissored(id, bg, bounds, snapshots, bbox, &hint_rects)
             }
         };
         // Clear the per-frame force flag. An overlay visible this frame (its
         // pixels must be cleared when it closes) or a failed partial swap arms a
         // full redraw next frame; specific handlers also re-arm it.
-        if let Some(active) = self.active.as_mut() {
+        if let Some(active) = self.windows.get_mut(&id) {
             active.force_full = overlay_open || force_next;
             active.last_focus = active.session.focus(); // record the focus this frame painted, so the next focus move is detected
         }
@@ -4128,6 +5774,29 @@ impl App {
     /// draw + `end_frame`, over the current framebuffer (inside the cleared
     /// scissor bbox on the partial path).
     fn paint_overlays_or_instruments(active: &mut Active) {
+        // Drag-and-drop cues, before everything else this function draws: they
+        // must land above pane content (already painted before this function
+        // runs) but a drag can't coexist with prefs/menu/manual/search being
+        // open, so drawing them first (under those) is equivalent in practice.
+        // `drag_dim` alone is enough: while the pointer is hovering ANOTHER
+        // window, the source keeps only the dim (its cue and ghost went with
+        // the pointer) and must still paint it.
+        if active.drag_cue.is_some() || active.drag_ghost.is_some() || active.drag_dim.is_some() {
+            let dim = active.drag_dim.and_then(|p| {
+                let bounds = content_bounds(active.window.inner_size());
+                active.session.visible_rects(bounds).into_iter().find(|(id, _)| *id == p).map(|(_, r)| r)
+            });
+            let size = active.window.inner_size();
+            let cell = active.backend.cell_size();
+            chrome::dragdrop::draw(
+                &mut *active.backend,
+                active.drag_cue.as_ref(),
+                active.drag_ghost.as_ref(),
+                dim,
+                cell,
+                (size.width as f32, size.height as f32),
+            );
+        }
         // Preferences (and the colour picker over it): a native dialog on BOTH
         // backends. Checked before the per-backend split below, which only governs
         // how the instruments are drawn (inline on GL vs a persistent layer on
@@ -4185,7 +5854,7 @@ impl App {
             let url = Self::cell_at(active, pos.0, pos.1)
                 .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
             let has_sel = Self::selected_text(active).is_some();
-            let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
+            let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
             let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
             let hover = active.menu_hover;
             chrome::menu::draw(&mut *active.backend, &g, &rows, hover, cw, ch);
@@ -4283,8 +5952,8 @@ impl App {
 
     /// Today's exact full-window path: clear everything, draw all panes + chrome,
     /// egui, full swap. Byte-for-byte the pre-damage behaviour.
-    fn redraw_full(&mut self, bg: Color, bounds: Rect, snapshots: Vec<(rt_core::PaneId, PxRectSnap)>) {
-        let Some(active) = self.active.as_mut() else { return };
+    fn redraw_full(&mut self, id: WindowId, bg: Color, bounds: Rect, snapshots: Vec<(rt_core::PaneId, PxRectSnap)>) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
         active.backend.begin_frame(bg); // translucent clear
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame(); // upload + draw call
@@ -4306,13 +5975,14 @@ impl App {
     /// unavailable this frame, so we fell back to a full redraw + full swap here).
     fn redraw_scissored(
         &mut self,
+        id: WindowId,
         bg: Color,
         bounds: Rect,
         snapshots: Vec<(rt_core::PaneId, PxRectSnap)>,
         bbox: crate::damage::PxRect,
         hint_rects: &[crate::damage::PxRect],
     ) -> bool {
-        let Some(active) = self.active.as_mut() else { return false };
+        let Some(active) = self.windows.get_mut(&id) else { return false };
         active.backend.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame();
@@ -4441,6 +6111,22 @@ impl App {
             || active.mouse_report.is_some()
             || active.wiring_from.is_some()
             || active.selecting
+            // A pane/tab drag owns the pointer: it set Grabbing and keeps it
+            // until the drop, cue or no cue (over a gutter there is no cue but
+            // the drag is still on). An ARMED press is NOT a drag — the cursor
+            // keeps behaving normally until the threshold is passed.
+            || active.drag_ghost.is_some()
+            || active.drag_cue.is_some()
+            // …including while the pointer is over ANOTHER window: this one is
+            // the drag's source (only it dims a pane) and must keep Grabbing
+            // until the drop, or the shape would flicker back at the border.
+            || active.drag_dim.is_some()
+            // A CARRY owns the pointer in EVERY window (no button is held, so
+            // there is no grab to keep it in one): the card must survive
+            // arbitrary motion, over jacks and dividers included, until the
+            // carry drops or cancels. `cancel_carry` clears the flag first,
+            // which is what lets the very next call restore the real shape.
+            || active.carry_cursor
         {
             return;
         }
@@ -5328,7 +7014,15 @@ fn main() {
     sweep_stale_jacks();
     // Build the winit event loop and hand it our application.
     let event_loop = build_event_loop();
-    let mut app = App { font_db, mono_families, cli, active: None };
+    let mut app = App {
+        font_db,
+        mono_families,
+        cli,
+        windows: std::collections::HashMap::new(),
+        armed_drag: None,
+        drag: None,
+        carry: None,
+    };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);

@@ -5,6 +5,7 @@
 
 pub mod clip_history;
 pub mod colour_picker;
+pub mod dragdrop;
 pub mod instruments;
 pub mod manual;
 pub mod menu;
