@@ -14,5 +14,6 @@ pub mod raster; // CPU anti-aliased coverage masks (disc/ring/bar), used by rend
 pub mod render; // GL glyph-atlas renderer (also declared in main.rs for the bin);
                 // exposed here so the offscreen pixel-identity gate can drive it
 pub mod select; // anchored text selection mode — pure logic, no I/O
+pub mod touch; // multi-touch gesture state (also declared in main.rs for the bin) — pure logic
 
 pub use input::{chord_from_winit, encode_key};

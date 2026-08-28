@@ -190,6 +190,28 @@ MOUSE
   Hold SHIFT to override that and use rt's own select / scroll / menu.
 
 
+TOUCH  &  STYLUS
+  tap              a click: focus a pane, hit a tab, pick a menu row
+  drag one finger  a left drag: select text, drag a pane by its titlebar,
+                   move a gutter — everything the mouse does with a button
+                   held down
+  drag two fingers scroll the pane, the way the wheel does; the content
+                   follows your fingers. A selection the first finger had
+                   begun is undone when the second lands, so a scroll
+                   never leaves a stray highlight behind.
+  stylus tip       a left click / drag, pressure and tilt ignored (rt is a
+                   terminal, not a canvas); the barrel buttons are the
+                   right and middle buttons.
+  window border      finger or pen: drag it to move the window, drag an
+                     edge to resize, tap the buttons to minimise, maximise
+                     or close
+  On Wayland a compositor sends touch and stylus events ONLY to a client
+  that asks for them — there is no emulated pointer to fall back on — so
+  older rt builds were simply deaf to both. The border is drawn by winit,
+  which routed only mouse events to it; rt carries a patched winit that
+  routes finger and pen there as well.
+
+
 KEYBOARD
   Keys without an rt binding go to the shell as the usual xterm sequences
   (arrows honour application-cursor mode, Alt prefixes ESC, Ctrl gives

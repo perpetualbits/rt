@@ -121,7 +121,7 @@ impl BackgroundEffect {
     /// `None` — degrading silently — when this is not Wayland, the protocol is
     /// absent, or any setup step fails. Safe to call once, right after the window
     /// exists.
-    pub fn try_init(window: &Window, want: bool) -> Option<Self> {
+    pub fn try_init(window: &dyn Window, want: bool) -> Option<Self> {
         // winit's raw Wayland pointers; bail on anything non-Wayland.
         let display_ptr = match window.display_handle().map(|h| h.as_raw()) {
             Ok(RawDisplayHandle::Wayland(d)) => d.display.as_ptr(),
@@ -181,7 +181,7 @@ impl BackgroundEffect {
         );
 
         let size = {
-            let s = window.inner_size();
+            let s = window.surface_size();
             (s.width as i32, s.height as i32)
         };
         let mut me = BackgroundEffect {

@@ -33,3 +33,9 @@ strip = true                         # drop symbols from release artifacts shipp
 # Both live in vendor/; see docs/vendored-engine.md for provenance.
 [patch.crates-io]
 vte = { path = "vendor/vte" }
+
+# Vendored winit-wayland: routes TOUCH events to the client-side decoration.
+# Upstream feeds the frame from wl_pointer only, so a finger on the title bar or
+# a resize edge reached no window at all and was dropped — a winit window could
+# not be moved, resized or closed by touch. See docs/vendored-winit-wayland.md.
+winit-wayland = { path = "vendor/winit-wayland" }

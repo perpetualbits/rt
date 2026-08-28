@@ -4,8 +4,9 @@ version = "0.3.18"
 edition = "2021"
 # panic = "unwind" (crash isolation) can let a panic in the unprotected draw path reach
 # winit/wayland `extern "C"` frames; rustc ≥ 1.81 turns that into a *defined* abort shim
-# (older compilers make it UB), so pin the floor.
-rust-version = "1.81"
+# (older compilers make it UB). The floor is now set higher still by winit 0.31,
+# whose own MSRV is 1.85.
+rust-version = "1.85"
 license = "GPL-3.0-or-later"
 description = "rt — a fast, tiling terminal emulator (loose Rust port of Terminator)"
 repository = "https://github.com/perpetualbits/rt"
@@ -36,7 +37,7 @@ default = ["x11", "vtterm-default"]
 # DISPLAY at runtime, so `--features x11` is a universal binary. The DEFAULT
 # build omits this feature, keeping the dependency tree Wayland-only (zero X11
 # crates). Build/install universal: cargo install --path crates/rt --features x11
-x11 = ["winit/x11", "glutin/glx", "glutin/x11", "glutin-winit/glx", "glutin-winit/x11", "dep:arboard", "dep:x11rb"]
+x11 = ["winit/x11", "glutin/glx", "glutin/x11", "dep:arboard", "dep:x11rb"]
 
 [dependencies]
 rt-core = { path = "../rt-core" }
@@ -44,18 +45,26 @@ rt-config = { path = "../rt-config" }
 rt-engine = { path = "../rt-engine" }
 rt-session = { path = "../rt-session" }
 
-# Windowing + GL, pinned to the same versions alacritty ships so we inherit a
-# known-good winit/glutin combination.
+# Windowing + GL.
 #
-# rt is Wayland-native by design (ADR-0003): no X11/XWayland fallback. We enable
-# only winit's `wayland` backend (dlopen so we don't hard-link libwayland at
-# build time) and glutin's `egl` (the Wayland GL path). The `x11`/`glx` features
-# are deliberately omitted so an X11 code path cannot even be compiled in.
-winit = { version = "0.30.9", default-features = false, features = ["wayland", "wayland-dlopen", "rwh_06"] }
+# winit 0.31 (pinned exactly: it is a pre-release) is not a routine bump — it is
+# the first release that implements the Wayland `tablet_v2` protocol and routes
+# touch through the same unified pointer events as the mouse. That is the whole
+# reason a finger or a stylus reaches rt at all: Wayland does no compositor-side
+# touch-to-pointer emulation, so under 0.30 a touchscreen client that binds only
+# wl_pointer is simply deaf to both. See docs/touch-and-stylus.md.
+#
+# `wayland-csd-adwaita` draws the GNOME-style client-side decoration. Mutter
+# never grants server-side decorations to a Wayland client, so without it winit
+# falls back to a bare frame that looks nothing like the rest of the desktop.
+#
+# The default build stays Wayland-only (dlopen so we don't hard-link libwayland);
+# the `x11` feature adds the X11/XWayland backends on both winit and glutin.
+winit = { version = "=0.31.0-beta.2", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
+# glutin is joined to winit directly, by raw handle: `glutin-winit` is still
+# pinned to winit 0.30 and cannot bridge 0.31. Both speak raw-window-handle 0.6,
+# which is the only interface the join actually needs.
 glutin = { version = "0.32.2", default-features = false, features = ["egl", "wayland"] }
-# glutin-winit's DEFAULT features re-enable glx/x11, which would drag X11 crates
-# back into the tree — so disable defaults and opt into only egl+wayland.
-glutin-winit = { version = "0.5.0", default-features = false, features = ["egl", "wayland"] }
 raw-window-handle = "0.6"            # handle types passed between winit and glutin
 glow = "0.17"                        # OpenGL wrapper for the custom glyph/atlas renderer
 fontdue = "0.9"                      # CPU glyph rasteriser feeding the GL atlas

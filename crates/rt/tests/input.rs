@@ -87,7 +87,9 @@ fn sequence_keys_are_classified() {
     assert!(is_sequence_key(&NamedKey::ArrowUp));
     assert!(is_sequence_key(&NamedKey::Enter));
     assert!(is_sequence_key(&NamedKey::F5));
-    // Space is NOT a sequence key: it must go through the text path so a
-    // dead-key + space composes correctly.
-    assert!(!is_sequence_key(&NamedKey::Space));
+    // A named key rt does not encode is NOT a sequence key: it must fall
+    // through to the text path, which is what lets a dead key + space compose
+    // correctly (space itself is a *character* key, `Key::Character(" ")`, and
+    // so never reaches this classifier at all).
+    assert!(!is_sequence_key(&NamedKey::BrowserBack));
 }

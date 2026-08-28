@@ -21,7 +21,7 @@ pub struct X11Blur {
 
 impl X11Blur {
     /// Set up X11 blur for `window`, applying the initial `enabled` state.
-    pub fn try_init(window: &Window, enabled: bool) -> Self {
+    pub fn try_init(window: &dyn Window, enabled: bool) -> Self {
         #[cfg(feature = "x11")]
         {
             let state = imp::State::new(window);
@@ -67,7 +67,7 @@ mod imp {
     }
 
     impl State {
-        pub fn new(window: &Window) -> Option<Self> {
+        pub fn new(window: &dyn Window) -> Option<Self> {
             // The X11 window id, or bail if this isn't an X11 window (Wayland).
             let window = match window.window_handle().ok()?.as_raw() {
                 RawWindowHandle::Xlib(h) => h.window as u32,

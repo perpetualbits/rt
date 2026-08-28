@@ -82,7 +82,7 @@ pub trait Backend {
     ///   an EGL `swap_buffers_with_damage(hint_rects)`. Returns `true` iff the
     ///   partial present was unavailable/failed and the caller must fall back to a
     ///   full redraw followed by [`Backend::full_swap`].
-    fn present(&mut self, window: &Window, damage: Option<(PxRect, &[PxRect])>) -> bool;
+    fn present(&mut self, window: &dyn Window, damage: Option<(PxRect, &[PxRect])>) -> bool;
 
     /// A plain full buffer swap. Used only by the scissored path's full-redraw
     /// fallback (matching the old inline `swap_buffers` there — note this does NOT

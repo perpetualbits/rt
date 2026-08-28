@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-08-25"
+    updated: "2026-08-28"
   },
 
   statuses: {
@@ -35,12 +35,16 @@ window.PROJECT_MAP = {
     {
       id: "rt-app", label: "rt (run-loop)", layer: "frontend", status: "done",
       tags: ["binary", "winit"],
-      desc: "The rt binary: the winit event loop that owns the window, drives one frame per change, maps keyboard/mouse into rt actions or PTY bytes, and prefers native Wayland (never XWayland), falling back to X11. Everything else hangs off this loop.",
-      files: ["crates/rt/src/main.rs", "crates/rt/src/input.rs"],
-      specs: [],
+      desc: "The rt binary: the winit event loop that owns the window, drives one frame per change, maps keyboard/mouse/touch/stylus into rt actions or PTY bytes, and prefers native Wayland (never XWayland), falling back to X11. Everything else hangs off this loop. On winit 0.31, whose unified pointer events and tablet_v2 support are what let a finger or a pen reach the window at all — Wayland emulates no pointer for either.",
+      files: ["crates/rt/src/main.rs", "crates/rt/src/input.rs", "crates/rt/src/touch.rs", "vendor/winit-wayland"],
+      specs: [
+        { label: "Touch & stylus", href: "docs/touch-and-stylus.md" },
+        { label: "Vendored winit-wayland", href: "docs/vendored-winit-wayland.md" }
+      ],
       parts: [
         { label: "Input mapping (keys → PTY / actions)", status: "done", desc: "Dead-key/IME compose, app-cursor-aware arrow encoding, keymap chords." },
-        { label: "Frame scheduler", status: "done", desc: "Idle-throttled redraws; forces full frames only when needed." }
+        { label: "Frame scheduler", status: "done", desc: "Idle-throttled redraws; forces full frames only when needed." },
+        { label: "Touch & stylus", status: "done", desc: "Tap = click, one-finger drag = drag/select, two-finger drag = scroll, stylus = mouse. The window decoration takes finger and pen as well, via a patched winit (vendor/winit-wayland) that routes touch and tablet events to the frame upstream drops." }
       ],
       deps: ["rt-session", "render-gl", "render-xrender", "damage"]
     },
