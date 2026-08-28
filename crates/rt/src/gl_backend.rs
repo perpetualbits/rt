@@ -36,7 +36,7 @@ impl GlBackend {
         renderer: Renderer,
         surface: Surface<WindowSurface>,
         context: PossiblyCurrentContext,
-        #[cfg_attr(not(feature = "x11"), allow(unused_variables))] window: &Window,
+        #[cfg_attr(not(feature = "x11"), allow(unused_variables))] window: &dyn Window,
     ) -> Self {
         GlBackend {
             renderer,
@@ -75,8 +75,8 @@ impl GlBackend {
     /// (the caller then runs a full redraw + [`full_swap`](Self::full_swap)).
     /// `rects` are physical px, top-left origin; converted to EGL's bottom-left
     /// origin here.
-    fn present_with_damage(&mut self, window: &Window, rects: &[PxRect]) -> bool {
-        let screen_h = window.inner_size().height as i32;
+    fn present_with_damage(&mut self, window: &dyn Window, rects: &[PxRect]) -> bool {
+        let screen_h = window.surface_size().height as i32;
         let egl_rects: Vec<GlRect> = rects
             .iter()
             .map(|r| {
@@ -174,13 +174,13 @@ impl Backend for GlBackend {
         self.surface.resize(&self.context, w, h); // resize GL surface
     }
 
-    fn present(&mut self, window: &Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
+    fn present(&mut self, window: &dyn Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
         match damage {
             // --- full path (was redraw_full's tail), verbatim ---------------
             None => {
                 #[cfg(feature = "x11")]
                 if let Some(p) = self.x11_present.as_ref() {
-                    let sz = window.inner_size();
+                    let sz = window.surface_size();
                     let (w, h) = (sz.width as i32, sz.height as i32);
                     if p.present_rect(self.renderer.gl_ctx(), 0, 0, w, h, h) {
                         return false; // presented the full window via XPutImage; no swap
@@ -198,7 +198,7 @@ impl Backend for GlBackend {
                 let _ = bbox; // bbox is only consumed by the (cfg'd-out) Route-1 branch
                 #[cfg(feature = "x11")]
                 if let Some(p) = self.x11_present.as_ref() {
-                    let sh = window.inner_size().height as i32;
+                    let sh = window.surface_size().height as i32;
                     if p.present_rect(self.renderer.gl_ctx(), bbox.x, bbox.y, bbox.w, bbox.h, sh) {
                         return false; // presented the damage rect via XPutImage; no swap, no re-arm
                     }

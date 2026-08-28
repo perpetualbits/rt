@@ -38,7 +38,7 @@ impl X11Present {
     /// Build from rt's window. `None` on Wayland, an unsupported depth (not 24/32),
     /// a non-LSBFirst (big-endian) server, or if X setup fails — the caller then keeps
     /// the normal `swap_buffers` path. Requires little-endian + BGRX/TrueColor visual.
-    pub fn try_new(window: &Window) -> Option<Self> {
+    pub fn try_new(window: &dyn Window) -> Option<Self> {
         let win = match window.window_handle().ok()?.as_raw() {
             RawWindowHandle::Xlib(h) => h.window as u32,
             RawWindowHandle::Xcb(h) => h.window.get(),

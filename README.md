@@ -59,6 +59,7 @@ edges still being driven to zero.
 - **Border instruments** — live gauges on each pane's edge: output flow, CPU heat (blackbody), render latency. Idle-throttled, so they cost nothing when nothing's happening.
 - **Patch-bay** — wire panes' stdin/stdout/stderr to each other via `$RT_OUT` / `$RT_ERR` / `$RT_IN` (real named pipes). The animated wires *are* the bytes.
 - **Mouse** — full support, including forwarding to mouse-aware TUIs (vim, htop, …); hold **Shift** to override and use rt's own selection/scroll. Draggable scrollbar.
+- **Touch & stylus** — a tap is a click, one finger drags and selects, two fingers scroll, and a pen works like a mouse (barrel buttons = right/middle). Wayland sends these to no client that has not asked for them, so this is real support, not emulation — see [docs/touch-and-stylus.md](docs/touch-and-stylus.md). The window *decoration* stays mouse-only (a winit limitation).
 - **Background blur** — compositor blur where available (Wayland `ext-background-effect-v1` / KDE; X11 `_KDE_NET_WM_BLUR_BEHIND_REGION`).
 - **Scheme-aware chrome** — per-pane headers derived from your own foreground/background colours.
 

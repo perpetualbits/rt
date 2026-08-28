@@ -70,7 +70,7 @@ wayland_client::delegate_noop!(BlurState: ignore OrgKdeKwinBlur);
 
 /// Request KWin to blur behind `window`'s surface. Safe no-op on non-KDE
 /// compositors and on any error. Call once, right after the window exists.
-pub fn try_enable_kwin_blur(window: &Window) {
+pub fn try_enable_kwin_blur(window: &dyn Window) {
     // Fetch winit's raw Wayland display + surface pointers; bail on anything
     // that is not a Wayland handle (rt is Wayland-only, but be defensive).
     let display_ptr = match window.display_handle().map(|h| h.as_raw()) {

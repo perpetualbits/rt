@@ -30,7 +30,9 @@ fn mods_from_winit(m: ModifiersState) -> Mods {
     if m.alt_key() {
         out = out.with(Mods::ALT); // Alt held
     }
-    if m.super_key() {
+    // winit 0.31 calls this modifier `meta`; it is the same physical key rt
+    // binds as Super.
+    if m.meta_key() {
         out = out.with(Mods::SUPER); // Super/Meta held
     }
     out
@@ -208,7 +210,6 @@ pub fn encode_key(key: &Key, mods: ModifiersState, app_cursor: bool) -> Option<V
             NamedKey::Delete => Some(b"\x1b[3~".to_vec()),
             NamedKey::PageUp => Some(b"\x1b[5~".to_vec()),
             NamedKey::PageDown => Some(b"\x1b[6~".to_vec()),
-            NamedKey::Space => Some(b" ".to_vec()),
             // Function keys F1–F4 use SS3; F5–F12 use CSI ~ codes (xterm).
             NamedKey::F1 => Some(b"\x1bOP".to_vec()),
             NamedKey::F2 => Some(b"\x1bOQ".to_vec()),

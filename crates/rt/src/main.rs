@@ -32,6 +32,7 @@ mod prefs_model; // which setting each preferences row edits, and how a step cla
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
 mod render; // the GL glyph-atlas renderer
 mod select; // pure head-navigation logic for anchored selection
+mod touch; // pure multi-touch gesture state: which fingers are down, and what they mean
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
 use std::cell::RefCell; // shared jacks map between the spawn closure and Active
@@ -46,16 +47,25 @@ use std::time::{Duration, Instant}; // frame pacing for async PTY updates
 
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::ContextAttributesBuilder;
-use glutin::display::GetGlDisplay;
+use glutin::display::{Display, DisplayApiPreference};
 use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, buffer_age, …)
-use glutin::surface::SurfaceAttributesBuilder;
-use glutin_winit::{DisplayBuilder, GlWindow};
+use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    ButtonSource, ElementState, Ime, MouseButton, MouseScrollDelta, PointerKind, PointerSource,
+    WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+// `is_wayland()` / `is_x11()` — which backend winit picked at runtime, so the
+// per-backend window attributes (app_id vs WM_CLASS) go to the right one.
+use winit::platform::wayland::ActiveEventLoopExtWayland;
+#[cfg(feature = "x11")]
+use winit::platform::x11::ActiveEventLoopExtX11;
+use winit::cursor::{Cursor, CursorIcon, CustomCursor, CustomCursorSource};
+use winit::monitor::Fullscreen;
+use winit::window::{Window, WindowAttributes, WindowId};
 
 use render::{Color, Renderer};
 use rt_config::Keymap;
@@ -316,6 +326,7 @@ struct Active {
     mods: ModifiersState,                 // live modifier state (updated on change)
     settings: rt_config::Settings,        // window appearance (background opacity, …)
     mouse: (f32, f32),                    // last cursor position in physical pixels
+    touch: touch::Touch,                  // fingers on the glass, and the gesture they add up to
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
     // "Move Pane to <window>" targets, snapshotted when the menu opened: every
@@ -419,7 +430,7 @@ struct Active {
     // stands down entirely: a carry outlives motion, so nothing may reset the
     // shape until the carry ends. Cleared for every window by `cancel_carry`.
     carry_cursor: bool,
-    window: Window, // the OS window — LAST so it outlives everything that references it on Drop
+    window: Box<dyn Window>, // the OS window — LAST so it outlives everything that references it on Drop
 }
 
 /// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
@@ -624,7 +635,7 @@ struct DragState {
     // stands in for the whole drag. Read back by `commit_drag` when a
     // Ctrl-held release turns the drag into a CARRY: the card the pointer is
     // already wearing is handed straight to `enter_carry` rather than rebuilt.
-    card: Option<winit::window::CustomCursor>,
+    card: Option<CustomCursor>,
 }
 
 /// A CARRY in progress: the modal "pick up, aim, click to drop" state, the
@@ -641,11 +652,11 @@ struct CarryState {
     source: WindowId,                    // window it was picked up in (its home while carried)
     // Ghost chip text (pane title / "Tab: title"), snapshotted at pick-up so it
     // survives the title changing under the carry. Read by the hover block in
-    // `CursorMoved`, which puts it into the aimed window's `drag_ghost`.
+    // `PointerMoved`, which puts it into the aimed window's `drag_ghost`.
     label: String,
     // The held-pane cursor card, or None if the platform refused the image —
     // then plain `CursorIcon::Grabbing` stands in for the whole carry.
-    card: Option<winit::window::CustomCursor>,
+    card: Option<CustomCursor>,
 }
 
 /// Build the system font database (scans the usual font directories).
@@ -796,7 +807,7 @@ impl App {
     /// FIRST window. The patch-bay dir is process-scoped (`rt-<pid>`) and
     /// `ensure_jacks_dir` is idempotent, so every window shares the same dir
     /// while keeping its own `SharedJacks` map + spawn closure.
-    fn build_active(&mut self, event_loop: &ActiveEventLoop) -> Option<Active> {
+    fn build_active(&mut self, event_loop: &dyn ActiveEventLoop) -> Option<Active> {
         // Load persisted settings (before the renderer, so fonts/colours come
         // from the config). Env vars override for demos/screenshots. Loaded here
         // — ahead of the window — so `--cols`/`--rows` can pre-size it from the
@@ -841,22 +852,57 @@ impl App {
         // Wayland app_id / X11 WM_CLASS. This MUST equal the installed desktop
         // entry's basename (io.github.perpetualbits.rt.desktop) so the compositor
         // can bind our icon to the window — without it, no icon shows on Wayland
-        // no matter what's installed. Both winit ext traits write the same
-        // `platform_specific.name` field, so one call covers both backends
-        // (Wayland uses `general` as the app_id; X11 uses it as the WM_CLASS
-        // class). See extra/linux/ for the desktop entry + icon.
-        use winit::platform::wayland::WindowAttributesExtWayland;
+        // no matter what's installed. winit 0.31 keeps the two backends' window
+        // attributes apart instead of in one shared field, so each gets its own
+        // attributes object below; the string written is the same either way
+        // (Wayland uses `general` as the app_id, X11 as the WM_CLASS class).
+        // See extra/linux/ for the desktop entry + icon.
         const APP_ID: &str = "io.github.perpetualbits.rt";
-        let window_attrs = Window::default_attributes()
+        let mut window_attrs = WindowAttributes::default()
             .with_title("rt") // window title; per-pane titles update it later
-            .with_name(APP_ID, "rt") // app_id (Wayland) / WM_CLASS (X11) → icon binding
             .with_transparent(true) // REQUIRED for the compositor to honour our alpha
-            .with_inner_size(initial_size);
-        let template = ConfigTemplateBuilder::new().with_alpha_size(8); // want an alpha channel
-        // DisplayBuilder creates the window AND enumerates GL configs together,
-        // which is the supported winit-0.30/glutin-0.32 pattern.
-        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attrs));
-        let (window, gl_config) = match display_builder.build(event_loop, template, |configs| {
+            .with_surface_size(initial_size);
+
+        // --- open the GL display, ahead of the window --------------------
+        // `glutin-winit` used to create the window and enumerate GL configs in
+        // one call; joining glutin to winit 0.31 by hand means doing it in the
+        // order X11 requires — config FIRST, because on X11 the window has to be
+        // created with the config's visual (see the transparency note below) and
+        // a window's visual cannot be changed afterwards. On Wayland the order
+        // is free, so one sequence serves both.
+        let raw_display = match event_loop.display_handle() {
+            Ok(h) => h.as_raw(),
+            Err(e) => {
+                log::error!("no display handle: {e}");
+                return self.fail_build(event_loop);
+            }
+        };
+        // EGL is the path on Wayland and the preferred one on X11; the X11 build
+        // keeps GLX as a fallback for servers without the EGL platform extension,
+        // which is what glutin-winit's default preference gave us.
+        #[cfg(not(feature = "x11"))]
+        let api_preference = DisplayApiPreference::Egl;
+        #[cfg(feature = "x11")]
+        let api_preference = DisplayApiPreference::EglThenGlx(Box::new(
+            winit::platform::x11::register_xlib_error_hook,
+        ));
+        let gl_display = match unsafe { Display::new(raw_display, api_preference) } {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("failed to open the GL display: {e}");
+                return self.fail_build(event_loop);
+            }
+        };
+
+        let template = ConfigTemplateBuilder::new().with_alpha_size(8).build(); // want an alpha channel
+        let configs = match unsafe { gl_display.find_configs(template) } {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("no GL configs: {e}");
+                return self.fail_build(event_loop);
+            }
+        };
+        let gl_config = configs.reduce(|a, b| {
             // Prefer a config whose X11 VISUAL supports transparency, before any
             // other criterion. On X11 the WINDOW's visual — not the GL drawable's
             // alpha_size — decides transparency: a config can report alpha_size 8
@@ -867,38 +913,64 @@ impl App {
             // already reports transparency-capable configs, so this is a no-op
             // there; and where no such config exists (bare X, no compositor) we
             // fall through to the alpha/sample preference and stay 24-bit.
-            configs
-                .reduce(|a, b| {
-                    let (at, bt) = (
-                        a.supports_transparency().unwrap_or(false),
-                        b.supports_transparency().unwrap_or(false),
-                    );
-                    if at != bt {
-                        return if bt { b } else { a }; // the transparency-capable one wins
-                    }
-                    // Tie on transparency: prefer more alpha, then more samples.
-                    let better_alpha = b.alpha_size() > a.alpha_size();
-                    let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
-                    if better_alpha || same_more_samples { b } else { a }
-                })
-                .expect("at least one GL config")
-        }) {
-            Ok((Some(window), config)) => (window, config), // got a window + config
-            Ok((None, _)) => {
-                log::error!("window creation returned no window");
+            let (at, bt) = (
+                a.supports_transparency().unwrap_or(false),
+                b.supports_transparency().unwrap_or(false),
+            );
+            if at != bt {
+                return if bt { b } else { a }; // the transparency-capable one wins
+            }
+            // Tie on transparency: prefer more alpha, then more samples.
+            let better_alpha = b.alpha_size() > a.alpha_size();
+            let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
+            if better_alpha || same_more_samples { b } else { a }
+        });
+        let gl_config = match gl_config {
+            Some(c) => c,
+            None => {
+                log::error!("no GL config matched the template");
                 return self.fail_build(event_loop);
             }
+        };
+
+        // --- per-backend window attributes -------------------------------
+        // The X11 arm also pins the window to the chosen config's visual, which
+        // is the whole reason the config had to be picked first.
+        #[cfg(feature = "x11")]
+        if event_loop.is_x11() {
+            use glutin::platform::x11::X11GlConfigExt;
+            let mut x11_attrs =
+                winit::platform::x11::WindowAttributesX11::default().with_name(APP_ID, "rt");
+            if let Some(visual) = gl_config.x11_visual() {
+                x11_attrs = x11_attrs.with_x11_visual(visual.visual_id() as _);
+            }
+            window_attrs = window_attrs.with_platform_attributes(Box::new(x11_attrs));
+        }
+        if event_loop.is_wayland() {
+            window_attrs = window_attrs.with_platform_attributes(Box::new(
+                winit::platform::wayland::WindowAttributesWayland::default()
+                    .with_name(APP_ID, "rt"),
+            ));
+        }
+
+        let window = match event_loop.create_window(window_attrs) {
+            Ok(w) => w,
             Err(e) => {
-                log::error!("failed to create window/GL config: {e}");
+                log::error!("failed to create window: {e}");
                 return self.fail_build(event_loop);
             }
         };
 
         // --- create the GL context and surface ---------------------------
-        let gl_display = gl_config.display(); // the platform GL display
-        // Raw handle needed to bind the context to this specific window.
-        let raw_handle = window.window_handle().ok().map(|h| h.as_raw());
-        let context_attrs = ContextAttributesBuilder::new().build(raw_handle);
+        // Raw handle needed to bind the context and surface to this window.
+        let raw_handle = match window.window_handle() {
+            Ok(h) => h.as_raw(),
+            Err(e) => {
+                log::error!("no window handle: {e}");
+                return self.fail_build(event_loop);
+            }
+        };
+        let context_attrs = ContextAttributesBuilder::new().build(Some(raw_handle));
         // Create a not-yet-current context, then a surface, then make current.
         let not_current = match unsafe { gl_display.create_context(&gl_config, &context_attrs) } {
             Ok(c) => c,
@@ -907,15 +979,15 @@ impl App {
                 return self.fail_build(event_loop);
             }
         };
-        // Build the window surface at the window's current size.
-        let attrs = window.build_surface_attributes(SurfaceAttributesBuilder::new());
-        let attrs = match attrs {
-            Ok(a) => a,
-            Err(e) => {
-                log::error!("surface attributes failed: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
+        // Build the window surface at the window's current size. `max(1)` because
+        // a zero-sized surface is not representable (and a compositor may hand us
+        // a 0-height window while it is still being mapped).
+        let surface_size = window.surface_size();
+        let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            raw_handle,
+            NonZeroU32::new(surface_size.width.max(1)).expect("max(1) is non-zero"),
+            NonZeroU32::new(surface_size.height.max(1)).expect("max(1) is non-zero"),
+        );
         let surface = match unsafe { gl_display.create_window_surface(&gl_config, &attrs) } {
             Ok(s) => s,
             Err(e) => {
@@ -948,19 +1020,34 @@ impl App {
         };
         // Ask KWin to blur behind us (true background blur on KDE). No-op
         // elsewhere (COSMIC/GNOME/sway use the ext protocol below, or nothing).
-        blur::try_enable_kwin_blur(&window);
+        blur::try_enable_kwin_blur(window.as_ref());
         // Cross-compositor blur via the ext-background-effect-v1 staging protocol
         // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
         // translucent — blur behind an opaque surface is wasted compositor work.
         // None on compositors without the protocol (the window is just translucent).
-        let bg_effect = bg_effect::BackgroundEffect::try_init(&window, want_blur(&settings));
+        let bg_effect = bg_effect::BackgroundEffect::try_init(window.as_ref(), want_blur(&settings));
         // X11 counterpart: the _KDE_NET_WM_BLUR_BEHIND_REGION property (KWin-X11,
         // picom). Inert on Wayland and on a no-x11 build.
-        let x11_blur = x11_blur::X11Blur::try_init(&window, want_blur(&settings));
+        let x11_blur = x11_blur::X11Blur::try_init(window.as_ref(), want_blur(&settings));
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
-        // IMEs work: composed text arrives via WindowEvent::Ime(Commit).
-        window.set_ime_allowed(true);
+        // IMEs work: composed text arrives via WindowEvent::Ime(Commit). rt asks
+        // for no optional capability — no cursor area, no surrounding text — so
+        // the request carries an empty capability set and empty data, which is
+        // the pair `ImeEnableRequest::new` accepts. Failure just means this
+        // platform has no IME; plain typing is unaffected.
+        let ime_enable = winit::window::ImeEnableRequest::new(
+            winit::window::ImeCapabilities::new(),
+            winit::window::ImeRequestData::default(),
+        );
+        match ime_enable {
+            Some(req) => {
+                if let Err(e) = window.request_ime_update(winit::window::ImeRequest::Enable(req)) {
+                    log::debug!("IME unavailable ({e:?}); dead keys fall back to plain text");
+                }
+            }
+            None => log::debug!("IME enable request rejected its own capabilities; skipping"),
+        }
 
         // Clipboard (+ PRIMARY selection), tied to the window's display. Picks the
         // Wayland (smithay) or X11 (arboard, `x11` feature) backend from the raw
@@ -971,7 +1058,7 @@ impl App {
             .and_then(|h| clipboard::Clipboard::from_display(h.as_raw()));
 
         // Size the renderer/viewport to the window's physical pixels.
-        let size = window.inner_size(); // physical pixel size
+        let size = window.surface_size(); // physical pixel size
         renderer.resize(size.width as f32, size.height as f32);
         let cell = renderer.cell_size(); // (cell_w, cell_h) in pixels
 
@@ -1081,14 +1168,14 @@ impl App {
             #[cfg(feature = "x11")]
             let xr: Option<Box<dyn backend::Backend>> =
                 if matches!(backend_kind, backend::BackendKind::XRender) {
-                    xrender_backend::XRenderBackend::try_new(&window, &font_blobs, settings.font_size)
+                    xrender_backend::XRenderBackend::try_new(window.as_ref(), &font_blobs, settings.font_size)
                         .map(|b| Box::new(b) as Box<dyn backend::Backend>)
                 } else {
                     None
                 };
             #[cfg(not(feature = "x11"))]
             let xr: Option<Box<dyn backend::Backend>> = None;
-            xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window)))
+            xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, window.as_ref())))
         };
         let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
         Some(Active {
@@ -1099,6 +1186,7 @@ impl App {
             mods: ModifiersState::empty(),
             settings,
             mouse: (0.0, 0.0),
+            touch: touch::Touch::default(),
             menu: None,
             menu_hover: None,
             menu_windows: Vec::new(),
@@ -1190,7 +1278,7 @@ impl App {
     /// A window build failed. Fatal — stop the event loop — only while no
     /// window exists yet (the first window IS the app); a failed EXTRA window
     /// just doesn't open, and the existing windows keep running.
-    fn fail_build(&self, event_loop: &ActiveEventLoop) -> Option<Active> {
+    fn fail_build(&self, event_loop: &dyn ActiveEventLoop) -> Option<Active> {
         if self.windows.is_empty() {
             event_loop.exit();
         }
@@ -1199,12 +1287,12 @@ impl App {
 }
 
 impl ApplicationHandler for App {
-    /// Called when the app is (re)activated. On the first call we build the
-    /// first window (window, GL context, renderer, session) and apply the RT_*
+    /// Called when it is possible to create surfaces. On the first call we build
+    /// the first window (window, GL context, renderer, session) and apply the RT_*
     /// demo/startup hooks. Subsequent calls (after a suspend) are no-ops here
     /// because we keep the state alive. Extra windows are opened at runtime via
     /// `WindowCmd::NewWindow`, which reuses [`App::build_active`] without hooks.
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if !self.windows.is_empty() {
             return; // already initialised; nothing to do on re-resume
         }
@@ -1318,7 +1406,18 @@ impl ApplicationHandler for App {
 
     /// Handle a window event: close, resize, key input, redraw. Routed to the
     /// window it belongs to via `id`.
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // winit 0.31 delivers mouse, finger and stylus through the SAME pointer
+        // events, told apart only by their source. rt wants a tap and a stylus
+        // tip-down to mean what a left click means, so the source is collapsed
+        // to the button it stands for once, here, and every arm below matches on
+        // that: `mouse_button()` maps touch to Left, a stylus tip to Left and its
+        // barrel buttons to Right/Middle. `None` is a device winit could not
+        // classify — it names no button, so no arm claims it.
+        let ptr_button: Option<MouseButton> = match &event {
+            WindowEvent::PointerButton { button, .. } => button.clone().mouse_button(),
+            _ => None,
+        };
         // Two ways a mouse BUTTON event abandons a live pane/tab drag:
         //
         //  - it arrived in a window that is NOT where the gesture began, which
@@ -1343,15 +1442,9 @@ impl ApplicationHandler for App {
         // window's drag is not consumed: this window handles it as it always
         // would.
         let mut drag_abandoned = false;
-        if matches!(event, WindowEvent::MouseInput { .. }) {
-            let second_button = matches!(
-                event,
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    button: MouseButton::Right | MouseButton::Middle,
-                    ..
-                }
-            );
+        if matches!(event, WindowEvent::PointerButton { .. }) {
+            let second_button = matches!(event, WindowEvent::PointerButton { state: ElementState::Pressed, .. })
+                && matches!(ptr_button, Some(MouseButton::Right | MouseButton::Middle));
             if second_button || matches!(self.armed_drag.as_ref(), Some(a) if a.window != id) {
                 self.armed_drag = None; // a stale or abandoned arm: no click action anywhere
             }
@@ -1370,9 +1463,60 @@ impl ApplicationHandler for App {
                 self.cancel_carry();
             }
         }
+        // --- multi-touch -------------------------------------------------
+        // One finger already IS the pointer, thanks to winit 0.31 reporting it
+        // through the same events as a mouse: a tap clicks, a drag selects, and
+        // none of that needed code. Two fingers do not mean two pointers — they
+        // mean scroll — so the gesture state decides here whether an event goes
+        // on to the pointer handling below, drives the scrollback, or is
+        // swallowed because the pointer must not see it. Resolved BEFORE
+        // `active` is borrowed for the rest of the handler, because cancelling
+        // reaches `&mut self` state (a live cross-window drag) that a borrow out
+        // of `self.windows` would lock away.
+        let verdict = match self.windows.get_mut(&id) {
+            Some(active) => Self::touch_verdict(active, &event),
+            None => return,
+        };
+        match verdict {
+            None | Some(touch::Verdict::Pointer) => {} // mouse, stylus, or one finger
+            Some(touch::Verdict::Swallow) => return,
+            Some(touch::Verdict::Scroll(lines)) => {
+                if let Some(active) = self.windows.get_mut(&id) {
+                    Self::scroll_lines(active, lines);
+                }
+                return;
+            }
+            Some(touch::Verdict::CancelPointer) => {
+                // The first finger's press already landed as a left press, so a
+                // selection may be half-drawn and a pane drag armed. The second
+                // finger says the gesture was a scroll all along: undo both, or
+                // the scroll leaves a stray selection behind it.
+                self.armed_drag = None;
+                if self.drag.is_some() {
+                    self.cancel_drag();
+                }
+                if let Some(active) = self.windows.get_mut(&id) {
+                    active.selecting = false;
+                    active.selection = None;
+                    active.force_full = true; // the abandoned selection is off the damage-tracked path
+                    active.window.request_redraw();
+                }
+                return;
+            }
+        }
+
         // Everything here needs this window's state; ignore events before
         // resume and events for a window that has already closed.
         let Some(active) = self.windows.get_mut(&id) else { return };
+        // A pointer button now carries its own position, and for a finger that
+        // is the ONLY place it appears: touch has no hover, so no PointerMoved
+        // precedes the press to have set `active.mouse`. Syncing it here is what
+        // makes every hit test below — menu rows, tab labels, jacks, selection —
+        // work off the point actually touched rather than wherever the mouse was
+        // last left lying.
+        if let WindowEvent::PointerButton { position, .. } = &event {
+            active.mouse = (position.x as f32, position.y as f32);
+        }
         if active.ld_on && matches!(&event, WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed) {
             active.ld_keys += 1; // RT_XDIAG: key presses actually delivered to rt this second
         }
@@ -1390,11 +1534,13 @@ impl ApplicationHandler for App {
         // (via `commit_settings`) rather than per pointer-move — cheap over ssh -X.
         if active.picker.is_some() {
             use chrome::colour_picker as cp;
-            let size = active.window.inner_size();
+            let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
             let g = cp::layout(cw, ch, size.width as f32, size.height as f32);
             match &event {
-                WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                WindowEvent::PointerButton { state: ElementState::Pressed, .. }
+                    if ptr_button == Some(MouseButton::Left) =>
+                {
                     if !g.panel.contains(active.mouse) {
                         Self::close_picker(active); // a click outside dismisses
                         return;
@@ -1425,7 +1571,7 @@ impl ApplicationHandler for App {
                     active.window.request_redraw();
                     return;
                 }
-                WindowEvent::CursorMoved { position, .. } => {
+                WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
                     if let Some(d) = active.picker.and_then(|p| p.drag) {
                         {
@@ -1444,7 +1590,9 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                WindowEvent::PointerButton { state: ElementState::Released, .. }
+                    if ptr_button == Some(MouseButton::Left) =>
+                {
                     if let Some(pk) = active.picker.as_mut() {
                         pk.drag = None;
                     }
@@ -1473,7 +1621,7 @@ impl ApplicationHandler for App {
         if active.prefs_open {
             match &event {
                 WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
-                    let size = active.window.inner_size();
+                    let size = active.window.surface_size();
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
                     let cols = (content_bounds(size).w / cw).max(1.0) as usize;
@@ -1499,7 +1647,13 @@ impl ApplicationHandler for App {
                         }
                         Key::Named(NamedKey::ArrowLeft) => Self::prefs_step(active, &rws, -1),
                         Key::Named(NamedKey::ArrowRight) => Self::prefs_step(active, &rws, 1),
-                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+                        // Enter or Space activates the selected row. Space is a
+                        // *character* key in winit 0.31 (the W3C UI-Events key set
+                        // has no named Space), hence the guard rather than a second
+                        // `Key::Named` pattern.
+                        k if matches!(k, Key::Named(NamedKey::Enter))
+                            || matches!(k, Key::Character(c) if c == " ") =>
+                        {
                             if rws.get(active.prefs_sel).and_then(|r| r.pref) == Some(prefs_model::PrefRow::Close) {
                                 active.prefs_open = false;
                                 if let Some(new) = active.prefs_pending.take() {
@@ -1515,8 +1669,10 @@ impl ApplicationHandler for App {
                     active.window.request_redraw();
                     return;
                 }
-                WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                    let size = active.window.inner_size();
+                WindowEvent::PointerButton { state: ElementState::Pressed, .. }
+                    if ptr_button == Some(MouseButton::Left) =>
+                {
+                    let size = active.window.surface_size();
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
                     let cols = (content_bounds(size).w / cw).max(1.0) as usize;
@@ -1561,13 +1717,13 @@ impl ApplicationHandler for App {
                 // up, so a click that follows (without further motion outside the
                 // dialog) hit-tests against where the pointer actually is, rather
                 // than a stale pre-open position.
-                WindowEvent::CursorMoved { position, .. } => {
+                WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
                     return;
                 }
                 // Swallow all other input so it cannot reach the PTY.
                 WindowEvent::KeyboardInput { .. }
-                | WindowEvent::MouseInput { .. }
+                | WindowEvent::PointerButton { .. }
                 | WindowEvent::MouseWheel { .. }
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
@@ -1579,7 +1735,7 @@ impl ApplicationHandler for App {
         // and every other input is swallowed so it can't reach the PTY. One native
         // handler on both backends (no egui); lifecycle events fall through.
         if active.manual_open {
-            let size = active.window.inner_size();
+            let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
             let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch);
             match &event {
@@ -1632,8 +1788,8 @@ impl ApplicationHandler for App {
                 // Swallow all other input (releases, keys, mouse, IME, mods) so
                 // nothing leaks to the PTY; lifecycle events fall through.
                 WindowEvent::KeyboardInput { .. }
-                | WindowEvent::MouseInput { .. }
-                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::PointerButton { .. }
+                | WindowEvent::PointerMoved { .. }
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
                 _ => {}
@@ -1652,11 +1808,11 @@ impl ApplicationHandler for App {
                 .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
             let has_sel = Self::selected_text(active).is_some();
             let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
-            let size = active.window.inner_size();
+            let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
             let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
             match &event {
-                WindowEvent::CursorMoved { position, .. } => {
+                WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
                     active.menu_hover = chrome::menu::hit_row(&g, active.mouse);
                     active.window.request_redraw();
@@ -1675,13 +1831,13 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                WindowEvent::MouseInput { state, button, .. }
+                WindowEvent::PointerButton { state, .. }
                     if *state == ElementState::Pressed =>
                 {
                     if g.panel.contains(active.mouse) {
                         // Left-click on an ENABLED row acts + closes; a click on a
                         // disabled row or separator is ignored (menu stays open).
-                        if *button == MouseButton::Left {
+                        if ptr_button == Some(MouseButton::Left) {
                             if let Some(i) = chrome::menu::hit_row(&g, active.mouse) {
                                 if rows[i].enabled {
                                     active.menu = None;
@@ -1749,7 +1905,7 @@ impl ApplicationHandler for App {
                 // Swallow remaining input (releases, wheel, IME, mods); lifecycle
                 // events fall through to normal handling.
                 WindowEvent::KeyboardInput { .. }
-                | WindowEvent::MouseInput { .. }
+                | WindowEvent::PointerButton { .. }
                 | WindowEvent::MouseWheel { .. }
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
@@ -1760,7 +1916,7 @@ impl ApplicationHandler for App {
         // Clipboard-history overlay: modal like the context menu. Arrow keys move
         // the selection, Enter/click picks, Esc/click-outside closes.
         if let Some(sel) = active.clip_overlay {
-            let size = active.window.inner_size();
+            let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
             let n = active.clip_history.len();
             let anchor = Self::pane_content_rect(active, active.session.focus())
@@ -1790,7 +1946,7 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                WindowEvent::CursorMoved { position, .. } => {
+                WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
                     if let Some(i) = chrome::clip_history::hit_row(&g, active.mouse) {
                         active.clip_overlay = Some(i);
@@ -1799,7 +1955,9 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                WindowEvent::PointerButton { state: ElementState::Pressed, .. }
+                    if ptr_button == Some(MouseButton::Left) =>
+                {
                     match chrome::clip_history::hit_row(&g, active.mouse) {
                         Some(i) => Self::pick_clip(active, i),
                         None => {
@@ -1814,7 +1972,7 @@ impl ApplicationHandler for App {
                 // Swallow remaining input (releases, wheel, IME, mods); lifecycle
                 // events fall through to normal handling.
                 WindowEvent::KeyboardInput { .. }
-                | WindowEvent::MouseInput { .. }
+                | WindowEvent::PointerButton { .. }
                 | WindowEvent::MouseWheel { .. }
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
@@ -1899,10 +2057,14 @@ impl ApplicationHandler for App {
                 }
                 Ime::Enabled => {} // IME turned on; nothing to do
                 Ime::Disabled => active.ime_preedit = false, // IME off; clear any preedit gate
+                // An input method asking us to delete text around the cursor:
+                // meaningful for an editable text field, but a terminal owns no
+                // such buffer — the PTY child does. Nothing to delete here.
+                _ => {}
             },
 
             // Window resized: defer EVERYTHING to the settle (see RESIZE_SETTLE).
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 // Do nothing now -- not even repaint. Two costs hide in a drag, and
                 // both are paid per configure event, ~20 times, for sizes that are
                 // superseded within ~50ms and never looked at:
@@ -1950,41 +2112,13 @@ impl ApplicationHandler for App {
                 // Normalise both delta kinds to a signed line count.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as isize, // notch-based devices
-                    MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as isize, // touchpads (~20px/line)
+                    MouseScrollDelta::PixelDelta(p) => (p.y / touch::PX_PER_LINE as f64) as isize, // touchpads
                 };
-                if lines != 0 {
-                    // If the app under the pointer wants the wheel (and Shift
-                    // isn't held to force scrollback), send it one report per
-                    // notch instead of scrolling rt's history.
-                    if !active.mods.shift_key() {
-                        let up = lines > 0;
-                        let notches = lines.unsigned_abs().min(8); // cap runaway touchpad deltas
-                        let mut forwarded = false;
-                        for _ in 0..notches {
-                            if Self::forward_mouse(active, MouseReport::Scroll(up), active.mouse.0, active.mouse.1) {
-                                forwarded = true;
-                            } else {
-                                break; // pane doesn't want the mouse: fall through to scrollback
-                            }
-                        }
-                        if forwarded {
-                            active.window.request_redraw();
-                            return;
-                        }
-                    }
-                    let focus = active.session.focus(); // scroll the focused pane
-                    // Drive the terminal's own scrollback; in column mode the
-                    // whole tall viewport shifts, giving the cross-column flow.
-                    if let Some(pane) = active.session.pane(focus) {
-                        pane.scroll(lines); // &self method: locks the Term internally
-                    }
-                    active.force_full = true; // scrollback offset changed: cell→px mapping shifts
-                    active.window.request_redraw(); // repaint at the new offset
-                }
+                Self::scroll_lines(active, lines);
             }
 
             // Track the cursor; when a menu is open, update its hover highlight.
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::PointerMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
                 // --- pane/tab drag-and-drop owns the pointer while it lasts ---
                 // An armed press becomes a drag once the pointer has moved far
@@ -2010,7 +2144,7 @@ impl ApplicationHandler for App {
                                 let panes = active.session.tab_panes(first_pane).unwrap_or_else(|| vec![first_pane]);
                                 let label = active
                                     .session
-                                    .tab_bars(content_bounds(active.window.inner_size()))
+                                    .tab_bars(content_bounds(active.window.surface_size()))
                                     .into_iter()
                                     .flat_map(|bar| bar.tabs)
                                     .find(|t| t.first_pane == first_pane)
@@ -2021,8 +2155,8 @@ impl ApplicationHandler for App {
                         };
                         let card = Self::make_payload_card(event_loop, active, armed.payload);
                         match &card {
-                            Some(c) => active.window.set_cursor(winit::window::Cursor::Custom(c.clone())),
-                            None => active.window.set_cursor(CursorIcon::Grabbing),
+                            Some(c) => active.window.set_cursor(Cursor::Custom(c.clone())),
+                            None => active.window.set_cursor(CursorIcon::Grabbing.into()),
                         }
                         active.cursor_icon = Some(CursorIcon::Grabbing); // proxy: update_cursor's change
                         // detection only needs to see "not default" so it restores properly later.
@@ -2081,7 +2215,7 @@ impl ApplicationHandler for App {
                     if overlay_up {
                         Self::clear_carry_cue(active, dim);
                     } else {
-                        let bounds = content_bounds(active.window.inner_size());
+                        let bounds = content_bounds(active.window.surface_size());
                         let (panes, bars) =
                             (active.session.visible_rects(bounds), active.session.tab_bars(bounds));
                         // `payload_panes` only ever matches in the SOURCE
@@ -2194,7 +2328,7 @@ impl ApplicationHandler for App {
             // cursor keeps "holding" the payload across the gap, and the source
             // keeps dimming the payload at home). A no-op with nothing carried,
             // which is exactly what the event did before this arm existed.
-            WindowEvent::CursorLeft { .. } => {
+            WindowEvent::PointerLeft { .. } => {
                 if let Some(carry) = self.carry.as_ref() {
                     let dim = (carry.source == id)
                         .then(|| match carry.payload {
@@ -2208,8 +2342,8 @@ impl ApplicationHandler for App {
 
             // Mouse buttons: right opens the menu; left drives menu/tab/focus and
             // starts/ends a text selection; middle pastes the PRIMARY selection.
-            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
-                (ElementState::Pressed, MouseButton::Right) => {
+            WindowEvent::PointerButton { state, .. } => match (state, ptr_button) {
+                (ElementState::Pressed, Some(MouseButton::Right)) => {
                     // This press abandoned a pane/tab drag of ours (done at the
                     // top of `window_event`, where every window showing cues is
                     // reachable): it is consumed — no menu on it.
@@ -2251,7 +2385,7 @@ impl ApplicationHandler for App {
                     // `open_menu` takes as `&mut self`.
                     self.open_menu(id, pos);
                 }
-                (ElementState::Pressed, MouseButton::Left) => {
+                (ElementState::Pressed, Some(MouseButton::Left)) => {
                     // A carry DROPS on this press. First of everything — before
                     // compose, before the clip affordance / jack / divider /
                     // scrollbar / titlebar / tab hit-tests — so a drop can never
@@ -2324,7 +2458,7 @@ impl ApplicationHandler for App {
                         }
                     }
                     {
-                        let size = active.window.inner_size();
+                        let size = active.window.surface_size();
                         let bounds = content_bounds(size);
                         let (mx, my) = active.mouse;
                         // A second press must never arm a second gesture on top of
@@ -2350,9 +2484,9 @@ impl ApplicationHandler for App {
                             active.drag_cursor = Some((mx, my));
                             // Say "you are dragging a wire" without costing a frame.
                             // On the expensive paths the rubber-band is suppressed
-                            // (see CursorMoved), so this cursor is the ONLY feedback
+                            // (see PointerMoved), so this cursor is the ONLY feedback
                             // until the release paints the finished wire.
-                            active.window.set_cursor(CursorIcon::Grabbing);
+                            active.window.set_cursor(CursorIcon::Grabbing.into());
                             active.cursor_icon = Some(CursorIcon::Grabbing);
                             active.window.request_redraw();
                             return;
@@ -2380,7 +2514,7 @@ impl ApplicationHandler for App {
                         }
                         // A press on a pane's titlebar strip ARMS a pane drag: it
                         // may still turn out to be a plain click (the movement
-                        // threshold decides at the next motion, see CursorMoved).
+                        // threshold decides at the next motion, see PointerMoved).
                         // The band is the top `titlebar_h` of the pane's rect; the
                         // clipboard affordance that also lives there already
                         // returned above, so it can't be stolen here.
@@ -2527,7 +2661,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                (ElementState::Released, MouseButton::Left) => {
+                (ElementState::Released, Some(MouseButton::Left)) => {
                     // A press that never passed the movement threshold was a plain
                     // click after all. For a tab label that means "switch tabs" —
                     // the switch the press used to do, moved here so the label can
@@ -2607,7 +2741,7 @@ impl ApplicationHandler for App {
                     }
                     active.shift_press = false; // consumed
                 }
-                (ElementState::Pressed, MouseButton::Middle) => {
+                (ElementState::Pressed, Some(MouseButton::Middle)) => {
                     // As for the right button: a middle-click that abandoned a
                     // drag is consumed by it — it does not also paste into the
                     // pane that was moving.
@@ -2631,7 +2765,7 @@ impl ApplicationHandler for App {
                     // `self.enter_carry`, which needs `&mut self` — the same
                     // staging the left-press titlebar/tab arms rely on.
                     if self.carry.is_none() && self.drag.is_none() && self.armed_drag.is_none() {
-                        let bounds = content_bounds(active.window.inner_size());
+                        let bounds = content_bounds(active.window.surface_size());
                         let (mx, my) = active.mouse;
                         let tb_h = active.session.titlebar_h();
                         let pane_hit = if tb_h > 0.0 {
@@ -2691,8 +2825,8 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                (ElementState::Released, MouseButton::Right)
-                | (ElementState::Released, MouseButton::Middle) => {
+                (ElementState::Released, Some(MouseButton::Right))
+                | (ElementState::Released, Some(MouseButton::Middle)) => {
                     // Forward the button-up to the app if its press was forwarded.
                     Self::end_mouse_report(active);
                 }
@@ -2714,7 +2848,7 @@ impl ApplicationHandler for App {
     /// the keyboard. Windows whose last pane exited are closed AFTER the
     /// iteration (`close_window` mutates the map — and exits the process when
     /// it was the last window); the next wake is the fastest any window wants.
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         let mut to_close: Vec<WindowId> = Vec::new();
         let mut min_interval: Option<Duration> = None;
         // A pane inside the payload of a live drag can exit under the gesture
@@ -2926,7 +3060,7 @@ impl App {
         if active.resize_pending && now.duration_since(active.last_resize_at) >= RESIZE_SETTLE {
             // A window resize also owes the surface work, skipped per-event above.
             // Use the CURRENT size: every intermediate one collapses into this.
-            let size = active.window.inner_size();
+            let size = active.window.surface_size();
             if active.surface_pending.take().is_some() {
                 if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
                     active.backend.resize_surface(w, h); // back buffer + instrument layer
@@ -3194,10 +3328,10 @@ impl App {
     /// `None` means "build one for this payload".
     fn enter_carry(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn ActiveEventLoop,
         source: WindowId,
         payload: dragdrop::DragPayload,
-        reuse_card: Option<winit::window::CustomCursor>,
+        reuse_card: Option<CustomCursor>,
     ) -> bool {
         self.cancel_drag();
         self.cancel_carry();
@@ -3252,8 +3386,8 @@ impl App {
         let Some(card) = self.carry.as_ref().map(|c| c.card.clone()) else { return };
         for a in self.windows.values_mut() {
             match &card {
-                Some(c) => a.window.set_cursor(winit::window::Cursor::Custom(c.clone())),
-                None => a.window.set_cursor(CursorIcon::Grabbing),
+                Some(c) => a.window.set_cursor(Cursor::Custom(c.clone())),
+                None => a.window.set_cursor(CursorIcon::Grabbing.into()),
             }
             // Proxy for "not the default shape", exactly as a drag does: what
             // `update_cursor` compares against once the carry ends.
@@ -3357,8 +3491,8 @@ impl App {
     /// decides, because winit exposes no stacking order to consult.
     fn window_under_global(&self, global: (f64, f64)) -> Option<WindowId> {
         for (&wid, a) in self.windows.iter() {
-            let Ok(pos) = a.window.inner_position() else { continue };
-            let size = a.window.inner_size();
+            let Some(pos) = client_origin(a.window.as_ref()) else { continue };
+            let size = a.window.surface_size();
             let (lx, ly) = (global.0 - pos.x as f64, global.1 - pos.y as f64);
             if lx >= 0.0 && ly >= 0.0 && lx < size.width as f64 && ly < size.height as f64 {
                 return Some(wid);
@@ -3378,14 +3512,11 @@ impl App {
     /// tracker knows nothing about) plus a redraw request.
     fn drag_motion(&mut self, id: WindowId) {
         let Some(src) = self.windows.get(&id) else { return };
-        let mouse = src.mouse; // source-window-local, from the CursorMoved that got us here
+        let mouse = src.mouse; // source-window-local, from the PointerMoved that got us here
         // The pointer in screen coordinates. `None` on Wayland, where there is
         // no such thing for a client — the implicit grab still delivers
         // source-local coords, so the source stays the only resolvable window.
-        let global = src
-            .window
-            .inner_position()
-            .ok()
+        let global = client_origin(src.window.as_ref())
             .map(|p| (p.x as f64 + mouse.0 as f64, p.y as f64 + mouse.1 as f64));
         let (over, local) = match global {
             // Wayland: no globals, so the source is the only window we can
@@ -3395,7 +3526,7 @@ impl App {
             // release out there tears out; leaving it Some(source) here was
             // the bug that made a Wayland tear-out release a silent no-op).
             None => {
-                let size = src.window.inner_size();
+                let size = src.window.surface_size();
                 let inside = mouse.0 >= 0.0
                     && mouse.1 >= 0.0
                     && mouse.0 < size.width as f32
@@ -3408,7 +3539,7 @@ impl App {
                 Some(w) => {
                     // Another rt window: re-express the point in ITS coords.
                     let Some(a) = self.windows.get(&w) else { return };
-                    let Ok(p) = a.window.inner_position() else { return };
+                    let Some(p) = client_origin(a.window.as_ref()) else { return };
                     (Some(w), ((g.0 - p.x as f64) as f32, (g.1 - p.y as f64) as f32))
                 }
             },
@@ -3418,7 +3549,7 @@ impl App {
             None => None,
             Some(w) => {
                 let (Some(a), Some(drag)) = (self.windows.get(&w), self.drag.as_ref()) else { return };
-                let bounds = content_bounds(a.window.inner_size());
+                let bounds = content_bounds(a.window.surface_size());
                 let (panes, bars) = (a.session.visible_rects(bounds), a.session.tab_bars(bounds));
                 // `payload_panes` only ever matches in the SOURCE window (pane
                 // ids are process-global); passing it elsewhere is harmless.
@@ -3493,7 +3624,7 @@ impl App {
     /// only the drop-point placement stays X11-only.
     fn tear_out_release(&self, source: WindowId) -> Option<Option<winit::dpi::PhysicalPosition<i32>>> {
         let a = self.windows.get(&source)?;
-        let size = a.window.inner_size();
+        let size = a.window.surface_size();
         let (mx, my) = a.mouse;
         if mx >= 0.0 && my >= 0.0 && mx < size.width as f32 && my < size.height as f32 {
             return None; // still inside the source window: not a tear-out
@@ -3501,9 +3632,7 @@ impl App {
         // Outside: tear out. Place at the drop point where the platform can
         // say where that is (X11); let the compositor place it elsewhere.
         Some(
-            a.window
-                .inner_position()
-                .ok()
+            client_origin(a.window.as_ref())
                 .map(|pos| winit::dpi::PhysicalPosition::new(pos.x + mx as i32, pos.y + my as i32)),
         )
     }
@@ -3512,7 +3641,7 @@ impl App {
     /// which is where the button came up: winit's implicit grab keeps every
     /// pointer event with the window the press happened in, so this is the ONE
     /// place a drag can end, whichever window it is hovering.
-    fn commit_drag(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
+    fn commit_drag(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId) {
         let Some(drag) = self.drag.take() else { return };
         // Ctrl held at the moment of release turns a tear-out into a PICK-UP:
         // the payload stays where it is and the gesture becomes a carry (see
@@ -3582,7 +3711,7 @@ impl App {
                 // dissolving a two-tab group on the way out). Any OTHER strip —
                 // no current index for us there — is a genuine move.
                 rt_session::DropTarget::TabAt { anchor, index } => {
-                    let bounds = content_bounds(active.window.inner_size());
+                    let bounds = content_bounds(active.window.surface_size());
                     match Self::tab_index_in_bar(active, bounds, anchor, first_pane) {
                         Some(current) => {
                             active.session.reorder_tab(first_pane, dragdrop::index_for_reorder(current, index))
@@ -3815,7 +3944,7 @@ impl App {
             if a.session.focus() == departed {
                 a.session.focus_pane(arrival);
             }
-            a.session.relayout(content_bounds(a.window.inner_size()));
+            a.session.relayout(content_bounds(a.window.surface_size()));
             a.force_full = true;
             a.window.request_redraw();
         }
@@ -3874,15 +4003,84 @@ impl App {
         active.window.request_redraw();
     }
 
+    /// Scroll the focused pane's history by `lines` (positive = up = toward
+    /// older content), first offering the movement to a mouse-reporting app the
+    /// way a wheel notch is offered. Shared by the wheel and by a two-finger
+    /// drag, so both feel the same and neither can drift from the other.
+    fn scroll_lines(active: &mut Active, lines: isize) {
+        if lines == 0 {
+            return;
+        }
+        // If the app under the pointer wants the wheel (and Shift isn't held to
+        // force scrollback), send it one report per notch instead of scrolling
+        // rt's history.
+        if !active.mods.shift_key() {
+            let up = lines > 0;
+            let notches = lines.unsigned_abs().min(8); // cap runaway touchpad/touch deltas
+            let mut forwarded = false;
+            for _ in 0..notches {
+                if Self::forward_mouse(active, MouseReport::Scroll(up), active.mouse.0, active.mouse.1) {
+                    forwarded = true;
+                } else {
+                    break; // pane doesn't want the mouse: fall through to scrollback
+                }
+            }
+            if forwarded {
+                active.window.request_redraw();
+                return;
+            }
+        }
+        let focus = active.session.focus(); // scroll the focused pane
+        // Drive the terminal's own scrollback; in column mode the whole tall
+        // viewport shifts, giving the cross-column flow.
+        if let Some(pane) = active.session.pane(focus) {
+            pane.scroll(lines); // &self method: locks the Term internally
+        }
+        active.force_full = true; // scrollback offset changed: cell→px mapping shifts
+        active.window.request_redraw(); // repaint at the new offset
+    }
+
+    /// The gesture verdict for a touch event, or `None` when the event is not
+    /// touch at all — a mouse or a stylus, both of which simply are the pointer.
+    ///
+    /// winit 0.31 reports a finger through the same pointer events as a mouse,
+    /// so this is the only place that has to tell them apart, and it does so
+    /// purely to catch the one gesture the pointer cannot express: two fingers.
+    fn touch_verdict(active: &mut Active, event: &WindowEvent) -> Option<touch::Verdict> {
+        match event {
+            WindowEvent::PointerButton {
+                state, position, button: ButtonSource::Touch { finger_id, .. }, ..
+            } => {
+                let pos = (position.x as f32, position.y as f32);
+                Some(match state {
+                    ElementState::Pressed => active.touch.press(finger_id.into_raw(), pos),
+                    ElementState::Released => active.touch.release(finger_id.into_raw()),
+                })
+            }
+            WindowEvent::PointerMoved {
+                position, source: PointerSource::Touch { finger_id, .. }, ..
+            } => Some(
+                active.touch.motion(finger_id.into_raw(), (position.x as f32, position.y as f32)),
+            ),
+            // Tracking cancelled rather than ended — focus lost, or the palm
+            // that was resting on the glass finally rejected. The finger is
+            // gone with no release to match its press.
+            WindowEvent::PointerLeft { kind: PointerKind::Touch(finger_id), .. } => {
+                Some(active.touch.release(finger_id.into_raw()))
+            }
+            _ => None,
+        }
+    }
+
     /// The held-pane cursor card for a drag/carry payload, or None (fall back to
     /// CursorIcon::Grabbing) if the platform refuses the image. Cursor problems
     /// must never affect gesture logic.
     fn make_payload_card(
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn ActiveEventLoop,
         active: &Active,
         payload: dragdrop::DragPayload,
-    ) -> Option<winit::window::CustomCursor> {
-        let bounds = content_bounds(active.window.inner_size());
+    ) -> Option<CustomCursor> {
+        let bounds = content_bounds(active.window.surface_size());
         let rect = match payload {
             dragdrop::DragPayload::Pane(p) => active
                 .session
@@ -3895,8 +4093,14 @@ impl App {
         let (w, h) = rect.map(|r| (r.w, r.h)).unwrap_or((bounds.w, bounds.h));
         let aspect = if h > 0.0 { w / h } else { 1.0 };
         let (rgba, cw, ch) = carry_card::build_card_rgba(aspect, active.settings.background);
-        match winit::window::CustomCursor::from_rgba(rgba, cw, ch, carry_card::CARD_HOTSPOT.0, carry_card::CARD_HOTSPOT.1) {
-            Ok(src) => Some(event_loop.create_custom_cursor(src)),
+        match CustomCursorSource::from_rgba(rgba, cw, ch, carry_card::CARD_HOTSPOT.0, carry_card::CARD_HOTSPOT.1) {
+            Ok(src) => match event_loop.create_custom_cursor(src) {
+                Ok(cursor) => Some(cursor),
+                Err(e) => {
+                    log::warn!("held-pane cursor rejected by the platform ({e}); falling back to Grabbing");
+                    None
+                }
+            },
             Err(e) => {
                 log::warn!("held-pane cursor unavailable ({e}); falling back to Grabbing");
                 None
@@ -3951,7 +4155,7 @@ impl App {
     /// Execute what an [`Action`] asked the window-owner level to do — the part
     /// [`App::apply_action`] cannot: it only holds one window's `Active`, and
     /// creating or closing OS windows needs the event loop + the window map.
-    fn run_window_cmd(&mut self, event_loop: &ActiveEventLoop, id: WindowId, cmd: WindowCmd) {
+    fn run_window_cmd(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId, cmd: WindowCmd) {
         match cmd {
             WindowCmd::None => {}
             WindowCmd::CloseWindow => self.close_window(id),
@@ -3976,13 +4180,13 @@ impl App {
     /// window `id` into a fresh OS window — the keyboard/menu gesture. Picks
     /// the payload, then hands it to [`App::tear_out`], which is also what a
     /// drag released on the desktop calls.
-    fn detach(&mut self, event_loop: &ActiveEventLoop, id: WindowId, tab: bool) {
+    fn detach(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId, tab: bool) {
         let Some(active) = self.windows.get(&id) else { return };
         let payload = if tab {
             // The focused pane's tab: find its strip's active entry (first_pane
             // identity), same "first strip with an active tab" convention as
             // `move_focused_tab`.
-            let bounds = content_bounds(active.window.inner_size());
+            let bounds = content_bounds(active.window.surface_size());
             let first = active
                 .session
                 .tab_bars(bounds)
@@ -4002,11 +4206,11 @@ impl App {
     /// carry mode — the keyboard/menu twin of [`App::detach`], picking the
     /// payload exactly the same way. Nothing moves yet: the payload waits,
     /// dimmed at home, until the carry is dropped or cancelled.
-    fn pick_up(&mut self, event_loop: &ActiveEventLoop, id: WindowId, tab: bool) {
+    fn pick_up(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId, tab: bool) {
         let Some(active) = self.windows.get(&id) else { return };
         let payload = if tab {
             // Same "first strip with an active tab" convention as `detach`.
-            let bounds = content_bounds(active.window.inner_size());
+            let bounds = content_bounds(active.window.surface_size());
             let first = active
                 .session
                 .tab_bars(bounds)
@@ -4043,7 +4247,7 @@ impl App {
     /// re-adopt a package it already tore out.
     fn tear_out(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn ActiveEventLoop,
         source: WindowId,
         payload: dragdrop::DragPayload,
         position: Option<winit::dpi::PhysicalPosition<i32>>,
@@ -4060,7 +4264,7 @@ impl App {
         }
         let Some(mut new_active) = self.build_active(event_loop) else { return false };
         if let Some(at) = position {
-            new_active.window.set_outer_position(at); // land under the cursor (X11)
+            new_active.window.set_outer_position(at.into()); // land under the cursor (X11)
         }
         // The fresh window spawned one pane of its own; drop it before
         // adopting the moved panes into the (now empty) tree, so the new
@@ -4140,7 +4344,7 @@ impl App {
     /// Which output jack (if any) the physical-pixel point `(mx, my)` hits: the
     /// stdout jack sits at the right edge upper third, the stderr jack lower third.
     fn jack_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, Stream)> {
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let bounds = content_bounds(size);
         const R: f32 = 12.0; // grab radius in px
         for (id, r) in active.session.visible_rects(bounds) {
@@ -4158,7 +4362,7 @@ impl App {
 
     /// The pane whose rectangle contains the physical-pixel point `(mx, my)`.
     fn pane_at(active: &Active, mx: f32, my: f32) -> Option<rt_core::PaneId> {
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let bounds = content_bounds(size);
         active
             .session
@@ -4283,7 +4487,7 @@ impl App {
                 let fs = if active.window.fullscreen().is_some() {
                     None
                 } else {
-                    Some(winit::window::Fullscreen::Borderless(None))
+                    Some(Fullscreen::Borderless(None))
                 };
                 active.window.set_fullscreen(fs);
                 active.window.request_redraw();
@@ -4332,7 +4536,7 @@ impl App {
     /// clamped at the ends). The focused tab is the ACTIVE tab of its strip;
     /// with no tab strip (or a single tab) this is a no-op.
     fn move_focused_tab(active: &mut Active, delta: isize) {
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let bounds = content_bounds(size);
         for bar in active.session.tab_bars(bounds) {
             if let Some(idx) = bar.tabs.iter().position(|t| t.active) {
@@ -4438,7 +4642,7 @@ impl App {
     /// The grid (content) rectangle of a specific pane, or `None` if it isn't
     /// currently visible. Like the per-pane branch of `cell_at`, but keyed by id.
     fn pane_content_rect(active: &Active, pane: rt_core::PaneId) -> Option<Rect> {
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let bounds = content_bounds(size);
         active.session.visible_rects(bounds)
             .into_iter()
@@ -4508,7 +4712,7 @@ impl App {
     }
 
     fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let bounds = content_bounds(size);
         let (cw, ch) = active.backend.cell_size();
         for (id, rect) in active.session.visible_rects(bounds) {
@@ -4633,7 +4837,7 @@ impl App {
     /// pane, its grid rect, and the current thumb's `(y, height)`. `None` when
     /// the pointer isn't on a scrollbar or the pane has no scrollback.
     fn scrollbar_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, Rect, f32, f32)> {
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let bounds = content_bounds(size);
         for (id, full) in active.session.visible_rects(bounds) {
             if !full.contains(mx, my) {
@@ -4936,7 +5140,7 @@ impl App {
             Ok(()) => {
                 let cell = active.backend.cell_size(); // new cell metrics
                 active.session.set_cell(cell);
-                let size = active.window.inner_size();
+                let size = active.window.surface_size();
                 active.session.relayout(content_bounds(size));
             }
             Err(e) => log::warn!("font reload failed: {e}"),
@@ -4955,7 +5159,7 @@ impl App {
     /// Handle one key *press*: close an open menu on Escape, otherwise translate
     /// to a chord and either run the bound action or type the key into the
     /// focused PTY(s).
-    fn on_key_press(&mut self, event_loop: &ActiveEventLoop, id: WindowId, key_event: winit::event::KeyEvent) {
+    fn on_key_press(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId, key_event: winit::event::KeyEvent) {
         // Escape aborts a pane/tab drag before anything else looks at the key —
         // the universal "get me out of this gesture". A drag in flight swallows
         // it; a merely ARMED press (no movement yet) is disarmed but the key
@@ -5126,7 +5330,7 @@ impl App {
         // through, compositor permitting). Glyphs and chrome stay fully opaque.
         let cfg_bg = active.settings.background; // configured background RGB
         let bg = Color::rgb(cfg_bg[0], cfg_bg[1], cfg_bg[2]).with_alpha(active.settings.background_opacity);
-        let size = active.window.inner_size(); // physical pixels
+        let size = active.window.surface_size(); // physical pixels
         let bounds = content_bounds(size);
 
         // Decide this frame's damage. The partial (scissored) path is taken ONLY
@@ -5783,10 +5987,10 @@ impl App {
         // the pointer) and must still paint it.
         if active.drag_cue.is_some() || active.drag_ghost.is_some() || active.drag_dim.is_some() {
             let dim = active.drag_dim.and_then(|p| {
-                let bounds = content_bounds(active.window.inner_size());
+                let bounds = content_bounds(active.window.surface_size());
                 active.session.visible_rects(bounds).into_iter().find(|(id, _)| *id == p).map(|(_, r)| r)
             });
-            let size = active.window.inner_size();
+            let size = active.window.surface_size();
             let cell = active.backend.cell_size();
             chrome::dragdrop::draw(
                 &mut *active.backend,
@@ -5808,7 +6012,7 @@ impl App {
             }
             return;
         }
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let (cw, ch) = active.backend.cell_size();
         // Whether a menu/manual/search overlay is up; instruments hide beneath it.
         // (Preferences returned above.)
@@ -5966,7 +6170,7 @@ impl App {
         // empty and end_frame early-returns).
         active.backend.end_frame();
         // Present the full window (X11 Route-1 full present, else swap_buffers).
-        active.backend.present(&active.window, None);
+        active.backend.present(active.window.as_ref(), None);
     }
 
     /// Partial path (software GL, EGL surface only): preserve the buffer,
@@ -6001,7 +6205,7 @@ impl App {
         }
         active.backend.clear_scissor(); // next frame starts with a clean scissor
         // Present just the damage (X11 Route-1 bbox present, else EGL partial swap).
-        if active.backend.present(&active.window, Some((bbox, hint_rects))) {
+        if active.backend.present(active.window.as_ref(), Some((bbox, hint_rects))) {
             // EGL partial swap unavailable/failed → guarantee correctness with a
             // full redraw + full swap this frame, and force a full frame next time.
             active.backend.begin_frame(bg);
@@ -6095,7 +6299,7 @@ impl App {
         Self::draw_panes(active, bounds, snapshots);
         active.backend.end_frame();
         active.backend.clear_scissor();
-        active.backend.present(&active.window, Some((present_bbox, &[])));
+        active.backend.present(active.window.as_ref(), Some((present_bbox, &[])));
         true
     }
 
@@ -6130,7 +6334,7 @@ impl App {
         {
             return;
         }
-        let bounds = content_bounds(active.window.inner_size());
+        let bounds = content_bounds(active.window.surface_size());
         // Jacks sit ON the divider, and a press checks `jack_at` FIRST (a jack
         // wins there). The cursor must agree: "resize" over a jack advertises the
         // wrong action on a small target, which makes the jack hard to trust even
@@ -6146,7 +6350,7 @@ impl App {
                 .map(|h| if h.horizontal { CursorIcon::ColResize } else { CursorIcon::RowResize })
         };
         if want != active.cursor_icon {
-            active.window.set_cursor(want.unwrap_or(CursorIcon::Default));
+            active.window.set_cursor(want.unwrap_or(CursorIcon::Default).into());
             active.cursor_icon = want;
         }
     }
@@ -6160,7 +6364,7 @@ impl App {
     /// "Size (px)". Selecting the first real row up front avoids that entirely.
     fn open_prefs(active: &mut Active) {
         active.prefs_open = true;
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let (cw, _ch) = active.backend.cell_size();
         let cols = (content_bounds(size).w / cw).max(1.0) as usize;
         let rows = chrome::prefs::rows(&active.settings, total_ram_bytes(), cols);
@@ -6198,7 +6402,7 @@ impl App {
         // resize all PTYs.
         if titlebar_changed {
             active.session.set_show_titlebar(active.settings.show_titlebar);
-            let size = active.window.inner_size();
+            let size = active.window.surface_size();
             active.session.relayout(content_bounds(size));
         }
         // Colours: rebuild the palette and apply it live to every pane.
@@ -6225,7 +6429,7 @@ impl App {
     /// just stepped is on screen immediately — the terminal behind it changes
     /// once, on settle.
     fn paint_prefs(active: &mut Active) {
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let (cw, ch) = active.backend.cell_size();
         let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
         // Exactly how the old egui dialog derived it: a full-width pane at the
@@ -6242,7 +6446,7 @@ impl App {
     /// Draw the colour picker over the prefs dialog, from its live H/S/V.
     fn paint_picker(active: &mut Active) {
         let Some(pk) = active.picker else { return };
-        let size = active.window.inner_size();
+        let size = active.window.surface_size();
         let (cw, ch) = active.backend.cell_size();
         let g = chrome::colour_picker::layout(cw, ch, size.width as f32, size.height as f32);
         chrome::colour_picker::draw(&mut *active.backend, &g, pk.h, pk.s, pk.v, &pk.slot.label(), cw, ch);
@@ -6949,13 +7153,25 @@ fn flow_point(x: f32, y: f32, w: f32, h: f32, t: f32) -> (f32, f32) {
     }
 }
 
+/// The desktop position of a window's CLIENT AREA, or `None` on a platform with
+/// no global coordinates at all (Wayland, where a client is never told where it
+/// sits). winit 0.31 splits what 0.30 gave as one `inner_position` into two
+/// halves — `outer_position`, the window on the desktop, and `surface_position`,
+/// the surface inside that window — so they are put back together here, once,
+/// rather than at each of the four call sites that want a global point.
+fn client_origin(window: &dyn Window) -> Option<winit::dpi::PhysicalPosition<i32>> {
+    let outer = window.outer_position().ok()?;
+    let surface = window.surface_position();
+    Some(winit::dpi::PhysicalPosition::new(outer.x + surface.x, outer.y + surface.y))
+}
+
 /// Program entry point: set up logging, load a font, and run the winit loop.
 /// Build the winit event loop, choosing the backend explicitly so a universal
 /// (`x11`-feature) binary uses **native Wayland** on a Wayland session and only
 /// falls back to X11 otherwise — never XWayland when Wayland is present. On a
 /// Wayland-only build there is nothing to disambiguate. A user-set
 /// `WINIT_UNIX_BACKEND` still wins (we don't override an explicit choice).
-fn build_event_loop() -> EventLoop<()> {
+fn build_event_loop() -> EventLoop {
     let mut builder = EventLoop::builder();
     #[cfg(feature = "x11")]
     {
@@ -7014,7 +7230,7 @@ fn main() {
     sweep_stale_jacks();
     // Build the winit event loop and hand it our application.
     let event_loop = build_event_loop();
-    let mut app = App {
+    let app = App {
         font_db,
         mono_families,
         cli,
@@ -7023,7 +7239,7 @@ fn main() {
         drag: None,
         carry: None,
     };
-    if let Err(e) = event_loop.run_app(&mut app) {
+    if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
     }

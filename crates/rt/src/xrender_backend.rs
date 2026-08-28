@@ -274,7 +274,7 @@ impl XRenderBackend {
         }
     }
 
-    pub fn try_new(window: &Window, blobs: &FontBlobs, font_px: f32) -> Option<Self> {
+    pub fn try_new(window: &dyn Window, blobs: &FontBlobs, font_px: f32) -> Option<Self> {
         let win = match window.window_handle().ok()?.as_raw() {
             RawWindowHandle::Xlib(h) => h.window as u32,
             RawWindowHandle::Xcb(h) => h.window.get(),
@@ -874,7 +874,7 @@ impl Backend for XRenderBackend {
         self.win_h = h.get() as u16;
         self.recreate_back(); // back buffer must match the new window size
     }
-    fn present(&mut self, _window: &Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
+    fn present(&mut self, _window: &dyn Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
         // Instruments are BAKED into the back buffer (see begin_instrument_layer),
         // so present is just a CopyArea — NO RENDER Composite (that per-present
         // software composite was what pegged Xwayland over ssh -X). Full frames
