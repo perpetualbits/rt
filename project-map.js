@@ -44,7 +44,7 @@ window.PROJECT_MAP = {
       parts: [
         { label: "Input mapping (keys → PTY / actions)", status: "done", desc: "Dead-key/IME compose, app-cursor-aware arrow encoding, keymap chords." },
         { label: "Frame scheduler", status: "done", desc: "Idle-throttled redraws; forces full frames only when needed." },
-        { label: "Touch & stylus", status: "done", desc: "Tap = click, one-finger drag = drag/select, two-finger drag = scroll, stylus = mouse. The window decoration takes touch too, via a patched winit (vendor/winit-wayland); a stylus on the decoration is still upstream's gap." }
+        { label: "Touch & stylus", status: "done", desc: "Tap = click, one-finger drag = drag/select, two-finger drag = scroll, stylus = mouse. The window decoration takes finger and pen as well, via a patched winit (vendor/winit-wayland) that routes touch and tablet events to the frame upstream drops." }
       ],
       deps: ["rt-session", "render-gl", "render-xrender", "damage"]
     },

@@ -202,14 +202,14 @@ TOUCH  &  STYLUS
   stylus tip       a left click / drag, pressure and tilt ignored (rt is a
                    terminal, not a canvas); the barrel buttons are the
                    right and middle buttons.
-  window border      drag it with a finger to move the window, an edge to
-                     resize, tap the buttons to minimise/maximise/close
+  window border      finger or pen: drag it to move the window, drag an
+                     edge to resize, tap the buttons to minimise, maximise
+                     or close
   On Wayland a compositor sends touch and stylus events ONLY to a client
   that asks for them — there is no emulated pointer to fall back on — so
   older rt builds were simply deaf to both. The border is drawn by winit,
-  which routes only mouse events to it; rt carries a patched winit that
-  routes touch there too. The STYLUS still does nothing on the border
-  (the same gap, one layer over) — use a finger or a mouse for that.
+  which routed only mouse events to it; rt carries a patched winit that
+  routes finger and pen there as well.
 
 
 KEYBOARD
