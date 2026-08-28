@@ -102,6 +102,12 @@ that made it possible:
   The surface is cloned rather than borrowed so the tool's state stays writable
   for the `Left` cleanup, which the decoration path performs exactly as the
   main path does.
+- The decoration path also records `latest_button_serial` on a tip press, which
+  only the main path did. `ToolEvent::Up` carries no serial, so without it a tip
+  RELEASE on the frame has none to offer and is dropped — and a frame button
+  acts on the release. Move and resize fire on the press, so they worked while
+  minimise, maximise and close silently did nothing: a good reminder that "the
+  frame responds" is not one behaviour to test but three.
 
 Nothing else in the crate is touched, and no public API changes: rt depends on
 `winit`, which pulls this crate in, redirected by `[patch.crates-io]` in the

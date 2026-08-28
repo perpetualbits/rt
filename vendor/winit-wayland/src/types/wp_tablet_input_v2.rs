@@ -277,6 +277,17 @@ impl Dispatch<ZwpTabletToolV2, TabletToolData, WinitState> for TabletManager {
                     let window_id = crate::make_wid(parent.as_ref().unwrap_or(&surface));
 
                     if parent.is_some() {
+                        // Keep the tool's serial bookkeeping in step with the
+                        // main path below, which this branch skips. `ToolEvent::Up`
+                        // carries no serial of its own, so without the press's
+                        // serial recorded here a tip RELEASE on the frame has
+                        // none to offer and is dropped — and a frame button acts
+                        // on the release, not the press. Move and resize fire on
+                        // the press and so worked regardless; minimise, maximise
+                        // and close did not.
+                        if let TabletEvent::Button { serial: Some(serial), .. } = &event {
+                            data.latest_button_serial = Some(*serial);
+                        }
                         Self::tool_on_decoration(
                             state, &event, &data, &surface, window_id, timestamp,
                         );
