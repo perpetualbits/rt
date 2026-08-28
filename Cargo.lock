@@ -1363,7 +1363,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rt"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "arboard",
  "env_logger",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "rt-config"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "serde",
  "toml",
@@ -1397,11 +1397,11 @@ dependencies = [
 
 [[package]]
 name = "rt-core"
-version = "0.3.18"
+version = "0.3.19"
 
 [[package]]
 name = "rt-engine"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "rt-mux"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "crossterm",
  "libc",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "rt-session"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "rt-config",
  "rt-core",
@@ -1936,7 +1936,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vt-conformance"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "alacritty_terminal",
  "unicode-width",
@@ -1947,14 +1947,14 @@ dependencies = [
 
 [[package]]
 name = "vt-parser"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "memchr",
 ]
 
 [[package]]
 name = "vt-term"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "unicode-width",
  "vt-parser",
