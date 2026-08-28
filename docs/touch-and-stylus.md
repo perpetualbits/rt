@@ -68,15 +68,25 @@ Two details that do need code:
 | two-finger drag = scroll | yes | n/a |
 | barrel buttons = right / middle click | n/a | yes |
 | pressure and tilt | n/a | ignored — rt is a terminal |
-| **the window decoration** | **no** | **no** |
+| the window decoration (move / resize / buttons) | yes¹ | no |
 
-The last row is an upstream limit, not an rt one. On GNOME the decoration is
-drawn by the client, and winit draws it: `winit-wayland`'s frame is fed from
-`seat/pointer` (`frame_point_moved`, `frame_click`) and **nothing** routes
-`wl_touch` or tablet events to it. So the title bar and resize edges stay
-mouse-only in every winit application, rt and scribe alike, until winit routes
-touch to its frame. Move and resize by keyboard, by the compositor's own
-gesture, or with a mouse.
+¹ Only through the vendored winit fork. Upstream winit feeds its client-side
+decoration from `seat/pointer` alone: a touch on the title bar or a resize edge
+reports the *frame's* surface, which is not a window in winit's map, so the
+event was looked up, missed and dropped — no winit window could be moved,
+resized or closed by touch. `vendor/winit-wayland` resolves the parent surface
+the way the pointer handler always did and routes the touch to the frame; see
+[vendored-winit-wayland.md](vendored-winit-wayland.md).
+
+The stylus still does not drive the decoration. That is the same bug in a second
+place: winit's `tablet_v2` handler explicitly skips any surface with a parent
+(`if surface_data.parent_surface().is_none()`, else `continue`), so a pen over
+the frame is discarded exactly as a finger was. It is left unfixed on purpose —
+unlike the touch path, the tablet tool's state carries neither the `WlSeat` nor
+a timestamp that `frame_click` needs, so covering it means adding seat plumbing
+to the vendored crate, which would make the fork harder to upstream for a case a
+finger already handles. A pen on the title bar therefore does nothing; use a
+finger or a mouse.
 
 ## The decoration's *appearance*
 
