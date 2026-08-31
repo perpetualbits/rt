@@ -97,12 +97,22 @@ impl<'a> Reader<'a> {
     }
 
     /// LEB128 unsigned, capped at ten bytes — the most a u64 can occupy.
+    ///
+    /// The tenth byte carries only ONE meaningful bit (9 * 7 = 63 bits precede
+    /// it), so a tenth byte above 1 encodes a value that cannot be a u64. It is
+    /// rejected rather than silently truncated: a peer's corrupt varint must be
+    /// an error, and two byte sequences must never decode to one value — that
+    /// would put a hole in the canonical encoding the golden corpus rests on.
     pub fn varint(&mut self) -> Result<u64> {
         let mut out: u64 = 0;
         let mut shift = 0u32;
-        for _ in 0..10 {
+        for i in 0..10 {
             let byte = self.u8()?;
-            out |= ((byte & 0x7f) as u64) << shift;
+            let chunk = (byte & 0x7f) as u64;
+            if i == 9 && chunk > 1 {
+                return Err(WireError::VarintOverflow);
+            }
+            out |= chunk << shift;
             if byte & 0x80 == 0 {
                 return Ok(out);
             }
@@ -167,6 +177,21 @@ mod tests {
         let bytes = [0x80u8; 11];
         let mut r = Reader::new(&bytes);
         assert_eq!(r.varint().unwrap_err(), WireError::VarintOverflow);
+    }
+
+    #[test]
+    fn a_ten_byte_varint_past_u64_is_rejected_not_truncated() {
+        // Nine 0xFF bytes carry 63 bits; the tenth byte holds one meaningful
+        // bit. A tenth byte of 0x03 needs bit 64, so it is not a u64 — it must
+        // error rather than decode to the same value 0x01 would give.
+        let mut over = [0xFFu8; 10];
+        over[9] = 0x03;
+        let mut r = Reader::new(&over);
+        assert_eq!(r.varint().unwrap_err(), WireError::VarintOverflow);
+
+        let mut max = [0xFFu8; 10];
+        max[9] = 0x01;
+        assert_eq!(Reader::new(&max).varint().unwrap(), u64::MAX);
     }
 
     #[test]
