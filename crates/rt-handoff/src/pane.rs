@@ -58,7 +58,7 @@ pub fn name_of_tag(tag: u64) -> Option<&'static str> {
 }
 
 /// One pane, ready to be handed to another rt process.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaneWire {
     pub pane_uid: u64,
     pub title: String,
@@ -83,38 +83,6 @@ pub struct PaneWire {
     /// Tags this build skipped. Always empty when encoding. Rule R6.
     pub unknown_tags: Vec<u64>,
 }
-
-// `tag_names` is decode-derived metadata: `encode` rebuilds it from whatever
-// other fields it emits, and a freshly constructed `PaneWire` never sets it
-// (see the field doc comment above). Comparing it in `PartialEq` would make
-// every round-trip test (`decode(p.encode()) == p`) fail structurally, since
-// the left side always carries a populated `tag_names` and the right side
-// never does. Two panes are equal when their actual data agrees, regardless
-// of what a decode happened to record about the wire's own tag names.
-impl PartialEq for PaneWire {
-    fn eq(&self, other: &Self) -> bool {
-        self.pane_uid == other.pane_uid
-            && self.title == other.title
-            && self.cwd == other.cwd
-            && self.cols == other.cols
-            && self.rows == other.rows
-            && self.scrollback_limit == other.scrollback_limit
-            && self.columns_count == other.columns_count
-            && self.group == other.group
-            && self.broadcast == other.broadcast
-            && self.child_pid == other.child_pid
-            && self.shell_argv == other.shell_argv
-            && self.env_extras == other.env_extras
-            && self.show_titlebar == other.show_titlebar
-            && self.palette == other.palette
-            && self.style_table == other.style_table
-            && self.screen_primary == other.screen_primary
-            && self.screen_alt == other.screen_alt
-            && self.unknown_tags == other.unknown_tags
-    }
-}
-
-impl Eq for PaneWire {}
 
 impl PaneWire {
     /// Every field this pane emits, as `(tag, bytes)` in ascending tag order,
@@ -311,7 +279,17 @@ mod tests {
     use super::*;
     use crate::error::WireError;
     use crate::grid::{Grid, Line, Run};
-    use crate::style::{Colour, Style};
+    use crate::style::Style;
+
+    /// Encode, decode, compare — normalising `tag_names`, which the ENCODER
+    /// produces and the DECODER reads back, so a freshly-built pane never has
+    /// it. Everything else must survive the trip untouched.
+    fn assert_round_trips(p: &PaneWire) {
+        let back = PaneWire::decode(&p.encode()).unwrap();
+        let mut expected = p.clone();
+        expected.tag_names = back.tag_names.clone();
+        assert_eq!(back, expected);
+    }
 
     /// The smallest pane that satisfies every required field.
     fn minimal() -> PaneWire {
@@ -329,8 +307,7 @@ mod tests {
 
     #[test]
     fn minimal_pane_round_trips() {
-        let p = minimal();
-        assert_eq!(PaneWire::decode(&p.encode()).unwrap(), p);
+        assert_round_trips(&minimal());
     }
 
     #[test]
@@ -348,7 +325,7 @@ mod tests {
             screen_alt: Some(Grid { lines: vec![Line { flags: 0, runs: vec![Run::text(0, "alt")] }] }),
             ..minimal()
         };
-        assert_eq!(PaneWire::decode(&p.encode()).unwrap(), p);
+        assert_round_trips(&p);
     }
 
     #[test]
@@ -429,7 +406,7 @@ mod tests {
             .collect();
         let p = PaneWire { screen_primary: Grid { lines }, ..minimal() };
         let bytes = p.encode();
-        assert_eq!(PaneWire::decode(&bytes).unwrap(), p);
+        assert_round_trips(&p);
         // Run-length encoding is why the spec specifies no compression: a
         // typical line must cost tens of bytes, not hundreds.
         assert!(bytes.len() < 5_000 * 60, "5k lines took {} bytes", bytes.len());
