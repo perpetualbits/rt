@@ -9,6 +9,7 @@
 pub mod error;
 pub mod frame;
 pub mod buf;
+pub mod tlv;
 
 /// The protocol version this build speaks. Unrelated to the crate version.
 pub const PROTO_V1: u32 = 1;
