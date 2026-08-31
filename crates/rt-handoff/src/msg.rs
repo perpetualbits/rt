@@ -181,15 +181,28 @@ pub struct Failed {
     pub text: String,
 }
 
+/// Encode one field's value with a fresh writer.
+fn enc(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
+    let mut w = Writer::new();
+    f(&mut w);
+    w.into_vec()
+}
+
+/// Write already-sorted `(tag, bytes)` pairs as a TLV body. `FieldWriter`
+/// asserts ascending order, so the sort in each `fields()` is what keeps this
+/// honest.
+fn encode_fields(fields: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let mut fw = FieldWriter::new();
+    for (tag, val) in fields {
+        fw.field(*tag, val);
+    }
+    fw.into_vec()
+}
+
 impl Hello {
     /// `(tag, bytes)` in ascending order. Public so a test can splice in a
     /// field from an imagined future version.
     pub fn fields(&self) -> Vec<(u64, Vec<u8>)> {
-        fn enc(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
-            let mut w = Writer::new();
-            f(&mut w);
-            w.into_vec()
-        }
         let mut out = vec![
             (hello_tags::MAGIC, crate::MAGIC.to_vec()),
             (hello_tags::PROTO_MIN, enc(|w| w.varint(self.proto_min as u64))),
@@ -212,15 +225,16 @@ impl Hello {
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut fw = FieldWriter::new();
-        for (tag, val) in &self.fields() {
-            fw.field(*tag, val);
-        }
-        fw.into_vec()
+        encode_fields(&self.fields())
     }
 
     fn decode(body: &[u8]) -> Result<Hello> {
         let mut h = Hello::default();
+        // The magic must be PRESENT, not merely correct-when-present: a body
+        // that omits it entirely is not from an rt peer, and saying so here is
+        // the whole reason the field exists. Without this it would surface far
+        // downstream as a baffling version mismatch against proto 0/0.
+        let mut saw_magic = false;
         let unknown = tlv::walk(body, |tag, val| {
             let mut r = Reader::new(val);
             match tag {
@@ -228,6 +242,7 @@ impl Hello {
                     if val != crate::MAGIC {
                         return Err(WireError::BadValue { tag, why: "not an rt handoff peer" });
                     }
+                    saw_magic = true;
                     return Ok(true);
                 }
                 hello_tags::PROTO_MIN => h.proto_min = r.varint()? as u32,
@@ -249,6 +264,9 @@ impl Hello {
             r.finish()?;
             Ok(true)
         })?;
+        if !saw_magic {
+            return Err(WireError::BadValue { tag: hello_tags::MAGIC, why: "not an rt handoff peer" });
+        }
         h.unknown_tags = unknown;
         Ok(h)
     }
@@ -256,11 +274,6 @@ impl Hello {
 
 impl Offer {
     pub fn fields(&self) -> Vec<(u64, Vec<u8>)> {
-        fn enc(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
-            let mut w = Writer::new();
-            f(&mut w);
-            w.into_vec()
-        }
         let mut out = vec![
             (offer_tags::TOKEN, self.token.to_vec()),
             (offer_tags::PANE_COUNT, enc(|w| w.varint(self.pane_count as u64))),
@@ -277,11 +290,7 @@ impl Offer {
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut fw = FieldWriter::new();
-        for (tag, val) in &self.fields() {
-            fw.field(*tag, val);
-        }
-        fw.into_vec()
+        encode_fields(&self.fields())
     }
 
     fn decode(body: &[u8]) -> Result<Offer> {
@@ -315,11 +324,6 @@ impl Offer {
 
 impl Claim {
     pub fn fields(&self) -> Vec<(u64, Vec<u8>)> {
-        fn enc(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
-            let mut w = Writer::new();
-            f(&mut w);
-            w.into_vec()
-        }
         let mut out = vec![
             (claim_tags::TOKEN, self.token.to_vec()),
             (claim_tags::TARGET, enc(|w| self.target.write(w))),
@@ -330,11 +334,7 @@ impl Claim {
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut fw = FieldWriter::new();
-        for (tag, val) in &self.fields() {
-            fw.field(*tag, val);
-        }
-        fw.into_vec()
+        encode_fields(&self.fields())
     }
 
     fn decode(body: &[u8]) -> Result<Claim> {
@@ -520,6 +520,21 @@ mod tests {
         let mut fw = crate::tlv::FieldWriter::new();
         fw.field(hello_tags::MAGIC, b"NOTRTHAND");
         fw.field(hello_tags::PROTO_MIN, &[1]);
+        let frame = crate::frame::Frame { msg_type: msg_type::HELLO, flags: 0, payload: fw.into_vec() };
+        assert_eq!(
+            Message::from_frame(&frame).unwrap_err(),
+            WireError::BadValue { tag: hello_tags::MAGIC, why: "not an rt handoff peer" }
+        );
+    }
+
+    #[test]
+    fn a_hello_that_omits_the_magic_entirely_is_rejected() {
+        // Not the same case as a WRONG magic: tlv::walk has no notion of a
+        // required tag, so an omitted one would otherwise decode to a default
+        // Hello and be mistaken for a protocol-0 peer.
+        let mut fw = crate::tlv::FieldWriter::new();
+        fw.field(hello_tags::PROTO_MIN, &[1]);
+        fw.field(hello_tags::PROTO_MAX, &[1]);
         let frame = crate::frame::Frame { msg_type: msg_type::HELLO, flags: 0, payload: fw.into_vec() };
         assert_eq!(
             Message::from_frame(&frame).unwrap_err(),
