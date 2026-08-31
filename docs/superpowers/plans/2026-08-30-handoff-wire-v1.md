@@ -3939,7 +3939,7 @@ fn pane_encoding_is_canonical() {
         let pane = gen_pane(&mut r);
         let once = pane.encode();
         assert_eq!(once, pane.encode(), "seed {seed}: encoding is not deterministic");
-        let back = PaneWire::decode(&once).unwrap();
+        let back = PaneWire::decode(&once).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(back.encode(), once, "seed {seed}: re-encoding a decoded pane changed the bytes");
     }
 }
@@ -3963,7 +3963,7 @@ fn every_message_round_trips_through_a_frame() {
 
         // Also exercise the frame envelope itself, including the byte count.
         let mut wire = Vec::new();
-        frame.encode(&mut wire).unwrap();
+        frame.encode(&mut wire).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let (decoded_frame, used) = Frame::decode(&wire).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(used, wire.len(), "seed {seed}");
 
@@ -3988,7 +3988,10 @@ fn truncating_any_encoded_pane_errors_rather_than_panics() {
         let mut r = Rng::new(seed);
         let bytes = gen_pane(&mut r).encode();
         for cut in [1, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
-            let _ = PaneWire::decode(&bytes[..cut]); // must return, not panic
+            // Must return rather than panic. A panic unwinds out of here and
+            // fails the test, so name the seed and cut for reproducibility.
+            let outcome = std::panic::catch_unwind(|| PaneWire::decode(&bytes[..cut]));
+            assert!(outcome.is_ok(), "seed {seed}, cut {cut}: decode panicked");
         }
     }
 }
