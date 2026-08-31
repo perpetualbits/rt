@@ -3284,6 +3284,11 @@ impl Hello {
 
     fn decode(body: &[u8]) -> Result<Hello> {
         let mut h = Hello::default();
+        // The magic must be PRESENT, not merely correct-when-present: a body
+        // that omits it entirely is not from an rt peer, and saying so here is
+        // the whole reason the field exists. Without this it would surface far
+        // downstream as a baffling version mismatch against proto 0/0.
+        let mut saw_magic = false;
         let unknown = tlv::walk(body, |tag, val| {
             let mut r = Reader::new(val);
             match tag {
@@ -3291,6 +3296,7 @@ impl Hello {
                     if val != crate::MAGIC {
                         return Err(WireError::BadValue { tag, why: "not an rt handoff peer" });
                     }
+                    saw_magic = true;
                     return Ok(true);
                 }
                 hello_tags::PROTO_MIN => h.proto_min = r.varint()? as u32,
@@ -3312,6 +3318,9 @@ impl Hello {
             r.finish()?;
             Ok(true)
         })?;
+        if !saw_magic {
+            return Err(WireError::BadValue { tag: hello_tags::MAGIC, why: "not an rt handoff peer" });
+        }
         h.unknown_tags = unknown;
         Ok(h)
     }
@@ -3720,7 +3729,10 @@ pub fn gen_pane(r: &mut Rng) -> PaneWire {
     let n_styles = 1 + r.below(8) as u32;
     PaneWire {
         pane_uid: r.next_u64(),
-        title: gen_text(r, 1 + r.below(20) as usize),
+        // NB: hoist the length. `gen_text(r, 1 + r.below(20) as usize)` fails
+        // to compile (E0499, `r` borrowed twice in one argument list). Drawing
+        // the length first keeps the RNG draw order identical either way.
+        title: { let n = 1 + r.below(20) as usize; gen_text(r, n) },
         cwd: r.bool().then(|| format!("/home/u/{}", gen_text(r, 5))),
         cols: 1 + r.below(400) as u32,
         rows: 1 + r.below(200) as u32,
