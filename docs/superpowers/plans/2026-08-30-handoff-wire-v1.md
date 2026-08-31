@@ -4442,10 +4442,16 @@ Expected: PASS, 4 tests.
 
 - [ ] **Step 6: Prove the corpus actually bites**
 
-Temporarily change one attribute constant in `style.rs` (say `OVERLINE` to
-16384), run `cargo test -p rt-handoff --test golden`, and confirm it FAILS with
-the "re-encoding changed the bytes" message. Then revert the constant and
-confirm it passes again. A corpus that cannot fail is decoration.
+Temporarily change `attrs::KNOWN` in `style.rs` from 16383 to 8191, run
+`cargo test -p rt-handoff --test golden`, and confirm it FAILS with the
+"re-encoding changed the bytes" message. Then revert it and confirm it passes
+again. A corpus that cannot fail is decoration.
+
+Use `KNOWN`, not one of the individual bit constants: `Style::write` emits the
+raw `u32` and `Style::read` masks with `KNOWN`, so `OVERLINE` and its siblings
+are never consulted by an encode or decode path. Changing one of those fails
+only the frozen-constants unit test, not the corpus — which looks like the
+corpus is decorative when it is not.
 
 - [ ] **Step 7: Run the whole battery**
 
