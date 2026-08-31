@@ -1409,6 +1409,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt-handoff"
+version = "0.3.19"
+
+[[package]]
 name = "rt-mux"
 version = "0.3.19"
 dependencies = [
