@@ -13,6 +13,7 @@ pub mod tlv;
 pub mod style;
 pub mod grid;
 pub mod pane;
+pub mod tree;
 
 /// The protocol version this build speaks. Unrelated to the crate version.
 pub const PROTO_V1: u32 = 1;
