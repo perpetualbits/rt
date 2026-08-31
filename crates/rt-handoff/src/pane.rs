@@ -25,9 +25,22 @@ pub mod tags {
     pub const SHOW_TITLEBAR: u64 = 0x0D;
     pub const PALETTE: u64 = 0x0E;
     pub const TAG_NAMES: u64 = 0x0F;
+    pub const MODES: u64 = 0x20;
+    pub const CURSOR: u64 = 0x21;
+    pub const SAVED_CURSOR: u64 = 0x22;
+    pub const CHARSETS: u64 = 0x23;
+    pub const TAB_STOPS: u64 = 0x24;
+    pub const MARGINS: u64 = 0x25;
+    pub const TITLE_STACK: u64 = 0x26;
+    pub const PEN: u64 = 0x27;
+    pub const ACTIVE_SCREEN: u64 = 0x28;
+    pub const KITTY_KBD: u64 = 0x29;
+    pub const PENDING_RAW: u64 = 0x2A;
     pub const STYLE_TABLE: u64 = 0x3F;
     pub const SCREEN_PRIMARY: u64 = 0x40;
     pub const SCREEN_ALT: u64 = 0x41;
+    pub const URI_TABLE: u64 = 0x50;
+    pub const IMAGE_TABLE: u64 = 0x51;
 }
 
 /// The short name a receiver prints when it skips a field it does not know
@@ -50,11 +63,101 @@ pub fn name_of_tag(tag: u64) -> Option<&'static str> {
         tags::SHOW_TITLEBAR => "show_titlebar",
         tags::PALETTE => "palette",
         tags::TAG_NAMES => "tag_names",
+        tags::MODES => "modes",
+        tags::CURSOR => "cursor",
+        tags::SAVED_CURSOR => "saved_cursor",
+        tags::CHARSETS => "charsets",
+        tags::TAB_STOPS => "tab_stops",
+        tags::MARGINS => "margins",
+        tags::TITLE_STACK => "title_stack",
+        tags::PEN => "pen",
+        tags::ACTIVE_SCREEN => "active_screen",
+        tags::KITTY_KBD => "kitty_kbd",
+        tags::PENDING_RAW => "pending_raw",
         tags::STYLE_TABLE => "style_table",
         tags::SCREEN_PRIMARY => "screen_primary",
         tags::SCREEN_ALT => "screen_alt",
+        tags::URI_TABLE => "uri_table",
+        tags::IMAGE_TABLE => "image_table",
         _ => return None,
     })
+}
+
+/// One terminal mode, identified the way the VT spec identifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeEntry {
+    /// 0 = ANSI mode, 1 = DEC private mode. Two distinct namespaces.
+    pub kind: u8,
+    /// The mode number itself: 1 DECCKM, 7 DECAWM, 25 DECTCEM, 2004 bracketed
+    /// paste, 1049 alt screen, 2026 synchronised update, and so on.
+    pub number: u32,
+    pub value: u8,
+}
+
+/// Where the cursor is and how it looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorState {
+    pub col: u32,
+    pub row: u32,
+    /// 0 block, 1 underline, 2 bar.
+    pub shape: u8,
+    pub visible: bool,
+    pub blink: bool,
+    /// The deferred-wrap flag: the cursor sits past the last column and the
+    /// next printable character wraps first. Dropping it misplaces output.
+    pub pending_wrap: bool,
+}
+
+/// DECSC state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SavedCursor {
+    pub col: u32,
+    pub row: u32,
+    pub pen: Style,
+    pub charsets: Charsets,
+    pub origin: bool,
+}
+
+/// G0..G3 designators plus the GL/GR locking shifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Charsets {
+    /// The final character of each designation sequence: b'B' ASCII, b'0' DEC
+    /// graphics, and so on.
+    pub g: [u8; 4],
+    pub gl: u8,
+    pub gr: u8,
+}
+
+impl Default for Charsets {
+    fn default() -> Self {
+        Charsets { g: [b'B'; 4], gl: 0, gr: 0 }
+    }
+}
+
+/// Scrolling and horizontal margins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Margins {
+    pub top: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub right: u32,
+}
+
+/// Kitty keyboard protocol flag stack plus the xterm modifyOtherKeys level.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KittyKbd {
+    pub stack: Vec<u32>,
+    pub modify_other_keys: u8,
+}
+
+/// One inline image. `format` is 1 for PNG; other values are reserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageEntry {
+    pub id: u32,
+    pub format: u8,
+    pub w: u32,
+    pub h: u32,
+    pub data: Vec<u8>,
 }
 
 /// One pane, ready to be handed to another rt process.
@@ -75,6 +178,25 @@ pub struct PaneWire {
     pub show_titlebar: Option<bool>,
     /// Exactly 256 entries when present.
     pub palette: Option<Vec<(u8, u8, u8)>>,
+    pub modes: Vec<ModeEntry>,
+    pub cursor: CursorState,
+    pub saved_cursor: Option<SavedCursor>,
+    pub charsets: Option<Charsets>,
+    /// One entry per column.
+    pub tab_stops: Option<Vec<bool>>,
+    pub margins: Option<Margins>,
+    pub title_stack: Vec<String>,
+    /// The current SGR state, so output after the move continues in the same
+    /// attributes.
+    pub pen: Style,
+    /// 0 primary, 1 alt.
+    pub active_screen: u8,
+    pub kitty_kbd: Option<KittyKbd>,
+    /// Bytes of an escape sequence the donor's parser had not finished, to be
+    /// replayed into the receiver's parser before anything else.
+    pub pending_raw: Vec<u8>,
+    pub uri_table: Vec<(u32, String)>,
+    pub image_table: Vec<ImageEntry>,
     pub style_table: Vec<Style>,
     pub screen_primary: Grid,
     pub screen_alt: Option<Grid>,
@@ -143,6 +265,105 @@ impl PaneWire {
                     w.u8(*r);
                     w.u8(*g);
                     w.u8(*b);
+                }
+            })));
+        }
+        out.push((tags::MODES, enc(|w| {
+            w.varint(self.modes.len() as u64);
+            for m in &self.modes {
+                w.u8(m.kind);
+                w.varint(m.number as u64);
+                w.u8(m.value);
+            }
+        })));
+        out.push((tags::CURSOR, enc(|w| {
+            w.varint(self.cursor.col as u64);
+            w.varint(self.cursor.row as u64);
+            w.u8(self.cursor.shape);
+            w.u8(self.cursor.visible as u8);
+            w.u8(self.cursor.blink as u8);
+            w.u8(self.cursor.pending_wrap as u8);
+        })));
+        if let Some(sc) = &self.saved_cursor {
+            out.push((tags::SAVED_CURSOR, enc(|w| {
+                w.varint(sc.col as u64);
+                w.varint(sc.row as u64);
+                sc.pen.write(w);
+                w.raw(&sc.charsets.g);
+                w.u8(sc.charsets.gl);
+                w.u8(sc.charsets.gr);
+                w.u8(sc.origin as u8);
+            })));
+        }
+        if let Some(cs) = &self.charsets {
+            out.push((tags::CHARSETS, enc(|w| {
+                w.raw(&cs.g);
+                w.u8(cs.gl);
+                w.u8(cs.gr);
+            })));
+        }
+        if let Some(stops) = &self.tab_stops {
+            out.push((tags::TAB_STOPS, enc(|w| {
+                w.varint(stops.len() as u64);
+                for chunk in stops.chunks(8) {
+                    let mut byte = 0u8;
+                    for (i, on) in chunk.iter().enumerate() {
+                        if *on {
+                            byte |= 1 << i;
+                        }
+                    }
+                    w.u8(byte);
+                }
+            })));
+        }
+        if let Some(m) = &self.margins {
+            out.push((tags::MARGINS, enc(|w| {
+                w.varint(m.top as u64);
+                w.varint(m.bottom as u64);
+                w.varint(m.left as u64);
+                w.varint(m.right as u64);
+            })));
+        }
+        if !self.title_stack.is_empty() {
+            out.push((tags::TITLE_STACK, enc(|w| {
+                w.varint(self.title_stack.len() as u64);
+                for t in &self.title_stack {
+                    w.str(t);
+                }
+            })));
+        }
+        out.push((tags::PEN, enc(|w| self.pen.write(w))));
+        out.push((tags::ACTIVE_SCREEN, enc(|w| w.u8(self.active_screen))));
+        if let Some(k) = &self.kitty_kbd {
+            out.push((tags::KITTY_KBD, enc(|w| {
+                w.varint(k.stack.len() as u64);
+                for f in &k.stack {
+                    w.varint(*f as u64);
+                }
+                w.u8(k.modify_other_keys);
+            })));
+        }
+        if !self.pending_raw.is_empty() {
+            out.push((tags::PENDING_RAW, enc(|w| w.bytes(&self.pending_raw))));
+        }
+        if !self.uri_table.is_empty() {
+            out.push((tags::URI_TABLE, enc(|w| {
+                w.varint(self.uri_table.len() as u64);
+                for (id, uri) in &self.uri_table {
+                    w.varint(*id as u64);
+                    w.str(uri);
+                }
+            })));
+        }
+        if !self.image_table.is_empty() {
+            out.push((tags::IMAGE_TABLE, enc(|w| {
+                w.varint(self.image_table.len() as u64);
+                for img in &self.image_table {
+                    w.varint(img.id as u64);
+                    w.u8(img.format);
+                    w.varint(img.w as u64);
+                    w.varint(img.h as u64);
+                    w.bytes(&img.data);
                 }
             })));
         }
@@ -247,6 +468,96 @@ impl PaneWire {
                     seen.push(tag);
                     return Ok(true);
                 }
+                tags::MODES => {
+                    let n = r.varint()? as usize;
+                    for _ in 0..n {
+                        let kind = r.u8()?;
+                        let number = r.varint()? as u32;
+                        let value = r.u8()?;
+                        p.modes.push(ModeEntry { kind, number, value });
+                    }
+                }
+                tags::CURSOR => {
+                    p.cursor = CursorState {
+                        col: r.varint()? as u32,
+                        row: r.varint()? as u32,
+                        shape: r.u8()?,
+                        visible: r.u8()? != 0,
+                        blink: r.u8()? != 0,
+                        pending_wrap: r.u8()? != 0,
+                    };
+                }
+                tags::SAVED_CURSOR => {
+                    let col = r.varint()? as u32;
+                    let row = r.varint()? as u32;
+                    let pen = Style::read(&mut r, tag)?;
+                    let gb = r.take(4)?;
+                    let charsets = Charsets { g: [gb[0], gb[1], gb[2], gb[3]], gl: r.u8()?, gr: r.u8()? };
+                    p.saved_cursor = Some(SavedCursor { col, row, pen, charsets, origin: r.u8()? != 0 });
+                }
+                tags::CHARSETS => {
+                    let gb = r.take(4)?;
+                    p.charsets = Some(Charsets { g: [gb[0], gb[1], gb[2], gb[3]], gl: r.u8()?, gr: r.u8()? });
+                }
+                tags::TAB_STOPS => {
+                    let n = r.varint()? as usize;
+                    let bytes = r.take(n.div_ceil(8))?; // one byte per eight columns, LSB first
+                    let mut stops = Vec::with_capacity(n.min(65536));
+                    for i in 0..n {
+                        stops.push(bytes[i / 8] & (1 << (i % 8)) != 0);
+                    }
+                    p.tab_stops = Some(stops);
+                }
+                tags::MARGINS => {
+                    p.margins = Some(Margins {
+                        top: r.varint()? as u32,
+                        bottom: r.varint()? as u32,
+                        left: r.varint()? as u32,
+                        right: r.varint()? as u32,
+                    });
+                }
+                tags::TITLE_STACK => {
+                    let n = r.varint()? as usize;
+                    for _ in 0..n {
+                        p.title_stack.push(r.str()?);
+                    }
+                }
+                tags::PEN => p.pen = Style::read(&mut r, tag)?,
+                tags::ACTIVE_SCREEN => {
+                    let v = r.u8()?;
+                    if v > 1 {
+                        return Err(WireError::BadValue { tag, why: "active_screen must be 0 or 1" });
+                    }
+                    p.active_screen = v;
+                }
+                tags::KITTY_KBD => {
+                    let n = r.varint()? as usize;
+                    let mut stack = Vec::with_capacity(n.min(256));
+                    for _ in 0..n {
+                        stack.push(r.varint()? as u32);
+                    }
+                    p.kitty_kbd = Some(KittyKbd { stack, modify_other_keys: r.u8()? });
+                }
+                tags::PENDING_RAW => p.pending_raw = r.bytes()?.to_vec(),
+                tags::URI_TABLE => {
+                    let n = r.varint()? as usize;
+                    for _ in 0..n {
+                        let id = r.varint()? as u32;
+                        let uri = r.str()?;
+                        p.uri_table.push((id, uri));
+                    }
+                }
+                tags::IMAGE_TABLE => {
+                    let n = r.varint()? as usize;
+                    for _ in 0..n {
+                        let id = r.varint()? as u32;
+                        let format = r.u8()?;
+                        let w = r.varint()? as u32;
+                        let h = r.varint()? as u32;
+                        let data = r.bytes()?.to_vec();
+                        p.image_table.push(ImageEntry { id, format, w, h, data });
+                    }
+                }
                 _ => return Ok(false),
             }
             r.finish()?;
@@ -260,6 +571,9 @@ impl PaneWire {
             tags::COLS,
             tags::ROWS,
             tags::CHILD_PID,
+            tags::MODES,
+            tags::CURSOR,
+            tags::PEN,
             tags::TAG_NAMES,
             tags::STYLE_TABLE,
             tags::SCREEN_PRIMARY,
@@ -279,7 +593,7 @@ mod tests {
     use super::*;
     use crate::error::WireError;
     use crate::grid::{Grid, Line, Run};
-    use crate::style::Style;
+    use crate::style::{Colour, Style};
 
     /// Encode, decode, compare — normalising `tag_names`, which the ENCODER
     /// produces and the DECODER reads back, so a freshly-built pane never has
@@ -299,6 +613,9 @@ mod tests {
             cols: 80,
             rows: 24,
             child_pid: 1234,
+            modes: vec![ModeEntry { kind: 1, number: 7, value: 1 }],
+            cursor: CursorState { col: 0, row: 0, shape: 0, visible: true, blink: true, pending_wrap: false },
+            pen: Style::default(),
             style_table: vec![Style::default()],
             screen_primary: Grid { lines: vec![Line { flags: 0, runs: vec![Run::blank(0, 80)] }] },
             ..PaneWire::default()
@@ -410,5 +727,105 @@ mod tests {
         // Run-length encoding is why the spec specifies no compression: a
         // typical line must cost tens of bytes, not hundreds.
         assert!(bytes.len() < 5_000 * 60, "5k lines took {} bytes", bytes.len());
+    }
+
+    #[test]
+    fn modes_travel_by_their_dec_number() {
+        let p = PaneWire {
+            modes: vec![
+                ModeEntry { kind: 1, number: 1, value: 1 },    // DECCKM on
+                ModeEntry { kind: 1, number: 2004, value: 1 }, // bracketed paste on
+                ModeEntry { kind: 1, number: 1049, value: 0 }, // alt screen off
+                ModeEntry { kind: 0, number: 20, value: 1 },   // LNM on (ANSI, not DEC)
+            ],
+            ..minimal()
+        };
+        let back = PaneWire::decode(&p.encode()).unwrap();
+        assert_eq!(back.modes, p.modes);
+        // The ANSI/DEC namespaces are distinct: mode 20 in each is a different mode.
+        assert_eq!(back.modes[3].kind, 0);
+    }
+
+    #[test]
+    fn a_mode_number_this_build_never_heard_of_survives_the_trip() {
+        // The decoder does not filter modes: it is not the transport's job to
+        // decide which modes an engine supports.
+        let p = PaneWire { modes: vec![ModeEntry { kind: 1, number: 65000, value: 1 }], ..minimal() };
+        assert_eq!(PaneWire::decode(&p.encode()).unwrap().modes, p.modes);
+    }
+
+    #[test]
+    fn cursor_state_round_trips_including_pending_wrap() {
+        let p = PaneWire {
+            cursor: CursorState { col: 79, row: 3, shape: 2, visible: true, blink: false, pending_wrap: true },
+            ..minimal()
+        };
+        let back = PaneWire::decode(&p.encode()).unwrap();
+        assert_eq!(back.cursor, p.cursor);
+        assert!(back.cursor.pending_wrap, "deferred wrap is part of the cursor, not a detail");
+    }
+
+    #[test]
+    fn the_whole_terminal_state_round_trips() {
+        let p = PaneWire {
+            modes: vec![ModeEntry { kind: 1, number: 7, value: 1 }],
+            cursor: CursorState { col: 1, row: 2, shape: 1, visible: true, blink: true, pending_wrap: false },
+            saved_cursor: Some(SavedCursor {
+                col: 5,
+                row: 6,
+                pen: Style { fg: Colour::Indexed(3), ..Style::default() },
+                charsets: Charsets { g: [b'B', b'0', b'B', b'B'], gl: 0, gr: 2 },
+                origin: true,
+            }),
+            charsets: Some(Charsets { g: [b'B', b'B', b'B', b'B'], gl: 0, gr: 0 }),
+            tab_stops: Some((0..80).map(|i| i % 8 == 0).collect()),
+            margins: Some(Margins { top: 1, bottom: 22, left: 0, right: 79 }),
+            title_stack: vec!["one".into(), "two".into()],
+            pen: Style { attrs: crate::style::attrs::BOLD, ..Style::default() },
+            active_screen: 1,
+            kitty_kbd: Some(KittyKbd { stack: vec![1, 5], modify_other_keys: 2 }),
+            pending_raw: vec![0x1b, b'[', b'3'],
+            uri_table: vec![(1, "https://example.invalid/a".into())],
+            image_table: vec![ImageEntry { id: 9, format: 1, w: 4, h: 2, data: vec![1, 2, 3, 4] }],
+            ..minimal()
+        };
+        assert_round_trips(&p);
+    }
+
+    #[test]
+    fn pending_raw_carries_an_incomplete_sequence_verbatim() {
+        // The freeze captures a half-parsed escape; the receiver replays the
+        // bytes into its own parser. Raw bytes mean the same thing in every
+        // build, which is why the format ships them rather than parser state.
+        let p = PaneWire { pending_raw: vec![0x1b, b'[', b'3', b'8', b';', b'5'], ..minimal() };
+        assert_eq!(PaneWire::decode(&p.encode()).unwrap().pending_raw, p.pending_raw);
+    }
+
+    #[test]
+    fn the_new_required_fields_are_enforced() {
+        for missing in [tags::MODES, tags::CURSOR, tags::PEN] {
+            let mut fw = crate::tlv::FieldWriter::new();
+            for (tag, val) in minimal().fields() {
+                if tag != missing {
+                    fw.field(tag, &val);
+                }
+            }
+            let err = PaneWire::decode(&fw.into_vec()).unwrap_err();
+            assert_eq!(err, WireError::MissingField { tag: missing }, "tag 0x{missing:02x}");
+        }
+    }
+
+    #[test]
+    fn active_screen_must_be_zero_or_one() {
+        let mut fields = minimal().fields();
+        fields.retain(|(t, _)| *t != tags::ACTIVE_SCREEN);
+        fields.push((tags::ACTIVE_SCREEN, vec![7]));
+        fields.sort_by_key(|(t, _)| *t);
+        let mut fw = crate::tlv::FieldWriter::new();
+        for (tag, val) in &fields {
+            fw.field(*tag, val);
+        }
+        let err = PaneWire::decode(&fw.into_vec()).unwrap_err();
+        assert_eq!(err, WireError::BadValue { tag: tags::ACTIVE_SCREEN, why: "active_screen must be 0 or 1" });
     }
 }
