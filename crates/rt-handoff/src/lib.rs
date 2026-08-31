@@ -6,6 +6,11 @@
 //!
 //! It has no dependencies and must not gain any — see README.md.
 
+// `Integer::is_multiple_of` stabilised in 1.87; adopting it would raise the
+// MSRV of a crate whose whole premise is being vendorable and buildable in
+// isolation for years.
+#![allow(clippy::manual_is_multiple_of)]
+
 pub mod error;
 pub mod frame;
 pub mod buf;

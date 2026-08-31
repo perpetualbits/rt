@@ -210,6 +210,82 @@ unsigned varints; fixed-width fields are little-endian.
 | 0x0C | Pong | either |
 | 0x0D | Bye | either |
 
+`msg_flags` is a bitfield, and a receiver **rejects any frame whose flags carry a
+bit it does not implement** — v1 implements none, so v1 rejects any non-zero
+`msg_flags`. This is the opposite of the unknown-tag rule (R2) and deliberately
+so: an unknown TLV tag is inert data the receiver simply does not read, while an
+unknown frame flag changes what the payload MEANS. The reserved `compressed`
+flag is the case in point — a receiver that ignored it would hand compressed
+bytes to the v1 decoder and produce confident garbage instead of saying "this
+peer used a frame feature I do not support". Adding a flag is therefore a
+protocol-version change, negotiated through `Hello`, not a silent extension.
+
+### `Hello` fields (0x01)
+
+| tag | field | notes |
+|---|---|---|
+| 0x01 | `magic` — the nine bytes `RTHANDOFF` | required, and required to be PRESENT: an omitted magic is not a proto-0 peer, it is not an rt peer |
+| 0x02 | `proto_min` varint | |
+| 0x03 | `proto_max` varint | |
+| 0x04 | `rt_version` utf8 | named in the refusal when protocols do not overlap |
+| 0x05 | `engine` utf8 | `vtterm`, `alacritty`; informational, transfers are engine-neutral |
+| 0x06 | `boot_id` utf8 | mismatch → abort, a stale socket from a previous boot |
+| 0x07 | `caps` — varint count, then that many varints | |
+| 0x08 | `max_scrollback_lines` varint | |
+| 0x09 | `max_payload_bytes` varint | |
+| 0x0A | `display` utf8 — `wayland`, `x11` | informational; XDND is X11-only |
+
+### `Offer` fields (0x02)
+
+| tag | field |
+|---|---|
+| 0x01 | `token` — exactly 16 raw bytes |
+| 0x02 | `pane_count` varint |
+| 0x03 | `titles` — varint count, then that many utf8 strings |
+| 0x04 | `byte_estimate` varint |
+
+### `Claim` fields (0x03)
+
+| tag | field |
+|---|---|
+| 0x01 | `token` — exactly 16 raw bytes, the one minted for this offer |
+| 0x02 | `target` — a DropTarget, below |
+| 0x03 | `accepted_budget` varint — lines |
+
+```
+DropTarget := varint kind
+              kind 0 root
+              kind 1 split-left    : varint pane_uid
+              kind 2 split-right   : varint pane_uid
+              kind 3 split-above   : varint pane_uid
+              kind 4 split-below   : varint pane_uid
+              kind 5 swap          : varint pane_uid
+              kind 6 tab-insert    : varint first_pane | varint index
+```
+
+The `pane_uid` in a drop target is one of the RECEIVER's panes — where to put
+what is arriving — not one of the donor's.
+
+### The positional bodies
+
+`PaneFds`, `Adopted` and `Failed` are too small to be worth a TLV body and are
+frozen as they stand. A future version that must extend them adds a message
+type rather than a field.
+
+```
+PaneFds := varint pane_uid          (the two fds ride the SCM_RIGHTS control
+                                     message: master_fd then pidfd)
+Adopted := varint n | varint pane_uid × n
+Failed  := varint code | utf8 text
+```
+
+`Cancel`, `Ping`, `Pong` and `Bye` have empty bodies. A receiver **ignores**
+whatever payload arrives with them rather than rejecting trailing bytes, which
+every other decoder does reject. That leniency is deliberate and is the mirror
+image of the frame-flag rule above: a later version may give these bodies
+meaning, and an ignored INERT payload cannot change how a receiver interprets
+data it does act on.
+
 ### TLV bodies
 
 `Hello`, `Offer`, `Claim` and `PaneState` — the messages that negotiate and
@@ -274,7 +350,7 @@ Compatibility rules, binding on every future version:
 | 0x27 | `pen` — the current SGR state, as a Style entry | ● | default |
 | 0x28 | `active_screen` u8 — 0 primary, 1 alt | | 0 |
 | 0x29 | `kitty_kbd` — keyboard protocol flag stack, modifyOtherKeys level | | off |
-| 0x2A | `pending_raw` — bytes of an incomplete sequence, replayed by R | | empty |
+| 0x2A | `pending_raw` — bytes of an incomplete sequence, replayed by R. Its TLV value is itself a length-prefixed byte string, so the length appears twice; `palette` (0x0E) is raw bytes with no inner prefix. Frozen either way — written down because a reimplementer would otherwise guess wrong. | | empty |
 | 0x3F | `style_table` — see below | ● | — |
 | 0x40 | `screen_primary` — GridBlob | ● | — |
 | 0x41 | `screen_alt` — GridBlob | | absent |
@@ -284,7 +360,7 @@ Compatibility rules, binding on every future version:
 **Modes (0x20)** are the version-independence trick. A list of entries:
 
 ```
-ModeEntry := varint kind (0 = ANSI, 1 = DEC private) | varint number | u8 value
+ModeEntry := u8 kind (0 = ANSI, 1 = DEC private) | varint number | u8 value
 ```
 
 `number` is the mode number **from the spec** — 1 DECCKM, 4 IRM, 6 DECOM, 7 DECAWM,
@@ -318,13 +394,21 @@ GridBlob := varint row_count | Line × row_count
 Line     := varint line_flags | varint run_count | Run × run_count
 Run      := u8 run_flags | varint style_id | varint cell_span
             | varint text_len | text[text_len]
-            | [if run_flags & 1: varint char_count × cell_span]
+            | [if run_flags & 1: varint char_count × cell_count]
 ```
 
 - `line_flags`: bit0 soft-wrapped into the next line · bit1 DECDWL · bit2 DECDHL top ·
   bit3 DECDHL bottom.
 - `run_flags`: bit0 per-cell char counts follow (combining marks) · bit1 wide-char run
-  (every cell spans 2 columns).
+  (every cell spans 2 columns). A receiver **rejects a run whose flags carry a bit it
+  does not implement**, unlike `line_flags` and `attrs`, which it ignores and masks.
+  The asymmetry is not an oversight: bit0 already changes the GRAMMAR by appending an
+  array, so a future bit that did the same would desynchronise an older receiver for
+  every remaining run and line in the blob — silently, because a GridBlob is positional
+  and carries no per-run length to skip by. `line_flags` and `attrs` are pure booleans
+  over a fixed grammar, where ignoring an unknown bit costs at most a decoration.
+  Adding a run flag is therefore a protocol-version change; adding a line flag or an
+  attribute bit is not.
 - `cell_span` is measured in **columns**. The run's cell count is `cell_span` normally
   and `cell_span / 2` when bit1 is set; the bit0 array has exactly that many entries.
   A run never mixes wide and narrow cells — it breaks instead.
@@ -333,7 +417,9 @@ Run      := u8 run_flags | varint style_id | varint cell_span
 
 A typical 200-column shell line is one run: a few dozen bytes. 50 000 lines lands
 around 1–3 MB, which is why v1 specifies no compression. A `compressed` frame flag is
-reserved for later without a format change.
+reserved for later without a change to the PAYLOAD grammar — but setting it is a
+protocol-version change, because a v1 receiver rejects any frame flag it does not
+implement rather than ignoring it. See [Framing](#framing).
 
 ### Scrollback (0x07 `ScrollChunk`)
 

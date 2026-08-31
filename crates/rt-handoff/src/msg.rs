@@ -1,7 +1,7 @@
 //! The message set. Bodies are TLV like everything else, so a v1 receiver can
 //! read a v2 Hello and still learn the version it needs to refuse.
 
-use crate::buf::{Reader, Writer};
+use crate::buf::{enc, Reader, Writer};
 use crate::error::{Result, WireError};
 use crate::frame::Frame;
 use crate::grid::Line;
@@ -25,6 +25,15 @@ pub mod msg_type {
     pub const PONG: u16 = 0x0C;
     pub const BYE: u16 = 0x0D;
 }
+
+/// Every `msg_flags` bit this build implements — none, in v1.
+///
+/// The spec reserves a `compressed` frame flag for a later version. A receiver
+/// that ignored an unknown flag would hand a compressed payload straight to the
+/// v1 decoder and produce garbage, instead of saying "this peer used a frame
+/// feature I do not support". So unlike an unknown TLV tag, which is skipped by
+/// its length (R2), an unknown frame flag is fatal to the frame.
+pub const KNOWN_FLAGS: u16 = 0;
 
 /// `Failed.code` values. Frozen. An unknown code is treated as `INTERNAL`.
 pub mod fail {
@@ -119,7 +128,7 @@ impl DropTargetWire {
             3 => DropTargetWire::SplitAbove(r.varint()?),
             4 => DropTargetWire::SplitBelow(r.varint()?),
             5 => DropTargetWire::Swap(r.varint()?),
-            6 => DropTargetWire::TabInsert { first_pane: r.varint()?, index: r.varint()? as u32 },
+            6 => DropTargetWire::TabInsert { first_pane: r.varint()?, index: r.varint_u32()? },
             _ => return Err(WireError::BadValue { tag, why: "unknown drop target kind" }),
         })
     }
@@ -181,13 +190,6 @@ pub struct Failed {
     pub text: String,
 }
 
-/// Encode one field's value with a fresh writer.
-fn enc(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
-    let mut w = Writer::new();
-    f(&mut w);
-    w.into_vec()
-}
-
 /// Write already-sorted `(tag, bytes)` pairs as a TLV body. `FieldWriter`
 /// asserts ascending order, so the sort in each `fields()` is what keeps this
 /// honest.
@@ -235,7 +237,14 @@ impl Hello {
         // the whole reason the field exists. Without this it would surface far
         // downstream as a baffling version mismatch against proto 0/0.
         let mut saw_magic = false;
+        let mut seen: Vec<u64> = Vec::new();
         let unknown = tlv::walk(body, |tag, val| {
+            // A repeated known tag is malformed: the second copy would silently
+            // overwrite or extend the first, so `decode -> encode` would stop
+            // being idempotent. Unknown tags stay exempt (R2).
+            if seen.contains(&tag) {
+                return Err(WireError::BadValue { tag, why: "duplicate tag" });
+            }
             let mut r = Reader::new(val);
             match tag {
                 hello_tags::MAGIC => {
@@ -243,10 +252,11 @@ impl Hello {
                         return Err(WireError::BadValue { tag, why: "not an rt handoff peer" });
                     }
                     saw_magic = true;
+                    seen.push(tag);
                     return Ok(true);
                 }
-                hello_tags::PROTO_MIN => h.proto_min = r.varint()? as u32,
-                hello_tags::PROTO_MAX => h.proto_max = r.varint()? as u32,
+                hello_tags::PROTO_MIN => h.proto_min = r.varint_u32()?,
+                hello_tags::PROTO_MAX => h.proto_max = r.varint_u32()?,
                 hello_tags::RT_VERSION => h.rt_version = r.str()?,
                 hello_tags::ENGINE => h.engine = r.str()?,
                 hello_tags::BOOT_ID => h.boot_id = r.str()?,
@@ -256,12 +266,13 @@ impl Hello {
                         h.caps.push(r.varint()?);
                     }
                 }
-                hello_tags::MAX_SCROLLBACK_LINES => h.max_scrollback_lines = r.varint()? as u32,
+                hello_tags::MAX_SCROLLBACK_LINES => h.max_scrollback_lines = r.varint_u32()?,
                 hello_tags::MAX_PAYLOAD_BYTES => h.max_payload_bytes = r.varint()?,
                 hello_tags::DISPLAY => h.display = r.str()?,
                 _ => return Ok(false),
             }
             r.finish()?;
+            seen.push(tag);
             Ok(true)
         })?;
         if !saw_magic {
@@ -295,7 +306,12 @@ impl Offer {
 
     fn decode(body: &[u8]) -> Result<Offer> {
         let mut o = Offer::default();
+        let mut seen: Vec<u64> = Vec::new();
         o.unknown_tags = tlv::walk(body, |tag, val| {
+            // See Hello::decode: a repeated known tag is malformed.
+            if seen.contains(&tag) {
+                return Err(WireError::BadValue { tag, why: "duplicate tag" });
+            }
             let mut r = Reader::new(val);
             match tag {
                 offer_tags::TOKEN => {
@@ -303,9 +319,10 @@ impl Offer {
                         return Err(WireError::BadValue { tag, why: "token must be 16 bytes" });
                     }
                     o.token.copy_from_slice(val);
+                    seen.push(tag);
                     return Ok(true);
                 }
-                offer_tags::PANE_COUNT => o.pane_count = r.varint()? as u32,
+                offer_tags::PANE_COUNT => o.pane_count = r.varint_u32()?,
                 offer_tags::TITLES => {
                     let n = r.varint()? as usize;
                     for _ in 0..n {
@@ -316,6 +333,7 @@ impl Offer {
                 _ => return Ok(false),
             }
             r.finish()?;
+            seen.push(tag);
             Ok(true)
         })?;
         Ok(o)
@@ -341,7 +359,12 @@ impl Claim {
         let mut token = [0u8; 16];
         let mut target = DropTargetWire::Root;
         let mut accepted_budget = 0u32;
+        let mut seen: Vec<u64> = Vec::new();
         let unknown_tags = tlv::walk(body, |tag, val| {
+            // See Hello::decode: a repeated known tag is malformed.
+            if seen.contains(&tag) {
+                return Err(WireError::BadValue { tag, why: "duplicate tag" });
+            }
             let mut r = Reader::new(val);
             match tag {
                 claim_tags::TOKEN => {
@@ -349,13 +372,15 @@ impl Claim {
                         return Err(WireError::BadValue { tag, why: "token must be 16 bytes" });
                     }
                     token.copy_from_slice(val);
+                    seen.push(tag);
                     return Ok(true);
                 }
                 claim_tags::TARGET => target = DropTargetWire::read(&mut r, tag)?,
-                claim_tags::ACCEPTED_BUDGET => accepted_budget = r.varint()? as u32,
+                claim_tags::ACCEPTED_BUDGET => accepted_budget = r.varint_u32()?,
                 _ => return Ok(false),
             }
             r.finish()?;
+            seen.push(tag);
             Ok(true)
         })?;
         Ok(Claim { token, target, accepted_budget, unknown_tags })
@@ -430,6 +455,12 @@ impl Message {
     }
 
     pub fn from_frame(frame: &Frame) -> Result<Message> {
+        // Before anything is parsed: a flag we do not implement can change what
+        // the payload MEANS, so decoding it anyway would produce confident
+        // garbage. Contrast the inert bodies of Cancel/Ping/Pong/Bye below.
+        if frame.flags & !KNOWN_FLAGS != 0 {
+            return Err(WireError::UnknownFrameFlags(frame.flags));
+        }
         let body = &frame.payload[..];
         Ok(match frame.msg_type {
             msg_type::HELLO => Message::Hello(Hello::decode(body)?),
@@ -467,11 +498,17 @@ impl Message {
             }
             msg_type::FAILED => {
                 let mut r = Reader::new(body);
-                let code = r.varint()? as u32;
+                let code = r.varint_u32()?;
                 let text = r.str()?;
                 r.finish()?;
                 Message::Failed(Failed { code, text })
             }
+            // These four ignore their payloads while every other decoder
+            // rejects trailing bytes, and that leniency is deliberate: a future
+            // version may give these bodies meaning, and an ignored INERT
+            // payload cannot change how we interpret data we DO act on. An
+            // unknown frame flag or run flag can, which is why those are
+            // rejected instead.
             msg_type::CANCEL => Message::Cancel,
             msg_type::PING => Message::Ping,
             msg_type::PONG => Message::Pong,
@@ -655,6 +692,105 @@ mod tests {
         assert_eq!(fail::FD_PASSING_FAILED, 6);
         assert_eq!(fail::CANNOT_PLACE, 7);
         assert_eq!(fail::INTERNAL, 8);
+    }
+
+    #[test]
+    fn a_frame_flag_this_build_does_not_implement_is_rejected() {
+        // 0x0001 is where the spec's reserved `compressed` flag would land. A
+        // v1 receiver that ignored it would decode compressed bytes as v1 and
+        // produce garbage, so it must refuse the frame instead.
+        let mut frame = Message::Ping.to_frame().unwrap();
+        frame.flags = 0x0001;
+        assert_eq!(Message::from_frame(&frame).unwrap_err(), WireError::UnknownFrameFlags(0x0001));
+
+        // The check is over the whole field, not just bit 0.
+        frame.flags = 0x8000;
+        assert_eq!(Message::from_frame(&frame).unwrap_err(), WireError::UnknownFrameFlags(0x8000));
+    }
+
+    #[test]
+    fn a_frame_with_no_flags_still_decodes() {
+        assert_eq!(KNOWN_FLAGS, 0, "v1 implements no frame flags");
+        let frame = Message::Ping.to_frame().unwrap();
+        assert_eq!(frame.flags, 0, "our encoder never sets a flag");
+        assert_eq!(Message::from_frame(&frame).unwrap(), Message::Ping);
+    }
+
+    #[test]
+    fn a_repeated_known_tag_is_rejected_in_every_tlv_message() {
+        // Hello.
+        let mut fw = crate::tlv::FieldWriter::new();
+        fw.field(hello_tags::MAGIC, crate::MAGIC);
+        fw.field(hello_tags::RT_VERSION, &enc(|w| w.str("0.3.19")));
+        // FieldWriter enforces ascending order, so the repeat is spliced by hand.
+        let mut body = fw.into_vec();
+        body.extend_from_slice(&enc(|w| {
+            w.varint(hello_tags::RT_VERSION);
+            w.bytes(&enc(|w| w.str("0.9.0")));
+        }));
+        let frame = Frame { msg_type: msg_type::HELLO, flags: 0, payload: body };
+        assert_eq!(
+            Message::from_frame(&frame).unwrap_err(),
+            WireError::BadValue { tag: hello_tags::RT_VERSION, why: "duplicate tag" }
+        );
+
+        // Offer: `titles` would ACCUMULATE, which is the same class of bug as
+        // shell_argv in PaneState.
+        let mut body = enc(|w| {
+            w.varint(offer_tags::TITLES);
+            w.bytes(&enc(|w| {
+                w.varint(1);
+                w.str("zsh");
+            }));
+        });
+        body.extend_from_slice(&enc(|w| {
+            w.varint(offer_tags::TITLES);
+            w.bytes(&enc(|w| {
+                w.varint(1);
+                w.str("vim");
+            }));
+        }));
+        let frame = Frame { msg_type: msg_type::OFFER, flags: 0, payload: body };
+        assert_eq!(
+            Message::from_frame(&frame).unwrap_err(),
+            WireError::BadValue { tag: offer_tags::TITLES, why: "duplicate tag" }
+        );
+
+        // Claim, including a repeated fixed-width tag that returns early.
+        let mut body = enc(|w| {
+            w.varint(claim_tags::TOKEN);
+            w.bytes(&[1u8; 16]);
+        });
+        body.extend_from_slice(&enc(|w| {
+            w.varint(claim_tags::TOKEN);
+            w.bytes(&[2u8; 16]);
+        }));
+        let frame = Frame { msg_type: msg_type::CLAIM, flags: 0, payload: body };
+        assert_eq!(
+            Message::from_frame(&frame).unwrap_err(),
+            WireError::BadValue { tag: claim_tags::TOKEN, why: "duplicate tag" }
+        );
+    }
+
+    #[test]
+    fn a_repeated_unknown_tag_is_still_not_an_error() {
+        // R2 binds even here: only KNOWN tags may not repeat.
+        let mut body = enc(|w| {
+            w.varint(hello_tags::MAGIC);
+            w.bytes(crate::MAGIC);
+        });
+        for _ in 0..2 {
+            body.extend_from_slice(&enc(|w| {
+                w.varint(0x6000);
+                w.bytes(b"from the future");
+            }));
+        }
+        let frame = Frame { msg_type: msg_type::HELLO, flags: 0, payload: body };
+        let back = match Message::from_frame(&frame).unwrap() {
+            Message::Hello(h) => h,
+            other => panic!("wrong message: {other:?}"),
+        };
+        assert_eq!(back.unknown_tags, vec![0x6000, 0x6000]);
     }
 
     #[test]

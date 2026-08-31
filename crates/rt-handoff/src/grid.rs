@@ -27,6 +27,13 @@ pub mod run_flags {
     pub const CHAR_COUNTS: u8 = 1;
     /// Every cell in this run occupies two columns.
     pub const WIDE: u8 = 2;
+    /// Every bit this version implements. Unlike `attrs` and `line_flags`, an
+    /// unknown bit here is REJECTED rather than ignored: bit 0 already changes
+    /// the GRAMMAR by appending a `char_counts` array, so a future bit that did
+    /// the same would make a v1 receiver misparse every remaining run and line
+    /// in the blob — silently, because a GridBlob is positional and carries no
+    /// per-run length to skip by.
+    pub const KNOWN: u8 = CHAR_COUNTS | WIDE;
 }
 
 /// A stretch of cells sharing one style.
@@ -94,8 +101,11 @@ impl Run {
 
     fn read(r: &mut Reader<'_>, tag: u64) -> Result<Run> {
         let flags = r.u8()?;
-        let style_id = r.varint()? as u32;
-        let cell_span = r.varint()? as u32;
+        if flags & !run_flags::KNOWN != 0 {
+            return Err(WireError::BadValue { tag, why: "unknown run flag" });
+        }
+        let style_id = r.varint_u32()?;
+        let cell_span = r.varint_u32()?;
         let text = r.str()?;
 
         if flags & run_flags::WIDE != 0 && cell_span % 2 != 0 {
@@ -106,7 +116,7 @@ impl Run {
         let mut char_counts = Vec::new();
         if flags & run_flags::CHAR_COUNTS != 0 {
             for _ in 0..cells {
-                char_counts.push(r.varint()? as u32);
+                char_counts.push(r.varint_u32()?);
             }
             let want: u64 = char_counts.iter().map(|c| *c as u64).sum();
             if want != text.chars().count() as u64 {
@@ -137,6 +147,11 @@ impl Line {
     }
 
     pub fn read(r: &mut Reader<'_>, tag: u64) -> Result<Line> {
+        // Deliberately NOT `varint_u32`, and deliberately not rejecting unknown
+        // bits: the spec says `varint line_flags`, and line flags are pure
+        // booleans over a fixed grammar. A future bit changes nothing about how
+        // the rest of the blob parses, so ignoring one is safe — while erroring
+        // would reject an entire pane over a line decoration we cannot draw.
         let flags = r.varint()? as u32;
         let n = r.varint()? as usize;
         let mut runs = Vec::with_capacity(n.min(4096));
@@ -292,6 +307,73 @@ mod tests {
         };
         let err = Grid::read(&bad.write_unchecked(), 0x40).unwrap_err();
         assert_eq!(err, WireError::BadValue { tag: 0x40, why: "text character count must equal the run's cell count" });
+    }
+
+    #[test]
+    fn an_unknown_run_flag_is_rejected() {
+        // Bit 2 is not in run_flags::KNOWN. A future version that gave it a
+        // grammar — as bit 0 already has — would desynchronise this decoder for
+        // the rest of the blob, so it must be an error and not an ignored bit.
+        let bad = Grid {
+            lines: vec![Line {
+                flags: 0,
+                runs: vec![Run { flags: 0b100, style_id: 0, cell_span: 1, text: String::new(), char_counts: vec![] }],
+            }],
+        };
+        let err = Grid::read(&bad.write_unchecked(), 0x40).unwrap_err();
+        assert_eq!(err, WireError::BadValue { tag: 0x40, why: "unknown run flag" });
+
+        // ...and the high bit too, so the check is over the whole byte.
+        let bad = Grid {
+            lines: vec![Line {
+                flags: 0,
+                runs: vec![Run { flags: 0x80, style_id: 0, cell_span: 1, text: String::new(), char_counts: vec![] }],
+            }],
+        };
+        assert_eq!(
+            Grid::read(&bad.write_unchecked(), 0x40).unwrap_err(),
+            WireError::BadValue { tag: 0x40, why: "unknown run flag" }
+        );
+    }
+
+    #[test]
+    fn every_known_run_flag_combination_is_accepted() {
+        assert_eq!(run_flags::KNOWN, 0b11);
+        for r in [
+            Run::blank(0, 4),
+            Run::text(0, "abcd"),
+            Run::wide(0, "日本"),
+            Run { flags: run_flags::CHAR_COUNTS | run_flags::WIDE, style_id: 0, cell_span: 4, text: "日本\u{0301}".into(), char_counts: vec![1, 2] },
+        ] {
+            let g = Grid { lines: vec![Line { flags: 0, runs: vec![r] }] };
+            assert_eq!(round_trip(&g), g);
+        }
+    }
+
+    #[test]
+    fn an_unknown_line_flag_is_ignored_not_rejected() {
+        // The opposite decision from run_flags, and deliberately so: line flags
+        // are booleans over a fixed grammar, so a bit we cannot draw must not
+        // cost the user the whole pane.
+        let mut w = Writer::new();
+        w.varint(1); // one line
+        w.varint(1 << 20); // a line flag from a future version
+        w.varint(0); // no runs
+        let g = Grid::read(&w.into_vec(), 0x40).unwrap();
+        assert_eq!(g.lines[0].flags, 1 << 20);
+    }
+
+    #[test]
+    fn a_run_dimension_past_u32_is_rejected_not_truncated() {
+        let mut w = Writer::new();
+        w.varint(1); // one line
+        w.varint(0); // line flags
+        w.varint(1); // one run
+        w.u8(0); // run flags
+        w.varint(0); // style_id
+        w.varint((1u64 << 32) + 80); // cell_span, one past u32
+        w.str("");
+        assert_eq!(Grid::read(&w.into_vec(), 0x40).unwrap_err(), WireError::VarintOverflow);
     }
 
     #[test]

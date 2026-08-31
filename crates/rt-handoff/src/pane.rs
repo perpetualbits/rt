@@ -3,6 +3,7 @@
 //! Field numbers come from the spec's PaneState table and are frozen. Adding a
 //! field means adding a tag, never changing one.
 
+use crate::buf::enc;
 use crate::error::{Result, WireError};
 use crate::grid::Grid;
 use crate::style::{self, Style};
@@ -211,13 +212,6 @@ impl PaneWire {
     /// `tag_names` included. `encode` is just this list written out, so a test
     /// can drop or corrupt one field and still produce an otherwise-valid body.
     pub fn fields(&self) -> Vec<(u64, Vec<u8>)> {
-        /// Encode one field's value with a fresh writer.
-        fn enc(f: impl FnOnce(&mut crate::buf::Writer)) -> Vec<u8> {
-            let mut w = crate::buf::Writer::new();
-            f(&mut w);
-            w.into_vec()
-        }
-
         let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
         out.push((tags::PANE_UID, enc(|w| w.varint(self.pane_uid))));
         out.push((tags::TITLE, enc(|w| w.str(&self.title))));
@@ -408,18 +402,25 @@ impl PaneWire {
         let mut seen: Vec<u64> = Vec::new();
 
         let unknown = tlv::walk(body, |tag, val| {
+            // A repeated known tag is malformed. `shell_argv` would ACCUMULATE
+            // and `title` would OVERWRITE, so `decode -> encode` would not be
+            // idempotent for such a body — the exact property the golden corpus
+            // rests on. Unknown tags are exempt: R2 says they are never an error.
+            if seen.contains(&tag) {
+                return Err(WireError::BadValue { tag, why: "duplicate tag" });
+            }
             let mut r = crate::buf::Reader::new(val);
             match tag {
                 tags::PANE_UID => p.pane_uid = r.varint()?,
                 tags::TITLE => p.title = r.str()?,
                 tags::CWD => p.cwd = Some(r.str()?),
-                tags::COLS => p.cols = r.varint()? as u32,
-                tags::ROWS => p.rows = r.varint()? as u32,
-                tags::SCROLLBACK_LIMIT => p.scrollback_limit = Some(r.varint()? as u32),
-                tags::COLUMNS_COUNT => p.columns_count = Some(r.varint()? as u32),
-                tags::GROUP => p.group = Some(r.varint()? as u32),
+                tags::COLS => p.cols = r.varint_u32()?,
+                tags::ROWS => p.rows = r.varint_u32()?,
+                tags::SCROLLBACK_LIMIT => p.scrollback_limit = Some(r.varint_u32()?),
+                tags::COLUMNS_COUNT => p.columns_count = Some(r.varint_u32()?),
+                tags::GROUP => p.group = Some(r.varint_u32()?),
                 tags::BROADCAST => p.broadcast = Some(r.u8()? != 0),
-                tags::CHILD_PID => p.child_pid = r.varint()? as u32,
+                tags::CHILD_PID => p.child_pid = r.varint_u32()?,
                 tags::SHELL_ARGV => {
                     let n = r.varint()? as usize;
                     for _ in 0..n {
@@ -472,15 +473,15 @@ impl PaneWire {
                     let n = r.varint()? as usize;
                     for _ in 0..n {
                         let kind = r.u8()?;
-                        let number = r.varint()? as u32;
+                        let number = r.varint_u32()?;
                         let value = r.u8()?;
                         p.modes.push(ModeEntry { kind, number, value });
                     }
                 }
                 tags::CURSOR => {
                     p.cursor = CursorState {
-                        col: r.varint()? as u32,
-                        row: r.varint()? as u32,
+                        col: r.varint_u32()?,
+                        row: r.varint_u32()?,
                         shape: r.u8()?,
                         visible: r.u8()? != 0,
                         blink: r.u8()? != 0,
@@ -488,8 +489,8 @@ impl PaneWire {
                     };
                 }
                 tags::SAVED_CURSOR => {
-                    let col = r.varint()? as u32;
-                    let row = r.varint()? as u32;
+                    let col = r.varint_u32()?;
+                    let row = r.varint_u32()?;
                     let pen = Style::read(&mut r, tag)?;
                     let gb = r.take(4)?;
                     let charsets = Charsets { g: [gb[0], gb[1], gb[2], gb[3]], gl: r.u8()?, gr: r.u8()? };
@@ -510,10 +511,10 @@ impl PaneWire {
                 }
                 tags::MARGINS => {
                     p.margins = Some(Margins {
-                        top: r.varint()? as u32,
-                        bottom: r.varint()? as u32,
-                        left: r.varint()? as u32,
-                        right: r.varint()? as u32,
+                        top: r.varint_u32()?,
+                        bottom: r.varint_u32()?,
+                        left: r.varint_u32()?,
+                        right: r.varint_u32()?,
                     });
                 }
                 tags::TITLE_STACK => {
@@ -534,7 +535,7 @@ impl PaneWire {
                     let n = r.varint()? as usize;
                     let mut stack = Vec::with_capacity(n.min(256));
                     for _ in 0..n {
-                        stack.push(r.varint()? as u32);
+                        stack.push(r.varint_u32()?);
                     }
                     p.kitty_kbd = Some(KittyKbd { stack, modify_other_keys: r.u8()? });
                 }
@@ -542,7 +543,7 @@ impl PaneWire {
                 tags::URI_TABLE => {
                     let n = r.varint()? as usize;
                     for _ in 0..n {
-                        let id = r.varint()? as u32;
+                        let id = r.varint_u32()?;
                         let uri = r.str()?;
                         p.uri_table.push((id, uri));
                     }
@@ -550,10 +551,10 @@ impl PaneWire {
                 tags::IMAGE_TABLE => {
                     let n = r.varint()? as usize;
                     for _ in 0..n {
-                        let id = r.varint()? as u32;
+                        let id = r.varint_u32()?;
                         let format = r.u8()?;
-                        let w = r.varint()? as u32;
-                        let h = r.varint()? as u32;
+                        let w = r.varint_u32()?;
+                        let h = r.varint_u32()?;
                         let data = r.bytes()?.to_vec();
                         p.image_table.push(ImageEntry { id, format, w, h, data });
                     }
@@ -813,6 +814,62 @@ mod tests {
             let err = PaneWire::decode(&fw.into_vec()).unwrap_err();
             assert_eq!(err, WireError::MissingField { tag: missing }, "tag 0x{missing:02x}");
         }
+    }
+
+    #[test]
+    fn a_repeated_known_tag_is_rejected() {
+        // Two cases with different symptoms, both fatal to idempotence:
+        // shell_argv ACCUMULATES, title OVERWRITES. Either way `decode ->
+        // encode` stops reproducing the bytes, which is the property the golden
+        // corpus rests on.
+        for (tag, second) in [
+            (tags::SHELL_ARGV, crate::buf::enc(|w| {
+                w.varint(1);
+                w.str("-l");
+            })),
+            (tags::TITLE, crate::buf::enc(|w| w.str("a different title"))),
+        ] {
+            let mut p = minimal();
+            p.shell_argv = vec!["/bin/zsh".into()];
+            // FieldWriter enforces ascending order, so the repeat is spliced by hand.
+            let mut body = p.encode();
+            body.extend_from_slice(&crate::buf::enc(|w| {
+                w.varint(tag);
+                w.bytes(&second);
+            }));
+            assert_eq!(
+                PaneWire::decode(&body).unwrap_err(),
+                WireError::BadValue { tag, why: "duplicate tag" },
+                "tag 0x{tag:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_unknown_tag_is_still_skipped() {
+        // R2 is not weakened by the duplicate check: it binds known tags only.
+        let mut body = minimal().encode();
+        for _ in 0..2 {
+            body.extend_from_slice(&crate::buf::enc(|w| {
+                w.varint(0x7000);
+                w.bytes(b"from rt 0.9");
+            }));
+        }
+        assert_eq!(PaneWire::decode(&body).unwrap().unknown_tags, vec![0x7000, 0x7000]);
+    }
+
+    #[test]
+    fn a_dimension_past_u32_is_rejected_rather_than_truncated() {
+        // The silent case this closes: 2^32 + 80 must not decode to cols 80.
+        let mut fields = minimal().fields();
+        fields.retain(|(t, _)| *t != tags::COLS);
+        fields.push((tags::COLS, crate::buf::enc(|w| w.varint((1u64 << 32) + 80))));
+        fields.sort_by_key(|(t, _)| *t);
+        let mut fw = crate::tlv::FieldWriter::new();
+        for (tag, val) in &fields {
+            fw.field(*tag, val);
+        }
+        assert_eq!(PaneWire::decode(&fw.into_vec()).unwrap_err(), WireError::VarintOverflow);
     }
 
     #[test]

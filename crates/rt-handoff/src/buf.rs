@@ -58,6 +58,16 @@ impl Writer {
     }
 }
 
+/// Encode one field's value with a fresh writer.
+///
+/// Lives here rather than in `pane.rs` and `msg.rs`, which each had a verbatim
+/// copy: two copies of the same helper is one copy too many to keep honest.
+pub fn enc(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
+    let mut w = Writer::new();
+    f(&mut w);
+    w.into_vec()
+}
+
 /// A cursor over a byte slice. Every method either advances or fails.
 #[derive(Debug)]
 pub struct Reader<'a> {
@@ -119,6 +129,19 @@ impl<'a> Reader<'a> {
             shift += 7;
         }
         Err(WireError::VarintOverflow)
+    }
+
+    /// A varint that must fit a u32: every dimension and identifier in this
+    /// format is one.
+    ///
+    /// `varint()? as u32` truncates silently, so a `cols` of `2^32 + 80` would
+    /// decode to `80` with `Ok` — while a u64 overflow one line away is a hard
+    /// error. That asymmetry is the bug; this closes it. The two deliberate
+    /// exceptions are `attrs` and `line_flags`, whose high bits are reserved by
+    /// the spec and masked off rather than rejected — see the comments there.
+    pub fn varint_u32(&mut self) -> Result<u32> {
+        let v = self.varint()?;
+        u32::try_from(v).map_err(|_| WireError::VarintOverflow)
     }
 
     pub fn bytes(&mut self) -> Result<&'a [u8]> {
@@ -192,6 +215,37 @@ mod tests {
         let mut max = [0xFFu8; 10];
         max[9] = 0x01;
         assert_eq!(Reader::new(&max).varint().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn varint_u32_accepts_the_whole_u32_range_and_rejects_one_past_it() {
+        for v in [0u64, 1, 127, 128, 65535, u32::MAX as u64] {
+            let mut w = Writer::new();
+            w.varint(v);
+            let bytes = w.into_vec();
+            assert_eq!(Reader::new(&bytes).varint_u32().unwrap(), v as u32, "value {v}");
+        }
+        for v in [u32::MAX as u64 + 1, (1u64 << 32) + 80, u64::MAX] {
+            let mut w = Writer::new();
+            w.varint(v);
+            let bytes = w.into_vec();
+            assert_eq!(Reader::new(&bytes).varint_u32().unwrap_err(), WireError::VarintOverflow, "value {v}");
+        }
+    }
+
+    #[test]
+    fn varint_u32_does_not_silently_truncate() {
+        // The exact bug: 2^32 + 80 must not decode to 80.
+        let mut w = Writer::new();
+        w.varint((1u64 << 32) + 80);
+        let bytes = w.into_vec();
+        assert_eq!(Reader::new(&bytes).varint().unwrap(), (1u64 << 32) + 80);
+        assert!(Reader::new(&bytes).varint_u32().is_err());
+    }
+
+    #[test]
+    fn enc_builds_a_value_with_a_fresh_writer() {
+        assert_eq!(super::enc(|w| w.u32le(0x0102_0304)), vec![0x04, 0x03, 0x02, 0x01]);
     }
 
     #[test]

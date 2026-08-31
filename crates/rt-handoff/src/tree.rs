@@ -29,6 +29,14 @@ impl Node {
                 w.varint(*pane_uid);
             }
             Node::HSplit { ratio, children } | Node::VSplit { ratio, children } => {
+                // The encoder-side twin of the decoder's check, matching
+                // `Grid::write`: writing a ratio our own decoder rejects is an
+                // encoder bug and must surface in the build that caused it, not
+                // as a baffling `BadValue` in the peer three versions later.
+                debug_assert!(
+                    ratio.is_finite() && (0.0..=1.0).contains(ratio),
+                    "split ratio must be finite and within 0.0..=1.0, got {ratio}"
+                );
                 w.varint(if matches!(self, Node::HSplit { .. }) { 1 } else { 2 });
                 w.u32le(ratio.to_bits());
                 w.varint(children.len() as u64);
@@ -72,7 +80,7 @@ impl Node {
                 Ok(if kind == 1 { Node::HSplit { ratio, children } } else { Node::VSplit { ratio, children } })
             }
             3 => {
-                let active = r.varint()? as u32;
+                let active = r.varint_u32()?;
                 let n = r.varint()? as usize;
                 let mut children = Vec::with_capacity(n.min(1024));
                 for _ in 0..n {
@@ -196,6 +204,14 @@ mod tests {
             Node::decode(&w.into_vec()).unwrap_err(),
             WireError::BadValue { tag: 0x04, why: "split ratio must be finite and within 0.0..=1.0" }
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "split ratio must be finite")]
+    fn encoding_a_ratio_our_own_decoder_rejects_is_an_encoder_bug() {
+        // Debug-only, like `Grid::write`'s invariant: the point is that the
+        // build that produced the bad ratio is the one that stops.
+        let _ = Node::HSplit { ratio: 1.5, children: vec![] }.encode();
     }
 
     #[test]

@@ -212,10 +212,14 @@ impl Style {
         let fg = Colour::read(r, tag)?;
         let bg = Colour::read(r, tag)?;
         let underline = Colour::read(r, tag)?;
-        // Mask off bits from a future version: carrying them would mean
-        // re-emitting a bit we cannot describe or render.
+        // Deliberately NOT `varint_u32`. The spec makes `attrs` a varint and
+        // says higher bits are reserved and masked off by a receiver, so a
+        // future rt using attribute bit 40 is LEGAL wire: erroring on it would
+        // reject an entire pane over an attribute this build merely cannot
+        // render. Masking is also what stops us re-emitting a bit we cannot
+        // describe.
         let attrs = (r.varint()? as u32) & attrs::KNOWN;
-        let link_id = r.varint()? as u32;
+        let link_id = r.varint_u32()?;
         Ok(Style { fg, bg, underline, attrs, link_id })
     }
 }
