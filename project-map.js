@@ -302,7 +302,7 @@ window.PROJECT_MAP = {
       files: ["crates/rt-handoff"],
       specs: [{ label: "Cross-instance pane & tab transfer design", href: "docs/superpowers/specs/2026-08-29-cross-instance-pane-transfer-design.md" }],
       parts: [
-        { label: "Frame + TLV + varint core", status: "done", desc: "Frame header, tagged-field walker, LEB128 varints — little-endian and architecture-neutral (checked on x86-64)." },
+        { label: "Frame + TLV + varint core", status: "done", desc: "Frame header, tagged-field walker, LEB128 varints — little-endian and architecture-neutral (verified on x86-64 and riscv-64)." },
         { label: "Style / grid / pane / tree encoding", status: "done", desc: "Cell styles (indexed colour stays indexed), scrollback grid, whole-pane snapshot, and the split/tab layout tree." },
         { label: "Handshake messages", status: "done", desc: "Hello/Offer/Claim/Adopted/Bye, forward-compatible: an unknown TLV tag is skipped by its length and reported, never fatal. An unknown message TYPE is an error — the frame header's length is what lets the stream survive it, not the decoder." },
         { label: "Golden corpus (wire v1)", status: "done", desc: "32 committed fixtures spanning panes/trees/messages; every future build must decode and re-encode each one byte-for-byte. Demonstrated to fail when the format changes." },
