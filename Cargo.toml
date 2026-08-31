@@ -10,6 +10,7 @@ members = [
     "crates/rt-engine",              # PTY + alacritty_terminal wrapper (one backend per pane)
     "crates/rt-config",              # keybindings + config, Terminator-compatible syntax
     "crates/rt-session",             # controller: ties tree+engine+focus+broadcast into actions
+    "crates/rt-handoff",             # frozen cross-process pane-handoff wire format (no deps)
     "crates/rt",                     # the binary: winit + GL front-end + input mapping
     "crates/rt-mux",                 # text-mode sibling: rt-engine panes hosted in mullion tiles
     "crates/vt-parser",              # in-house VT/ANSI parser (own engine, Phase 2)
