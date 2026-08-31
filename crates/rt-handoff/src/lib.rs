@@ -16,6 +16,12 @@ pub mod pane;
 pub mod tree;
 pub mod msg;
 
+// Unconditional, NOT `#[cfg(test)]`: integration tests under `tests/` link the
+// library built WITHOUT `cfg(test)`, so a gated module would be invisible to
+// them. Phase 2's engine tests reuse it too. It costs a few hundred bytes.
+#[doc(hidden)]
+pub mod testgen;
+
 /// The protocol version this build speaks. Unrelated to the crate version.
 pub const PROTO_V1: u32 = 1;
 
