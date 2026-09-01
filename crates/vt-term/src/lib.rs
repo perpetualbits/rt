@@ -147,8 +147,11 @@ impl Cell {
     }
     /// A [`SPACER`] written as the before-wrap placeholder (alacritty's
     /// `LEADING_WIDE_CHAR_SPACER`), not an ordinary trailing spacer. Meaningless if
-    /// `spacer()` is false.
-    fn leading_spacer(&self) -> bool {
+    /// `spacer()` is false. A caller distinguishing a wide glyph's real second
+    /// cell from the invisible before-wrap placeholder (e.g. `rt-engine`'s
+    /// handoff export, deciding whether the PREVIOUS cell is wide) needs this:
+    /// both set `spacer()`, and only this flag tells them apart.
+    pub fn leading_spacer(&self) -> bool {
         self.flags & LEADING != 0
     }
     pub fn wrapline(&self) -> bool {

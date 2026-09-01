@@ -81,23 +81,41 @@ fn style_of(cell: &Cell) -> Style {
     }
 }
 
-/// True for a cell that contributes nothing: a space in a style that renders
-/// identically to the default. Only these are dropped from a line's tail.
+/// True for the second half of a wide glyph — and NOT for the before-wrap
+/// placeholder `put_char` writes when a double-width glyph will not fit the
+/// last column. Both set `spacer()`; only the placeholder sets `leading`.
+/// Confusing them tags a narrow glyph as double-width, and the wire's own
+/// invariants (text length vs. cell count) cannot detect it: both readings
+/// still balance.
+fn is_trailing_spacer(cell: &Cell) -> bool {
+    cell.spacer() && !cell.leading_spacer()
+}
+
+/// True for a cell that contributes nothing to the wire: a space in a style
+/// that renders identically to the default, OR the before-wrap placeholder —
+/// it renders as nothing and exists only to hold the last column while its
+/// glyph wraps to the next row, so it is exactly as droppable as a blank.
 ///
-/// A wide glyph's trailing `spacer()` cell also has `c == ' '` and no SGR
-/// attributes of its own, but it is NOT blank: it is the second half of the
-/// glyph before it, and dropping it (e.g. via the tail-trim below) would
-/// desync the wide/narrow width check for that glyph. Only a true standalone
-/// space counts.
+/// A wide glyph's ordinary trailing `spacer()` cell is NOT blank: it is the
+/// second half of the glyph before it, and dropping it independently (e.g.
+/// via the tail-trim below) would desync the wide/narrow width check for
+/// that glyph.
 fn is_blank(cell: &Cell) -> bool {
-    !cell.spacer() && cell.c == ' ' && style_of(cell) == Style::default()
+    if cell.spacer() {
+        cell.leading_spacer()
+    } else {
+        cell.c == ' ' && style_of(cell) == Style::default()
+    }
 }
 
 /// One row of live cells to one wire line.
 ///
 /// `cells` is the whole row, `cells.len()` columns wide. A wide glyph appears
-/// as a leading cell followed by a `spacer()`; the spacer is consumed into the
-/// leading cell's run and never emitted on its own.
+/// as a leading cell followed by a trailing `spacer()`; the spacer is
+/// consumed into the leading cell's run and never emitted on its own. A
+/// *leading* spacer — the before-wrap placeholder at the last column when a
+/// wide glyph doesn't fit and wraps instead — is not part of any glyph here;
+/// it is blank (see [`is_blank`]) and normally vanishes in the tail-trim.
 pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
     let wrapped = cells.last().map(|c| c.wrapline()).unwrap_or(false);
     let flags = if wrapped { line_flags::WRAPPED } else { 0 };
@@ -111,12 +129,12 @@ pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
     while i < cells.len() {
         let cell = &cells[i];
         let style_id = styles.intern(cell);
-        let wide = i + 1 < cells.len() && cells[i + 1].spacer();
+        let wide = i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1]);
 
         if is_blank(cell) && !wide {
             // A stretch of blanks in one style: no text, just a span.
             let start = i;
-            while i < cells.len() && is_blank(&cells[i]) && !(i + 1 < cells.len() && cells[i + 1].spacer()) {
+            while i < cells.len() && is_blank(&cells[i]) && !(i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1])) {
                 i += 1;
             }
             runs.push(Run::blank(style_id, (i - start) as u32));
@@ -129,11 +147,13 @@ pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
         while i < cells.len() {
             let c = &cells[i];
             if c.spacer() {
-                // Consumed by the leading cell before it.
+                // Consumed by the leading cell before it (a trailing spacer's
+                // own leading glyph), or blank and already trimmed away (a
+                // wrap placeholder) — either way, not this run's content.
                 i += 1;
                 continue;
             }
-            let c_wide = i + 1 < cells.len() && cells[i + 1].spacer();
+            let c_wide = i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1]);
             if styles.intern(c) != style_id || c_wide != wide || is_blank(c) {
                 break;
             }
@@ -299,6 +319,22 @@ mod tests {
         assert_eq!(line.runs.len(), 2, "the run breaks at the width change");
         assert_eq!(line.runs[0].text, "ab");
         assert_eq!(line.runs[1].text, "日");
+    }
+
+    #[test]
+    fn a_wrap_placeholder_does_not_make_the_previous_glyph_look_wide() {
+        // Three columns: 'a', 'b', then a wide glyph that cannot fit, so the
+        // engine writes a leading placeholder and wraps the glyph to row 1.
+        let mut t = vt_term::Term::new(3, 2);
+        t.feed("ab日".as_bytes());
+        let cells: Vec<Cell> = (0..3).map(|c| t.cell(0, c)).collect();
+        let mut st = StyleTable::new();
+        let line = row_to_line(&cells, &mut st);
+        for r in &line.runs {
+            assert_eq!(r.flags & run_flags::WIDE, 0, "no run on this row is wide: {r:?}");
+        }
+        let text: String = line.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "ab", "the placeholder is not content");
     }
 
     #[test]
