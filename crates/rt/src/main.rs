@@ -25,6 +25,7 @@ mod clip_history; // in-memory clipboard history: bounded most-recently-used rin
 mod damage; // pure pixel-rect damage accumulator
 mod dragdrop; // pure drop-target resolver for cross-window pane/tab drag-and-drop
 mod carry_card; // pure RGBA held-pane card builder
+mod crashlog; // panic hook + stderr sink, so a crash leaves evidence behind
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
@@ -7206,6 +7207,13 @@ fn build_event_loop() -> EventLoop {
 }
 
 fn main() {
+    // FIRST, before anything can fail: make a crash leave evidence. rt takes
+    // every tab, pane and shell with it when it dies, and three crashes had
+    // produced nothing to go on — no core (apport skips unpackaged binaries),
+    // no stderr (the desktop launcher keeps none), no log.
+    crashlog::capture_stderr_if_not_a_tty();
+    crashlog::install_panic_hook();
+    crashlog::selftest_if_asked();
     // Honour RUST_LOG, but default to showing warnings+errors even when it's unset —
     // otherwise a GL/window-creation failure (logged via log::error!) is silent and the
     // user just sees a blank window with no clue why. RUST_LOG still overrides for more.
