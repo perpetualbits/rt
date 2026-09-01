@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::tty::{self, EventedPty, EventedReadWrite, Options as PtyOptions, Shell};
 
-use crate::budget::{self, SCROLLBACK_MEMORY_BUDGET};
+use crate::budget::{Budget, SCROLLBACK_MEMORY_BUDGET};
 use crate::palette::{self, Palette};
 use crate::{
     CellAttrs, CellDamage, CursorPos, CursorShape, Damage, LineBounds, PaneEvent, SearchMatch,
@@ -95,7 +95,11 @@ pub struct VtPane {
 
 impl VtPane {
     /// Fork `shell` in `working_directory` on a fresh PTY and start the reader thread.
-    /// Mirrors [`crate::TermPane::spawn_env`]'s signature so the seam can dispatch to it.
+    /// Otherwise mirrors [`crate::TermPane::spawn_env`]'s signature so the seam can
+    /// dispatch to it, plus one addition: `budget`, the process-wide scrollback
+    /// coordinator this pane registers with (see `crate::budget::Budget`). The caller
+    /// owns it — typically one `Arc<Budget>` shared across every pane a host spawns — so
+    /// registration is explicit rather than reaching for a hidden global.
     pub fn spawn_env(
         shell: Option<(String, Vec<String>)>,
         working_directory: Option<std::path::PathBuf>,
@@ -103,6 +107,7 @@ impl VtPane {
         rows: usize,
         env: &[(String, String)],
         scrollback: usize,
+        budget: &Arc<Budget>,
     ) -> std::io::Result<Self> {
         let mut pty_opts = PtyOptions::default();
         if let Some((program, args)) = shell {
@@ -132,11 +137,11 @@ impl VtPane {
         let mut term = vt_term::Term::new(cols, rows);
         term.set_scrollback(scrollback, SCROLLBACK_MEMORY_BUDGET);
         let term = Arc::new(Mutex::new(term));
-        // Register with the process-wide budget coordinator so a periodic rebalance (the
+        // Register with the caller's budget coordinator so a periodic rebalance (the
         // host's frame loop, on a timer — Task 2) can tighten this pane's byte cap below
         // `SCROLLBACK_MEMORY_BUDGET` if the process-wide total ever exceeds its own
         // budget. A `Weak` reference is stored; nothing to unregister on drop.
-        budget::register(&term);
+        budget.register(&term);
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let dirty = Arc::new(AtomicBool::new(true));
         let exited = Arc::new(AtomicBool::new(false));

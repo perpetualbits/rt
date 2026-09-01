@@ -1080,6 +1080,32 @@ pub enum TermPane {
     Vt(vtpane::VtPane),
 }
 
+/// The scrollback budget coordinator `TermPane`'s own dispatcher (`spawn_env`,
+/// `spawn_vt_env`) hands to every `VtPane` it creates, since `TermPane`'s own signature —
+/// used directly by `rt`, `rt-session`, and `rt-mux` — doesn't (yet) take one as a
+/// parameter.
+///
+/// This is deliberately the ONLY `static` anywhere in the scrollback-budget feature:
+/// `budget::Budget` itself holds no global state (see its module doc) and every test
+/// builds its own instance. This one exists solely so `TermPane::spawn_env`'s *existing*
+/// callers keep compiling unchanged while still getting a real, shared, process-wide
+/// budget for the panes they actually spawn through it — lazily created on first use, one
+/// per process, exactly what a host owning `Arc::new(Budget::default())` up front and
+/// threading it down would also give them.
+///
+/// It is an interim shim, not the intended end state: `budget::Budget`'s whole design is
+/// "the host owns it and passes it down" (see `budget.rs`'s module doc and
+/// `VtPane::spawn_env`'s `budget` parameter), and threading an explicit `&Arc<Budget>`
+/// through `TermPane::spawn_env`/`spawn_vt_env` down to `rt`'s `App`, `rt-session`, and
+/// `rt-mux` would let this go away — each of those becoming an explicit "host" in the
+/// sense `budget.rs` means, rather than an implicit one sharing this default. That's
+/// broader than this change (`rt-mux` in particular doesn't even run `VtPane` today, so it
+/// would need to opt in on its own), so it's left for whoever does that wiring.
+fn process_default_budget() -> Arc<budget::Budget> {
+    static DEFAULT: std::sync::OnceLock<Arc<budget::Budget>> = std::sync::OnceLock::new();
+    DEFAULT.get_or_init(|| Arc::new(budget::Budget::default())).clone()
+}
+
 impl TermPane {
     /// Spawn a pane; the backend is chosen by `RT_ENGINE` (`vtterm` → in-house, anything
     /// else / unset → the vendored alacritty engine).
@@ -1124,7 +1150,7 @@ impl TermPane {
         });
         if use_vtterm {
             Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
-                shell, working_directory, cols, rows, env, scrollback,
+                shell, working_directory, cols, rows, env, scrollback, &process_default_budget(),
             )?))
         } else {
             Ok(TermPane::Alac(AlacPane::spawn_env(
@@ -1149,7 +1175,7 @@ impl TermPane {
         scrollback: usize,
     ) -> std::io::Result<TermPane> {
         Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
-            shell, working_directory, cols, rows, env, scrollback,
+            shell, working_directory, cols, rows, env, scrollback, &process_default_budget(),
         )?))
     }
 
@@ -1387,6 +1413,7 @@ mod vtpane_tests {
             10,
             &[],
             1000,
+            &Arc::new(budget::Budget::default()),
         )
         .expect("spawn");
         let mut saw_exit = false;
@@ -1421,6 +1448,7 @@ mod vtpane_tests {
             10,
             &[],
             1000,
+            &Arc::new(budget::Budget::default()),
         )
         .expect("spawn vt-term pane");
 
@@ -1509,7 +1537,7 @@ mod vtpane_tests {
         let pane = TermPane::Vt(
             vtpane::VtPane::spawn_env(
                 Some(("/bin/sh".into(), vec!["-c".into(), "printf 'EXPORTED'; sleep 5".into()])),
-                None, 40, 6, &[], 1000,
+                None, 40, 6, &[], 1000, &Arc::new(budget::Budget::default()),
             )
             .expect("spawn"),
         );
@@ -1533,7 +1561,7 @@ mod vtpane_tests {
         let pane = TermPane::Vt(
             vtpane::VtPane::spawn_env(
                 Some(("/bin/sh".into(), vec!["-c".into(), "printf 'ALIVE'; sleep 5".into()])),
-                None, 20, 4, &[], 1000,
+                None, 20, 4, &[], 1000, &Arc::new(budget::Budget::default()),
             )
             .expect("spawn"),
         );
@@ -1648,6 +1676,7 @@ mod damage_tests {
             10,
             &[],
             1000,
+            &Arc::new(budget::Budget::default()),
         )
         .expect("spawn");
         std::thread::sleep(Duration::from_millis(100)); // let the child settle
@@ -1678,6 +1707,7 @@ mod damage_tests {
             24,
             &[],
             1000,
+            &Arc::new(budget::Budget::default()),
         )
         .expect("spawn");
         std::thread::sleep(Duration::from_millis(200)); // let the shell start
@@ -1723,6 +1753,7 @@ mod damage_tests {
             24,
             &[],
             1000,
+            &Arc::new(budget::Budget::default()),
         )
         .expect("spawn");
 

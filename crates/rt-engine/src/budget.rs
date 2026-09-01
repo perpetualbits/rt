@@ -5,15 +5,24 @@
 //! it has never actually bitten only because the user's line cap reaches its own limit
 //! first, at a far smaller byte count. Raise the line slider and nothing catches it.
 //!
-//! This module adds the missing ceiling: a process-wide registry of every live pane's
-//! `Term` (held `Weak`, so a dropped pane leaks no slot), and a periodic [`rebalance`] that
-//! sums every pane's [`vt_term::Term::history_bytes`] and, only once the total exceeds the
-//! budget, tightens each pane's byte cap in proportion to how much of that total it holds
-//! — never equally. `rebalance` does none of the eviction itself: it just moves each
-//! pane's cap via the existing [`vt_term::Term::set_scrollback`], whose `trim_history`
-//! already evicts oldest-first under that pane's own lock and keeps `history_bytes` in
-//! step. Reusing that is deliberate — this module's whole job is bookkeeping across panes,
-//! not per-pane eviction logic, which already exists and is already tested.
+//! This module adds the missing ceiling: [`Budget`], an owned value holding a registry of
+//! every live pane's `Term` (held `Weak`, so a dropped pane leaks no slot) plus the two
+//! policy constants. A periodic [`Budget::rebalance`] sums every pane's
+//! [`vt_term::Term::history_bytes`] and, only once the total exceeds the budget, tightens
+//! each pane's byte cap in proportion to how much of that total it holds — never equally.
+//! `rebalance` does none of the eviction itself: it just moves each pane's cap via the
+//! existing [`vt_term::Term::set_scrollback`], whose `trim_history` already evicts
+//! oldest-first under that pane's own lock and keeps `history_bytes` in step. Reusing that
+//! is deliberate — this module's whole job is bookkeeping across panes, not per-pane
+//! eviction logic, which already exists and is already tested.
+//!
+//! **Ownership, deliberately not a global.** `Budget` is a plain value a host constructs
+//! and hands to every pane it spawns (`VtPane::spawn_env` takes `&Arc<Budget>`) — there is
+//! no `static` anywhere in this module. "Process-wide" is a property of the host creating
+//! exactly one `Arc<Budget>` and sharing it, not of the type system forcing a single
+//! instance to exist. That keeps every test able to build its own `Budget` with zero shared
+//! state (no serializing lock needed between tests), and leaves room for a host that wants
+//! a different scope — per-window, say — without this module standing in the way.
 //!
 //! **Locking discipline:** `rebalance` and `total_usage` each visit panes one at a time —
 //! never two `Term` locks held at once — and use `try_lock` throughout, so a pane whose
@@ -21,6 +30,7 @@
 //! blocked on. This runs on the GUI thread (via a ~1s timer, added in Task 2); a lock skip
 //! costs nothing but staleness until the next pass, which is always imminent.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use vt_term::Term;
@@ -80,42 +90,176 @@ pub const GLOBAL_SCROLLBACK_BUDGET: usize = 4 * (1 << 30); // 4 GiB
 /// well under `GLOBAL_SCROLLBACK_BUDGET`, leaving the rest to be shared by actual usage.
 pub const PANE_FLOOR: usize = 2 << 20; // 2 MiB
 
-/// Every pane's `Term`, held weakly: registering never keeps a pane alive, and a dropped
-/// pane's slot is reclaimed (not merely ignored) the next time anything here walks the
-/// registry — see `prune_and_upgrade`.
-static REGISTRY: Mutex<Vec<Weak<Mutex<Term>>>> = Mutex::new(Vec::new());
-
-/// Register a pane's `Term` with the process-wide budget coordinator. Call once per pane,
-/// right after it's created (`VtPane::spawn_env` does this). Cheap and idempotent-ish: it
-/// always appends, so registering the same `Arc` twice double-counts it — callers must
-/// register each pane exactly once.
-pub fn register(term: &Arc<Mutex<Term>>) {
-    REGISTRY.lock().unwrap().push(Arc::downgrade(term));
+/// An owned, process-wide-*by-convention* scrollback budget coordinator. A host constructs
+/// exactly one (typically `Arc::new(Budget::default())`), hands `&Arc<Budget>` to every
+/// pane it spawns (see `VtPane::spawn_env`), and calls [`rebalance`](Budget::rebalance) or
+/// [`rebalance_default`](Budget::rebalance_default) periodically (Task 2: a ~1s timer on
+/// the GUI thread). Nothing here reaches for a `static` — sharing is the host's choice, made
+/// by sharing the `Arc`, not something this type imposes.
+pub struct Budget {
+    /// Every registered pane's `Term`, held weakly: registering never keeps a pane alive,
+    /// and a dropped pane's slot is reclaimed (not merely ignored) the next time anything
+    /// here walks the registry — see `prune_and_upgrade`.
+    registry: Mutex<Vec<Weak<Mutex<Term>>>>,
+    /// This instance's process-wide ceiling — normally `GLOBAL_SCROLLBACK_BUDGET`, but a
+    /// test (or a future non-default host) may pick any value.
+    global_budget: usize,
+    /// This instance's per-pane floor — normally `PANE_FLOOR`.
+    pane_floor: usize,
+    /// Set once `rebalance` has tightened at least one pane's cap below the generous
+    /// default, cleared once a later call has restored every pane back to it. Lets
+    /// `rebalance` skip its apply pass ENTIRELY in the steady state where the process has
+    /// never gone over budget (or has fully recovered from doing so) — the common case
+    /// under a periodic timer, where touching every pane's lock for a guaranteed no-op
+    /// would just be contention against every reader thread for nothing.
+    squeezed: AtomicBool,
 }
 
-/// Count of currently-live registered panes. Walking it also prunes dead slots as a side
-/// effect (see `prune_and_upgrade`), so this is also how a dropped pane's slot gets
-/// reclaimed if nothing else has rebalanced since it dropped. Exposed mainly so tests can
-/// assert a dropped pane doesn't leak a slot forever.
-pub fn live_panes() -> usize {
-    prune_and_upgrade().len()
+impl Default for Budget {
+    /// A `Budget` using the real production constants — what a host actually wants.
+    fn default() -> Self {
+        Self::new(GLOBAL_SCROLLBACK_BUDGET, PANE_FLOOR)
+    }
 }
 
-/// Drop every registry slot whose pane no longer exists (`Weak::upgrade` failing is the
-/// only signal we need — no separate liveness bookkeeping), and return the survivors
-/// upgraded to strong references for this call's use. Holds the registry lock only long
-/// enough to filter the `Vec`; never a `Term` lock.
-fn prune_and_upgrade() -> Vec<Arc<Mutex<Term>>> {
-    let mut reg = REGISTRY.lock().unwrap();
-    let mut live = Vec::with_capacity(reg.len());
-    reg.retain(|weak| match weak.upgrade() {
-        Some(strong) => {
-            live.push(strong);
-            true
+impl Budget {
+    /// Build a `Budget` against an explicit process budget and per-pane floor. Production
+    /// callers should prefer `Budget::default()`; this exists so tests (and any future
+    /// caller with a reason to differ) can exercise the policy against any numbers without
+    /// touching the constants.
+    pub fn new(global_budget: usize, pane_floor: usize) -> Self {
+        Budget {
+            registry: Mutex::new(Vec::new()),
+            global_budget,
+            pane_floor,
+            squeezed: AtomicBool::new(false),
         }
-        None => false, // the pane is gone; its slot is not kept around
-    });
-    live
+    }
+
+    /// Register a pane's `Term` with this coordinator. Call once per pane, right after
+    /// it's created (`VtPane::spawn_env` does this with the `&Arc<Budget>` it's given).
+    /// Cheap and idempotent-ish: it always appends, so registering the same `Arc` twice
+    /// double-counts it — callers must register each pane exactly once.
+    pub fn register(&self, term: &Arc<Mutex<Term>>) {
+        self.registry.lock().unwrap().push(Arc::downgrade(term));
+    }
+
+    /// Count of currently-live registered panes. Walking it also prunes dead slots as a
+    /// side effect (see `prune_and_upgrade`), so this is also how a dropped pane's slot
+    /// gets reclaimed if nothing else has rebalanced since it dropped. Exposed mainly so
+    /// tests can assert a dropped pane doesn't leak a slot forever.
+    pub fn live_panes(&self) -> usize {
+        self.prune_and_upgrade().len()
+    }
+
+    /// Drop every registry slot whose pane no longer exists (`Weak::upgrade` failing is
+    /// the only signal needed — no separate liveness bookkeeping), and return the
+    /// survivors upgraded to strong references for this call's use. Holds the registry
+    /// lock only long enough to filter the `Vec`; never a `Term` lock.
+    fn prune_and_upgrade(&self) -> Vec<Arc<Mutex<Term>>> {
+        let mut reg = self.registry.lock().unwrap();
+        let mut live = Vec::with_capacity(reg.len());
+        reg.retain(|weak| match weak.upgrade() {
+            Some(strong) => {
+                live.push(strong);
+                true
+            }
+            None => false, // the pane is gone; its slot is not kept around
+        });
+        live
+    }
+
+    /// Sum of `history_bytes` over every live pane this pass could read without blocking.
+    /// A pane whose lock is contended at this instant is simply left out of this sum —
+    /// it's re-read next call, never blocked on.
+    pub fn total_usage(&self) -> usize {
+        self.prune_and_upgrade()
+            .iter()
+            .filter_map(|t| try_with_term(t, |term| term.history_bytes()))
+            .sum()
+    }
+
+    /// The core policy (see the module doc): sum every live pane's usage. If it's within
+    /// `budget`, the normal case, leave every pane on the generous per-pane cap — and if
+    /// nothing has been squeezed since the last time this was true, don't even touch a
+    /// pane's lock to re-assert it; there's nothing to do. Otherwise tighten each pane's
+    /// byte cap to its proportional share of `budget`, floored at this `Budget`'s
+    /// `pane_floor`, and apply it via `set_scrollback` (which evicts, via its own
+    /// `trim_history`, entirely under that pane's own lock).
+    ///
+    /// Two passes when there's anything to apply, never two `Term` locks held at once: the
+    /// first reads usage from each live pane in turn; the second applies the cap computed
+    /// from that snapshot, one pane at a time. A pane whose lock is contended in either
+    /// pass is skipped for that pass — its contribution to `total`, or its new cap, is
+    /// simply stale until the next call (on the host's ~1s timer in Task 2, that's never
+    /// long).
+    ///
+    /// Note the feedback loop and don't try to defeat it: a newly busy pane starts at the
+    /// floor and its share grows only as its usage grows, converging pane-by-pane across
+    /// successive calls rather than needing one instant of perfect foresight.
+    ///
+    /// Takes `budget` explicitly (rather than reading this `Budget`'s own `global_budget`)
+    /// so it's directly testable against any budget a test wants to exercise; production
+    /// callers use [`rebalance_default`](Self::rebalance_default), the thin wrapper that
+    /// supplies this instance's own constant.
+    pub fn rebalance(&self, budget: usize) {
+        // Always prune first: a dropped pane's slot must be reclaimed on every pass,
+        // whether or not anything below needs applying.
+        let panes = self.prune_and_upgrade();
+
+        // Pass 1: read usage. Locks one pane at a time; never blocks.
+        let usages: Vec<(Arc<Mutex<Term>>, usize)> = panes
+            .into_iter()
+            .filter_map(|t| {
+                let usage = try_with_term(&t, |term| term.history_bytes())?;
+                Some((t, usage))
+            })
+            .collect();
+
+        let total: usize = usages.iter().map(|(_, usage)| *usage).sum();
+
+        if total <= budget {
+            if !self.squeezed.load(Ordering::SeqCst) {
+                // Steady state: every pane is already sitting on `SCROLLBACK_MEMORY_
+                // BUDGET` from spawn (or from a previous restore below) and nothing has
+                // squeezed anything since. Skip the apply pass entirely — no lock touched.
+                return;
+            }
+            // Something WAS squeezed on an earlier call; the process has since come back
+            // under budget (a busy pane's output slowed, or a pane closed). Restore every
+            // pane to the generous cap once, then clear the flag so later calls
+            // short-circuit again above.
+            for (term, _usage) in &usages {
+                try_with_term(term, |t| {
+                    let lines = t.scrollback_lines(); // preserve the line cap — only the
+                    t.set_scrollback(lines, SCROLLBACK_MEMORY_BUDGET); // byte cap moves.
+                });
+            }
+            self.squeezed.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        // Over budget: tighten. Pass 2, locking one pane at a time; never blocks.
+        for (term, usage) in &usages {
+            // usage * budget can overflow a usize well before either operand is huge;
+            // widen to u128 for the multiply, matching `total`'s own scale.
+            let share = (*usage as u128 * budget as u128 / (total.max(1)) as u128) as usize;
+            let cap = share.max(self.pane_floor);
+            try_with_term(term, |t| {
+                let lines = t.scrollback_lines();
+                t.set_scrollback(lines, cap);
+            });
+        }
+        self.squeezed.store(true, Ordering::SeqCst);
+    }
+
+    /// Rebalance against this instance's own process-wide budget (`GLOBAL_SCROLLBACK_
+    /// BUDGET` for `Budget::default()`) — what a host's periodic timer actually calls.
+    /// [`rebalance`](Self::rebalance) itself takes the budget as a parameter so tests can
+    /// exercise the policy against any budget without needing a second `Budget` instance.
+    pub fn rebalance_default(&self) {
+        self.rebalance(self.global_budget);
+    }
 }
 
 /// Read or mutate one pane's `Term` without ever blocking the caller: `WouldBlock` (the
@@ -133,89 +277,9 @@ fn try_with_term<T>(term: &Arc<Mutex<Term>>, f: impl FnOnce(&mut Term) -> T) -> 
     }
 }
 
-/// Sum of `history_bytes` over every live pane this pass could read without blocking. A
-/// pane whose lock is contended at this instant is simply left out of this sum — it's
-/// re-read next call, never blocked on.
-pub fn total_usage() -> usize {
-    prune_and_upgrade()
-        .iter()
-        .filter_map(|t| try_with_term(t, |term| term.history_bytes()))
-        .sum()
-}
-
-/// The core policy (see the module doc): sum every live pane's usage; if it's within
-/// `budget`, leave every pane on the generous per-pane cap — the normal case, and it must
-/// cost nothing observable, so nothing is touched beyond re-asserting the same cap every
-/// pane already has. Otherwise tighten each pane's byte cap to its proportional share of
-/// `budget`, floored at `PANE_FLOOR`, and apply it via `set_scrollback` (which evicts, via
-/// its own `trim_history`, entirely under that pane's own lock).
-///
-/// Two passes, never two `Term` locks held at once: the first reads usage from each live
-/// pane in turn; the second applies the cap computed from that snapshot, one pane at a
-/// time. A pane whose lock is contended in either pass is skipped for that pass — its
-/// contribution to `total`, or its new cap, is simply stale until the next call (on the
-/// host's ~1s timer in Task 2, that's never long).
-///
-/// Note the feedback loop and don't try to defeat it: a newly busy pane starts at the
-/// floor and its share grows only as its usage grows, converging pane-by-pane across
-/// successive calls rather than needing one instant of perfect foresight.
-///
-/// Takes `budget` explicitly (rather than reading `GLOBAL_SCROLLBACK_BUDGET` itself) so
-/// it's directly testable against any budget a test wants to exercise; production callers
-/// use [`rebalance_default`], the thin wrapper that supplies the real constant.
-pub fn rebalance(budget: usize) {
-    let panes = prune_and_upgrade();
-
-    // Pass 1: read usage. Locks one pane at a time; never blocks.
-    let usages: Vec<(Arc<Mutex<Term>>, usize)> = panes
-        .into_iter()
-        .filter_map(|t| {
-            let usage = try_with_term(&t, |term| term.history_bytes())?;
-            Some((t, usage))
-        })
-        .collect();
-
-    let total: usize = usages.iter().map(|(_, usage)| *usage).sum();
-
-    // Pass 2: apply. Also locks one pane at a time; never blocks.
-    for (term, usage) in &usages {
-        let cap = if total <= budget {
-            SCROLLBACK_MEMORY_BUDGET
-        } else {
-            // usage * budget can overflow a usize well before either operand is huge;
-            // widen to u128 for the multiply, matching `total`'s own scale.
-            let share = (*usage as u128 * budget as u128 / (total.max(1)) as u128) as usize;
-            share.max(PANE_FLOOR)
-        };
-        try_with_term(term, |t| {
-            let lines = t.scrollback_lines(); // preserve the user's configured line cap —
-            t.set_scrollback(lines, cap); // only the byte cap moves here.
-        });
-    }
-}
-
-/// Rebalance against the process-wide [`GLOBAL_SCROLLBACK_BUDGET`] constant — what the
-/// host's periodic timer (Task 2) actually calls. [`rebalance`] itself takes the budget as
-/// a parameter so tests can exercise the policy against any budget without touching the
-/// constant.
-pub fn rebalance_default() {
-    rebalance(GLOBAL_SCROLLBACK_BUDGET);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `REGISTRY` is one process-wide static — exactly the design this module needs in
-    /// production (there is only ever one process to bound). In this test binary, though,
-    /// cargo runs tests in parallel threads of the *same* process, so two budget tests
-    /// touching the shared registry at once would see each other's panes: e.g.
-    /// `dropped_panes_are_pruned_and_do_not_leak_slots` asserting `live_panes() == 1`
-    /// would flake if another test's panes happened to still be registered and alive at
-    /// that instant. Every test below that registers a pane takes this lock first, which
-    /// serializes just the budget tests against each other (a standard no-dependency
-    /// stand-in for `serial_test`) without limiting the rest of the suite.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A pane-shaped Term with `n` bytes of history already accumulated.
     /// Build it by feeding real output, not by poking fields — the point is to
@@ -238,65 +302,115 @@ mod tests {
 
     #[test]
     fn under_budget_nothing_is_squeezed() {
-        let _serial = TEST_LOCK.lock().unwrap();
         // The normal case: total below the global budget leaves every pane on
         // the generous per-pane cap, so the line cap governs exactly as before.
+        // Each test builds its own `Budget` — no shared state, no serializing lock.
+        let budget = Budget::default();
         let a = term_with_history(80, 10, 200);
         let b = term_with_history(80, 10, 200);
-        register(&a); register(&b);
+        budget.register(&a);
+        budget.register(&b);
         let before = (a.lock().unwrap().history_bytes(), b.lock().unwrap().history_bytes());
-        rebalance(usize::MAX); // an unreachable budget
+        budget.rebalance(usize::MAX); // an unreachable budget
         let after = (a.lock().unwrap().history_bytes(), b.lock().unwrap().history_bytes());
         assert_eq!(before, after, "nothing may be evicted while under budget");
     }
 
     #[test]
     fn over_budget_the_total_comes_down_under_the_cap() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let coordinator = Budget::default();
         let a = term_with_history(80, 10, 4000);
         let b = term_with_history(80, 10, 4000);
-        register(&a); register(&b);
-        let total = total_usage();
-        let budget = total / 2;
-        rebalance(budget);
-        assert!(total_usage() <= budget, "total {} still over budget {budget}", total_usage());
+        coordinator.register(&a);
+        coordinator.register(&b);
+        let total = coordinator.total_usage();
+        let cap = total / 2;
+        coordinator.rebalance(cap);
+        assert!(
+            coordinator.total_usage() <= cap,
+            "total {} still over budget {cap}",
+            coordinator.total_usage()
+        );
     }
 
     #[test]
     fn the_busy_pane_keeps_more_than_the_quiet_one() {
-        let _serial = TEST_LOCK.lock().unwrap();
         // The whole point of proportional: a pane with a big log keeps its
         // history while an idle neighbour holds little.
+        let coordinator = Budget::default();
         let busy = term_with_history(80, 10, 8000);
         let quiet = term_with_history(80, 10, 200);
-        register(&busy); register(&quiet);
-        let budget = total_usage() / 2;
-        rebalance(budget);
+        coordinator.register(&busy);
+        coordinator.register(&quiet);
+        let cap = coordinator.total_usage() / 2;
+        coordinator.rebalance(cap);
         let (bu, qu) = (busy.lock().unwrap().history_bytes(), quiet.lock().unwrap().history_bytes());
         assert!(bu > qu, "busy {bu} should keep more than quiet {qu}");
     }
 
     #[test]
     fn a_quiet_pane_is_never_starved_to_nothing() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let coordinator = Budget::default();
         let busy = term_with_history(80, 10, 20000);
         let quiet = term_with_history(80, 10, 50);
-        register(&busy); register(&quiet);
-        rebalance(PANE_FLOOR * 2); // brutally tight
+        coordinator.register(&busy);
+        coordinator.register(&quiet);
+        coordinator.rebalance(PANE_FLOOR * 2); // brutally tight
         assert!(quiet.lock().unwrap().history_bytes() > 0 || PANE_FLOOR == 0,
                 "the floor must leave a quiet pane something");
     }
 
     #[test]
     fn dropped_panes_are_pruned_and_do_not_leak_slots() {
-        let _serial = TEST_LOCK.lock().unwrap();
+        let coordinator = Budget::default();
         let live = term_with_history(80, 10, 100);
-        register(&live);
+        coordinator.register(&live);
         {
             let temp = term_with_history(80, 10, 100);
-            register(&temp);
+            coordinator.register(&temp);
         } // temp dropped here
-        rebalance(usize::MAX);
-        assert_eq!(live_panes(), 1, "the dropped pane's slot must be reclaimed");
+        coordinator.rebalance(usize::MAX);
+        assert_eq!(coordinator.live_panes(), 1, "the dropped pane's slot must be reclaimed");
+    }
+
+    #[test]
+    fn a_pane_squeezed_earlier_is_restored_once_the_process_is_back_under_budget() {
+        // The apply-pass short-circuit (skip entirely when under budget) must not skip the
+        // ONE pass needed to undo a previous squeeze — otherwise a pane tightened while the
+        // process was briefly over budget would stay tightened forever, even long after
+        // its neighbour's usage (or its own) drops back down. That would violate "under
+        // budget, behaviour is byte-identical to today." Eviction is one-way (evicted lines
+        // don't come back), so the only way to observe whether the BYTE CAP itself was
+        // really loosened back up is to feed more output afterward and see whether it's
+        // allowed to grow past what the tightened cap would have allowed.
+        let coordinator = Budget::default();
+        let busy = term_with_history(80, 10, 8000);
+        let quiet = term_with_history(80, 10, 200);
+        coordinator.register(&busy);
+        coordinator.register(&quiet);
+
+        // Force a squeeze tight enough that `quiet` is pinned at the floor.
+        coordinator.rebalance(PANE_FLOOR * 2);
+        let squeezed_quiet = quiet.lock().unwrap().history_bytes();
+        assert!(squeezed_quiet <= PANE_FLOOR * 2, "test setup: quiet should have been squeezed");
+
+        // Now rebalance against a budget nothing could exceed; the squeeze must lift.
+        coordinator.rebalance(usize::MAX);
+
+        // Feed far more than the squeezed cap ever allowed. If the byte cap is still
+        // pinned near the floor, this stays capped near `squeezed_quiet`; if it was
+        // correctly restored to the generous per-pane cap, it grows well past it.
+        {
+            let mut t = quiet.lock().unwrap();
+            for i in 0..8000 {
+                t.feed(format!("more{i} {}\r\n", "x".repeat(40)).as_bytes());
+            }
+        }
+        let grown_quiet = quiet.lock().unwrap().history_bytes();
+        assert!(
+            grown_quiet > squeezed_quiet * 4,
+            "quiet pane's cap must be restored after the process is back under budget \
+             (squeezed at {squeezed_quiet}, only grew to {grown_quiet} after feeding much more)"
+        );
     }
 }
