@@ -402,7 +402,14 @@ pub fn export_term(
                     designator(sc.charsets[2]),
                     designator(sc.charsets[3]),
                 ],
-                gl: 0,
+                // vt-term's DECSC saves the four G-set DESIGNATIONS but not the
+                // GL lock, so there is no saved value to send. Carry the live
+                // one: a receiver's DECRC then leaves GL where it is, which is
+                // what this engine's own DECRC does. Sending a hardcoded 0
+                // would instead reset GL to G0 on that DECRC — a guess, and a
+                // wrong one for anything that has locked GL to G1 with SO.
+                gl: term.gl() as u8,
+                // vt-term has no GR locking shift; the wire's default is G0.
                 gr: 0,
             },
             origin: sc.origin,
@@ -1007,6 +1014,20 @@ mod tests {
         let (p, _) = export_term(&t, 1, 99, 0);
         assert_eq!(p.active_screen, 1);
         assert!(p.screen_alt.is_some(), "the held-aside primary rides along");
+    }
+
+    #[test]
+    fn the_saved_cursors_gl_lock_is_the_live_one_not_a_guess() {
+        // vt-term's DECSC does not save GL, so the wire's saved-cursor `gl` has
+        // no saved value to carry. Sending a hardcoded 0 would reset GL to G0
+        // on the receiver's DECRC; carrying the live lock leaves it alone,
+        // which is what this engine's own DECRC does.
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b)0\x0e\x1b7"); // G1 = DEC graphics, SO locks GL to G1, then DECSC
+        assert_eq!(t.gl(), 1);
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert_eq!(p.charsets.unwrap().gl, 1, "the live GL lock travels");
+        assert_eq!(p.saved_cursor.unwrap().charsets.gl, 1, "and the saved copy does not reset it");
     }
 
     #[test]

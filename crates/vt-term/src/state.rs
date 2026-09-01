@@ -256,12 +256,27 @@ mod tests {
     }
 
     #[test]
-    fn every_accessor_is_a_pure_read() {
-        // Calling them twice must give the same answer — nothing is consumed.
-        let t = term_after(b"\x1b[1m\x1b[5;20r\x1b[?7l");
-        assert_eq!(t.margins(), t.margins());
-        assert_eq!(t.autowrap(), t.autowrap());
-        assert_eq!(t.pen().fg, t.pen().fg);
-        assert_eq!(t.charsets(), t.charsets());
+    fn reading_the_whole_handoff_state_steals_nothing_from_the_host() {
+        // The previous version of this test compared each accessor against
+        // itself (`assert_eq!(t.margins(), t.margins())`). On `&self` methods
+        // returning owned copies that cannot fail, so it asserted nothing.
+        //
+        // The real hazard is the one this module's doc names: `take_title` and
+        // `take_output` next door ARE one-shot, and the host reads them every
+        // frame. An export path that reached for a consuming sibling would
+        // silently eat the pending title or a query reply the child is waiting
+        // on. So: queue both, sweep every accessor the export uses, and check
+        // the host can still collect them.
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b]0;a title\x07\x1b[6n\x1b[5;20r\x1b[1m\x1b[?1002h\x1b)0\x0e\x1b7");
+
+        let _ = (t.pen(), t.margins(), t.autowrap(), t.origin());
+        let _ = (t.insert_mode(), t.newline_mode(), t.pending_wrap(), t.cursor_blink());
+        let _ = (t.utf8_mouse(), t.urgency_hints(), t.mouse_click(), t.mouse_drag());
+        let _ = (t.retained_history(), t.charsets(), t.gl(), t.saved_cursor());
+        let _ = (t.has_inactive_screen(), t.inactive_rows(), t.inactive_cell(0, 0));
+
+        assert_eq!(t.take_title().as_deref(), Some("a title"), "the pending title was eaten");
+        assert!(!t.take_output().is_empty(), "the pending CPR reply was eaten");
     }
 }

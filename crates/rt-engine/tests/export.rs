@@ -32,7 +32,7 @@ fn pane_running(script: &str, cols: usize, rows: usize, probe: impl Fn(&TermPane
     panic!("the pane never produced the expected output within 10s");
 }
 
-/// Reconstruct a wire line's text, INCLUDING blanks.
+/// Reconstruct ANY wire line's text, INCLUDING blanks.
 ///
 /// A run's `text` is empty when the run is blank (`grid.rs`: "Empty means
 /// blanks") — that is how the format keeps a mostly-empty line cheap. Naively
@@ -41,9 +41,15 @@ fn pane_running(script: &str, cols: usize, rows: usize, probe: impl Fn(&TermPane
 /// pty" round-trips as "hellofromarealpty", because each inter-word space is
 /// its own blank run with `text == ""`. Blanks are always narrow, so
 /// `cell_span` spaces reconstructs them exactly.
-fn line_text(wire: &rt_handoff::pane::PaneWire, row: usize) -> String {
+///
+/// Takes the `Line`, not a screen and a row: scrollback lines and the
+/// held-aside grid have exactly the same hazard, and concatenating raw
+/// `run.text` there happened to work only because those fixtures start at
+/// column 0 with no interior blanks. One fixture with a leading indent or two
+/// spaces in it and those assertions would have compared the wrong string.
+fn line_text(line: &rt_handoff::grid::Line) -> String {
     let mut s = String::new();
-    for run in &wire.screen_primary.lines[row].runs {
+    for run in &line.runs {
         if run.text.is_empty() {
             s.extend(std::iter::repeat(' ').take(run.cell_span as usize));
         } else {
@@ -90,7 +96,7 @@ fn a_real_shells_output_survives_export_and_the_wire() {
     );
     let (wire, _scroll) = pane.export(1, 0).expect("in-house engine exports");
 
-    assert!(line_text(&wire, 0).starts_with("hello from a real pty"));
+    assert!(line_text(&wire.screen_primary.lines[0]).starts_with("hello from a real pty"));
 
     // And the whole thing survives a round trip through the frozen format.
     let back = rt_handoff::pane::PaneWire::decode(&wire.encode()).expect("decode");
@@ -133,11 +139,8 @@ fn scrollback_from_a_real_program_comes_back_newest_first() {
     let (_, scroll) = pane.export(1, 100).unwrap();
     assert!(!scroll.is_empty(), "40 lines through a 5-row screen leaves history");
 
-    let text_of = |l: &rt_handoff::grid::Line| -> String {
-        l.runs.iter().map(|r| r.text.as_str()).collect()
-    };
-    let first = text_of(&scroll[0]);
-    let last = text_of(&scroll[scroll.len() - 1]);
+    let first = line_text(&scroll[0]);
+    let last = line_text(&scroll[scroll.len() - 1]);
     let n = |s: &str| -> usize { s.trim().trim_start_matches("line").parse().unwrap_or(0) };
     assert!(n(&first) > n(&last), "newest first: {first:?} must precede {last:?}");
 }
@@ -158,9 +161,12 @@ fn an_alt_screen_program_exports_both_screens() {
     );
     let (wire, _) = pane.export(1, 0).unwrap();
     assert_eq!(wire.active_screen, 1, "the alt screen is showing");
-    assert!(line_text(&wire, 0).starts_with("ONTOP"), "primary grid = what is displayed");
+    assert!(
+        line_text(&wire.screen_primary.lines[0]).starts_with("ONTOP"),
+        "primary grid = what is displayed"
+    );
     let alt = wire.screen_alt.as_ref().expect("the held-aside screen rides along");
-    let beneath: String = alt.lines[0].runs.iter().map(|r| r.text.as_str()).collect();
+    let beneath = line_text(&alt.lines[0]);
     assert!(beneath.starts_with("BENEATH"), "got {beneath:?}");
 }
 
@@ -180,7 +186,7 @@ fn an_alt_screen_pane_still_carries_its_scrollback() {
     let (wire, scroll) = pane.export(1, 100).unwrap();
     assert_eq!(wire.active_screen, 1, "the alt screen is showing");
     assert!(!scroll.is_empty(), "the primary's history must ride along from the alt screen");
-    let newest: String = scroll[0].runs.iter().map(|r| r.text.as_str()).collect();
+    let newest = line_text(&scroll[0]);
     assert!(newest.trim().starts_with("line"), "got {newest:?}");
 }
 
