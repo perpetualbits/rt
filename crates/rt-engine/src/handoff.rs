@@ -211,11 +211,19 @@ pub fn screen_to_grid(term: &Term, styles: &mut StyleTable) -> Grid {
 }
 
 /// The screen held aside while the other one is displayed, if any.
+///
+/// Exactly `term.rows()` lines, NOT `term.inactive_rows()`. `Term::resize` does
+/// not touch `saved_screen`, so after a resize on the alt screen the held-aside
+/// grid keeps its old height — and a `PaneWire` whose `rows` says 3 while
+/// `screen_alt` carries 6 lines encodes and decodes without complaint, because
+/// no wire invariant relates the two. `inactive_cell`'s `Option` pads the short
+/// case with blanks and its column bound truncates the wide case, which is the
+/// same faithful clamp the receiver would have to apply anyway.
 pub fn inactive_to_grid(term: &Term, styles: &mut StyleTable) -> Option<Grid> {
     if !term.has_inactive_screen() {
         return None;
     }
-    let rows = term.inactive_rows()?;
+    let rows = term.rows();
     let cols = term.cols();
     let lines = (0..rows)
         .map(|r| {
@@ -737,6 +745,46 @@ mod tests {
         assert_eq!(visible.lines[0].runs[0].text, "ALT", "primary grid = what is on screen");
         assert_eq!(inactive.lines[0].runs[0].text, "PRIMARY");
         assert!(t.alt_screen(), "and active_screen will be 1");
+    }
+
+    #[test]
+    fn the_inactive_grid_is_always_as_tall_as_the_pane() {
+        // `Term::resize` leaves `saved_screen` alone, so the held-aside screen
+        // keeps the height it had when the alt screen was entered. Sizing the
+        // grid from it produced a pane whose `rows` contradicted its own
+        // `screen_alt` — and the wire has no invariant tying the two, so it
+        // encoded and decoded without complaint.
+        let mut t = vt_term::Term::new(20, 6);
+        t.feed(b"PRIMARY");
+        t.feed(b"\x1b[?1049h");
+        assert_eq!(t.inactive_rows(), Some(6));
+
+        t.resize(10, 3);
+        assert_eq!(t.inactive_rows(), Some(6), "the held-aside screen kept its old height");
+
+        let (p, _) = export_term(&t, 1, 99, 0);
+        let alt = p.screen_alt.as_ref().expect("the held-aside screen rides along");
+        assert_eq!(p.rows, 3);
+        assert_eq!(alt.lines.len(), p.rows as usize, "the grid must match the pane's rows");
+        assert_eq!(p.screen_primary.lines.len(), p.rows as usize);
+        assert_eq!(alt.lines[0].runs[0].text, "PRIMARY", "and it is still the right content");
+    }
+
+    #[test]
+    fn the_inactive_grid_pads_a_screen_shorter_than_the_pane() {
+        // The other direction: growing the pane on the alt screen leaves the
+        // held-aside grid short, and `inactive_cell`'s `Option` fills the rest
+        // with blanks rather than emitting fewer lines than `rows`.
+        let mut t = vt_term::Term::new(20, 3);
+        t.feed(b"PRIMARY");
+        t.feed(b"\x1b[?1049h");
+        t.resize(20, 8);
+
+        let (p, _) = export_term(&t, 1, 99, 0);
+        let alt = p.screen_alt.as_ref().expect("the held-aside screen rides along");
+        assert_eq!(p.rows, 8);
+        assert_eq!(alt.lines.len(), 8, "the missing rows are padded, not omitted");
+        assert!(alt.lines[7].runs.is_empty(), "and the padding is blank");
     }
 
     #[test]
