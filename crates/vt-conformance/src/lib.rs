@@ -179,6 +179,37 @@ pub fn feed_resize<E: VtEngine>(
     e.observe()
 }
 
+/// Spawn engine `E` at `cols1`×`rows1`, feed `script1`, resize to `cols2`×`rows2`, feed
+/// `script2`, and observe.
+///
+/// This exists because [`feed_resize`] observes IMMEDIATELY after the resize and never
+/// writes again — so any bug where a resize corrupts state that only a LATER write (or
+/// mode change, like leaving the alt screen) exposes is outside what `feed_resize` can
+/// ever reach, no matter how many scripts are thrown at it. That is not a hypothetical:
+/// it is exactly the shape of the crash fixed alongside this function (see
+/// `Term::swap_alt` in vt-term) — a resize left the parked primary screen's geometry
+/// stale, and the panic only fired when the alt screen was later exited and the restored
+/// grid was indexed. `feed_resize`'s 10,000+-script corpus was structurally blind to it:
+/// the corruption existed in memory but nothing after the resize ever touched it.
+///
+/// Do not "simplify" this back into `feed_resize` with two scripts concatenated — the
+/// resize must land BETWEEN the two feeds, not before both, or this degenerates to
+/// exactly the blind spot it exists to close.
+pub fn feed_resize_feed<E: VtEngine>(
+    cols1: usize,
+    rows1: usize,
+    script1: &[u8],
+    cols2: usize,
+    rows2: usize,
+    script2: &[u8],
+) -> ScreenState {
+    let mut e = E::spawn(cols1, rows1);
+    e.feed(script1);
+    e.resize(cols2, rows2);
+    e.feed(script2);
+    e.observe()
+}
+
 /// Spawn engine `E`, feed the script as the given chunks, and observe. Used to prove
 /// chunk-invariance (identical to [`feed_whole`] for a correct engine).
 pub fn feed_chunks<E: VtEngine>(cols: usize, rows: usize, chunks: &[&[u8]]) -> ScreenState {
