@@ -220,7 +220,10 @@ pub struct SavedCursor {
     pub col: usize,
     pub pen: Cell,
     pub origin: bool,
-    pub autowrap: bool,
+    /// The DEFERRED-WRAP flag saved by DECSC — NOT autowrap/DECAWM. Verified
+    /// against the DECSC write site and the DECRC read site; the declaration's
+    /// bare `bool` gives no hint, and the two are easy to confuse.
+    pub pending_wrap: bool,
     pub charsets: [Charset; 4],
 }
 
@@ -279,8 +282,8 @@ impl Term {
     /// rather than being optional, matching DECRC's behaviour before any DECSC.
     pub fn saved_cursor(&self) -> SavedCursor {
         // Element order confirmed against the DECSC/DECRC handlers in lib.rs.
-        let (row, col, pen, origin, autowrap, charsets) = self.saved_cursor;
-        SavedCursor { row, col, pen, origin, autowrap, charsets }
+        let (row, col, pen, origin, pending_wrap, charsets) = self.saved_cursor;
+        SavedCursor { row, col, pen, origin, pending_wrap, charsets }
     }
 
     /// True when a screen is being held aside — i.e. the alt screen is active
@@ -302,7 +305,7 @@ impl Term {
     /// caller that only ever reads cells.
     pub fn inactive_cell(&self, row: usize, col: usize) -> Option<Cell> {
         let saved = self.saved_screen.as_ref()?;
-        saved.0.get(row).and_then(|line| line.get(col)).copied()
+        saved.0.get(row).and_then(|line| line.cells.get(col)).copied()
     }
 }
 ```

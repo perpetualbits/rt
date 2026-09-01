@@ -451,6 +451,10 @@ Written down so it is a decision and not a bug report:
 
 - Scrollback beyond the negotiated budget (oldest dropped first).
 - The child's **exit status** — `Exited(None)` thereafter.
+- The DECSC saved cursor's own deferred-wrap flag. vt-term saves `pending_wrap`
+  alongside the saved cursor, but the wire's `saved_cursor` carries only position,
+  pen, charsets and origin. The LIVE cursor's `pending_wrap` does travel (0x21); only
+  the saved copy is lost, so a DECRC after a move restores without a deferred wrap.
 - Selection, search state, and instrument history (deliberately dropped).
 - Inline images if the donor's v1 omits `image_table`; those cells render blank.
 - The child's environment still names the donor's `$RT_OUT`/`$RT_IN` paths — a
