@@ -232,6 +232,142 @@ pub fn scrollback_newest_first(term: &Term, budget: usize, styles: &mut StyleTab
     out
 }
 
+use rt_handoff::pane::{Charsets, CursorState, Margins, ModeEntry, PaneWire, SavedCursor};
+
+/// DEC private mode numbers this engine can report. Kept as literals so the
+/// namespace is the VT spec's, not rt's — that is what lets a build years from
+/// now understand a mode it does not implement, or skip one it has never heard
+/// of, without any shared enum.
+fn modes_of(term: &Term) -> Vec<ModeEntry> {
+    let dec = [
+        (1u32, term.app_cursor()),
+        (6, term.origin()),
+        (7, term.autowrap()),
+        (25, term.cursor_visible()),
+        (1000, term.wants_mouse()),
+        (1003, term.wants_motion()),
+        (1004, term.focus_events()),
+        (1005, term.utf8_mouse()),
+        (1006, term.mouse_sgr()),
+        (1007, term.alt_scroll()),
+        (1049, term.alt_screen()),
+        (2004, term.bracketed_paste()),
+    ];
+    let ansi = [(4u32, term.insert_mode()), (20, term.newline_mode())];
+
+    ansi.iter()
+        .map(|(n, v)| ModeEntry { kind: 0, number: *n, value: *v as u8 })
+        .chain(dec.iter().map(|(n, v)| ModeEntry { kind: 1, number: *n, value: *v as u8 }))
+        .collect()
+}
+
+fn charsets_of(term: &Term) -> Charsets {
+    let g = term.charsets();
+    Charsets {
+        // The final character of each designation sequence.
+        g: [designator(g[0]), designator(g[1]), designator(g[2]), designator(g[3])],
+        gl: term.gl() as u8,
+        // vt-term has no GR locking shift; the wire's default is G0.
+        gr: 0,
+    }
+}
+
+/// A `vt_term::Charset` as the final byte of its designation sequence.
+fn designator(c: vt_term::Charset) -> u8 {
+    match c {
+        vt_term::Charset::Ascii => b'B',
+        // vt-term calls the DEC line-drawing set `Special`; its designation
+        // sequence is ESC ( 0, so the final byte on the wire is '0'.
+        vt_term::Charset::Special => b'0',
+    }
+}
+
+/// Read a live terminal into the wire model.
+///
+/// Returns the pane plus its scrollback, newest-first, which the caller streams
+/// as separate `ScrollChunk` messages rather than inlining.
+///
+/// ENGINE-KNOWN FIELDS ONLY. `title`, `cwd`, `group`, `broadcast`,
+/// `columns_count`, `show_titlebar`, `scrollback_limit`, `shell_argv` and
+/// `env_extras` belong to the host and are overlaid by `rt-session`.
+pub fn export_term(
+    term: &Term,
+    pane_uid: u64,
+    child_pid: u32,
+    scrollback_budget: usize,
+) -> (PaneWire, Vec<Line>) {
+    let mut styles = StyleTable::new();
+    let screen_primary = screen_to_grid(term, &mut styles);
+    let screen_alt = inactive_to_grid(term, &mut styles);
+    let scrollback = scrollback_newest_first(term, scrollback_budget, &mut styles);
+
+    // `Term::cursor()` returns `(col, row)` — confirmed against every other call
+    // site in this codebase (rt-engine's vtpane.rs, vt-term's own tests) and by
+    // its source (`(self.col, self.row)`). Destructuring it as `(row, col)`
+    // silently swaps the wire's cursor position; there is no compile error and
+    // no existing test here caught it, so this is called out explicitly.
+    let (ccol, crow) = term.cursor();
+    let sc = term.saved_cursor();
+    let (top, bottom) = term.margins();
+
+    let pane = PaneWire {
+        pane_uid,
+        cols: term.cols() as u32,
+        rows: term.rows() as u32,
+        child_pid,
+        modes: modes_of(term),
+        cursor: CursorState {
+            col: ccol as u32,
+            row: crow as u32,
+            shape: shape_code(term.cursor_shape()),
+            visible: term.cursor_visible(),
+            blink: false, // vt-term does not track a blink flag separately
+            pending_wrap: term.pending_wrap(),
+        },
+        saved_cursor: Some(SavedCursor {
+            col: sc.col as u32,
+            row: sc.row as u32,
+            pen: style_of(&sc.pen),
+            charsets: Charsets {
+                g: [
+                    designator(sc.charsets[0]),
+                    designator(sc.charsets[1]),
+                    designator(sc.charsets[2]),
+                    designator(sc.charsets[3]),
+                ],
+                gl: 0,
+                gr: 0,
+            },
+            origin: sc.origin,
+        }),
+        charsets: Some(charsets_of(term)),
+        margins: Some(Margins {
+            top: top as u32,
+            bottom: bottom as u32,
+            left: 0,   // vt-term has no DECSLRM
+            right: term.cols().saturating_sub(1) as u32,
+        }),
+        pen: style_of(&term.pen()),
+        active_screen: term.alt_screen() as u8,
+        style_table: styles.into_vec(),
+        screen_primary,
+        screen_alt,
+        // Left for the host, and the four this engine cannot source.
+        ..PaneWire::default()
+    };
+
+    (pane, scrollback)
+}
+
+/// The wire's cursor shape code: 0 block, 1 underline, 2 bar (vt-term's `Beam`).
+fn shape_code(s: vt_term::CursorShape) -> u8 {
+    match s {
+        vt_term::CursorShape::Block => 0,
+        vt_term::CursorShape::Underline => 1,
+        vt_term::CursorShape::Beam => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +645,111 @@ mod tests {
         t.feed(b"just one line");
         let mut st = StyleTable::new();
         assert!(scrollback_newest_first(&t, 100, &mut st).is_empty());
+    }
+
+    fn mode_value(p: &rt_handoff::pane::PaneWire, kind: u8, number: u32) -> Option<u8> {
+        p.modes.iter().find(|m| m.kind == kind && m.number == number).map(|m| m.value)
+    }
+
+    #[test]
+    fn modes_travel_by_their_dec_number() {
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b[?1h\x1b[?2004h\x1b[?7l"); // DECCKM on, bracketed paste on, DECAWM off
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert_eq!(mode_value(&p, 1, 1), Some(1), "DECCKM");
+        assert_eq!(mode_value(&p, 1, 2004), Some(1), "bracketed paste");
+        assert_eq!(mode_value(&p, 1, 7), Some(0), "DECAWM off");
+    }
+
+    #[test]
+    fn ansi_and_dec_modes_are_separate_namespaces() {
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b[4h\x1b[20h"); // IRM, LNM — ANSI, kind 0
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert_eq!(mode_value(&p, 0, 4), Some(1), "IRM is ANSI mode 4");
+        assert_eq!(mode_value(&p, 0, 20), Some(1), "LNM is ANSI mode 20");
+        assert_eq!(mode_value(&p, 1, 4), None, "there is no DEC PRIVATE mode 4 here");
+    }
+
+    #[test]
+    fn the_cursor_carries_position_shape_and_pending_wrap() {
+        // 4 columns; CUP to row 2 col 3 (0-based row 1, col 2) leaves exactly two
+        // columns — "ab" fills col 2 then col 3 (the last column), which is what
+        // sets the deferred-wrap flag. Feeding a third/fourth character (the
+        // brief's original "abcd") would trigger the wrap itself and clear the
+        // flag before export — verified against vt-term directly: after "abcd"
+        // `pending_wrap()` is false and `cursor()` is `(2, 2)`, not the wire-edge
+        // state this test means to capture. "ab" is the correct fixture.
+        let mut t = vt_term::Term::new(4, 4);
+        t.feed(b"\x1b[2;3Hab");
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert!(p.cursor.visible);
+        assert!(p.cursor.pending_wrap, "the deferred wrap must survive");
+        // `Term::cursor()` returns `(col, row)` (confirmed at every other call
+        // site in this codebase, e.g. rt-engine's vtpane.rs and vt-term's own
+        // tests) — position must reach the wire uninverted.
+        assert_eq!((p.cursor.col, p.cursor.row), (3, 1), "position must not be col/row swapped");
+    }
+
+    #[test]
+    fn margins_and_the_pen_are_exported() {
+        let mut t = vt_term::Term::new(20, 24);
+        t.feed(b"\x1b[5;20r\x1b[1;38;5;42m");
+        let (p, _) = export_term(&t, 1, 99, 0);
+        let m = p.margins.expect("DECSTBM was set");
+        assert_eq!((m.top, m.bottom), (4, 19));
+        assert_eq!(p.pen.fg, rt_handoff::style::Colour::Indexed(42));
+        assert!(p.pen.attrs & rt_handoff::style::attrs::BOLD != 0);
+    }
+
+    #[test]
+    fn active_screen_flags_which_grid_is_showing() {
+        let mut t = vt_term::Term::new(20, 4);
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert_eq!(p.active_screen, 0);
+        assert!(p.screen_alt.is_none());
+
+        t.feed(b"\x1b[?1049h");
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert_eq!(p.active_screen, 1);
+        assert!(p.screen_alt.is_some(), "the held-aside primary rides along");
+    }
+
+    #[test]
+    fn the_four_unsupported_fields_ship_absent() {
+        // vt-term tracks no tab stops, title stack, hyperlinks or images.
+        // Rule R3 means the receiver applies documented defaults.
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"hello");
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert!(p.tab_stops.is_none());
+        assert!(p.title_stack.is_empty());
+        assert!(p.uri_table.is_empty());
+        assert!(p.image_table.is_empty());
+    }
+
+    #[test]
+    fn host_level_fields_are_left_for_the_session_to_fill() {
+        // export() knows the engine, not the window. Title, cwd, group and the
+        // rest belong to rt-session and are overlaid later.
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b]0;a title\x07");
+        let (p, _) = export_term(&t, 7, 4242, 0);
+        assert_eq!(p.pane_uid, 7);
+        assert_eq!(p.child_pid, 4242);
+        assert_eq!(p.title, "", "the host owns the title, not the engine");
+        assert!(p.cwd.is_none());
+        assert!(p.shell_argv.is_empty());
+    }
+
+    #[test]
+    fn an_exported_pane_encodes_and_decodes_unchanged() {
+        let mut t = vt_term::Term::new(40, 6);
+        t.feed("\x1b[1;38;5;9mred\x1b[m normal 日本\r\nsecond".as_bytes());
+        let (p, _) = export_term(&t, 3, 111, 0);
+        let back = rt_handoff::pane::PaneWire::decode(&p.encode()).unwrap();
+        let mut expected = p.clone();
+        expected.tag_names = back.tag_names.clone();
+        assert_eq!(back, expected, "a real exported pane must survive the wire");
     }
 }
