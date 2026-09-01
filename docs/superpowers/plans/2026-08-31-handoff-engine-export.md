@@ -656,7 +656,12 @@ pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
     while i < cells.len() {
         let cell = &cells[i];
         let style_id = styles.intern(cell);
-        let wide = i + 1 < cells.len() && cells[i + 1].spacer();
+        // NOT just `spacer()`: that flag is ALSO set on the before-wrap
+        // placeholder written when a wide glyph will not fit the last column.
+        // Folding one of those into the preceding cell would tag a narrow
+        // glyph as double-width, undetectably — the wire's invariants still
+        // hold, so nothing downstream would catch it.
+        let wide = i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1]);
 
         if is_blank(cell) && !wide {
             // A stretch of blanks in one style: no text, just a span.
