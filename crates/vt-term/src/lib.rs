@@ -157,6 +157,19 @@ impl Cell {
     pub fn wrapline(&self) -> bool {
         self.flags & WRAPLINE != 0
     }
+    /// Whether this cell's CHARACTER is double-width (CJK/emoji), i.e. it occupies two
+    /// columns and owns a trailing [`SPACER`] beside it when the grid is well formed.
+    ///
+    /// Derived from the character, deliberately: `delete_chars`, `erase_chars` and the
+    /// insert-mode shift do raw cell moves with no wide-glyph cleanup (matching
+    /// alacritty), so a glyph can end up with no spacer and a spacer can end up with no
+    /// glyph. Anything that must know a cell's column width — `rt-engine`'s handoff
+    /// export, say — has to ask the glyph, not its neighbour. Spacers themselves carry
+    /// `c == ' '` and so are never wide by this test, which is what makes an orphaned
+    /// spacer classifiable as the one blank column it really is.
+    pub fn is_wide(&self) -> bool {
+        char_width(self.c) == 2
+    }
 }
 
 /// One grid row: its cells plus `occ`, the number of cells written since the last reset.

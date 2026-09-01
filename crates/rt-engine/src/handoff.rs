@@ -91,50 +91,76 @@ fn is_trailing_spacer(cell: &Cell) -> bool {
     cell.spacer() && !cell.leading_spacer()
 }
 
-/// True for a cell that contributes nothing to the wire: a space in a style
-/// that renders identically to the default, OR the before-wrap placeholder —
-/// it renders as nothing and exists only to hold the last column while its
-/// glyph wraps to the next row, so it is exactly as droppable as a blank.
+/// True when `cells[i]` is the second half of the wide glyph immediately to its
+/// left — the only spacer a run may absorb.
 ///
-/// A wide glyph's ordinary trailing `spacer()` cell is NOT blank: it is the
-/// second half of the glyph before it, and dropping it independently (e.g.
-/// via the tail-trim below) would desync the wide/narrow width check for
-/// that glyph.
+/// Both halves of the test matter. A spacer whose left neighbour is NOT a
+/// double-width glyph is an ORPHAN: vt-term's `delete_chars`, `erase_chars` and
+/// insert-mode shift move cells raw, with no wide-glyph cleanup (deliberate —
+/// alacritty does the same, `vt-term/src/lib.rs`), so `日x` + `CSI 1P` leaves
+/// `[spacer][x]` with the glyph gone. An orphan still occupies its column, so
+/// absorbing it would shorten the row and shift everything to its right one
+/// column left.
+fn is_glyph_spacer(cells: &[Cell], i: usize) -> bool {
+    is_trailing_spacer(&cells[i]) && i > 0 && cells[i - 1].is_wide()
+}
+
+/// True for a cell that contributes nothing but its column: a space in a style
+/// that renders identically to the default.
+///
+/// Called only for cells that are not a glyph's own spacer (see
+/// [`is_glyph_spacer`]), so the spacers that reach it — the before-wrap
+/// placeholder, and orphans left behind by a raw cell shift — are judged
+/// exactly as the invisible one-column blanks they are. If such a spacer
+/// carries a non-default background it is not blank and travels as a real
+/// space, which is what it paints.
 fn is_blank(cell: &Cell) -> bool {
-    if cell.spacer() {
-        cell.leading_spacer()
-    } else {
-        cell.c == ' ' && style_of(cell) == Style::default()
-    }
+    cell.c == ' ' && style_of(cell) == Style::default()
 }
 
 /// One row of live cells to one wire line.
 ///
-/// `cells` is the whole row, `cells.len()` columns wide. A wide glyph appears
-/// as a leading cell followed by a trailing `spacer()`; the spacer is
-/// consumed into the leading cell's run and never emitted on its own. A
-/// *leading* spacer — the before-wrap placeholder at the last column when a
-/// wide glyph doesn't fit and wraps instead — is not part of any glyph here;
-/// it is blank (see [`is_blank`]) and normally vanishes in the tail-trim.
+/// `cells` is the whole row, `cells.len()` columns wide. A cell's WIDTH comes
+/// from its own character (`Cell::is_wide`), never from whether its neighbour
+/// happens to carry the spacer flag: the grid can hold a glyph with no spacer
+/// and a spacer with no glyph, and reading the neighbour turns both into wrong
+/// content — a narrow glyph tagged double-width, or a row a column short.
+///
+/// A well-formed wide glyph's trailing spacer is absorbed into that glyph's run
+/// and never emitted on its own; every other cell, spacer or not, contributes
+/// exactly one column.
 pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
     let wrapped = cells.last().map(|c| c.wrapline()).unwrap_or(false);
     let flags = if wrapped { line_flags::WRAPPED } else { 0 };
 
+    // Which cells belong to the glyph on their left; computed once, because the
+    // trim below and both loops must agree on it.
+    let absorbed: Vec<bool> = (0..cells.len()).map(|i| is_glyph_spacer(cells, i)).collect();
+
     // Drop the tail of blank default cells; the receiver pads the line back out.
-    let end = cells.iter().rposition(|c| !is_blank(c)).map(|i| i + 1).unwrap_or(0);
-    let cells = &cells[..end];
+    // An absorbed spacer at the end goes with them: its glyph's run still spans
+    // both columns, so nothing is lost.
+    let mut end = cells.len();
+    while end > 0 && (absorbed[end - 1] || is_blank(&cells[end - 1])) {
+        end -= 1;
+    }
 
     let mut runs: Vec<Run> = Vec::new();
     let mut i = 0usize;
-    while i < cells.len() {
+    while i < end {
+        if absorbed[i] {
+            i += 1; // its glyph's run already covered this column
+            continue;
+        }
         let cell = &cells[i];
         let style_id = styles.intern(cell);
-        let wide = i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1]);
+        let wide = cell.is_wide();
 
-        if is_blank(cell) && !wide {
-            // A stretch of blanks in one style: no text, just a span.
+        if is_blank(cell) {
+            // A stretch of blanks in one style: no text, just a span. A blank is
+            // never wide (its character is a space), so no glyph is swallowed.
             let start = i;
-            while i < cells.len() && is_blank(&cells[i]) && !(i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1])) {
+            while i < end && !absorbed[i] && is_blank(&cells[i]) {
                 i += 1;
             }
             runs.push(Run::blank(style_id, (i - start) as u32));
@@ -144,21 +170,17 @@ pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
         // A run of same-style, same-width, non-blank cells.
         let mut text = String::new();
         let mut span = 0u32;
-        while i < cells.len() {
-            let c = &cells[i];
-            if c.spacer() {
-                // Consumed by the leading cell before it (a trailing spacer's
-                // own leading glyph), or blank and already trimmed away (a
-                // wrap placeholder) — either way, not this run's content.
-                i += 1;
+        while i < end {
+            if absorbed[i] {
+                i += 1; // the spacer of the wide glyph this run just took
                 continue;
             }
-            let c_wide = i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1]);
-            if styles.intern(c) != style_id || c_wide != wide || is_blank(c) {
+            let c = &cells[i];
+            if styles.intern(c) != style_id || c.is_wide() != wide || is_blank(c) {
                 break;
             }
             text.push(c.c);
-            span += if c_wide { 2 } else { 1 };
+            span += if wide { 2 } else { 1 };
             i += 1;
         }
         runs.push(Run {
@@ -514,6 +536,99 @@ mod tests {
         assert_eq!(line.runs.len(), 2, "the run breaks at the width change");
         assert_eq!(line.runs[0].text, "ab");
         assert_eq!(line.runs[1].text, "日");
+    }
+
+    /// Every run's `(cell_span, WIDE?, text)`, plus the columns they cover in
+    /// total — the number the receiver lays out, and the one a neighbour-based
+    /// width guess gets wrong.
+    fn shape(line: &Line) -> (Vec<(u32, bool, String)>, u32) {
+        let runs: Vec<(u32, bool, String)> = line
+            .runs
+            .iter()
+            .map(|r| (r.cell_span, r.flags & run_flags::WIDE != 0, r.text.clone()))
+            .collect();
+        let cols = runs.iter().map(|(s, _, _)| *s).sum();
+        (runs, cols)
+    }
+
+    /// The row of a live `Term`, as the exporter reads it.
+    fn live_row(t: &vt_term::Term, row: usize) -> Vec<Cell> {
+        (0..t.cols()).map(|c| t.cell(row, c)).collect()
+    }
+
+    // ── Raw cell shifts leave the grid inconsistent; width must come from the
+    // glyph, not the neighbour. vt-term's `delete_chars`/`erase_chars`/insert
+    // shift do no wide-glyph cleanup (deliberately, matching alacritty), and
+    // ncurses reaches for `dch`/`ech` whenever terminfo has them, so a CJK
+    // pane hits all three of these routinely.
+
+    #[test]
+    fn a_deleted_wide_glyph_leaves_its_spacer_as_one_blank_column() {
+        // `日x` then DCH 1 at column 0 shifts the row left over the glyph,
+        // leaving `[orphan spacer][x]`. The spacer still occupies a column:
+        // absorbing it (there is no glyph left to absorb it INTO) would make
+        // the line one column short and slide everything right of it left.
+        let mut t = vt_term::Term::new(20, 2);
+        t.feed("日x".as_bytes());
+        t.feed(b"\x1b[H\x1b[1P");
+        assert!(t.cell(0, 0).spacer() && !t.cell(0, 0).leading_spacer(), "an orphaned spacer");
+        assert_eq!(t.cell(0, 1).c, 'x');
+
+        let mut st = StyleTable::new();
+        let line = row_to_line(&live_row(&t, 0), &mut st);
+        let (runs, cols) = shape(&line);
+        assert_eq!(cols, 2, "the row still occupies two columns");
+        assert_eq!(runs, vec![(1, false, String::new()), (1, false, "x".into())]);
+    }
+
+    #[test]
+    fn a_shifted_spacer_does_not_make_a_narrow_glyph_look_wide() {
+        // `ab日c` then DCH 2 at column 1 leaves `[a][orphan spacer][c]`. Reading
+        // the neighbour's flag calls `a` double-width — the same CRITICAL the
+        // LEADING flag fixed for the wrap placeholder, reached another way.
+        let mut t = vt_term::Term::new(20, 2);
+        t.feed("ab日c".as_bytes());
+        t.feed(b"\x1b[2G\x1b[2P");
+        assert_eq!(t.cell(0, 0).c, 'a');
+        assert!(t.cell(0, 1).spacer() && !t.cell(0, 1).leading_spacer(), "an orphaned spacer");
+
+        let mut st = StyleTable::new();
+        let line = row_to_line(&live_row(&t, 0), &mut st);
+        let (runs, cols) = shape(&line);
+        for (_, wide, text) in &runs {
+            assert!(!wide, "no run here is double-width: {text:?}");
+        }
+        assert_eq!(cols, 3);
+        assert_eq!(
+            runs,
+            vec![(1, false, "a".into()), (1, false, String::new()), (1, false, "c".into())]
+        );
+    }
+
+    #[test]
+    fn an_erased_spacer_leaves_its_glyph_two_columns_wide() {
+        // `A日B` then ECH 1 over the spacer leaves the wide glyph with none.
+        // It still paints two columns, so calling it narrow makes the next
+        // run start a column early and overlap it.
+        let mut t = vt_term::Term::new(20, 2);
+        t.feed("A日B".as_bytes());
+        t.feed(b"\x1b[3G\x1b[1X");
+        assert!(t.cell(0, 1).is_wide(), "the glyph is still there");
+        assert!(!t.cell(0, 2).spacer(), "but its spacer was erased");
+
+        let mut st = StyleTable::new();
+        let line = row_to_line(&live_row(&t, 0), &mut st);
+        let (runs, cols) = shape(&line);
+        assert_eq!(cols, 5, "A + a two-column glyph + the erased column + B");
+        assert_eq!(
+            runs,
+            vec![
+                (1, false, "A".into()),
+                (2, true, "日".into()),
+                (1, false, String::new()),
+                (1, false, "B".into()),
+            ]
+        );
     }
 
     #[test]
