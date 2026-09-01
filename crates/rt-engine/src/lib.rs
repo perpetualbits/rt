@@ -1476,6 +1476,28 @@ mod vtpane_tests {
         }
     }
 
+    /// Poll — draining events as a real host would — until the WHOLE of `want`
+    /// is on screen, or the deadline passes.
+    ///
+    /// Whole-substring, never a single leading character. A probe on the first
+    /// character of a multi-character write can fire between the reader thread
+    /// applying that character and the rest of the write, so the test then runs
+    /// against a half-written screen. For `export_does_not_disturb_the_pane`
+    /// that is worse than flaky: if the tail of `ALIVE` lands between the two
+    /// exports, the two screens differ and the test fails claiming "export is a
+    /// pure read" — a false accusation against correct code. Same convention as
+    /// `tests/export.rs`'s `has_text`.
+    fn wait_for_text(pane: &TermPane, want: &str) {
+        for _ in 0..500 {
+            let _ = pane.drain_events();
+            if pane.snapshot().to_text().contains(want) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the pane never printed {want:?}");
+    }
+
     #[test]
     fn a_live_vt_pane_exports_its_screen() {
         // Force the in-house engine deterministically: `TermPane::spawn_env` picks the
@@ -1491,13 +1513,7 @@ mod vtpane_tests {
             .expect("spawn"),
         );
         // Give the child a moment to write, draining events as a real host would.
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let _ = pane.drain_events();
-            if pane.snapshot().rows.iter().any(|r| r.iter().any(|c| c.c == 'E')) {
-                break;
-            }
-        }
+        wait_for_text(&pane, "EXPORTED");
         let (wire, _scroll) = pane.export(42, 0).expect("the in-house engine exports");
         assert_eq!(wire.pane_uid, 42);
         assert_eq!(wire.cols, 40);
@@ -1520,13 +1536,7 @@ mod vtpane_tests {
             )
             .expect("spawn"),
         );
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let _ = pane.drain_events();
-            if pane.snapshot().rows.iter().any(|r| r.iter().any(|c| c.c == 'A')) {
-                break;
-            }
-        }
+        wait_for_text(&pane, "ALIVE");
         let (a, _) = pane.export(1, 0).unwrap();
         let (b, _) = pane.export(1, 0).unwrap();
         assert_eq!(a.screen_primary, b.screen_primary, "export is a pure read");
