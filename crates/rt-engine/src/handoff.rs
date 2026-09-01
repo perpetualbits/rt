@@ -212,6 +212,9 @@ pub fn screen_to_grid(term: &Term, styles: &mut StyleTable) -> Grid {
 
 /// The screen held aside while the other one is displayed, if any.
 pub fn inactive_to_grid(term: &Term, styles: &mut StyleTable) -> Option<Grid> {
+    if !term.has_inactive_screen() {
+        return None;
+    }
     let rows = term.inactive_rows()?;
     let cols = term.cols();
     let lines = (0..rows)
@@ -268,18 +271,32 @@ use rt_handoff::pane::{Charsets, CursorState, Margins, ModeEntry, PaneWire, Save
 /// namespace is the VT spec's, not rt's — that is what lets a build years from
 /// now understand a mode it does not implement, or skip one it has never heard
 /// of, without any shared enum.
+///
+/// The three mouse-tracking modes each get their own entry, from their own flag.
+/// They are mutually exclusive in the engine (setting one clears the other two,
+/// as xterm does), so mapping 1000 to `wants_mouse()` — the OR of all three —
+/// exported a 1002 pane as `1000=1, 1003=0`, and the receiver came up
+/// click-only with drag reporting gone. 1002 is what vim, tmux, htop and less
+/// actually set. Reporting each flag separately also removes a replay-order
+/// dependency: previously a 1003 pane said both `1000=1` and `1003=1`, and only
+/// the emission order stopped a naive replay landing on click-only.
 fn modes_of(term: &Term) -> Vec<ModeEntry> {
     let dec = [
         (1u32, term.app_cursor()),
         (6, term.origin()),
         (7, term.autowrap()),
         (25, term.cursor_visible()),
-        (1000, term.wants_mouse()),
+        (1000, term.mouse_click()),
+        (1002, term.mouse_drag()),
+        // `wants_motion()` IS the 1003 flag — it is the renderer-facing name for
+        // `mouse_motion`, keyed on 1003 alone (see its doc comment). No separate
+        // accessor is added for it.
         (1003, term.wants_motion()),
         (1004, term.focus_events()),
         (1005, term.utf8_mouse()),
         (1006, term.mouse_sgr()),
         (1007, term.alt_scroll()),
+        (1042, term.urgency_hints()),
         (1049, term.alt_screen()),
         (2004, term.bracketed_paste()),
     ];
@@ -806,6 +823,43 @@ mod tests {
         assert_eq!(mode_value(&p, 1, 1), Some(1), "DECCKM");
         assert_eq!(mode_value(&p, 1, 2004), Some(1), "bracketed paste");
         assert_eq!(mode_value(&p, 1, 7), Some(0), "DECAWM off");
+    }
+
+    #[test]
+    fn each_mouse_tracking_mode_travels_as_itself() {
+        // The three are mutually exclusive in the engine, so exactly one of
+        // 1000/1002/1003 may be set at a time — and 1002 (button-event
+        // tracking) is what vim, tmux, htop and less actually enable. Folding
+        // them into `wants_mouse()` exported a 1002 pane as click-only.
+        for (seq, want) in [
+            (&b"\x1b[?1000h"[..], 1000u32),
+            (&b"\x1b[?1002h"[..], 1002),
+            (&b"\x1b[?1003h"[..], 1003),
+        ] {
+            let mut t = vt_term::Term::new(20, 4);
+            t.feed(seq);
+            let (p, _) = export_term(&t, 1, 99, 0);
+            for n in [1000u32, 1002, 1003] {
+                let expect = u8::from(n == want);
+                assert_eq!(
+                    mode_value(&p, 1, n),
+                    Some(expect),
+                    "with DECSET {want} set, mode {n} must export as {expect}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn urgency_hints_travel_as_dec_1042() {
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b[?1042l");
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert_eq!(mode_value(&p, 1, 1042), Some(0), "DECRST 1042 must reach the wire");
+
+        t.feed(b"\x1b[?1042h");
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert_eq!(mode_value(&p, 1, 1042), Some(1));
     }
 
     #[test]

@@ -72,6 +72,23 @@ impl Term {
         self.utf8_mouse
     }
 
+    /// DECSET 1000 alone: report button press and release, nothing else.
+    ///
+    /// The three mouse-tracking modes are mutually exclusive — setting any one
+    /// clears the other two, as xterm does — so a caller that must reproduce the
+    /// pane's mode elsewhere needs each flag on its own. [`Term::wants_mouse`] is
+    /// their OR, which answers the renderer's question ("do I forward mouse
+    /// events at all?") and cannot distinguish 1000 from 1002 from 1003.
+    pub fn mouse_click(&self) -> bool {
+        self.mouse_click
+    }
+
+    /// DECSET 1002: button-event tracking (motion reported while a button is
+    /// down). What vim, tmux, htop and less actually enable.
+    pub fn mouse_drag(&self) -> bool {
+        self.mouse_drag
+    }
+
     pub fn urgency_hints(&self) -> bool {
         self.urgency_hints
     }
