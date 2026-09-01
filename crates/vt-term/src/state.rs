@@ -29,6 +29,16 @@ pub struct SavedCursor {
 }
 
 impl Term {
+    /// The raw bytes of a sequence [`feed`](Term::feed) has not yet finished parsing
+    /// — empty at a parse boundary. Delegates to [`vt_parser::Parser::pending_raw`];
+    /// see there for what it covers (a stashed partial UTF-8 codepoint, an in-flight
+    /// escape sequence, or a buffered synchronized update). This is what a pane
+    /// freeze hands to the next process, alongside the state derived from it, so a
+    /// replay lands in the same place.
+    pub fn pending_raw(&self) -> std::borrow::Cow<'_, [u8]> {
+        self.parser.pending_raw()
+    }
+
     /// The current SGR state — the template applied to the NEXT cell written.
     pub fn pen(&self) -> Cell {
         self.pen
@@ -159,6 +169,15 @@ mod tests {
         let mut t = Term::new(80, 24);
         t.feed(seq);
         t
+    }
+
+    #[test]
+    fn pending_raw_reflects_a_partial_sequence_fed_to_the_term() {
+        let t = term_after(b"text \x1b[38;5");
+        assert_eq!(&*t.pending_raw(), b"\x1b[38;5", "half-finished CSI is pending verbatim");
+
+        let t = term_after(b"hello");
+        assert!(t.pending_raw().is_empty(), "a complete stream leaves nothing pending");
     }
 
     #[test]

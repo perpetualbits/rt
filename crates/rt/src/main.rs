@@ -5552,7 +5552,26 @@ impl App {
                 // Pre-fetched once/frame in the planning loop (Some here because
                 // pane(id) was Some there too). In column mode this is a
                 // count*rows-tall screen.
-                let snap = snap_pre.as_ref().expect("pane present ⇒ snapshot fetched in planning loop");
+                //
+                // This used to be an `.expect`, and that turned a single unpaintable
+                // frame into process death — taking every tab, pane and shell in the
+                // window with it. It fired as the SECOND panic of a real crash, cascading
+                // off a panic in the engine while the first unwind was in flight. A
+                // missing snapshot costs at most one pane one frame, so skip the pane
+                // (grid, cursor, scrollbar and its titlebar strip alike — the window was
+                // already cleared to the background, so it simply reads as empty) and let
+                // the next frame repaint it. It is still logged (once, not once per frame
+                // at 60fps) so a bug that makes it reachable is loud.
+                let Some(snap) = snap_pre.as_ref() else {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        log::warn!(
+                            "draw_panes: pane {id:?} has no snapshot from the planning loop; \
+                             skipping it this frame (further occurrences are not logged)"
+                        );
+                    });
+                    continue;
+                };
                 let geom = active.session.column_layout(id, rect); // count/col_cells/rows/gap
                 // The selection, if it belongs to this (single-column) pane.
                 let pane_sel: Option<Selection> = active.selection.filter(|s| n <= 1 && s.pane == id);

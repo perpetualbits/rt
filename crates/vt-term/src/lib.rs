@@ -862,8 +862,18 @@ impl Term {
     }
     /// The cell at absolute line `abs` (visible lines `0..rows`, history negative down to
     /// `topmost`) and column `col`, or a blank cell if out of range.
+    ///
+    /// The bounds check is deliberately against what is actually INDEXED — `grid.len()`
+    /// and the row's own width — as well as the logical range (`rows`). Guarding on
+    /// `self.rows` alone once cost a user every tab, pane and shell they had open: a
+    /// stale-sized grid restored from the alt screen made `grid.len() < rows`, and this
+    /// read panicked the render loop (`index out of bounds: the len is 53 but the index
+    /// is 53`), unwinding the whole process. That invariant is now maintained at its
+    /// source (see `swap_alt`); this guard is the defence in depth that keeps the NEXT
+    /// break a blank cell — which is what the line above has always promised — instead of
+    /// a crash. Callers get a read-only view, so a blank is always a safe answer.
     pub fn cell_at(&self, abs: i32, col: usize) -> Cell {
-        let row = if abs >= 0 && (abs as usize) < self.rows {
+        let row = if abs >= 0 && (abs as usize) < self.rows && (abs as usize) < self.grid.len() {
             &self.grid[abs as usize]
         } else if abs < 0 {
             let idx = self.history.len() as i32 + abs; // -history..-1 → 0..H-1
@@ -1609,15 +1619,60 @@ impl Term {
             self.saved_screen = Some((saved, self.row, self.col, self.pen, self.pending_wrap, self.charsets));
             self.alt = true;
         } else if !to_alt && self.alt {
-            if let Some((grid, row, col, pen, wrap, charsets)) = self.saved_screen.take() {
-                self.grid = grid;
-                self.row = row.min(self.rows - 1);
-                self.col = col.min(self.cols - 1);
-                self.pen = pen;
-                self.pending_wrap = wrap;
-                self.charsets = charsets;
-            }
+            // Back on the primary screen BEFORE the reconciliation below, so the helpers
+            // it reuses (and `history_size`) see the primary's rules, not the alt's.
             self.alt = false;
+            if let Some((grid, row, col, pen, wrap, charsets)) = self.saved_screen.take() {
+                // `saved_screen` is PARKED state: `resize` only ever reconciles the grid
+                // that is live at the time (see `reflow`), and it never touches
+                // `saved_screen`. So the screen being handed back here may be the wrong
+                // height AND the wrong width — a TUI takes the alt screen, the pane is
+                // resized underneath it, the TUI exits. Restoring it wholesale left
+                // `grid.len() != rows` with rows of the old width, which is exactly what
+                // killed rt (every tab, pane and shell) out of `cell_at`.
+                //
+                // The fix is to put the parked screen through the same reconciliation an
+                // ordinary resize would have applied: adopt it at ITS geometry, then run
+                // the existing `shrink_lines`/`grow_lines`/`resize_columns_flat` helpers
+                // rather than open-coding a fourth copy of that loop.
+                let (target_rows, target_cols) = (self.rows, self.cols);
+                self.pen = pen; // blanks minted below take the restored pen's background
+                self.charsets = charsets;
+                let saved_rows = grid.len();
+                self.rows = saved_rows;
+                self.grid = grid;
+                // The cursor as the parked screen knew it (clamped to that screen), so
+                // `shrink_lines` can decide from it whether to scroll to keep it in view.
+                self.row = row.min(saved_rows.saturating_sub(1));
+                self.col = col;
+                // Rows: `keep = true` — this IS the primary screen, so lines that scroll
+                // off its top belong in its scrollback. Note which end loses content, and
+                // why the BOTTOM is the right one: `shrink_lines` truncates from the
+                // bottom outright, and only shifts lines off the TOP as far as it must to
+                // keep the cursor visible — and those go into `history`, where the user can
+                // still scroll back to them. Bottom rows have nowhere to go, so dropping
+                // there is the only genuinely destructive choice, and it is the end that
+                // holds the least: a screen parked behind a TUI has its live content at the
+                // top and blank tail rows below. Reusing the shared helper (rather than
+                // open-coding it) is also what guarantees the alt-exit path can never
+                // disagree with an ordinary resize about where content goes.
+                match target_rows.cmp(&saved_rows) {
+                    std::cmp::Ordering::Less => self.shrink_lines(target_rows, true),
+                    std::cmp::Ordering::Greater => self.grow_lines(target_rows, true),
+                    std::cmp::Ordering::Equal => {}
+                }
+                // Columns: each parked row is still the old width (as are any rows
+                // `grow_lines` just pulled back out of history, which an alt-screen resize
+                // also leaves alone). Truncate/blank-extend them flat — no reflow: the
+                // parked screen's wrap structure was never rewrapped at resize time, so
+                // there is nothing faithful to rewrap against.
+                self.resize_columns_flat(target_cols);
+                // `resize_columns_flat` clears `pending_wrap` and clamps `col`; restore
+                // the saved deferred-wrap flag afterwards.
+                self.col = col.min(self.cols - 1);
+                self.pending_wrap = wrap;
+                debug_assert_eq!(self.grid.len(), self.rows);
+            }
         }
     }
 
@@ -2708,3 +2763,171 @@ mod sgr_tests {
         assert_eq!(t.cell(0, 1).fg, crate::Color::Indexed(200));
     }
 }
+
+#[cfg(test)]
+mod alt_screen_resize_tests {
+    //! Regression tests for the crash that killed rt (every tab, pane and shell) when a
+    //! full-screen TUI exited after its pane had been resized.
+    //!
+    //! `saved_screen` parks the primary grid at the geometry it had when the alt screen
+    //! was entered. `resize` only ever reconciles the ACTIVE grid, so after a resize the
+    //! parked grid is stale in BOTH dimensions; restoring it wholesale used to leave
+    //! `grid.len() != rows` and rows of the wrong width, and `cell_at` — which guarded on
+    //! `self.rows` but indexed `self.grid` — then panicked with
+    //! `index out of bounds: the len is N but the index is N`.
+    use super::*;
+
+    /// Fill a primary screen with one identifiable line per row.
+    fn seed(cols: usize, rows: usize) -> Term {
+        let mut t = Term::new(cols, rows);
+        for r in 0..rows {
+            t.feed(format!("row{r}").as_bytes());
+            if r + 1 < rows {
+                t.feed(b"\r\n");
+            }
+        }
+        t
+    }
+
+    /// The structural invariant `shrink_lines`/`grow_lines` maintain and `swap_alt` used
+    /// to break: the grid is exactly `rows` lines of exactly `cols` cells.
+    fn assert_geometry(t: &Term, what: &str) {
+        assert_eq!(t.grid.len(), t.rows, "{what}: grid height must equal rows");
+        for (i, line) in t.grid.iter().enumerate() {
+            assert_eq!(line.cells.len(), t.cols, "{what}: row {i} must be `cols` wide");
+        }
+        assert!(t.row < t.rows, "{what}: cursor row in range");
+        assert!(t.col < t.cols, "{what}: cursor col in range");
+    }
+
+    /// Read every readable cell (history + viewport, all columns). Must not panic.
+    fn sweep(t: &Term) {
+        for abs in t.topmost()..=t.bottommost() {
+            for c in 0..t.cols() {
+                let _ = t.cell_at(abs, c);
+            }
+        }
+        for r in 0..t.rows() {
+            for c in 0..t.cols() {
+                let _ = t.cell(r, c);
+            }
+        }
+    }
+
+    /// THE CRASH: alt screen entered at N rows, pane GREW, alt screen left. The restored
+    /// grid is still N lines but `rows` is larger, so `cell_at(N, _)` indexed past the
+    /// end — exactly the reported `len is 53 but the index is 53`.
+    #[test]
+    fn leaving_alt_after_a_row_grow_keeps_the_grid_in_sync() {
+        let mut t = seed(20, 10);
+        t.feed(b"\x1b[?1049h"); // full-screen TUI takes the alt screen
+        t.feed(b"TUI");
+        t.resize(20, 14); // the pane is resized while the TUI owns the screen
+        t.feed(b"\x1b[?1049l"); // the TUI exits
+        assert_geometry(&t, "grow");
+        sweep(&t);
+        // The parked content survives at the top; the new rows below are blank.
+        assert_eq!(t.cell(0, 0).c, 'r');
+        assert_eq!(t.cell(0, 3).c, '0');
+    }
+
+    /// The exact reported crash, reproduced verbatim. Before the fix this panicked with
+    /// `index out of bounds: the len is 53 but the index is 53` at the `cell_at` line —
+    /// byte for byte the message from the user's log.
+    #[test]
+    fn the_reported_crash_53_rows_grown_to_54() {
+        let mut t = Term::new(80, 53);
+        t.feed(b"\x1b[?1049h"); // Claude Code takes the alt screen
+        t.resize(80, 54); // the pane grows underneath it
+        t.feed(b"\x1b[?1049l"); // the user types `exit`
+        for abs in t.topmost()..=t.bottommost() {
+            let _ = t.cell_at(abs, 0); // rt's per-frame render sweep
+        }
+        assert_geometry(&t, "reported crash");
+    }
+
+    /// The mirror case: the pane SHRANK while the TUI held the screen.
+    #[test]
+    fn leaving_alt_after_a_row_shrink_keeps_the_grid_in_sync() {
+        let mut t = seed(20, 10);
+        t.feed(b"\x1b[?1049h");
+        t.resize(20, 4);
+        t.feed(b"\x1b[?1049l");
+        assert_geometry(&t, "shrink");
+        sweep(&t);
+    }
+
+    /// Columns grew while parked: every restored row is still the old, narrower width.
+    #[test]
+    fn leaving_alt_after_a_column_grow_widens_every_row() {
+        let mut t = seed(20, 6);
+        t.feed(b"\x1b[?1049h");
+        t.resize(40, 6);
+        t.feed(b"\x1b[?1049l");
+        assert_geometry(&t, "col grow");
+        sweep(&t);
+        assert_eq!(t.cell(0, 0).c, 'r'); // content kept
+        assert_eq!(t.cell(0, 39).c, ' '); // blank-extended, not out of bounds
+    }
+
+    /// Columns shrank while parked: every restored row is still the old, wider width.
+    #[test]
+    fn leaving_alt_after_a_column_shrink_narrows_every_row() {
+        let mut t = seed(40, 6);
+        t.feed(b"\x1b[?1049h");
+        t.resize(12, 6);
+        t.feed(b"\x1b[?1049l");
+        assert_geometry(&t, "col shrink");
+        sweep(&t);
+    }
+
+    /// Both dimensions at once, in both directions, over a spread of sizes.
+    #[test]
+    fn leaving_alt_reconciles_both_dimensions_over_many_sizes() {
+        for &(c0, r0) in &[(20usize, 10usize), (80, 24), (10, 3)] {
+            for &(c1, r1) in &[(1usize, 1usize), (5, 40), (200, 2), (80, 24), (20, 10)] {
+                let mut t = seed(c0, r0);
+                t.feed(b"\x1b[?1049h");
+                t.resize(c1, r1);
+                t.feed(b"\x1b[?1049l");
+                assert_geometry(&t, &format!("{c0}x{r0} -> {c1}x{r1}"));
+                sweep(&t);
+                assert_eq!((t.cols(), t.rows()), (c1, r1));
+            }
+        }
+    }
+
+    /// The real-world sequence, end to end: a shell scrolls its primary screen (so there
+    /// is scrollback), a TUI takes the alt screen, the window is resized, the user types
+    /// `exit`, and the shell keeps writing to the restored screen.
+    #[test]
+    fn shell_keeps_working_after_a_tui_exits_into_a_resized_pane() {
+        let mut t = seed(20, 6);
+        for i in 0..20 {
+            t.feed(format!("\r\nscroll{i}").as_bytes()); // push lines into scrollback
+        }
+        t.feed(b"\x1b[?1049h");
+        t.resize(30, 9);
+        t.feed(b"\x1b[?1049l");
+        assert_geometry(&t, "post-exit");
+        t.feed(b"\r\n$ echo hi\r\nhi");
+        assert_geometry(&t, "post-write");
+        sweep(&t);
+    }
+
+    /// Defence in depth: `cell_at` promises "a blank cell if out of range" — it must
+    /// honour that even if some future change breaks the geometry invariant again,
+    /// rather than taking the whole process down.
+    #[test]
+    fn cell_at_returns_a_blank_when_the_grid_is_shorter_than_rows() {
+        let mut t = Term::new(10, 5);
+        t.grid.truncate(2); // forcibly break the invariant
+        assert_eq!(t.cell_at(3, 0), Cell::default());
+        assert_eq!(t.cell_at(4, 9), Cell::default());
+        t.grid[0].cells.truncate(1); // and a short row
+        assert_eq!(t.cell_at(0, 5), Cell::default());
+        assert_eq!(t.cell_at(99, 99), Cell::default());
+        assert_eq!(t.cell_at(-999, 0), Cell::default());
+    }
+}
+
