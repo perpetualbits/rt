@@ -429,15 +429,17 @@ Run      := u8 run_flags | varint style_id | varint cell_span
   A run never mixes wide and narrow cells — it breaks instead.
 - `text_len == 0` means `cell_span` blank cells in `style_id` — the common case.
 - Trailing default-blank cells are omitted; a short line is padded by the receiver.
-- A line's spans normally sum to at most `cols`, but MAY exceed it **by one column**,
-  in exactly one case: a wide glyph pinned at the last column with no trailing spacer,
-  which a resize shrinking through a wide pair can leave behind. A donor emits that
-  glyph truthfully as a `cell_span: 2` wide run — calling it narrow is a lie about the
+- A line's spans normally sum to at most `cols`, but MAY exceed it whenever a wide
+  glyph has lost its trailing spacer — a shrinking resize, a `DCH`, an `ECH`, or an
+  export truncating a held-aside screen's columns can each leave one behind — and by
+  **one column per such glyph**, at any column, not once per line. A donor emits that
+  glyph truthfully as a `cell_span: 2` wide run: calling it narrow is a lie about the
   glyph, and dropping it loses content. **An adopter MUST clamp each run as it lays a
-  line into a row, and must never size a write from `cell_span` alone.** Nothing on the
-  wire will catch it for you: `Grid::read` does not know `cols`, and `PaneWire::decode`
-  never cross-checks a grid against `rows`/`cols`, so a receiver that trusts the spans
-  writes past the end of the row.
+  line into a row, and must never size a write from `cell_span` alone** — in particular
+  do not size a buffer at `cols + 1` and assume that is enough. Nothing on the wire will
+  catch it for you: `Grid::read` does not know `cols`, and `PaneWire::decode` never
+  cross-checks a grid against `rows`/`cols`, so a receiver that trusts the spans writes
+  past the end of the row.
 
 A typical 200-column shell line is one run: a few dozen bytes. 50 000 lines lands
 around 1–3 MB, which is why v1 specifies no compression. A `compressed` frame flag is
