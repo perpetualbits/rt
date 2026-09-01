@@ -1301,9 +1301,19 @@ The third test needs a way to force the alacritty backend regardless of the
 build's default. If no such test constructor exists, add one — a
 `#[cfg(test)]`-only associated function on `TermPane` that calls
 `AlacPane::spawn_env` directly and returns `None` when the `vendored` feature
-is off. Do not achieve it by setting `RT_ENGINE` from the test: the engine
-choice is read once per process behind a `Once`, so an env var set inside one
-test would leak into every other test in the binary.
+is off. Do not achieve it by setting `RT_ENGINE` from the test. The variable is
+process-global and cargo runs a binary's tests on parallel threads, so a test
+that mutates it corrupts every sibling test in the same binary — not
+hypothetical, it is the measured one-run-in-three flake `engine_default.rs` had
+until it was fixed. (The choice is re-read on every spawn at `lib.rs:1108`; the
+`Once` at `:1113` guards only the startup banner. The race is between parallel
+tests, not a cached decision.)
+
+Note also that `rt-engine`'s OWN default features are `["vendored"]` with
+`vtterm-default` OFF — the rt BINARY enables it, the engine crate alone does
+not. So under `cargo test -p rt-engine`, a plain `TermPane::spawn_env` yields
+the ALACRITTY arm, and the tests above that need the in-house engine must
+construct `TermPane::Vt(VtPane::spawn_env(...))` directly.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
