@@ -875,10 +875,13 @@ pub fn scrollback_newest_first(term: &Term, budget: usize, styles: &mut StyleTab
         return Vec::new();
     }
     let cols = term.cols();
-    // Absolute lines: `topmost()` is the oldest retained, `bottommost()` the
-    // newest. The visible screen occupies the last `rows()` of that range, so
-    // scrollback ends just above it.
-    let newest_scrollback = term.bottommost() - term.rows() as i32 + 1;
+    // Absolute lines: 0 IS the first VISIBLE row — `bottommost()` is `rows - 1`
+    // and `topmost()` is `-history_size`. So scrollback is the negative range,
+    // and the newest scrollback line is -1. (Deriving it as
+    // `bottommost() - rows() + 1` gives 0, which is the top VISIBLE row: that
+    // duplicates it into scrollback and, with no history at all, invents a line.
+    // Verified empirically against a live Term.)
+    let newest_scrollback: i32 = -1;
     let oldest = term.topmost();
     let mut out = Vec::new();
     let mut abs = newest_scrollback;
