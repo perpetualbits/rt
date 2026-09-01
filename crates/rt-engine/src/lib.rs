@@ -14,6 +14,7 @@
 //! can fail returns `Result`/`Option` — no unwrap on the hot path — which is
 //! the direct antidote to Terminator's unguarded-callback crashes.
 
+pub mod budget; // process-wide scrollback memory budget, shared proportionally across panes
 mod handoff; // live vt-term cells -> rt-handoff wire runs (pane export)
 mod palette; // xterm 256-colour palette + cell-colour resolution
 mod vtpane; // in-house (vt-term) pane backend, selected by RT_ENGINE=vtterm

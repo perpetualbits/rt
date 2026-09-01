@@ -26,17 +26,19 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::tty::{self, EventedPty, EventedReadWrite, Options as PtyOptions, Shell};
 
+use crate::budget::{self, SCROLLBACK_MEMORY_BUDGET};
 use crate::palette::{self, Palette};
 use crate::{
     CellAttrs, CellDamage, CursorPos, CursorShape, Damage, LineBounds, PaneEvent, SearchMatch,
     SnapCell, Snapshot,
 };
 
-/// Per-pane scrollback memory budget (bytes). The scrollback also honors the user's
-/// configured line count, but evicts oldest-first once a pane's history estimate exceeds
-/// this, so cranking the line slider to its ceiling can't turn one runaway pane into a
-/// multi-GB allocation. 1 GiB is generous for real scrollback yet bounds the worst case.
-const SCROLLBACK_MEMORY_BUDGET: usize = 1 << 30;
+// `SCROLLBACK_MEMORY_BUDGET` — this pane's byte cap while the process stays under
+// `budget::GLOBAL_SCROLLBACK_BUDGET` — now lives in `budget.rs` beside the process-wide
+// budget it's the "normal case" for; see there for the full rationale (it also documents
+// what the two constants mean at 1/10/60 panes, and the accepted trade of a shared
+// budget). Kept as a `use` here, under its established name, so this file's own doc
+// comments referring to it below stay accurate.
 
 /// Cap on bytes queued to the writer thread but not yet written to the PTY. The channel is
 /// otherwise unbounded, so a child that stops reading stdin while input keeps arriving (a
@@ -130,6 +132,11 @@ impl VtPane {
         let mut term = vt_term::Term::new(cols, rows);
         term.set_scrollback(scrollback, SCROLLBACK_MEMORY_BUDGET);
         let term = Arc::new(Mutex::new(term));
+        // Register with the process-wide budget coordinator so a periodic rebalance (the
+        // host's frame loop, on a timer — Task 2) can tighten this pane's byte cap below
+        // `SCROLLBACK_MEMORY_BUDGET` if the process-wide total ever exceeds its own
+        // budget. A `Weak` reference is stored; nothing to unregister on drop.
+        budget::register(&term);
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let dirty = Arc::new(AtomicBool::new(true));
         let exited = Arc::new(AtomicBool::new(false));
