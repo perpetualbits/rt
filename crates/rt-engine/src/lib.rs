@@ -1132,6 +1132,26 @@ impl TermPane {
         }
     }
 
+    /// Spawn a pane on the in-house vt-term engine specifically, regardless of
+    /// the build's default or `RT_ENGINE`.
+    ///
+    /// Callers that need an EXPORTABLE pane need a way to ask for one:
+    /// `export` refuses on the vendored engine by design, so "spawn, then
+    /// discover you cannot move it" is not a usable contract. Phase 2b's
+    /// session layer needs this for the same reason.
+    pub fn spawn_vt_env(
+        shell: Option<(String, Vec<String>)>,
+        working_directory: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+        env: &[(String, String)],
+        scrollback: usize,
+    ) -> std::io::Result<TermPane> {
+        Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
+            shell, working_directory, cols, rows, env, scrollback,
+        )?))
+    }
+
     pub fn pid(&self) -> Option<u32> {
         match self {
             Self::Alac(p) => p.pid(),
