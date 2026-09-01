@@ -3,7 +3,14 @@
 //! PTY → EventLoop → Term → snapshot path without a display.
 
 use rt_engine::TermPane;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// A fresh, unshared budget per test — each test is its own process-wide host in
+/// miniature, so it gets its own coordinator rather than reaching for a global.
+fn test_budget() -> Arc<rt_engine::budget::Budget> {
+    Arc::new(rt_engine::budget::Budget::default())
+}
 
 /// Spawn `sh -c "printf ..."`, poll the snapshot until the text appears (or a
 /// timeout elapses), and assert we saw it. Polling (rather than a fixed sleep)
@@ -19,7 +26,7 @@ fn shell_output_reaches_the_grid() {
         vec!["-c".to_string(), format!("printf '{marker}'")],     // print marker, no newline needed
     ));
     // 80x24 is the classic default terminal size; plenty for our marker.
-    let pane = TermPane::spawn(shell, None, 80, 24).expect("pane spawns");
+    let pane = TermPane::spawn(shell, None, 80, 24, &test_budget()).expect("pane spawns");
 
     // Poll for up to 5 seconds for the marker to show up in the grid.
     let deadline = Instant::now() + Duration::from_secs(5); // hard cap
@@ -46,6 +53,7 @@ fn input_round_trips_through_the_shell() {
         None,
         80,
         24,
+        &test_budget(),
     )
     .expect("pane spawns");
 
@@ -79,6 +87,7 @@ fn child_exit_emits_exited_event() {
         None,
         80,
         24,
+        &test_budget(),
     )
     .expect("pane spawns");
 

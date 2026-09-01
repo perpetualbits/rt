@@ -1080,42 +1080,24 @@ pub enum TermPane {
     Vt(vtpane::VtPane),
 }
 
-/// The scrollback budget coordinator `TermPane`'s own dispatcher (`spawn_env`,
-/// `spawn_vt_env`) hands to every `VtPane` it creates, since `TermPane`'s own signature —
-/// used directly by `rt`, `rt-session`, and `rt-mux` — doesn't (yet) take one as a
-/// parameter.
-///
-/// This is deliberately the ONLY `static` anywhere in the scrollback-budget feature:
-/// `budget::Budget` itself holds no global state (see its module doc) and every test
-/// builds its own instance. This one exists solely so `TermPane::spawn_env`'s *existing*
-/// callers keep compiling unchanged while still getting a real, shared, process-wide
-/// budget for the panes they actually spawn through it — lazily created on first use, one
-/// per process, exactly what a host owning `Arc::new(Budget::default())` up front and
-/// threading it down would also give them.
-///
-/// It is an interim shim, not the intended end state: `budget::Budget`'s whole design is
-/// "the host owns it and passes it down" (see `budget.rs`'s module doc and
-/// `VtPane::spawn_env`'s `budget` parameter), and threading an explicit `&Arc<Budget>`
-/// through `TermPane::spawn_env`/`spawn_vt_env` down to `rt`'s `App`, `rt-session`, and
-/// `rt-mux` would let this go away — each of those becoming an explicit "host" in the
-/// sense `budget.rs` means, rather than an implicit one sharing this default. That's
-/// broader than this change (`rt-mux` in particular doesn't even run `VtPane` today, so it
-/// would need to opt in on its own), so it's left for whoever does that wiring.
-fn process_default_budget() -> Arc<budget::Budget> {
-    static DEFAULT: std::sync::OnceLock<Arc<budget::Budget>> = std::sync::OnceLock::new();
-    DEFAULT.get_or_init(|| Arc::new(budget::Budget::default())).clone()
-}
-
 impl TermPane {
     /// Spawn a pane; the backend is chosen by `RT_ENGINE` (`vtterm` → in-house, anything
-    /// else / unset → the vendored alacritty engine).
+    /// else / unset → the vendored alacritty engine). `budget` is the caller's process-wide
+    /// scrollback budget coordinator (see `crate::budget::Budget`) — every `Vt` pane spawned
+    /// registers with it; the vendored `Alac` backend does not participate (a known, tracked
+    /// gap: it has no per-pane byte accounting to register). The caller owns `budget`,
+    /// typically one `Arc<Budget>` created once at startup and passed to every pane spawn —
+    /// there is no default or fallback here, deliberately: a hidden per-process default was
+    /// tried and rejected (see the fix-round-2 report) because it was still shared, global
+    /// state that every caller, including tests, silently touched.
     pub fn spawn(
         shell: Option<(String, Vec<String>)>,
         working_directory: Option<std::path::PathBuf>,
         cols: usize,
         rows: usize,
+        budget: &Arc<budget::Budget>,
     ) -> std::io::Result<Self> {
-        Self::spawn_env(shell, working_directory, cols, rows, &[], DEFAULT_SCROLLBACK)
+        Self::spawn_env(shell, working_directory, cols, rows, &[], DEFAULT_SCROLLBACK, budget)
     }
 
     /// Like [`spawn`](Self::spawn) with extra child env + explicit scrollback.
@@ -1126,6 +1108,7 @@ impl TermPane {
         rows: usize,
         env: &[(String, String)],
         scrollback: usize,
+        budget: &Arc<budget::Budget>,
     ) -> std::io::Result<Self> {
         // Engine selection: `RT_ENGINE` wins if set (`vtterm` / `alacritty`); otherwise the
         // default is baked in at build time — the `vtterm-default` feature makes the
@@ -1150,7 +1133,7 @@ impl TermPane {
         });
         if use_vtterm {
             Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
-                shell, working_directory, cols, rows, env, scrollback, &process_default_budget(),
+                shell, working_directory, cols, rows, env, scrollback, budget,
             )?))
         } else {
             Ok(TermPane::Alac(AlacPane::spawn_env(
@@ -1173,9 +1156,10 @@ impl TermPane {
         rows: usize,
         env: &[(String, String)],
         scrollback: usize,
+        budget: &Arc<budget::Budget>,
     ) -> std::io::Result<TermPane> {
         Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
-            shell, working_directory, cols, rows, env, scrollback, &process_default_budget(),
+            shell, working_directory, cols, rows, env, scrollback, budget,
         )?))
     }
 

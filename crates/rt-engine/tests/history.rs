@@ -3,7 +3,13 @@
 //! reaches into scrollback and confirm the older lines are there, in order.
 
 use rt_engine::TermPane;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// A fresh, unshared budget per test.
+fn test_budget() -> Arc<rt_engine::budget::Budget> {
+    Arc::new(rt_engine::budget::Budget::default())
+}
 
 /// Print 60 numbered lines into an 80x24 terminal (so ~36 lines land in
 /// scrollback), then read a wide range through history and assert both an early
@@ -17,6 +23,7 @@ fn snapshot_lines_reads_scrollback_in_order() {
         None,
         80,
         24,
+        &test_budget(),
     )
     .expect("pane spawns");
 
@@ -64,6 +71,7 @@ fn scroll_up_reveals_history_not_blanks() {
         None,
         80,
         24,
+        &test_budget(),
     )
     .expect("pane spawns");
 
@@ -99,6 +107,7 @@ fn search_finds_hits_across_scrollback() {
         None,
         80,
         24,
+        &test_budget(),
     )
     .expect("pane spawns");
 

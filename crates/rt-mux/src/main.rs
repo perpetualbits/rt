@@ -30,6 +30,7 @@ use std::io::{self, Read, Stdout, Write}; // stdout backend + Result + pipe I/O
 use std::os::unix::ffi::OsStrExt; // OsStr -> bytes for CString
 use std::os::unix::fs::OpenOptionsExt; // custom_flags for O_NONBLOCK
 use std::path::{Path, PathBuf}; // fifo paths
+use std::sync::Arc; // shared, process-wide scrollback budget
 use std::time::{Duration, Instant}; // frame pacing
 
 /// Number of green "packets" spaced evenly around each pane's border ring. They
@@ -328,6 +329,16 @@ struct Mux {
     /// The tiling area from the last frame, used by directional focus (which
     /// needs a viewport but runs before the next draw computes one).
     area: Rect,
+    /// This process's scrollback memory budget, shared proportionally across every
+    /// pane rt-mux spawns (see `rt_engine::budget::Budget`). Created once here and
+    /// handed to every `TermPane::spawn_env` call below — rt-mux is a second host of
+    /// the same engine `rt` is, so it owns its own coordinator rather than sharing a
+    /// hidden default. NOTE: rt-mux currently runs the vendored `AlacPane` backend
+    /// (it neither sets `RT_ENGINE` nor builds with `vtterm-default`), which does not
+    /// register with `Budget` at all — this field exists so the plumbing is correct
+    /// and ready the day rt-mux opts into the in-house engine, but today it bounds
+    /// nothing. That gap is tracked separately and is not this change's job to close.
+    budget: Arc<rt_engine::budget::Budget>,
 }
 
 impl Mux {
@@ -338,6 +349,7 @@ impl Mux {
         // when set, so it's per-user tmpfs and auto-removed on logout).
         let dir = mux_base().join(format!("rt-mux-{}", std::process::id()));
         ensure_mux_dir(&dir)?; // 0700, owned, no planted nodes — or refuse to start
+        let budget = Arc::new(rt_engine::budget::Budget::default());
         let mut mux = Mux {
             tree: Tree::new(Node::Tile(1)), // start with one leaf, id 1
             panes: HashMap::new(),
@@ -366,12 +378,13 @@ impl Mux {
             next_id: 2, // 1 is taken by the first pane
             prefix_armed: false,
             area,
+            budget,
         };
         // Size the first pane to the content area (screen minus the 1-cell frame).
         let cols = area.width.saturating_sub(2).max(1) as usize;
         let rows = area.height.saturating_sub(2).max(1) as usize;
         let env = mux.make_jacks(1); // its $RT_OUT / $RT_IN
-        let pane = TermPane::spawn_env(None, None, cols, rows, &env, rt_engine::DEFAULT_SCROLLBACK)?; // None = default login shell
+        let pane = TermPane::spawn_env(None, None, cols, rows, &env, rt_engine::DEFAULT_SCROLLBACK, &mux.budget)?; // None = default login shell
         mux.panes.insert(1, pane);
         mux.tree.focus_set(1); // focus the only pane
         Ok(mux)
@@ -398,7 +411,7 @@ impl Mux {
         let id = self.next_id; // candidate id (committed only on success)
         let env = self.make_jacks(id);
         // 80x24 is only a seed; `render` resizes every pane to its tile each frame.
-        match TermPane::spawn_env(None, None, 80, 24, &env, rt_engine::DEFAULT_SCROLLBACK) {
+        match TermPane::spawn_env(None, None, 80, 24, &env, rt_engine::DEFAULT_SCROLLBACK, &self.budget) {
             Ok(pane) => {
                 self.next_id += 1;
                 self.panes.insert(id, pane);

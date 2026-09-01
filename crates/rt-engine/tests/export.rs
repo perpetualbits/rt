@@ -4,6 +4,7 @@
 //! the whole path — fork, pty, reader thread, parser, grid — and is what would
 //! catch a break between them.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rt_engine::TermPane;
@@ -11,6 +12,10 @@ use rt_engine::TermPane;
 /// Spawn a shell running `script`, then poll until `probe` sees what it wants
 /// or the deadline passes. Draining events is what a real host does each frame.
 fn pane_running(script: &str, cols: usize, rows: usize, probe: impl Fn(&TermPane) -> bool) -> TermPane {
+    // Each call gets its own budget: `pane_running` is invoked once per test, so this
+    // keeps every test's pane isolated from every other test's, exactly as `Budget`'s
+    // design intends (no shared, global coordinator state between tests).
+    let budget = Arc::new(rt_engine::budget::Budget::default());
     let pane = TermPane::spawn_vt_env(
         Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
         None,
@@ -18,6 +23,7 @@ fn pane_running(script: &str, cols: usize, rows: usize, probe: impl Fn(&TermPane
         rows,
         &[],
         10_000,
+        &budget,
     )
     .expect("spawn a pane");
 

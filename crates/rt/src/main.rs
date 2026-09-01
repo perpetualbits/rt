@@ -604,6 +604,12 @@ struct App {
     // mutually exclusive with a drag (`enter_carry` cancels one to start the
     // other).
     carry: Option<CarryState>,
+    /// This process's scrollback memory budget, shared proportionally across every
+    /// pane every window spawns (see `rt_engine::budget::Budget`). Created once in
+    /// `main` and cloned into each window's pane-spawn closure — one coordinator for
+    /// the whole app, not per-window, since scrollback memory is a process-wide
+    /// resource regardless of which window a pane lives in.
+    budget: std::sync::Arc<rt_engine::budget::Budget>,
 }
 
 /// A left-press on a pane titlebar or a tab label. It is not a drag yet — it
@@ -1096,6 +1102,10 @@ impl App {
         // Preferences takes effect for the next terminal without a restart.
         let scrollback = Rc::new(std::cell::Cell::new(settings.scrollback));
         let scrollback_spawn = scrollback.clone();
+        // This window's spawn closure shares the app-wide budget (cloning the Arc,
+        // not the coordinator) so every pane in every window reports into the same
+        // process-wide total.
+        let budget_spawn = self.budget.clone();
         // The factory spawns a shell-backed pane at the requested cell size.
         // Returning `None` on failure lets the session refuse the split/tab
         // gracefully (the initial pane's failure is startup-fatal, handled in
@@ -1117,7 +1127,7 @@ impl App {
                 }
                 _ => Vec::new(), // no jacks: the pane still runs, just unwireable
             };
-            let mut pane = match TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get()) {
+            let mut pane = match TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get(), &budget_spawn) {
                 Ok(pane) => pane,
                 Err(e) => {
                     // Out of ptys/fds: report it and let the session refuse the pane
@@ -7292,6 +7302,7 @@ fn main() {
         armed_drag: None,
         drag: None,
         carry: None,
+        budget: std::sync::Arc::new(rt_engine::budget::Budget::default()),
     };
     if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
