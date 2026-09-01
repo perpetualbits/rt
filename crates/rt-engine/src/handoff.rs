@@ -173,6 +173,65 @@ pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
     Line { flags, runs }
 }
 
+use rt_handoff::grid::Grid;
+use vt_term::Term;
+
+/// The currently visible screen, one wire line per row.
+pub fn screen_to_grid(term: &Term, styles: &mut StyleTable) -> Grid {
+    let cols = term.cols();
+    let lines = (0..term.rows())
+        .map(|r| {
+            let cells: Vec<Cell> = (0..cols).map(|c| term.cell(r, c)).collect();
+            row_to_line(&cells, styles)
+        })
+        .collect();
+    Grid { lines }
+}
+
+/// The screen held aside while the other one is displayed, if any.
+pub fn inactive_to_grid(term: &Term, styles: &mut StyleTable) -> Option<Grid> {
+    let rows = term.inactive_rows()?;
+    let cols = term.cols();
+    let lines = (0..rows)
+        .map(|r| {
+            let cells: Vec<Cell> =
+                (0..cols).map(|c| term.inactive_cell(r, c).unwrap_or_default()).collect();
+            row_to_line(&cells, styles)
+        })
+        .collect();
+    Some(Grid { lines })
+}
+
+/// Scrollback above the visible screen, NEWEST FIRST and capped at `budget`.
+///
+/// Newest-first is deliberate: a transfer that is cancelled or runs into the
+/// receiver's budget keeps the history nearest the prompt, which is the part
+/// anyone would miss.
+///
+/// Absolute line numbers (see `Term::cell_at`): `0..rows` is the visible
+/// screen (row 0 is its top), and scrollback is negative — `-1` is the line
+/// immediately above the visible screen's top row, down to `topmost()`
+/// (`-history_size()`), the oldest retained line. So the newest scrollback
+/// line is always `-1`, never a function of `rows()`/`bottommost()`: the
+/// brief's `bottommost() - rows() + 1` collapses to `0`, which is the
+/// visible top row, not scrollback — it would duplicate that row into the
+/// scrollback output (and return one bogus line even with zero history).
+pub fn scrollback_newest_first(term: &Term, budget: usize, styles: &mut StyleTable) -> Vec<Line> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    let cols = term.cols();
+    let oldest = term.topmost();
+    let mut out = Vec::new();
+    let mut abs = -1i32;
+    while abs >= oldest && out.len() < budget {
+        let cells: Vec<Cell> = (0..cols).map(|c| term.cell_at(abs, c)).collect();
+        out.push(row_to_line(&cells, styles));
+        abs -= 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +422,92 @@ mod tests {
         let grid = rt_handoff::grid::Grid { lines };
         let bytes = grid.write();
         assert_eq!(rt_handoff::grid::Grid::read(&bytes, 0x40).unwrap(), grid);
+    }
+
+    #[test]
+    fn the_visible_screen_becomes_the_primary_grid() {
+        let mut t = vt_term::Term::new(20, 3);
+        t.feed(b"one\r\ntwo\r\nthree");
+        let mut st = StyleTable::new();
+        let g = screen_to_grid(&t, &mut st);
+        assert_eq!(g.lines.len(), 3, "one wire line per visible row");
+        assert_eq!(g.lines[0].runs[0].text, "one");
+        assert_eq!(g.lines[2].runs[0].text, "three");
+    }
+
+    #[test]
+    fn there_is_no_inactive_grid_on_the_primary_screen() {
+        let t = vt_term::Term::new(20, 3);
+        let mut st = StyleTable::new();
+        assert!(inactive_to_grid(&t, &mut st).is_none());
+    }
+
+    #[test]
+    fn the_alt_screen_puts_the_primary_content_in_the_inactive_grid() {
+        let mut t = vt_term::Term::new(20, 3);
+        t.feed(b"PRIMARY");
+        t.feed(b"\x1b[?1049h");
+        // Entering the alt screen clears its content but, matching real xterm
+        // 1049 semantics, leaves the cursor exactly where it was on the
+        // primary screen (row 0, col 7, right after "PRIMARY") — it does not
+        // home it. A real full-screen app (vim, less) always homes the
+        // cursor itself before drawing; do the same here, or "ALT" lands at
+        // columns 7..10 and `runs[0]` is a leading blank run, not "ALT".
+        t.feed(b"\x1b[H");
+        t.feed(b"ALT");
+        let mut st = StyleTable::new();
+        let visible = screen_to_grid(&t, &mut st);
+        let inactive = inactive_to_grid(&t, &mut st).expect("primary is held aside");
+        assert_eq!(visible.lines[0].runs[0].text, "ALT", "primary grid = what is on screen");
+        assert_eq!(inactive.lines[0].runs[0].text, "PRIMARY");
+        assert!(t.alt_screen(), "and active_screen will be 1");
+    }
+
+    #[test]
+    fn scrollback_comes_back_newest_first() {
+        let mut t = vt_term::Term::new(20, 2);
+        for i in 0..6 {
+            t.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let mut st = StyleTable::new();
+        let lines = scrollback_newest_first(&t, 100, &mut st);
+        assert!(!lines.is_empty(), "six lines through a two-row screen leaves history");
+        let first_text = &lines[0].runs[0].text;
+        let last_text = &lines[lines.len() - 1].runs[0].text;
+        let first_n: usize = first_text.trim_start_matches("line").parse().unwrap();
+        let last_n: usize = last_text.trim_start_matches("line").parse().unwrap();
+        assert!(first_n > last_n, "newest first: {first_text} must precede {last_text}");
+    }
+
+    #[test]
+    fn the_scrollback_budget_keeps_the_newest_lines() {
+        let mut t = vt_term::Term::new(20, 2);
+        for i in 0..30 {
+            t.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let mut st = StyleTable::new();
+        let all = scrollback_newest_first(&t, 1000, &mut st);
+        let mut st2 = StyleTable::new();
+        let capped = scrollback_newest_first(&t, 5, &mut st2);
+        assert_eq!(capped.len(), 5, "the budget is a hard cap");
+        assert_eq!(capped[0].runs[0].text, all[0].runs[0].text, "and it keeps the NEWEST");
+    }
+
+    #[test]
+    fn a_zero_budget_yields_no_scrollback() {
+        let mut t = vt_term::Term::new(20, 2);
+        for i in 0..10 {
+            t.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let mut st = StyleTable::new();
+        assert!(scrollback_newest_first(&t, 0, &mut st).is_empty());
+    }
+
+    #[test]
+    fn a_pane_with_no_history_yields_no_scrollback() {
+        let mut t = vt_term::Term::new(20, 10);
+        t.feed(b"just one line");
+        let mut st = StyleTable::new();
+        assert!(scrollback_newest_first(&t, 100, &mut st).is_empty());
     }
 }
