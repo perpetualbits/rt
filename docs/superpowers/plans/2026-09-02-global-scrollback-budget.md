@@ -6,7 +6,7 @@
 
 **Why:** `SCROLLBACK_MEMORY_BUDGET` is **1 GiB per pane** (`crates/rt-engine/src/vtpane.rs:39`) and its comment claims it "bounds the worst case". It bounds it per pane: with 60 panes that is a 60 GiB ceiling and no process-wide limit at all. It has never actually bitten only because the configured line cap (100 000 in the user's config) reaches its limit first at roughly 12 MB/pane. Raise the line slider and nothing catches it.
 
-**Architecture:** A process-wide registry of live panes in `rt-engine`, holding `Weak<Mutex<Term>>`. A `rebalance()` call sums each pane's `history_bytes`; when the total exceeds the global budget it recomputes每 pane's BYTE cap proportional to that pane's current usage (with a floor) and calls the existing `Term::set_scrollback`, whose `trim_history` does the eviction under the pane's own lock. No cross-pane locking during eviction, and no new eviction logic — the coordinator only moves the caps.
+**Architecture:** A process-wide registry of live panes in `rt-engine`, holding `Weak<Mutex<Term>>`. A `rebalance()` call sums each pane's `history_bytes`; when the total exceeds the global budget it recomputes each pane's BYTE cap proportional to that pane's current usage (with a floor) and calls the existing `Term::set_scrollback`, whose `trim_history` does the eviction under the pane's own lock. No cross-pane locking during eviction, and no new eviction logic — the coordinator only moves the caps.
 
 **Tech Stack:** Rust 2021, no new dependencies.
 
