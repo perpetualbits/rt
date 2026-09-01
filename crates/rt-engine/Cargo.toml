@@ -29,3 +29,4 @@ own = []
 alacritty_terminal = { path = "../../vendor/alacritty_terminal", optional = true }  # vendored throughput fork (see docs/vendored-engine.md)
 libc = "0.2"  # PTY read/write/ioctl for the in-house (vt-term) backend
 vt-term = { path = "../vt-term" }  # the in-house Term (RT_ENGINE=vtterm backend)
+rt-handoff = { path = "../rt-handoff" }  # the frozen cross-process wire model
