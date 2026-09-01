@@ -15,6 +15,9 @@ use std::collections::VecDeque;
 use unicode_width::UnicodeWidthChar;
 use vt_parser::{Params, Parser, Perform};
 
+mod state;
+pub use state::SavedCursor;
+
 /// Maximum scrollback lines, matching the vendored oracle's `scrolling_history`.
 /// Default scrollback cap (lines), matching the vendored oracle's `scrolling_history`.
 /// A live `Term` raises this (and adds a memory budget) via [`Term::set_scrollback`];
