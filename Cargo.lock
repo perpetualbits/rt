@@ -1405,6 +1405,7 @@ version = "0.3.19"
 dependencies = [
  "alacritty_terminal",
  "libc",
+ "rt-handoff",
  "vt-term",
 ]
 

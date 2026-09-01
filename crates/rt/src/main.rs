@@ -25,6 +25,7 @@ mod clip_history; // in-memory clipboard history: bounded most-recently-used rin
 mod damage; // pure pixel-rect damage accumulator
 mod dragdrop; // pure drop-target resolver for cross-window pane/tab drag-and-drop
 mod carry_card; // pure RGBA held-pane card builder
+mod crashlog; // panic hook + stderr sink, so a crash leaves evidence behind
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
@@ -1379,6 +1380,33 @@ impl ApplicationHandler for App {
         // (mirrors RT_OPEN_MANUAL).
         if std::env::var_os("RT_OPEN_PREFS").is_some() {
             Self::open_prefs(&mut active);
+        }
+        // Debug/verification hook: RT_SOAK_LAYOUT="TABSxPANES" (e.g. "20x3") builds a
+        // large layout at startup — N tabs, M panes each — so a soak can drive many
+        // live shells without synthetic input. Input injection was not an option: the
+        // headless compositors available here do not implement the virtual-keyboard
+        // protocol, and kernel-level injection would land in whatever window the user
+        // actually has focused. Each pane runs $SHELL as usual, so the workload is
+        // chosen by the caller's environment rather than baked in here.
+        if let Ok(spec) = std::env::var("RT_SOAK_LAYOUT") {
+            let (tabs, panes) = spec.split_once('x').unwrap_or(("1", "1"));
+            let tabs: usize = tabs.parse().unwrap_or(1);
+            let panes: usize = panes.parse().unwrap_or(1);
+            for t in 0..tabs.max(1) {
+                if t > 0 {
+                    active.session.apply(rt_config::Action::NewTab);
+                }
+                for p in 1..panes.max(1) {
+                    // Alternate the axis so panes stay usably shaped rather than
+                    // degenerating into slivers along one dimension.
+                    active.session.apply(if p % 2 == 1 {
+                        rt_config::Action::SplitVert
+                    } else {
+                        rt_config::Action::SplitHoriz
+                    });
+                }
+            }
+            eprintln!("rt: RT_SOAK_LAYOUT={spec} -> {tabs} tabs x {panes} panes");
         }
         // Debug/verification hook: RT_WIRE_DEMO builds a live patch-bay scene —
         // split, wire pane1.stdout → pane2.stdin, and run a producer + reader — so
@@ -7206,6 +7234,13 @@ fn build_event_loop() -> EventLoop {
 }
 
 fn main() {
+    // FIRST, before anything can fail: make a crash leave evidence. rt takes
+    // every tab, pane and shell with it when it dies, and three crashes had
+    // produced nothing to go on — no core (apport skips unpackaged binaries),
+    // no stderr (the desktop launcher keeps none), no log.
+    crashlog::capture_stderr_if_not_a_tty();
+    crashlog::install_panic_hook();
+    crashlog::selftest_if_asked();
     // Honour RUST_LOG, but default to showing warnings+errors even when it's unset —
     // otherwise a GL/window-creation failure (logged via log::error!) is silent and the
     // user just sees a blank window with no clue why. RUST_LOG still overrides for more.

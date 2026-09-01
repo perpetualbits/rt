@@ -27,7 +27,17 @@ codegen-units = 1                    # let the optimiser see whole crates (slowe
 panic = "unwind"                     # per-pane crash isolation: a panic in one pane's parser/render
                                      # unwinds its thread (caught, pane marked crashed) instead of
                                      # aborting the whole app and every other pane with it
-strip = true                         # drop symbols from release artifacts shipped in packages
+# Keep the symbol table. `strip = true` made every backtrace frame `<unknown>`
+# in release — worthless in exactly the build that crashes, and rt takes every
+# tab, pane and shell with it when it does. Measured on this binary:
+#   strip = true         7.6M   frames are all <unknown>          (useless)
+#   strip = "debuginfo"  9.1M   frames are named functions        (chosen)
+#   strip = "none"      35.0M   frames are named + file:line
+# Named frames identify the code path, which is what a crash report needs; +20%
+# buys that, where file:line costs +360%. If a real crash's names are not enough,
+# rebuild once with strip = "none" to get lines for that trace.
+debug = "line-tables-only"
+strip = "debuginfo"
 
 # Vendored throughput fork: the vendored alacritty_terminal (path dep in
 # rt-engine) needs the forked vte that adds the batched input_run/print_str hook.

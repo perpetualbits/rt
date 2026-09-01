@@ -15,6 +15,9 @@ use std::collections::VecDeque;
 use unicode_width::UnicodeWidthChar;
 use vt_parser::{Params, Parser, Perform};
 
+mod state;
+pub use state::SavedCursor;
+
 /// Maximum scrollback lines, matching the vendored oracle's `scrolling_history`.
 /// Default scrollback cap (lines), matching the vendored oracle's `scrolling_history`.
 /// A live `Term` raises this (and adds a memory budget) via [`Term::set_scrollback`];
@@ -144,12 +147,28 @@ impl Cell {
     }
     /// A [`SPACER`] written as the before-wrap placeholder (alacritty's
     /// `LEADING_WIDE_CHAR_SPACER`), not an ordinary trailing spacer. Meaningless if
-    /// `spacer()` is false.
-    fn leading_spacer(&self) -> bool {
+    /// `spacer()` is false. A caller distinguishing a wide glyph's real second
+    /// cell from the invisible before-wrap placeholder (e.g. `rt-engine`'s
+    /// handoff export, deciding whether the PREVIOUS cell is wide) needs this:
+    /// both set `spacer()`, and only this flag tells them apart.
+    pub fn leading_spacer(&self) -> bool {
         self.flags & LEADING != 0
     }
     pub fn wrapline(&self) -> bool {
         self.flags & WRAPLINE != 0
+    }
+    /// Whether this cell's CHARACTER is double-width (CJK/emoji), i.e. it occupies two
+    /// columns and owns a trailing [`SPACER`] beside it when the grid is well formed.
+    ///
+    /// Derived from the character, deliberately: `delete_chars`, `erase_chars` and the
+    /// insert-mode shift do raw cell moves with no wide-glyph cleanup (matching
+    /// alacritty), so a glyph can end up with no spacer and a spacer can end up with no
+    /// glyph. Anything that must know a cell's column width — `rt-engine`'s handoff
+    /// export, say — has to ask the glyph, not its neighbour. Spacers themselves carry
+    /// `c == ' '` and so are never wide by this test, which is what makes an orphaned
+    /// spacer classifiable as the one blank column it really is.
+    pub fn is_wide(&self) -> bool {
+        char_width(self.c) == 2
     }
 }
 

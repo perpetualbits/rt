@@ -220,7 +220,10 @@ pub struct SavedCursor {
     pub col: usize,
     pub pen: Cell,
     pub origin: bool,
-    pub autowrap: bool,
+    /// The DEFERRED-WRAP flag saved by DECSC — NOT autowrap/DECAWM. Verified
+    /// against the DECSC write site and the DECRC read site; the declaration's
+    /// bare `bool` gives no hint, and the two are easy to confuse.
+    pub pending_wrap: bool,
     pub charsets: [Charset; 4],
 }
 
@@ -279,8 +282,8 @@ impl Term {
     /// rather than being optional, matching DECRC's behaviour before any DECSC.
     pub fn saved_cursor(&self) -> SavedCursor {
         // Element order confirmed against the DECSC/DECRC handlers in lib.rs.
-        let (row, col, pen, origin, autowrap, charsets) = self.saved_cursor;
-        SavedCursor { row, col, pen, origin, autowrap, charsets }
+        let (row, col, pen, origin, pending_wrap, charsets) = self.saved_cursor;
+        SavedCursor { row, col, pen, origin, pending_wrap, charsets }
     }
 
     /// True when a screen is being held aside — i.e. the alt screen is active
@@ -302,7 +305,7 @@ impl Term {
     /// caller that only ever reads cells.
     pub fn inactive_cell(&self, row: usize, col: usize) -> Option<Cell> {
         let saved = self.saved_screen.as_ref()?;
-        saved.0.get(row).and_then(|line| line.get(col)).copied()
+        saved.0.get(row).and_then(|line| line.cells.get(col)).copied()
     }
 }
 ```
@@ -653,7 +656,12 @@ pub fn row_to_line(cells: &[Cell], styles: &mut StyleTable) -> Line {
     while i < cells.len() {
         let cell = &cells[i];
         let style_id = styles.intern(cell);
-        let wide = i + 1 < cells.len() && cells[i + 1].spacer();
+        // NOT just `spacer()`: that flag is ALSO set on the before-wrap
+        // placeholder written when a wide glyph will not fit the last column.
+        // Folding one of those into the preceding cell would tag a narrow
+        // glyph as double-width, undetectably — the wire's invariants still
+        // hold, so nothing downstream would catch it.
+        let wide = i + 1 < cells.len() && is_trailing_spacer(&cells[i + 1]);
 
         if is_blank(cell) && !wide {
             // A stretch of blanks in one style: no text, just a span.
@@ -867,10 +875,13 @@ pub fn scrollback_newest_first(term: &Term, budget: usize, styles: &mut StyleTab
         return Vec::new();
     }
     let cols = term.cols();
-    // Absolute lines: `topmost()` is the oldest retained, `bottommost()` the
-    // newest. The visible screen occupies the last `rows()` of that range, so
-    // scrollback ends just above it.
-    let newest_scrollback = term.bottommost() - term.rows() as i32 + 1;
+    // Absolute lines: 0 IS the first VISIBLE row — `bottommost()` is `rows - 1`
+    // and `topmost()` is `-history_size`. So scrollback is the negative range,
+    // and the newest scrollback line is -1. (Deriving it as
+    // `bottommost() - rows() + 1` gives 0, which is the top VISIBLE row: that
+    // duplicates it into scrollback and, with no history at all, invents a line.
+    // Verified empirically against a live Term.)
+    let newest_scrollback: i32 = -1;
     let oldest = term.topmost();
     let mut out = Vec::new();
     let mut abs = newest_scrollback;
@@ -1112,7 +1123,11 @@ pub fn export_term(
     let screen_alt = inactive_to_grid(term, &mut styles);
     let scrollback = scrollback_newest_first(term, scrollback_budget, &mut styles);
 
-    let (crow, ccol) = term.cursor();
+    // NB: `cursor()` returns (COL, ROW) — column first. The `saved_cursor`
+    // tuple is the other way round, (row, col, ...). Same crate, same concept,
+    // opposite order. Getting this backwards transposes every exported cursor
+    // and no wire invariant can detect it.
+    let (ccol, crow) = term.cursor();
     let sc = term.saved_cursor();
     let (top, bottom) = term.margins();
 
@@ -1286,9 +1301,19 @@ The third test needs a way to force the alacritty backend regardless of the
 build's default. If no such test constructor exists, add one — a
 `#[cfg(test)]`-only associated function on `TermPane` that calls
 `AlacPane::spawn_env` directly and returns `None` when the `vendored` feature
-is off. Do not achieve it by setting `RT_ENGINE` from the test: the engine
-choice is read once per process behind a `Once`, so an env var set inside one
-test would leak into every other test in the binary.
+is off. Do not achieve it by setting `RT_ENGINE` from the test. The variable is
+process-global and cargo runs a binary's tests on parallel threads, so a test
+that mutates it corrupts every sibling test in the same binary — not
+hypothetical, it is the measured one-run-in-three flake `engine_default.rs` had
+until it was fixed. (The choice is re-read on every spawn at `lib.rs:1108`; the
+`Once` at `:1113` guards only the startup banner. The race is between parallel
+tests, not a cached decision.)
+
+Note also that `rt-engine`'s OWN default features are `["vendored"]` with
+`vtterm-default` OFF — the rt BINARY enables it, the engine crate alone does
+not. So under `cargo test -p rt-engine`, a plain `TermPane::spawn_env` yields
+the ALACRITTY arm, and the tests above that need the in-house engine must
+construct `TermPane::Vt(VtPane::spawn_env(...))` directly.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1386,7 +1411,47 @@ catch a break in the path between the pty, the reader thread and the grid.
 
 **Interfaces:**
 - Consumes: `rt_engine::TermPane`, `rt_handoff::pane::PaneWire`.
-- Produces: nothing; this is the slice's acceptance test.
+- Produces: `TermPane::spawn_vt_env(...)` — a public constructor forcing the in-house engine.
+
+**Why a new constructor.** These tests live in `tests/`, so they link the crate
+EXTERNALLY. `mod vtpane` is private (`lib.rs:19`), so the trick Task 5 used
+in-crate — `TermPane::Vt(VtPane::spawn_env(...))` — is unavailable here. And a
+plain `TermPane::spawn_env` yields the ALACRITTY arm under `cargo test -p
+rt-engine`, because the engine crate's own defaults are `["vendored"]` with
+`vtterm-default` off, so every `.expect()` below would panic.
+
+Add to `crates/rt-engine/src/lib.rs`, beside the other constructors:
+
+```rust
+    /// Spawn a pane on the in-house vt-term engine specifically, regardless of
+    /// the build's default or `RT_ENGINE`.
+    ///
+    /// Callers that need an EXPORTABLE pane need a way to ask for one:
+    /// `export` refuses on the vendored engine by design, so "spawn, then
+    /// discover you cannot move it" is not a usable contract. Phase 2b's
+    /// session layer needs this for the same reason.
+    pub fn spawn_vt_env(
+        shell: Option<(String, Vec<String>)>,
+        working_directory: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+        env: &[(String, String)],
+        scrollback: usize,
+    ) -> std::io::Result<TermPane> {
+        Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
+            shell,
+            working_directory,
+            cols,
+            rows,
+            env,
+            scrollback,
+        )?))
+    }
+```
+
+Match `VtPane::spawn_env`'s real parameter list rather than assuming the shape
+above — verify it before writing. The tests below then call `spawn_vt_env`
+where they currently call `spawn_env`.
 
 - [ ] **Step 1: Write the test**
 
@@ -1406,7 +1471,7 @@ use rt_engine::TermPane;
 /// Spawn a shell running `script`, then poll until `probe` sees what it wants
 /// or the deadline passes. Draining events is what a real host does each frame.
 fn pane_running(script: &str, cols: usize, rows: usize, probe: impl Fn(&TermPane) -> bool) -> TermPane {
-    let mut pane = TermPane::spawn_env(
+    let mut pane = TermPane::spawn_vt_env(
         Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
         None,
         cols,

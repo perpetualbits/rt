@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-08-31"
+    updated: "2026-09-01"
   },
 
   statuses: {
@@ -306,7 +306,8 @@ window.PROJECT_MAP = {
         { label: "Style / grid / pane / tree encoding", status: "done", desc: "Cell styles (indexed colour stays indexed), scrollback grid, whole-pane snapshot, and the split/tab layout tree." },
         { label: "Handshake messages", status: "done", desc: "Hello/Offer/Claim/Adopted/Bye, forward-compatible: an unknown TLV tag is skipped by its length and reported, never fatal. An unknown message TYPE is an error — the frame header's length is what lets the stream survive it, not the decoder." },
         { label: "Golden corpus (wire v1)", status: "done", desc: "32 committed fixtures spanning panes/trees/messages; every future build must decode and re-encode each one byte-for-byte. Demonstrated to fail when the format changes." },
-        { label: "fd passing (SCM_RIGHTS) + snapshot bridge", status: "planned", desc: "Phase 2: move the PTY fd between processes; bridge to/from rt-engine's Snapshot." },
+        { label: "Engine-neutral snapshot bridge (export)", status: "done", desc: "Phase 2a: rt-engine::TermPane::export reads a live in-house-engine pane (grid, scrollback, cursor, modes, style table) into a PaneWire, keeping indexed colours indexed; the vendored-engine arm refuses by name. A pure read under the live lock — no freeze/thaw yet. Real-shell-through-a-real-PTY integration tested, not just fed a Term directly." },
+        { label: "fd passing (SCM_RIGHTS) + adopt()", status: "planned", desc: "Phase 2b/2c: build a pane FROM a PaneWire on the receiving side, and move the PTY fd between processes." },
         { label: "Transfer entry points", status: "planned", desc: "Phase 3: carry across instances, bulk migrate, keyboard picker, X11 XDND." }
       ],
       deps: []
@@ -321,9 +322,10 @@ window.PROJECT_MAP = {
       specs: [{ label: "Engine seam contract", href: "docs/engine-seam.md" }],
       parts: [
         { label: "Agnostic snapshot / damage types", status: "done", desc: "The interface the renderer draws from and the harness drives." },
-        { label: "RT_ENGINE impl selection", status: "done", desc: "in-house default; RT_ENGINE=alacritty selects the vendored fallback." }
+        { label: "RT_ENGINE impl selection", status: "done", desc: "in-house default; RT_ENGINE=alacritty selects the vendored fallback." },
+        { label: "Pane export → rt-handoff wire", status: "done", desc: "TermPane::export(pane_uid, scrollback_budget) reads a live vt-term pane's grid/scrollback/cursor/modes/style table into rt-handoff's PaneWire for a cross-process move; the alacritty arm returns a named ExportError::EngineUnsupported. Host-level fields (title, cwd, group, …) are left for rt-session to overlay in phase 2b." }
       ],
-      deps: ["vt-term", "vendored-oracle"]
+      deps: ["vt-term", "vendored-oracle", "rt-handoff"]
     },
     {
       id: "vendored-oracle", label: "Vendored oracle", layer: "seam", status: "seam",
