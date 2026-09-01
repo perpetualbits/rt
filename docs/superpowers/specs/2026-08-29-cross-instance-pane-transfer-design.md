@@ -341,21 +341,36 @@ Compatibility rules, binding on every future version:
 | 0x0E | `palette` — 256 × RGB, only if OSC-4 overridden | | receiver palette |
 | 0x0F | `tag_names` — list of (varint tag, utf8 short name) for every tag emitted, so a receiver can name what it skipped (R6) | ● | — |
 | 0x20 | `modes` — see below | ● | all defaults |
-| 0x21 | `cursor` { col, row, shape, visible, blink, pending_wrap } | ● | — |
+| 0x21 | `cursor` { col, row, shape, visible, blink, pending_wrap } — `col`/`row` are **0-based** (col 0 is the leftmost column, row 0 the top visible row) | ● | — |
 | 0x22 | `saved_cursor` (DECSC: pos, pen, charsets, origin) | | none |
 | 0x23 | `charsets` — G0..G3 designators + GL/GR locks | | ASCII |
 | 0x24 | `tab_stops` — bitmap over `cols` | | every 8 |
-| 0x25 | `margins` { top, bottom, left, right } | | full screen |
+| 0x25 | `margins` { top, bottom, left, right } — **0-based and INCLUSIVE**: a full 24-row screen is `top: 0, bottom: 23` | | full screen |
 | 0x26 | `title_stack` — list of utf8 (XTPUSHTITLE) | | empty |
 | 0x27 | `pen` — the current SGR state, as a Style entry | ● | default |
 | 0x28 | `active_screen` u8 — 0 primary, 1 alt | | 0 |
 | 0x29 | `kitty_kbd` — keyboard protocol flag stack, modifyOtherKeys level | | off |
 | 0x2A | `pending_raw` — bytes of an incomplete sequence, replayed by R. Its TLV value is itself a length-prefixed byte string, so the length appears twice; `palette` (0x0E) is raw bytes with no inner prefix. Frozen either way — written down because a reimplementer would otherwise guess wrong. | | empty |
 | 0x3F | `style_table` — see below | ● | — |
-| 0x40 | `screen_primary` — GridBlob | ● | — |
-| 0x41 | `screen_alt` — GridBlob | | absent |
+| 0x40 | `screen_primary` — GridBlob. The **VISIBLE** screen, not the ANSI primary one; `active_screen` (0x28) says which that is | ● | — |
+| 0x41 | `screen_alt` — GridBlob. The screen held ASIDE, whichever it is | | absent |
 | 0x50 | `uri_table` — list of (varint id, utf8 uri), OSC 8 | | empty |
 | 0x51 | `image_table` — list of (id, format, w, h, bytes) | | empty (v1 may omit) |
+
+**Two frozen conventions, written down because the names do not carry them.**
+
+*`screen_primary` (0x40) is the VISIBLE screen, not the ANSI primary screen.* When
+`active_screen` (0x28) is 1, 0x40 carries the ALT screen's content and 0x41 carries the
+primary's, held aside. The field name is frozen and misleads; `active_screen` is the
+disambiguator. A receiver that paints 0x40 and then honours `active_screen` is correct;
+one that reads the name literally paints the alt screen into the primary and swaps it
+away.
+
+*`margins` (0x25) and `cursor` (0x21) are 0-based, and margins are INCLUSIVE.* A full
+24-row screen is `top: 0, bottom: 23`; the cursor's home is `col: 0, row: 0`. VT
+sequences are 1-based, so an `adopt()` must convert: `CSI top+1 ; bottom+1 r`, and
+`CSI row+1 ; col+1 H`. Emitting `CSI top ; bottom r` is a one-row scroll-region error
+that renders perfectly until something scrolls, and no encode/decode test can catch it.
 
 **Modes (0x20)** are the version-independence trick. A list of entries:
 
@@ -455,6 +470,17 @@ Written down so it is a decision and not a bug report:
   alongside the saved cursor, but the wire's `saved_cursor` carries only position,
   pen, charsets and origin. The LIVE cursor's `pending_wrap` does travel (0x21); only
   the saved copy is lost, so a DECRC after a move restores without a deferred wrap.
+- **The held-aside screen's own cursor, pen, charsets and pending-wrap.** vt-term
+  saves all of them alongside the screen it puts aside (`saved_screen`), but the wire
+  has nowhere to put them: 0x41 is a grid and nothing else, and 0x21/0x23/0x27 describe
+  the VISIBLE screen. So a pane moved while on the alt screen comes back with the right
+  held-aside content, and leaving the alt screen afterwards restores it with the
+  receiver's current cursor, pen and charsets instead of the ones it was put aside with.
+- **`pending_raw` (0x2A) from the in-house engine.** The field is in the format and a
+  receiver replays it, but `export` always sends it empty: vt-term's parser gives no way
+  to read back the bytes of a sequence it has half-consumed. Phase 2b's freeze/thaw makes
+  it sourceable — until then a move mid-escape-sequence loses that sequence's tail, and
+  the child's next write continues as if it had completed.
 - Selection, search state, and instrument history (deliberately dropped).
 - Inline images if the donor's v1 omits `image_table`; those cells render blank.
 - The child's environment still names the donor's `$RT_OUT`/`$RT_IN` paths — a

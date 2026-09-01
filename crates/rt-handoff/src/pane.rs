@@ -199,7 +199,18 @@ pub struct PaneWire {
     pub uri_table: Vec<(u32, String)>,
     pub image_table: Vec<ImageEntry>,
     pub style_table: Vec<Style>,
+    /// The VISIBLE screen — **not** the ANSI primary screen.
+    ///
+    /// The name is frozen and it misleads: when [`active_screen`](Self::active_screen)
+    /// is 1 this holds the ALT screen's content, and `screen_alt` holds the
+    /// primary's, held aside. Read it as "the screen that is showing", with
+    /// `active_screen` saying which one that is. A receiver that renders
+    /// `screen_primary` and honours `active_screen` is correct; one that assumes
+    /// this is the primary screen paints the alt screen's content into the
+    /// primary and then swaps it away.
     pub screen_primary: Grid,
+    /// The screen held aside, if either screen is. Its own cursor, pen, charsets
+    /// and pending-wrap do NOT travel — see "What does not survive a move".
     pub screen_alt: Option<Grid>,
     /// Names for every tag the donor emitted (0x0F). Filled on decode.
     pub tag_names: Vec<(u64, String)>,

@@ -345,6 +345,18 @@ fn designator(c: vt_term::Charset) -> u8 {
 /// ENGINE-KNOWN FIELDS ONLY. `title`, `cwd`, `group`, `broadcast`,
 /// `columns_count`, `show_titlebar`, `scrollback_limit`, `shell_argv` and
 /// `env_extras` belong to the host and are overlaid by `rt-session`.
+///
+/// `screen_primary` is filled with the VISIBLE screen, whichever it is, and
+/// `active_screen` says which — that is the wire's rule, not a shortcut here.
+/// `cursor` and `margins` go out 0-based, margins inclusive, exactly as
+/// `Term` reports them.
+///
+/// Everything else ships at its default because this engine cannot source it:
+/// `tab_stops`, `title_stack`, `uri_table`, `image_table`, `palette` and
+/// `kitty_kbd` are state vt-term does not track, and `pending_raw` is empty
+/// because `vt_parser` offers no way to read back the bytes of a sequence it
+/// has half-consumed — a pane moved mid-sequence loses that sequence's tail.
+/// Phase 2b's freeze/thaw is what makes `pending_raw` sourceable.
 pub fn export_term(
     term: &Term,
     pane_uid: u64,
@@ -407,7 +419,8 @@ pub fn export_term(
         style_table: styles.into_vec(),
         screen_primary,
         screen_alt,
-        // Left for the host, and the four this engine cannot source.
+        // Left for the host, and the fields this engine cannot source — see
+        // the doc comment above, `pending_raw` included.
         ..PaneWire::default()
     };
 
@@ -997,9 +1010,12 @@ mod tests {
     }
 
     #[test]
-    fn the_four_unsupported_fields_ship_absent() {
-        // vt-term tracks no tab stops, title stack, hyperlinks or images.
-        // Rule R3 means the receiver applies documented defaults.
+    fn the_unsupported_fields_ship_absent() {
+        // vt-term tracks no tab stops, title stack, hyperlinks, images, palette
+        // override or kitty keyboard stack, and `vt_parser` cannot hand back a
+        // half-consumed sequence, so `pending_raw` goes out empty too — it is
+        // sourceable only once phase 2b can freeze/thaw the parser. Rule R3
+        // means the receiver applies documented defaults for all of them.
         let mut t = vt_term::Term::new(20, 4);
         t.feed(b"hello");
         let (p, _) = export_term(&t, 1, 99, 0);
@@ -1007,6 +1023,9 @@ mod tests {
         assert!(p.title_stack.is_empty());
         assert!(p.uri_table.is_empty());
         assert!(p.image_table.is_empty());
+        assert!(p.palette.is_none());
+        assert!(p.kitty_kbd.is_none());
+        assert!(p.pending_raw.is_empty(), "documented as not surviving a 2a move");
     }
 
     #[test]
