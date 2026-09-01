@@ -232,18 +232,26 @@ pub fn inactive_to_grid(term: &Term, styles: &mut StyleTable) -> Option<Grid> {
 ///
 /// Absolute line numbers (see `Term::cell_at`): `0..rows` is the visible
 /// screen (row 0 is its top), and scrollback is negative — `-1` is the line
-/// immediately above the visible screen's top row, down to `topmost()`
-/// (`-history_size()`), the oldest retained line. So the newest scrollback
-/// line is always `-1`, never a function of `rows()`/`bottommost()`: the
-/// brief's `bottommost() - rows() + 1` collapses to `0`, which is the
-/// visible top row, not scrollback — it would duplicate that row into the
-/// scrollback output (and return one bogus line even with zero history).
+/// immediately above the visible screen's top row, down to `-retained_history()`,
+/// the oldest retained line. So the newest scrollback line is always `-1`,
+/// never a function of `rows()`/`bottommost()`: the brief's
+/// `bottommost() - rows() + 1` collapses to `0`, which is the visible top
+/// row, not scrollback — it would duplicate that row into the scrollback
+/// output (and return one bogus line even with zero history).
+///
+/// The walk is bounded by `retained_history()`, NOT by `topmost()`. `topmost()`
+/// is `-history_size()`, and `history_size()` is a VIEWPORT answer: it reports 0
+/// while the alt screen is active, because the alt screen cannot be scrolled
+/// back. The lines are still retained and `cell_at(-1, ..)` still returns them,
+/// so bounding by `topmost()` exported ZERO scrollback for any pane on the alt
+/// screen — vim, less, htop, the panes most worth moving — with no error and no
+/// wire invariant able to notice.
 pub fn scrollback_newest_first(term: &Term, budget: usize, styles: &mut StyleTable) -> Vec<Line> {
     if budget == 0 {
         return Vec::new();
     }
     let cols = term.cols();
-    let oldest = term.topmost();
+    let oldest = -(term.retained_history() as i32);
     let mut out = Vec::new();
     let mut abs = -1i32;
     while abs >= oldest && out.len() < budget {
@@ -760,6 +768,30 @@ mod tests {
         t.feed(b"just one line");
         let mut st = StyleTable::new();
         assert!(scrollback_newest_first(&t, 100, &mut st).is_empty());
+    }
+
+    #[test]
+    fn the_alt_screen_still_exports_the_primarys_scrollback() {
+        // A pane running vim/less/htop is exactly the pane worth moving, and it
+        // is on the alt screen. `history_size()` reports 0 there (the VIEWPORT
+        // cannot scroll back), but the lines are retained and `cell_at(-1, ..)`
+        // returns them — so bounding the walk by `topmost()` dropped the whole
+        // history silently, with nothing on the wire able to tell.
+        let mut t = vt_term::Term::new(20, 3);
+        for i in 0..20 {
+            t.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let mut st = StyleTable::new();
+        let on_primary = scrollback_newest_first(&t, 1000, &mut st);
+        assert!(on_primary.len() > 10, "20 lines through a 3-row screen leaves history");
+
+        t.feed(b"\x1b[?1049h");
+        assert!(t.alt_screen());
+        assert_eq!(t.history_size(), 0, "the viewport really does report no scrollback here");
+
+        let mut st2 = StyleTable::new();
+        let on_alt = scrollback_newest_first(&t, 1000, &mut st2);
+        assert_eq!(on_alt, on_primary, "entering the alt screen must not drop the history");
     }
 
     fn mode_value(p: &rt_handoff::pane::PaneWire, kind: u8, number: u32) -> Option<u8> {

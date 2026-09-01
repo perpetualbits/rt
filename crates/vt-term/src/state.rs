@@ -76,6 +76,22 @@ impl Term {
         self.urgency_hints
     }
 
+    /// How many lines are actually held in scrollback, whichever screen is showing.
+    ///
+    /// NOT the same question as [`Term::history_size`], which answers "how far can
+    /// the viewport scroll from here" and so reports 0 on the alt screen — the alt
+    /// screen has no scrollback of its own, and the primary's is merely held aside.
+    /// The retained lines are still there and still readable through
+    /// [`Term::cell_at`] with a negative line number, which is what an exporter
+    /// needs: a pane running vim or less is exactly the pane whose history is worth
+    /// carrying, and bounding the walk by `history_size()` would silently export
+    /// none of it. History never grows while the alt screen is active (every
+    /// `push_history` site is guarded by `!self.alt`), so this is the primary's
+    /// scrollback, unpolluted.
+    pub fn retained_history(&self) -> usize {
+        self.history.len()
+    }
+
     /// The G0..G3 character-set designations.
     pub fn charsets(&self) -> [Charset; 4] {
         self.charsets

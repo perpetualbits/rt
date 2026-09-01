@@ -165,6 +165,26 @@ fn an_alt_screen_program_exports_both_screens() {
 }
 
 #[test]
+fn an_alt_screen_pane_still_carries_its_scrollback() {
+    // The end-to-end version of the trap: a real program scrolls a real pty,
+    // then switches to the alt screen (vim, less, htop all do). vt-term's
+    // `history_size()` reports 0 from there, so an export bounded by the
+    // VIEWPORT sends an empty scrollback and the receiver silently loses every
+    // line — no error, no wire invariant violated.
+    let pane = pane_running(
+        "for i in $(seq 1 40); do echo line$i; done; printf '\\033[?1049h'; printf 'ONTOP'; sleep 30",
+        20,
+        4,
+        |p| has_text(p, "ONTOP"),
+    );
+    let (wire, scroll) = pane.export(1, 100).unwrap();
+    assert_eq!(wire.active_screen, 1, "the alt screen is showing");
+    assert!(!scroll.is_empty(), "the primary's history must ride along from the alt screen");
+    let newest: String = scroll[0].runs.iter().map(|r| r.text.as_str()).collect();
+    assert!(newest.trim().starts_with("line"), "got {newest:?}");
+}
+
+#[test]
 fn a_wide_glyph_from_a_real_program_spans_two_columns() {
     let pane = pane_running("printf '日本語'; sleep 30", 20, 4, |p| has_all_chars(p, &['日', '本', '語']));
     let (wire, _) = pane.export(1, 0).unwrap();
