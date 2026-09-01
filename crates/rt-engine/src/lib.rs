@@ -18,6 +18,10 @@ mod handoff; // live vt-term cells -> rt-handoff wire runs (pane export)
 mod palette; // xterm 256-colour palette + cell-colour resolution
 mod vtpane; // in-house (vt-term) pane backend, selected by RT_ENGINE=vtterm
 pub use palette::{Palette, Rgb, CURSOR, DEFAULT_BG, DEFAULT_FG}; // colours + configurable palette
+// The frozen cross-process wire model `TermPane::export` produces. Re-exported so a later
+// phase's caller (rt-session) can name `rt_engine::rt_handoff::pane::PaneWire` etc. without
+// adding its own path dependency on rt-handoff.
+pub use rt_handoff;
 // (CursorShape/CursorPos are defined below and used by the renderer.)
 
 use std::borrow::Cow; // Msg::Input takes a Cow<[u8]>; we always own our bytes
@@ -1036,6 +1040,29 @@ impl Drop for AlacPane {
     }
 }
 
+/// Why a pane could not be exported for a cross-process move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportError {
+    /// This pane runs on an engine that cannot export its state. Phase 2 covers
+    /// the in-house vt-term engine; the vendored alacritty engine is the
+    /// differential-testing oracle and fallback, and gains export later if it
+    /// is ever wanted. Named rather than silent so the UI can say which pane
+    /// and why.
+    EngineUnsupported { engine: &'static str },
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportError::EngineUnsupported { engine } => {
+                write!(f, "the {engine} engine cannot export a pane for transfer")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}
+
 /// A terminal pane, backed by either the vendored `alacritty_terminal` engine
 /// ([`AlacPane`]) or the in-house `vt_parser` + `vt_term` engine ([`vtpane::VtPane`]).
 /// Every method dispatches on the variant, so callers (rt's GUI) use one type regardless
@@ -1269,6 +1296,59 @@ impl TermPane {
             Self::Vt(p) => p.drain_events(),
         }
     }
+
+    /// Read this pane's state for a cross-process move. See `ExportError`.
+    ///
+    /// Phase 2 covers the in-house vt-term engine only, by decision: the alacritty arm is a
+    /// named, explicit refusal rather than an omission, so adding export to that engine later
+    /// is filling in an arm, not reshaping this API.
+    pub fn export(
+        &self,
+        pane_uid: u64,
+        scrollback_budget: usize,
+    ) -> Result<(rt_handoff::pane::PaneWire, Vec<rt_handoff::grid::Line>), ExportError> {
+        match self {
+            TermPane::Vt(p) => Ok(p.export(pane_uid, scrollback_budget)),
+            TermPane::Alac(_) => Err(ExportError::EngineUnsupported { engine: "alacritty" }),
+        }
+    }
+
+    /// Test-only: force the vendored alacritty backend regardless of `RT_ENGINE`/the build's
+    /// default, so `the_alacritty_engine_refuses_to_export_by_name` can exercise the refusal
+    /// arm deterministically. `None` when the crate is built without the `vendored` feature
+    /// (no `AlacPane` to construct) — the caller skips the assertion rather than failing.
+    ///
+    /// Deliberately NOT done by setting `RT_ENGINE` from the test: the engine choice in
+    /// `spawn_env` above is process-global (read from the environment on every call, with no
+    /// caching here — but cargo still runs a binary's tests on many threads in one process),
+    /// so a test that mutated it would race every other test spawning a pane in this binary.
+    /// Constructing the variant directly needs no shared, mutable, process-wide state at all.
+    #[cfg(all(test, feature = "vendored"))]
+    fn spawn_env_with_engine_for_test_alac(
+        shell: Option<(String, Vec<String>)>,
+        working_directory: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+        env: &[(String, String)],
+        scrollback: usize,
+    ) -> Option<Self> {
+        Some(TermPane::Alac(
+            AlacPane::spawn_env(shell, working_directory, cols, rows, env, scrollback)
+                .expect("spawn"),
+        ))
+    }
+
+    #[cfg(all(test, not(feature = "vendored")))]
+    fn spawn_env_with_engine_for_test_alac(
+        _shell: Option<(String, Vec<String>)>,
+        _working_directory: Option<std::path::PathBuf>,
+        _cols: usize,
+        _rows: usize,
+        _env: &[(String, String)],
+        _scrollback: usize,
+    ) -> Option<Self> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1373,6 +1453,82 @@ mod vtpane_tests {
         match pane.render_snapshot().damage {
             Damage::Lines(l) => assert!(l.is_empty(), "idle pane reported damage: {l:?}"),
             other => panic!("idle pane should report empty Lines, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_live_vt_pane_exports_its_screen() {
+        // Force the in-house engine deterministically: `TermPane::spawn_env` picks the
+        // backend from `RT_ENGINE`/the build's default feature, neither of which this test
+        // controls, so construct the `Vt` arm directly — the same pattern the other tests in
+        // this module already use (`vtpane_runs_a_real_command` etc.) to test the in-house
+        // backend on its own, without depending on which engine the build defaults to.
+        let pane = TermPane::Vt(
+            vtpane::VtPane::spawn_env(
+                Some(("/bin/sh".into(), vec!["-c".into(), "printf 'EXPORTED'; sleep 5".into()])),
+                None, 40, 6, &[], 1000,
+            )
+            .expect("spawn"),
+        );
+        // Give the child a moment to write, draining events as a real host would.
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = pane.drain_events();
+            if pane.snapshot().rows.iter().any(|r| r.iter().any(|c| c.c == 'E')) {
+                break;
+            }
+        }
+        let (wire, _scroll) = pane.export(42, 0).expect("the in-house engine exports");
+        assert_eq!(wire.pane_uid, 42);
+        assert_eq!(wire.cols, 40);
+        assert_eq!(wire.rows, 6);
+        assert_ne!(wire.child_pid, 0, "the child pid rides along for the pidfd");
+        let text: String = wire.screen_primary.lines[0]
+            .runs
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert!(text.starts_with("EXPORTED"), "got {text:?}");
+    }
+
+    #[test]
+    fn export_does_not_disturb_the_pane() {
+        let pane = TermPane::Vt(
+            vtpane::VtPane::spawn_env(
+                Some(("/bin/sh".into(), vec!["-c".into(), "printf 'ALIVE'; sleep 5".into()])),
+                None, 20, 4, &[], 1000,
+            )
+            .expect("spawn"),
+        );
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = pane.drain_events();
+            if pane.snapshot().rows.iter().any(|r| r.iter().any(|c| c.c == 'A')) {
+                break;
+            }
+        }
+        let (a, _) = pane.export(1, 0).unwrap();
+        let (b, _) = pane.export(1, 0).unwrap();
+        assert_eq!(a.screen_primary, b.screen_primary, "export is a pure read");
+        // And the pane still works afterwards.
+        pane.write(b"\n");
+        assert!(!pane.is_crashed());
+    }
+
+    #[test]
+    fn the_alacritty_engine_refuses_to_export_by_name() {
+        let pane = TermPane::spawn_env_with_engine_for_test_alac(
+            Some(("/bin/sh".into(), vec!["-c".into(), "sleep 5".into()])),
+            None, 20, 4, &[], 1000,
+        );
+        let Some(pane) = pane else {
+            return; // built without the vendored engine; nothing to assert
+        };
+        match pane.export(1, 0) {
+            Err(ExportError::EngineUnsupported { engine }) => {
+                assert_eq!(engine, "alacritty");
+            }
+            other => panic!("expected a named refusal, got {other:?}"),
         }
     }
 }

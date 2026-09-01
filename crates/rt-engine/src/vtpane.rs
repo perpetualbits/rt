@@ -297,6 +297,19 @@ impl VtPane {
         self.scrollback_limit
     }
 
+    /// Read this pane's live state into the cross-process wire model.
+    ///
+    /// A pure read under the term lock: nothing is written, nothing consumed, no
+    /// descriptor moves. Returns the pane plus its scrollback newest-first.
+    pub fn export(
+        &self,
+        pane_uid: u64,
+        scrollback_budget: usize,
+    ) -> (rt_handoff::pane::PaneWire, Vec<rt_handoff::grid::Line>) {
+        let term = self.lock_term();
+        crate::handoff::export_term(&term, pane_uid, self.pid().unwrap_or(0), scrollback_budget)
+    }
+
     /// Lock the shared term, recovering the guard even if a prior parser panic poisoned the
     /// mutex. Pane crash isolation (panic = "unwind") catches a parser/grid panic on the
     /// reader thread, which drops its guard mid-update and poisons the lock; recovering it
