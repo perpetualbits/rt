@@ -196,6 +196,21 @@ pub struct Parser {
     osc_num_params: usize,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
+    /// Raw bytes of the escape sequence currently in flight, if any.
+    ///
+    /// Accumulates ONLY while the machine is off `Ground`: `advance_ground`'s bulk
+    /// `memchr` scan of printable text never touches it, so the hot path is
+    /// unaffected. The one exception is the single ESC byte that LEAVES `Ground` —
+    /// pushed at `advance_ground`'s three rare transition points, not on the
+    /// per-byte scan — after which every subsequent byte is echoed once, at
+    /// `change_state`, the single dispatch point for every non-`Ground` byte.
+    /// Cleared at every site that returns to `Ground`.
+    ///
+    /// This exists so a pane frozen mid-sequence can hand the bytes to another
+    /// process, which replays them into its own parser. Raw bytes are the right
+    /// currency: everything else the parser holds — state, intermediates, params,
+    /// partial UTF-8 — is itself derived from replaying them.
+    pending_raw: Vec<u8>,
     /// Synchronized-update (DECSET 2026) state. While `sync_active`, raw bytes are held in
     /// `sync_buffer` instead of being dispatched, and applied atomically when the update
     /// ends (ESU `\x1b[?2026l`, or the 2 MiB cap). `flushing` guards the buffer-replay so a
@@ -228,6 +243,37 @@ impl Parser {
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The bytes of a partially-consumed sequence, in order, ready to be replayed
+    /// into a fresh parser. Empty when the machine is at a boundary (`Ground`, no
+    /// open sync, no split codepoint).
+    ///
+    /// Three sources, at most one ever populated in the well-formed case: a stashed
+    /// partial UTF-8 codepoint (state stays `Ground` while `advance_partial_utf8`
+    /// waits for the rest), the echo buffer (populated only off `Ground`), and
+    /// `sync_buffer` mid-synchronized-update (state is always `Ground` there, so
+    /// the echo buffer is empty). Returns a borrowed slice in the overwhelmingly
+    /// common case — no sync in flight — so the accessor itself never allocates
+    /// unless there is genuinely a sync buffer to append. Chosen over a single
+    /// merged buffer because `sync_buffer`'s bytes get replayed through
+    /// `change_state` (which pushes to the echo buffer) when a sync ends
+    /// (`stop_sync` → `dispatch_raw`); dual-writing into one buffer while buffering
+    /// would double-count those bytes once the replay also pushed them.
+    pub fn pending_raw(&self) -> std::borrow::Cow<'_, [u8]> {
+        let in_flight: &[u8] = if self.partial_utf8_len != 0 {
+            &self.partial_utf8[..self.partial_utf8_len]
+        } else {
+            &self.pending_raw
+        };
+        if self.sync_buffer.is_empty() {
+            std::borrow::Cow::Borrowed(in_flight)
+        } else {
+            let mut combined = Vec::with_capacity(in_flight.len() + self.sync_buffer.len());
+            combined.extend_from_slice(in_flight);
+            combined.extend_from_slice(&self.sync_buffer);
+            std::borrow::Cow::Owned(combined)
+        }
     }
 
     #[inline]
@@ -393,6 +439,7 @@ impl Parser {
 
     #[inline]
     fn change_state<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        self.pending_raw.push(byte);
         match self.state {
             State::Ground => unreachable!("ground is handled by advance_ground"),
             State::Escape => self.advance_esc(performer, byte),
@@ -415,7 +462,10 @@ impl Parser {
     #[inline]
     fn anywhere(&mut self, byte: u8) {
         match byte {
-            0x18 | 0x1A => self.state = State::Ground,
+            0x18 | 0x1A => {
+                self.state = State::Ground;
+                self.pending_raw.clear();
+            }
             0x1B => {
                 self.reset_params();
                 self.state = State::Escape;
@@ -436,6 +486,7 @@ impl Parser {
             0x30..=0x4F | 0x51..=0x57 | 0x59..=0x5A | 0x5C | 0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground;
+                self.pending_raw.clear();
             }
             0x50 => {
                 self.reset_params();
@@ -454,6 +505,7 @@ impl Parser {
             0x18 | 0x1A => {
                 performer.execute(byte);
                 self.state = State::Ground;
+                self.pending_raw.clear();
             }
             _ => {}
         }
@@ -467,6 +519,7 @@ impl Parser {
             0x30..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground;
+                self.pending_raw.clear();
             }
             0x7F => {}
             _ => self.anywhere(byte),
@@ -537,7 +590,10 @@ impl Parser {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
             0x20..=0x3F => {}
-            0x40..=0x7E => self.state = State::Ground,
+            0x40..=0x7E => {
+                self.state = State::Ground;
+                self.pending_raw.clear();
+            }
             0x7F => {}
             _ => self.anywhere(byte),
         }
@@ -612,6 +668,7 @@ impl Parser {
                 performer.unhook();
                 performer.execute(byte);
                 self.state = State::Ground;
+                self.pending_raw.clear();
             }
             0x1B => {
                 performer.unhook();
@@ -622,6 +679,7 @@ impl Parser {
             0x9C => {
                 performer.unhook();
                 self.state = State::Ground;
+                self.pending_raw.clear();
             }
             _ => {}
         }
@@ -635,11 +693,13 @@ impl Parser {
             0x07 => {
                 self.osc_end(performer, byte);
                 self.state = State::Ground;
+                self.pending_raw.clear();
             }
             0x18 | 0x1A => {
                 self.osc_end(performer, byte);
                 performer.execute(byte);
                 self.state = State::Ground;
+                self.pending_raw.clear();
             }
             0x1B => {
                 self.osc_end(performer, byte);
@@ -671,6 +731,7 @@ impl Parser {
             self.sync_buffer.clear();
         }
         self.state = State::Ground;
+        self.pending_raw.clear();
     }
 
     #[inline]
@@ -767,9 +828,12 @@ impl Parser {
         let num_bytes = bytes.len();
         let plain = memchr::memchr(0x1B, bytes).unwrap_or(num_bytes);
         if plain == 0 {
-            // The very next byte is ESC: switch and consume it.
+            // The very next byte is ESC: switch and consume it. This is the one byte
+            // `advance_ground` ever pushes to `pending_raw` — the rare transition off
+            // `Ground`, not the bulk scan below, which never touches it.
             self.reset_params();
             self.state = State::Escape;
+            self.pending_raw.push(0x1B);
             return 1;
         }
         match str::from_utf8(&bytes[..plain]) {
@@ -780,6 +844,7 @@ impl Parser {
                     // The byte at `plain` is ESC.
                     self.reset_params();
                     self.state = State::Escape;
+                    self.pending_raw.push(0x1B);
                     processed += 1;
                 }
                 processed
@@ -804,6 +869,7 @@ impl Parser {
                             performer.print('\u{FFFD}');
                             self.reset_params();
                             self.state = State::Escape;
+                            self.pending_raw.push(0x1B);
                             plain + 1
                         } else {
                             // Truncated by the buffer end: stash the partial codepoint.
@@ -998,6 +1064,89 @@ mod tests {
             p.advance(&mut l, &[*b]);
         }
         assert_eq!(l.0, vec![Ev::Print('🦀')]);
+    }
+
+    /// Feed `bytes` to a fresh parser and return what it considers still in flight.
+    fn pending_after(bytes: &[u8]) -> Vec<u8> {
+        let mut p = Parser::new();
+        let mut sink = Log::default();
+        p.advance(&mut sink, bytes);
+        p.pending_raw().to_vec()
+    }
+
+    #[test]
+    fn a_complete_stream_leaves_nothing_pending() {
+        assert!(pending_after(b"hello \x1b[1mworld\x1b[m done").is_empty());
+    }
+
+    #[test]
+    fn ground_text_is_never_echoed() {
+        // The hot path must not accumulate. A megabyte of plain text with no
+        // escape at all must leave the buffer empty AND untouched.
+        let text = vec![b'x'; 1024 * 1024];
+        assert!(pending_after(&text).is_empty());
+    }
+
+    #[test]
+    fn a_half_finished_csi_is_pending_verbatim() {
+        assert_eq!(pending_after(b"\x1b[38;5"), b"\x1b[38;5");
+    }
+
+    #[test]
+    fn a_half_finished_osc_is_pending_verbatim() {
+        assert_eq!(pending_after(b"\x1b]0;a tit"), b"\x1b]0;a tit");
+    }
+
+    #[test]
+    fn a_lone_escape_is_pending() {
+        assert_eq!(pending_after(b"\x1b"), b"\x1b");
+    }
+
+    #[test]
+    fn a_split_utf8_codepoint_is_pending() {
+        // The first two bytes of a three-byte character.
+        let s = "日".as_bytes();
+        assert_eq!(pending_after(&s[..2]), &s[..2]);
+    }
+
+    #[test]
+    fn completing_a_sequence_clears_the_buffer() {
+        let mut p = Parser::new();
+        let mut sink = Log::default();
+        p.advance(&mut sink, b"\x1b[38;5");
+        assert!(!p.pending_raw().is_empty(), "mid-sequence");
+        p.advance(&mut sink, b";200m");
+        assert!(p.pending_raw().is_empty(), "the CSI completed");
+    }
+
+    #[test]
+    fn an_aborted_sequence_clears_the_buffer() {
+        // CAN (0x18) aborts from anywhere.
+        let mut p = Parser::new();
+        let mut sink = Log::default();
+        p.advance(&mut sink, b"\x1b[38;5\x18");
+        assert!(p.pending_raw().is_empty(), "CAN returned us to Ground");
+    }
+
+    #[test]
+    fn replaying_pending_bytes_into_a_fresh_parser_reproduces_the_state() {
+        // This is the property the whole accessor exists for: the receiver
+        // replays these bytes and lands in the same place the donor was.
+        let mut donor = Parser::new();
+        let mut sink = Log::default();
+        donor.advance(&mut sink, b"text \x1b[1;38;5");
+        let pending = donor.pending_raw().to_vec();
+
+        let mut receiver = Parser::new();
+        let mut sink2 = Log::default();
+        receiver.advance(&mut sink2, &pending);
+
+        // Finishing the sequence must dispatch identically on both.
+        let mut a = Log::default();
+        let mut b = Log::default();
+        donor.advance(&mut a, b";200m");
+        receiver.advance(&mut b, b";200m");
+        assert_eq!(a.0, b.0, "replayed parser dispatches identically");
     }
 
     #[test]
