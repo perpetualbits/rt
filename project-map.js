@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-08-28"
+    updated: "2026-08-31"
   },
 
   statuses: {
@@ -294,6 +294,22 @@ window.PROJECT_MAP = {
       specs: [{ label: "Roadmap · Phase 4", href: "docs/ROADMAP.md" }],
       parts: [],
       deps: ["rt-session"]
+    },
+    {
+      id: "rt-handoff", label: "rt-handoff (wire format)", layer: "control", status: "active",
+      tags: ["zero-dep", "wire v1"],
+      desc: "The frozen wire format for moving a pane or a whole tab from one rt process to another — including across different rt versions, so a live session survives an rt upgrade. A deliberately zero-dependency crate: a future rt vendors an old copy of itself to check its encoder against an old decoder, which only works while the crate is a self-contained pile of Rust with no build graph behind it. Phase 1 (this crate: frame/TLV/varint plumbing, style/grid/pane/tree encoding, the Hello/Offer/Claim/Adopted/Bye handshake messages, a seeded test-data generator, and a committed golden corpus pinning v1 byte-for-byte) is complete. Phase 2 (fd passing over SCM_RIGHTS, the engine-neutral snapshot bridge) and phase 3 (the four entry points: carry, bulk migrate, keyboard picker, X11 XDND) are not started.",
+      files: ["crates/rt-handoff"],
+      specs: [{ label: "Cross-instance pane & tab transfer design", href: "docs/superpowers/specs/2026-08-29-cross-instance-pane-transfer-design.md" }],
+      parts: [
+        { label: "Frame + TLV + varint core", status: "done", desc: "Frame header, tagged-field walker, LEB128 varints — little-endian and architecture-neutral (verified on x86-64 and riscv-64)." },
+        { label: "Style / grid / pane / tree encoding", status: "done", desc: "Cell styles (indexed colour stays indexed), scrollback grid, whole-pane snapshot, and the split/tab layout tree." },
+        { label: "Handshake messages", status: "done", desc: "Hello/Offer/Claim/Adopted/Bye, forward-compatible: an unknown TLV tag is skipped by its length and reported, never fatal. An unknown message TYPE is an error — the frame header's length is what lets the stream survive it, not the decoder." },
+        { label: "Golden corpus (wire v1)", status: "done", desc: "32 committed fixtures spanning panes/trees/messages; every future build must decode and re-encode each one byte-for-byte. Demonstrated to fail when the format changes." },
+        { label: "fd passing (SCM_RIGHTS) + snapshot bridge", status: "planned", desc: "Phase 2: move the PTY fd between processes; bridge to/from rt-engine's Snapshot." },
+        { label: "Transfer entry points", status: "planned", desc: "Phase 3: carry across instances, bulk migrate, keyboard picker, X11 XDND." }
+      ],
+      deps: []
     },
 
     /* ---- Engine Seam ---- */

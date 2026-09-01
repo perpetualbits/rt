@@ -25,13 +25,13 @@ for a in "$@"; do
 done
 [ ${#args[@]} -gt 0 ] && REMOTES=("${args[@]}")
 
-PKGS=(-p vt-parser -p vt-conformance)
+PKGS=(-p vt-parser -p vt-conformance -p rt-handoff)
 FAIL=0
 
 # Keep error: (colon) alongside error[ so cargo/build errors (e.g. a dead path override →
 # "error: failed to update path override") stay VISIBLE in the filtered remote output
 # instead of being silently dropped and mistaken for a clean run.
-tests_cmd='cargo test -q -p vt-parser -p vt-conformance 2>&1 | grep -E "test result:|error\[|error:|FAILED|panicked"'
+tests_cmd='cargo test -q -p vt-parser -p vt-conformance -p rt-handoff 2>&1 | grep -E "test result:|error\[|error:|FAILED|panicked"'
 bench_cmd='cargo run -q --release --example parser_bench -p vt-conformance 2>&1 | grep -vE "Compiling|Finished|Running|warning:"'
 
 # Evaluate one host's captured test output. A run PASSES only if it emitted at least one

@@ -1,0 +1,35 @@
+//! rt's cross-process pane-handoff wire format.
+//!
+//! This crate is the compatibility contract between two rt processes of
+//! possibly different versions. Read the spec before changing anything:
+//! `docs/superpowers/specs/2026-08-29-cross-instance-pane-transfer-design.md`.
+//!
+//! It has no dependencies and must not gain any — see README.md.
+
+// `Integer::is_multiple_of` stabilised in 1.87; adopting it would raise the
+// MSRV of a crate whose whole premise is being vendorable and buildable in
+// isolation for years.
+#![allow(clippy::manual_is_multiple_of)]
+
+pub mod error;
+pub mod frame;
+pub mod buf;
+pub mod tlv;
+pub mod style;
+pub mod grid;
+pub mod pane;
+pub mod tree;
+pub mod msg;
+
+// Unconditional, NOT `#[cfg(test)]`: integration tests under `tests/` link the
+// library built WITHOUT `cfg(test)`, so a gated module would be invisible to
+// them. Phase 2's engine tests reuse it too. It costs a few hundred bytes.
+#[doc(hidden)]
+pub mod testgen;
+
+/// The protocol version this build speaks. Unrelated to the crate version.
+pub const PROTO_V1: u32 = 1;
+
+/// Leading bytes of a `Hello` body, so a wrong-protocol peer is diagnosed
+/// immediately rather than as a confusing field error.
+pub const MAGIC: &[u8; 9] = b"RTHANDOFF";

@@ -1,0 +1,13 @@
+[package]
+name = "rt-handoff"
+version = "0.3.19"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "rt's frozen cross-process pane-handoff wire format. No dependencies, on purpose: a future rt must be able to vendor an old copy of this crate to check itself against."
+publish = false
+
+# INTENTIONALLY EMPTY. See README.md. Adding a dependency here breaks the
+# vendor-an-old-copy compatibility check that the whole format relies on.
+[dependencies]
+
+[dev-dependencies]
