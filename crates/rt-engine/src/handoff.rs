@@ -321,7 +321,7 @@ pub fn export_term(
             row: crow as u32,
             shape: shape_code(term.cursor_shape()),
             visible: term.cursor_visible(),
-            blink: false, // vt-term does not track a blink flag separately
+            blink: term.cursor_blink(),
             pending_wrap: term.pending_wrap(),
         },
         saved_cursor: Some(SavedCursor {
@@ -689,6 +689,38 @@ mod tests {
         // site in this codebase, e.g. rt-engine's vtpane.rs and vt-term's own
         // tests) — position must reach the wire uninverted.
         assert_eq!((p.cursor.col, p.cursor.row), (3, 1), "position must not be col/row swapped");
+    }
+
+    #[test]
+    fn cursor_blink_reaches_the_wire() {
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b[?12h"); // DECSET 12: blink on
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert!(p.cursor.blink, "DECSET 12 must reach the wire");
+
+        t.feed(b"\x1b[?12l"); // and off again
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert!(!p.cursor.blink);
+    }
+
+    #[test]
+    fn decscusr_blink_reaches_the_wire() {
+        // DECSCUSR (`CSI Ps SP q`): 0/1/2 = block, 3/4 = underline, 5/6 = bar;
+        // odd Ps blinks, even is steady. Verified against
+        // `set_cursor_shape` in vt-term/src/lib.rs: `cursor_blink =
+        // matches!(ps, 1 | 3 | 5)`, and the CSI dispatch site that reaches it
+        // on `(Some(&b' '), 'q')` — confirming `\x1b[1 q` / `\x1b[2 q` really
+        // do parse as Ps=1/2 with a space intermediate before `q`.
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b[1 q"); // blinking block
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert!(p.cursor.blink, "DECSCUSR 1 is a blinking cursor");
+        assert_eq!(p.cursor.shape, 0, "DECSCUSR 1 is still block-shaped");
+
+        t.feed(b"\x1b[2 q"); // steady block
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert!(!p.cursor.blink, "DECSCUSR 2 is steady");
+        assert_eq!(p.cursor.shape, 0, "DECSCUSR 2 is still block-shaped");
     }
 
     #[test]

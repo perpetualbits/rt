@@ -61,6 +61,13 @@ impl Term {
         self.pending_wrap
     }
 
+    /// Whether the cursor is set to blink (DECSET 12, or DECSCUSR's odd shape
+    /// codes). Tracked internally since the engine's first version; this is
+    /// only the accessor.
+    pub fn cursor_blink(&self) -> bool {
+        self.cursor_blink
+    }
+
     pub fn utf8_mouse(&self) -> bool {
         self.utf8_mouse
     }
