@@ -1123,7 +1123,11 @@ pub fn export_term(
     let screen_alt = inactive_to_grid(term, &mut styles);
     let scrollback = scrollback_newest_first(term, scrollback_budget, &mut styles);
 
-    let (crow, ccol) = term.cursor();
+    // NB: `cursor()` returns (COL, ROW) — column first. The `saved_cursor`
+    // tuple is the other way round, (row, col, ...). Same crate, same concept,
+    // opposite order. Getting this backwards transposes every exported cursor
+    // and no wire invariant can detect it.
+    let (ccol, crow) = term.cursor();
     let sc = term.saved_cursor();
     let (top, bottom) = term.margins();
 
