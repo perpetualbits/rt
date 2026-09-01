@@ -1411,7 +1411,47 @@ catch a break in the path between the pty, the reader thread and the grid.
 
 **Interfaces:**
 - Consumes: `rt_engine::TermPane`, `rt_handoff::pane::PaneWire`.
-- Produces: nothing; this is the slice's acceptance test.
+- Produces: `TermPane::spawn_vt_env(...)` — a public constructor forcing the in-house engine.
+
+**Why a new constructor.** These tests live in `tests/`, so they link the crate
+EXTERNALLY. `mod vtpane` is private (`lib.rs:19`), so the trick Task 5 used
+in-crate — `TermPane::Vt(VtPane::spawn_env(...))` — is unavailable here. And a
+plain `TermPane::spawn_env` yields the ALACRITTY arm under `cargo test -p
+rt-engine`, because the engine crate's own defaults are `["vendored"]` with
+`vtterm-default` off, so every `.expect()` below would panic.
+
+Add to `crates/rt-engine/src/lib.rs`, beside the other constructors:
+
+```rust
+    /// Spawn a pane on the in-house vt-term engine specifically, regardless of
+    /// the build's default or `RT_ENGINE`.
+    ///
+    /// Callers that need an EXPORTABLE pane need a way to ask for one:
+    /// `export` refuses on the vendored engine by design, so "spawn, then
+    /// discover you cannot move it" is not a usable contract. Phase 2b's
+    /// session layer needs this for the same reason.
+    pub fn spawn_vt_env(
+        shell: Option<(String, Vec<String>)>,
+        working_directory: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+        env: &[(String, String)],
+        scrollback: usize,
+    ) -> std::io::Result<TermPane> {
+        Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
+            shell,
+            working_directory,
+            cols,
+            rows,
+            env,
+            scrollback,
+        )?))
+    }
+```
+
+Match `VtPane::spawn_env`'s real parameter list rather than assuming the shape
+above — verify it before writing. The tests below then call `spawn_vt_env`
+where they currently call `spawn_env`.
 
 - [ ] **Step 1: Write the test**
 
@@ -1431,7 +1471,7 @@ use rt_engine::TermPane;
 /// Spawn a shell running `script`, then poll until `probe` sees what it wants
 /// or the deadline passes. Draining events is what a real host does each frame.
 fn pane_running(script: &str, cols: usize, rows: usize, probe: impl Fn(&TermPane) -> bool) -> TermPane {
-    let mut pane = TermPane::spawn_env(
+    let mut pane = TermPane::spawn_vt_env(
         Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
         None,
         cols,
