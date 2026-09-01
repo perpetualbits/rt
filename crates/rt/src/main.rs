@@ -1381,6 +1381,33 @@ impl ApplicationHandler for App {
         if std::env::var_os("RT_OPEN_PREFS").is_some() {
             Self::open_prefs(&mut active);
         }
+        // Debug/verification hook: RT_SOAK_LAYOUT="TABSxPANES" (e.g. "20x3") builds a
+        // large layout at startup — N tabs, M panes each — so a soak can drive many
+        // live shells without synthetic input. Input injection was not an option: the
+        // headless compositors available here do not implement the virtual-keyboard
+        // protocol, and kernel-level injection would land in whatever window the user
+        // actually has focused. Each pane runs $SHELL as usual, so the workload is
+        // chosen by the caller's environment rather than baked in here.
+        if let Ok(spec) = std::env::var("RT_SOAK_LAYOUT") {
+            let (tabs, panes) = spec.split_once('x').unwrap_or(("1", "1"));
+            let tabs: usize = tabs.parse().unwrap_or(1);
+            let panes: usize = panes.parse().unwrap_or(1);
+            for t in 0..tabs.max(1) {
+                if t > 0 {
+                    active.session.apply(rt_config::Action::NewTab);
+                }
+                for p in 1..panes.max(1) {
+                    // Alternate the axis so panes stay usably shaped rather than
+                    // degenerating into slivers along one dimension.
+                    active.session.apply(if p % 2 == 1 {
+                        rt_config::Action::SplitVert
+                    } else {
+                        rt_config::Action::SplitHoriz
+                    });
+                }
+            }
+            eprintln!("rt: RT_SOAK_LAYOUT={spec} -> {tabs} tabs x {panes} panes");
+        }
         // Debug/verification hook: RT_WIRE_DEMO builds a live patch-bay scene —
         // split, wire pane1.stdout → pane2.stdin, and run a producer + reader — so
         // the wiring can be verified/screenshotted without synthetic input.
