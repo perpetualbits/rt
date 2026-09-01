@@ -1190,6 +1190,53 @@ mod tests {
     }
 
     #[test]
+    fn a_sequence_split_across_three_chunks_accumulates_in_order() {
+        // The offset capture has to stitch a prefix from earlier chunks onto
+        // the tail of the current one. Two chunks exercises that once; three
+        // exercises it against an already-non-empty buffer.
+        let mut p = Parser::new();
+        let mut sink = Log::default();
+        p.advance(&mut sink, b"\x1b[");
+        p.advance(&mut sink, b"38;");
+        p.advance(&mut sink, b"5");
+        assert_eq!(p.pending_raw().as_ref(), b"\x1b[38;5");
+        p.advance(&mut sink, b";200m");
+        assert!(p.pending_raw().is_empty(), "the CSI completed");
+    }
+
+    #[test]
+    fn a_chunk_that_finishes_one_sequence_and_starts_another_keeps_only_the_second() {
+        // seq_start must be re-armed mid-chunk, not carried from the first
+        // sequence — otherwise the completed CSI leaks into pending_raw.
+        let mut p = Parser::new();
+        let mut sink = Log::default();
+        p.advance(&mut sink, b"\x1b[1m");            // completes
+        p.advance(&mut sink, b"text\x1b[38;5m\x1b[4"); // completes another, then starts one
+        assert_eq!(p.pending_raw().as_ref(), b"\x1b[4", "only the unfinished tail is pending");
+    }
+
+    #[test]
+    fn a_split_utf8_boundary_immediately_followed_by_an_escape_only_pends_the_escape() {
+        // partial_utf8_len != 0 and state != Ground are mutually exclusive: the
+        // codepoint completes (still in Ground) before any escape byte in the same
+        // chunk can start a new sequence, so only the new escape's bytes end up
+        // pending — this pins that invariant instead of leaving it to be re-derived.
+        let s = "日".as_bytes();
+        let mut p = Parser::new();
+        let mut sink = Log::default();
+        p.advance(&mut sink, &s[..2]);
+        assert_eq!(p.pending_raw().as_ref(), &s[..2], "split codepoint pending before completion");
+        let mut second_chunk = vec![s[2]];
+        second_chunk.extend_from_slice(b"\x1b[38;5");
+        p.advance(&mut sink, &second_chunk);
+        assert_eq!(
+            p.pending_raw().as_ref(),
+            b"\x1b[38;5",
+            "only the new escape is pending, not the completed codepoint"
+        );
+    }
+
+    #[test]
     fn a_dcs_session_past_the_cap_returns_empty_not_truncated() {
         // ESC P q hooks a DCS (final byte 'q' -> DcsPassthrough), then well past the
         // cap of passthrough data with no terminator. A truncated prefix would let a
