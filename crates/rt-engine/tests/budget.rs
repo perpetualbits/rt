@@ -123,13 +123,31 @@ fn process_wide_total_stays_under_budget_and_busy_pane_keeps_more_than_idle() {
     // The proportional property: busy panes' scrollback line counts (a valid proxy for
     // bytes here — vt-term's per-history-line cost is uniform at a fixed column width, so
     // more lines held means more bytes held) must clearly exceed idle panes' after the
-    // squeeze above. That's the entire reason this design is proportional, not equal
-    // division: equal division across 16 panes would have flattened this difference away.
+    // squeeze above, and by a margin equal division could never produce.
+    //
+    // A bare `busy_after > idle_after` does NOT distinguish this design from flat equal
+    // division (`cap_i = budget / pane_count`) — a fix-round review reproduced this exact
+    // scenario and simulated equal division against the same pre-rebalance usages,
+    // measuring roughly a 41:1 busy:idle ratio under real (proportional) rebalance versus
+    // roughly 2.35:1 under equal division. Both satisfy a bare `>`; only a ratio threshold
+    // set between those two numbers actually discriminates. `DISCRIMINATION_RATIO` (8x) sits
+    // in that gap with real margin on both sides — well below the ~41x proportional produces
+    // here, well above the ~2.35x equal division would — chosen so ordinary run-to-run PTY
+    // timing jitter can't flip it, while a regression to equal (or near-equal) division
+    // still would. This was verified empirically, not just derived: `rebalance` was
+    // temporarily patched to compute `cap = budget / pane_count` (floored, mirroring the
+    // real policy's floor), which turned this exact assertion red, then reverted (see the
+    // fix-round report for both transcripts) — this is not an assumption about what equal
+    // division would do, it's a measurement of what it actually did.
+    const DISCRIMINATION_RATIO: usize = 8;
     let busy_lines_after: usize = busy_panes.iter().map(|p| p.scroll_info().1).sum();
     let idle_lines_after: usize = idle_panes.iter().map(|p| p.scroll_info().1).sum();
     assert!(
-        busy_lines_after > idle_lines_after,
-        "busy panes ({busy_lines_after} history lines) should hold more than idle panes \
-         ({idle_lines_after} history lines) after rebalance"
+        busy_lines_after > idle_lines_after * DISCRIMINATION_RATIO,
+        "busy panes ({busy_lines_after} history lines) should hold more than \
+         {DISCRIMINATION_RATIO}x idle panes' ({idle_lines_after} history lines) after \
+         rebalance — a lesser margin doesn't distinguish proportional sharing from flat \
+         equal division, which a fix-round review measured producing only a ~2.35:1 ratio \
+         on this exact scenario"
     );
 }
