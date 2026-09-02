@@ -610,6 +610,14 @@ struct App {
     /// the whole app, not per-window, since scrollback memory is a process-wide
     /// resource regardless of which window a pane lives in.
     budget: std::sync::Arc<rt_engine::budget::Budget>,
+    /// Wall-clock of the last `budget.rebalance_default()` call. `about_to_wait` runs on
+    /// every event-loop wake (as often as every ~16ms while animating), but rebalancing is
+    /// deliberately NOT per-wake work: summing every live pane's `history_bytes` and
+    /// possibly re-applying `set_scrollback` on each is real, if small, per-pane work that
+    /// has no business happening faster than scrollback itself can meaningfully grow. Gate
+    /// it to roughly once a second here so `about_to_wait`'s own per-wake cost stays a
+    /// single `Instant::elapsed()` comparison the rest of the time.
+    budget_last_rebalance: Instant,
 }
 
 /// A left-press on a pane titlebar or a tab label. It is not a drag yet — it
@@ -2924,6 +2932,16 @@ impl ApplicationHandler for App {
         }
         for wid in to_close {
             self.close_window(wid);
+        }
+        // Process-wide scrollback rebalance, on a ~1s timer — NOT per wake/frame (see
+        // `budget_last_rebalance`'s doc). This call site must not stall the loop either:
+        // `Budget::rebalance` already uses `try_lock` per pane internally and skips a
+        // contended one rather than blocking, and this call itself holds no lock of ours
+        // across it (the `Arc<Budget>` clone below is the only thing touched, and dropping
+        // straight into `rebalance_default` takes no lock this thread already holds).
+        if self.budget_last_rebalance.elapsed() >= Duration::from_secs(1) {
+            self.budget.rebalance_default();
+            self.budget_last_rebalance = Instant::now();
         }
         if let Some(interval) = min_interval {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
@@ -7303,6 +7321,7 @@ fn main() {
         drag: None,
         carry: None,
         budget: std::sync::Arc::new(rt_engine::budget::Budget::default()),
+        budget_last_rebalance: Instant::now(),
     };
     if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure

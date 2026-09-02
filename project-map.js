@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-09-01"
+    updated: "2026-09-02"
   },
 
   statuses: {
@@ -323,7 +323,8 @@ window.PROJECT_MAP = {
       parts: [
         { label: "Agnostic snapshot / damage types", status: "done", desc: "The interface the renderer draws from and the harness drives." },
         { label: "RT_ENGINE impl selection", status: "done", desc: "in-house default; RT_ENGINE=alacritty selects the vendored fallback." },
-        { label: "Pane export → rt-handoff wire", status: "done", desc: "TermPane::export(pane_uid, scrollback_budget) reads a live vt-term pane's grid/scrollback/cursor/modes/style table into rt-handoff's PaneWire for a cross-process move; the alacritty arm returns a named ExportError::EngineUnsupported. Host-level fields (title, cwd, group, …) are left for rt-session to overlay in phase 2b." }
+        { label: "Pane export → rt-handoff wire", status: "done", desc: "TermPane::export(pane_uid, scrollback_budget) reads a live vt-term pane's grid/scrollback/cursor/modes/style table into rt-handoff's PaneWire for a cross-process move; the alacritty arm returns a named ExportError::EngineUnsupported. Host-level fields (title, cwd, group, …) are left for rt-session to overlay in phase 2b." },
+        { label: "Process-wide scrollback budget", status: "done", desc: "Each per-pane byte cap used to bound only one pane (1 GiB) with no ceiling across all of them — 60 panes meant a 60 GiB worst case. rt_engine::budget::Budget is an owned coordinator (never a static/global — two prior fix rounds removed exactly that): every Vt pane registers a Weak<Mutex<Term>> on spawn, and rebalance() sums live panes' history_bytes and, only once over a 4 GiB process-wide budget, tightens each pane's byte cap PROPORTIONAL to its usage (floored at 2 MiB so a busy neighbour can't starve a quiet pane to zero), applied through the existing set_scrollback→trim_history eviction. rt's frame loop (App::about_to_wait) calls it on a ~1s timer, not per frame; the call site never blocks (rebalance already uses try_lock per pane). Proven with a dozen-plus real PTY-backed panes: process-wide total comes under budget after rebalance, and busy panes keep far more history than idle ones. Measured cost with 60 real panes: ~8-11us mean per call (~0.05-0.07% of a 16ms frame), even forcing real eviction every call. The vendored rt-mux/AlacPane backend never registers, so its own Budget stays inert — a known, documented gap, not closed here." }
       ],
       deps: ["vt-term", "vendored-oracle", "rt-handoff"]
     },
