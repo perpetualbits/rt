@@ -348,16 +348,38 @@ mod tests {
         assert!(bu > qu, "busy {bu} should keep more than quiet {qu}");
     }
 
-    #[test]
-    fn a_quiet_pane_is_never_starved_to_nothing() {
-        let coordinator = Budget::default();
+    /// Squeeze one fixed pane population against a `Budget` whose ONLY difference from
+    /// the production one is `pane_floor`, and report what the quiet pane kept.
+    fn quiet_bytes_after_squeeze(pane_floor: usize) -> usize {
+        let coordinator = Budget::new(GLOBAL_SCROLLBACK_BUDGET, pane_floor);
         let busy = term_with_history(80, 10, 20000);
         let quiet = term_with_history(80, 10, 50);
         coordinator.register(&busy);
         coordinator.register(&quiet);
-        coordinator.rebalance(PANE_FLOOR * 2); // brutally tight
-        assert!(quiet.lock().unwrap().history_bytes() > 0 || PANE_FLOOR == 0,
-                "the floor must leave a quiet pane something");
+        coordinator.rebalance(PANE_FLOOR * 2); // brutally tight, both arms alike
+        let kept = quiet.lock().unwrap().history_bytes();
+        kept
+    }
+
+    #[test]
+    fn a_quiet_pane_is_never_starved_to_nothing() {
+        // What must NOT be asserted here: `quiet.history_bytes() > 0`. That is green with
+        // the floor deleted, because `trim_history` is guarded `history.len() > 1` — a
+        // pane with any history at all keeps its last line under ANY byte cap. Such an
+        // assertion measures a `vt-term` invariant, not this module's floor.
+        //
+        // So run the SAME pane population through two `Budget`s differing only in
+        // `pane_floor`. Whatever `trim_history`'s own last-line guard leaves behind is
+        // present in both arms and cancels out; the gap between them is the floor and
+        // nothing else. Measured: 53792 bytes floored vs 7872 unfloored.
+        let floored = quiet_bytes_after_squeeze(PANE_FLOOR);
+        let unfloored = quiet_bytes_after_squeeze(0);
+        assert!(
+            floored > unfloored,
+            "the floor must leave a quiet pane strictly more than strict proportionality \
+             would (floored {floored}, unfloored {unfloored}) — if these are equal the \
+             floor is doing nothing and only `trim_history`'s last-line guard is showing"
+        );
     }
 
     #[test]
