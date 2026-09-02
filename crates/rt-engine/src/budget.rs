@@ -29,6 +29,24 @@
 //! lock its reader thread currently holds is simply skipped for this pass rather than
 //! blocked on. This runs on the GUI thread (via a ~1s timer, added in Task 2); a lock skip
 //! costs nothing but staleness until the next pass, which is always imminent.
+//!
+//! **What that does and does not buy — state it precisely.** `try_lock` bounds how long
+//! this code waits FOR a lock (never), which is a different question from how long it
+//! works WHILE holding one. So the property here is *not* "never blocks the frame". It is:
+//!
+//! - a pane whose lock is contended right now is **skipped**, not waited on; and
+//! - the eviction a squeeze does perform is **synchronous on the GUI thread**, and costs
+//!   O(bytes evicted) — measured in release at roughly **39-50 µs per MiB evicted**
+//!   (62.5 MiB in 3.1 ms, 250.2 MiB in 9.6 ms, on a `Term` fed real output; the reviewer
+//!   independently measured 1.9 ms and 8.6 ms for the same two corpora). A single pass
+//!   that has to evict hundreds of MiB is therefore a multi-millisecond stall in the
+//!   frame it lands in.
+//!
+//! Task 2's benchmark (~8-11 µs per call with 60 panes) used a ~27 MiB corpus, so it did
+//! not bound the case this module exists for; read it as "the steady-state bookkeeping is
+//! free", not as a bound on eviction. Bounding per-pass eviction work (evicting
+//! incrementally across passes, or off-thread) is a real design change and needs its own
+//! review — it is deliberately NOT attempted here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
@@ -74,6 +92,11 @@ pub(crate) const SCROLLBACK_MEMORY_BUDGET: usize = 1 << 30;
 /// is why the user chose proportional anyway. It will occasionally look like a bug —
 /// scrollback that was there yesterday is gone today with no eviction the user asked for.
 /// It's the accepted cost of bounding the process instead of each pane in isolation.
+///
+/// **Note for a 32-bit port:** 4 GiB does not fit a 32-bit `usize`. Every rt target is
+/// 64-bit, and on a 32-bit one this is a const-eval error at compile time (a loud build
+/// failure, not a silent wrap), so it is a known limit rather than a lurking bug — but a
+/// 32-bit port must pick a smaller budget here rather than expect this to build.
 pub const GLOBAL_SCROLLBACK_BUDGET: usize = 4 * (1 << 30); // 4 GiB
 
 /// The minimum byte cap `rebalance` will ever assign a live pane, however far over budget
@@ -187,6 +210,12 @@ impl Budget {
     /// `pane_floor`, and apply it via `set_scrollback` (which evicts, via its own
     /// `trim_history`, entirely under that pane's own lock).
     ///
+    /// **Cost, stated honestly:** the apply pass evicts synchronously on the calling
+    /// thread (the GUI thread in both hosts), at roughly 39-50 µs per MiB evicted. Pass 1
+    /// and the under-budget short-circuit are effectively free; a pass that squeezes
+    /// hundreds of MiB is a multi-millisecond stall in that frame. `try_lock` does not
+    /// help with this — it bounds waiting for a lock, not work done under one.
+    ///
     /// Two passes when there's anything to apply, never two `Term` locks held at once: the
     /// first reads usage from each live pane in turn; the second applies the cap computed
     /// from that snapshot, one pane at a time. A pane whose lock is contended in either
@@ -239,7 +268,11 @@ impl Budget {
             return;
         }
 
-        // Over budget: tighten. Pass 2, locking one pane at a time; never blocks.
+        // Over budget: tighten. Pass 2, locking one pane at a time, never WAITING for a
+        // lock (a contended pane is skipped) — but this is the pass that actually evicts,
+        // synchronously, on the caller's thread: `set_scrollback` → `trim_history` costs
+        // roughly 39-50 µs per MiB it drops. See the module doc; "never blocks" is a claim
+        // about waiting for locks, not about how long this pass takes.
         for (term, usage) in &usages {
             // usage * budget can overflow a usize well before either operand is huge;
             // widen to u128 for the multiply, matching `total`'s own scale.

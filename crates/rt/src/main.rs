@@ -2934,11 +2934,14 @@ impl ApplicationHandler for App {
             self.close_window(wid);
         }
         // Process-wide scrollback rebalance, on a ~1s timer — NOT per wake/frame (see
-        // `budget_last_rebalance`'s doc). This call site must not stall the loop either:
-        // `Budget::rebalance` already uses `try_lock` per pane internally and skips a
-        // contended one rather than blocking, and this call itself holds no lock of ours
-        // across it (the `Arc<Budget>` clone below is the only thing touched, and dropping
-        // straight into `rebalance_default` takes no lock this thread already holds).
+        // `budget_last_rebalance`'s doc). What this call site is and is not: `Budget::
+        // rebalance` uses `try_lock` per pane and SKIPS a contended pane rather than
+        // waiting for it, and this call holds no lock of ours across it. That bounds
+        // waiting for locks — it does not bound the work done under one. When the process
+        // is over budget the apply pass evicts synchronously, right here on the GUI
+        // thread, at roughly 39-50 µs per MiB evicted (so a pass dropping hundreds of MiB
+        // is a multi-millisecond hitch in this frame). Under budget it short-circuits and
+        // costs nothing. Bounding per-pass eviction is a design change, not done here.
         if self.budget_last_rebalance.elapsed() >= Duration::from_secs(1) {
             self.budget.rebalance_default();
             self.budget_last_rebalance = Instant::now();
