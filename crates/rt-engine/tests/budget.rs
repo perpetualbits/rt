@@ -107,6 +107,24 @@ fn process_wide_total_stays_under_budget_and_busy_pane_keeps_more_than_idle() {
     let total_before = budget.total_usage();
     assert!(total_before > 0, "real scrolled output must have accounted for something");
 
+    // Snapshot the busy:idle split BEFORE the squeeze. The assertion at the end compares
+    // the ratio after against this one; capturing it here is what makes that comparison
+    // independent of BUSY_LINES/IDLE_LINES/N_BUSY/N_IDLE (see the comment there).
+    // History lines are a valid proxy for bytes at a fixed column width — vt-term's
+    // per-history-line cost is uniform.
+    let busy_lines_before: usize = busy_panes.iter().map(|p| p.scroll_info().1).sum();
+    let idle_lines_before: usize = idle_panes.iter().map(|p| p.scroll_info().1).sum();
+    // Setup precondition, not the property under test: ratio-preservation only
+    // discriminates on a LOPSIDED population. If busy and idle held the same amount,
+    // proportional and equal division would both leave the ratio at 1:1 and the assertion
+    // below would be vacuous. Fail loudly here if the constants ever stop producing a
+    // lopsided mix, rather than silently proving nothing.
+    assert!(
+        busy_lines_before > idle_lines_before * 2,
+        "test setup: the pane mix must be lopsided for a ratio test to mean anything \
+         (busy {busy_lines_before} vs idle {idle_lines_before} history lines)"
+    );
+
     // Squeeze hard — a quarter of what's actually accumulated — so the over-budget path
     // definitely runs (not the under-budget short-circuit), regardless of the exact byte
     // counts real shells/PTYs produce (not worth hardcoding; see `total_before` above).
@@ -120,34 +138,39 @@ fn process_wide_total_stays_under_budget_and_busy_pane_keeps_more_than_idle() {
          (started at {total_before})"
     );
 
-    // The proportional property: busy panes' scrollback line counts (a valid proxy for
-    // bytes here — vt-term's per-history-line cost is uniform at a fixed column width, so
-    // more lines held means more bytes held) must clearly exceed idle panes' after the
-    // squeeze above, and by a margin equal division could never produce.
+    // The proportional property, asserted so the pane mix can't decide the outcome.
     //
     // A bare `busy_after > idle_after` does NOT distinguish this design from flat equal
-    // division (`cap_i = budget / pane_count`) — a fix-round review reproduced this exact
-    // scenario and simulated equal division against the same pre-rebalance usages,
-    // measuring roughly a 41:1 busy:idle ratio under real (proportional) rebalance versus
-    // roughly 2.35:1 under equal division. Both satisfy a bare `>`; only a ratio threshold
-    // set between those two numbers actually discriminates. `DISCRIMINATION_RATIO` (8x) sits
-    // in that gap with real margin on both sides — well below the ~41x proportional produces
-    // here, well above the ~2.35x equal division would — chosen so ordinary run-to-run PTY
-    // timing jitter can't flip it, while a regression to equal (or near-equal) division
-    // still would. This was verified empirically, not just derived: `rebalance` was
-    // temporarily patched to compute `cap = budget / pane_count` (floored, mirroring the
-    // real policy's floor), which turned this exact assertion red, then reverted (see the
-    // fix-round report for both transcripts) — this is not an assumption about what equal
-    // division would do, it's a measurement of what it actually did.
-    const DISCRIMINATION_RATIO: usize = 8;
+    // division (`cap_i = budget / pane_count`): both pass it. An absolute threshold — the
+    // 8x this test used to assert — does distinguish it for THESE constants, but only for
+    // these: at IDLE_LINES = 25 equal division also clears 8x, and at IDLE_LINES = 200 the
+    // real proportional policy would fail it. That makes the test a property of the pane
+    // mix, so editing a constant two dozen lines above silently guts it.
+    //
+    // What is mix-independent is what proportional actually guarantees: every pane's cap
+    // is scaled by the SAME factor (`budget / total`), so the busy:idle ratio survives the
+    // squeeze. Equal division does the opposite by construction — it collapses every pane
+    // toward one flat cap, so the ratio falls toward 1 (or below, when the idle panes sit
+    // under the flat cap and are not trimmed at all). So: compare the ratio after against
+    // the ratio before, and require it to have held to within `RATIO_TOLERANCE`.
+    //
+    // Cross-multiplied to stay in integers (u128, since these are sums over panes):
+    //   busy_after / idle_after  >=  (busy_before / idle_before) / RATIO_TOLERANCE
+    // ⇔ busy_after * idle_before * RATIO_TOLERANCE  >=  busy_before * idle_after
+    //
+    // The tolerance absorbs line-granularity rounding on the small idle panes (a quarter
+    // of 16 lines does not divide evenly), which nudges the post ratio slightly down. It
+    // is nowhere near enough to absorb the collapse equal division causes: measured, the
+    // ratio goes from ~41:1 to ~2.35:1 here, a factor of ~17.
+    const RATIO_TOLERANCE: u128 = 2;
     let busy_lines_after: usize = busy_panes.iter().map(|p| p.scroll_info().1).sum();
     let idle_lines_after: usize = idle_panes.iter().map(|p| p.scroll_info().1).sum();
     assert!(
-        busy_lines_after > idle_lines_after * DISCRIMINATION_RATIO,
-        "busy panes ({busy_lines_after} history lines) should hold more than \
-         {DISCRIMINATION_RATIO}x idle panes' ({idle_lines_after} history lines) after \
-         rebalance — a lesser margin doesn't distinguish proportional sharing from flat \
-         equal division, which a fix-round review measured producing only a ~2.35:1 ratio \
-         on this exact scenario"
+        busy_lines_after as u128 * idle_lines_before as u128 * RATIO_TOLERANCE
+            >= busy_lines_before as u128 * idle_lines_after as u128,
+        "the busy:idle ratio must survive a proportional squeeze (every pane's cap scales \
+         by the same budget/total factor): before {busy_lines_before}:{idle_lines_before}, \
+         after {busy_lines_after}:{idle_lines_after}. A collapse toward 1:1 like this is \
+         what flat equal division produces, not proportional sharing"
     );
 }
