@@ -30,6 +30,7 @@ use std::io::{self, Read, Stdout, Write}; // stdout backend + Result + pipe I/O
 use std::os::unix::ffi::OsStrExt; // OsStr -> bytes for CString
 use std::os::unix::fs::OpenOptionsExt; // custom_flags for O_NONBLOCK
 use std::path::{Path, PathBuf}; // fifo paths
+use std::sync::Arc; // shared, process-wide scrollback budget
 use std::time::{Duration, Instant}; // frame pacing
 
 /// Number of green "packets" spaced evenly around each pane's border ring. They
@@ -328,6 +329,23 @@ struct Mux {
     /// The tiling area from the last frame, used by directional focus (which
     /// needs a viewport but runs before the next draw computes one).
     area: Rect,
+    /// This process's scrollback memory budget, shared proportionally across every
+    /// pane rt-mux spawns (see `rt_engine::budget::Budget`). Created once here and
+    /// handed to every `TermPane::spawn_env` call below — rt-mux is a second host of
+    /// the same engine `rt` is, so it owns its own coordinator rather than sharing a
+    /// hidden default. This DOES bind in a standard build: rt-mux's own manifest sets
+    /// no features, but cargo's resolver-2 unifies features across workspace members,
+    /// and `crates/rt/Cargo.toml`'s `default = ["x11", "vtterm-default"]` pulls in
+    /// `rt-engine/vtterm-default` — a `cargo build --workspace` compiles exactly one
+    /// `rt_engine` unit and it carries `feature="vtterm-default"`, so `spawn_env`'s
+    /// `cfg!(feature = "vtterm-default")` fallback picks `VtPane` here too and every
+    /// rt-mux pane registers with this `Budget`. (`RT_ENGINE=vtterm` reaches the same
+    /// backend regardless of how rt-mux was built.) Which is why the frame loop must
+    /// call `rebalance_default` — see `rebalance_scrollback`.
+    budget: Arc<rt_engine::budget::Budget>,
+    /// When the frame loop last called `Budget::rebalance_default`. Rebalancing is a
+    /// ~1s job, not a per-frame one; this paces it (see `rebalance_scrollback`).
+    budget_last_rebalance: Instant,
 }
 
 impl Mux {
@@ -338,6 +356,7 @@ impl Mux {
         // when set, so it's per-user tmpfs and auto-removed on logout).
         let dir = mux_base().join(format!("rt-mux-{}", std::process::id()));
         ensure_mux_dir(&dir)?; // 0700, owned, no planted nodes — or refuse to start
+        let budget = Arc::new(rt_engine::budget::Budget::default());
         let mut mux = Mux {
             tree: Tree::new(Node::Tile(1)), // start with one leaf, id 1
             panes: HashMap::new(),
@@ -366,12 +385,14 @@ impl Mux {
             next_id: 2, // 1 is taken by the first pane
             prefix_armed: false,
             area,
+            budget,
+            budget_last_rebalance: Instant::now(),
         };
         // Size the first pane to the content area (screen minus the 1-cell frame).
         let cols = area.width.saturating_sub(2).max(1) as usize;
         let rows = area.height.saturating_sub(2).max(1) as usize;
         let env = mux.make_jacks(1); // its $RT_OUT / $RT_IN
-        let pane = TermPane::spawn_env(None, None, cols, rows, &env, rt_engine::DEFAULT_SCROLLBACK)?; // None = default login shell
+        let pane = TermPane::spawn_env(None, None, cols, rows, &env, rt_engine::DEFAULT_SCROLLBACK, &mux.budget)?; // None = default login shell
         mux.panes.insert(1, pane);
         mux.tree.focus_set(1); // focus the only pane
         Ok(mux)
@@ -398,7 +419,7 @@ impl Mux {
         let id = self.next_id; // candidate id (committed only on success)
         let env = self.make_jacks(id);
         // 80x24 is only a seed; `render` resizes every pane to its tile each frame.
-        match TermPane::spawn_env(None, None, 80, 24, &env, rt_engine::DEFAULT_SCROLLBACK) {
+        match TermPane::spawn_env(None, None, 80, 24, &env, rt_engine::DEFAULT_SCROLLBACK, &self.budget) {
             Ok(pane) => {
                 self.next_id += 1;
                 self.panes.insert(id, pane);
@@ -884,6 +905,24 @@ impl Mux {
             }
         }
         moved
+    }
+
+    /// Rebalance the process-wide scrollback budget on a ~1s cadence — NOT per frame.
+    /// rt-mux's panes register with `self.budget` (the standard workspace build runs the
+    /// in-house `VtPane` backend here; see the `budget` field's doc), so without this
+    /// call nothing ever prunes the registry: every closed pane would leave a dangling
+    /// `Weak` pinning its `ArcInner` for the life of the process, and no pane's byte cap
+    /// would ever be tightened however far over budget the session went.
+    ///
+    /// `rebalance_default` is safe to call straight from the frame loop: it `try_lock`s
+    /// each pane and skips a contended one rather than waiting. It is not free, though —
+    /// when it does squeeze, it evicts synchronously here, at roughly 39 µs per MiB
+    /// evicted (see `rt_engine::budget`'s module doc).
+    fn rebalance_scrollback(&mut self) {
+        if self.budget_last_rebalance.elapsed() >= Duration::from_secs(1) {
+            self.budget.rebalance_default();
+            self.budget_last_rebalance = Instant::now();
+        }
     }
 
     /// Sample `/proc` (about twice a second) to update each pane's CPU load — the
@@ -1748,6 +1787,9 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         let piped = mux.pump();
         // Refresh the CPU-heat readings (self-throttled to ~2 Hz).
         mux.sample_heat();
+        // Prune closed panes from the scrollback registry and, if the session is over
+        // budget, tighten caps (self-throttled to ~1 Hz).
+        mux.rebalance_scrollback();
         // Advance the instruments by real wall-clock time (framerate-independent),
         // and register any deadline overrun as a latency spike.
         let now = Instant::now();

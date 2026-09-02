@@ -119,6 +119,26 @@ impl Term {
         self.history.len()
     }
 
+    /// The running estimate of scrollback memory in use, in bytes — the same counter
+    /// `push_history`/`trim_history` maintain incrementally (see `lib.rs`) rather than a
+    /// fresh walk of `history`. Exists for a host that wants to bound scrollback memory
+    /// *across* panes (a process-wide budget): summing this over every live `Term` and
+    /// tightening [`Term::set_scrollback`]'s byte cap on the heaviest ones is exactly how
+    /// `rt-engine`'s pane-budget coordinator uses it, without duplicating the eviction
+    /// this crate already does in `trim_history`.
+    pub fn history_bytes(&self) -> usize {
+        self.history_bytes
+    }
+
+    /// The currently configured scrollback *line* cap — the `lines` a caller last passed
+    /// to [`Term::set_scrollback`], independent of the `bytes` cap set alongside it. A
+    /// process-wide budget coordinator needs this to re-apply `set_scrollback` with a
+    /// tightened byte cap *without* disturbing the user's configured line count, which it
+    /// has no other way to read back.
+    pub fn scrollback_lines(&self) -> usize {
+        self.scrollback_lines
+    }
+
     /// The G0..G3 character-set designations.
     pub fn charsets(&self) -> [Charset; 4] {
         self.charsets

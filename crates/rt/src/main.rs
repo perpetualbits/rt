@@ -604,6 +604,20 @@ struct App {
     // mutually exclusive with a drag (`enter_carry` cancels one to start the
     // other).
     carry: Option<CarryState>,
+    /// This process's scrollback memory budget, shared proportionally across every
+    /// pane every window spawns (see `rt_engine::budget::Budget`). Created once in
+    /// `main` and cloned into each window's pane-spawn closure — one coordinator for
+    /// the whole app, not per-window, since scrollback memory is a process-wide
+    /// resource regardless of which window a pane lives in.
+    budget: std::sync::Arc<rt_engine::budget::Budget>,
+    /// Wall-clock of the last `budget.rebalance_default()` call. `about_to_wait` runs on
+    /// every event-loop wake (as often as every ~16ms while animating), but rebalancing is
+    /// deliberately NOT per-wake work: summing every live pane's `history_bytes` and
+    /// possibly re-applying `set_scrollback` on each is real, if small, per-pane work that
+    /// has no business happening faster than scrollback itself can meaningfully grow. Gate
+    /// it to roughly once a second here so `about_to_wait`'s own per-wake cost stays a
+    /// single `Instant::elapsed()` comparison the rest of the time.
+    budget_last_rebalance: Instant,
 }
 
 /// A left-press on a pane titlebar or a tab label. It is not a drag yet — it
@@ -1096,6 +1110,10 @@ impl App {
         // Preferences takes effect for the next terminal without a restart.
         let scrollback = Rc::new(std::cell::Cell::new(settings.scrollback));
         let scrollback_spawn = scrollback.clone();
+        // This window's spawn closure shares the app-wide budget (cloning the Arc,
+        // not the coordinator) so every pane in every window reports into the same
+        // process-wide total.
+        let budget_spawn = self.budget.clone();
         // The factory spawns a shell-backed pane at the requested cell size.
         // Returning `None` on failure lets the session refuse the split/tab
         // gracefully (the initial pane's failure is startup-fatal, handled in
@@ -1117,7 +1135,7 @@ impl App {
                 }
                 _ => Vec::new(), // no jacks: the pane still runs, just unwireable
             };
-            let mut pane = match TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get()) {
+            let mut pane = match TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get(), &budget_spawn) {
                 Ok(pane) => pane,
                 Err(e) => {
                     // Out of ptys/fds: report it and let the session refuse the pane
@@ -2914,6 +2932,19 @@ impl ApplicationHandler for App {
         }
         for wid in to_close {
             self.close_window(wid);
+        }
+        // Process-wide scrollback rebalance, on a ~1s timer — NOT per wake/frame (see
+        // `budget_last_rebalance`'s doc). What this call site is and is not: `Budget::
+        // rebalance` uses `try_lock` per pane and SKIPS a contended pane rather than
+        // waiting for it, and this call holds no lock of ours across it. That bounds
+        // waiting for locks — it does not bound the work done under one. When the process
+        // is over budget the apply pass evicts synchronously, right here on the GUI
+        // thread, at roughly 39-50 µs per MiB evicted (so a pass dropping hundreds of MiB
+        // is a multi-millisecond hitch in this frame). Under budget it short-circuits and
+        // costs nothing. Bounding per-pass eviction is a design change, not done here.
+        if self.budget_last_rebalance.elapsed() >= Duration::from_secs(1) {
+            self.budget.rebalance_default();
+            self.budget_last_rebalance = Instant::now();
         }
         if let Some(interval) = min_interval {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
@@ -7292,6 +7323,8 @@ fn main() {
         armed_drag: None,
         drag: None,
         carry: None,
+        budget: std::sync::Arc::new(rt_engine::budget::Budget::default()),
+        budget_last_rebalance: Instant::now(),
     };
     if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
