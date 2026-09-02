@@ -113,6 +113,22 @@ pub const GLOBAL_SCROLLBACK_BUDGET: usize = 4 * (1 << 30); // 4 GiB
 /// well under `GLOBAL_SCROLLBACK_BUDGET`, leaving the rest to be shared by actual usage.
 pub const PANE_FLOOR: usize = 2 << 20; // 2 MiB
 
+/// Hysteresis on the restore path, as a percentage of the budget: an earlier squeeze is
+/// only lifted once total usage has fallen BELOW this fraction of the budget. Squeezing
+/// lands the total at ≤ budget by construction, so a restore condition of plain
+/// "total ≤ budget" fires on the very next tick and the process sawtooths between
+/// squeezed and generous forever. 90% is far enough below the ceiling that only a real
+/// drop in usage (output stopped, or a pane closed) clears it, and close enough that a
+/// process which genuinely recovers gets its generous caps back within a tick or two.
+const RESTORE_PERCENT_OF_BUDGET: u128 = 90;
+
+/// The usage below which an earlier squeeze is lifted — `RESTORE_PERCENT_OF_BUDGET`% of
+/// `budget`, computed in `u128` so it is exact for any `budget` a caller can pass
+/// (including `usize::MAX`, which tests use as "unreachable").
+fn restore_threshold(budget: usize) -> usize {
+    (budget as u128 * RESTORE_PERCENT_OF_BUDGET / 100) as usize
+}
+
 /// An owned, process-wide-*by-convention* scrollback budget coordinator. A host constructs
 /// exactly one (typically `Arc::new(Budget::default())`), hands `&Arc<Budget>` to every
 /// pane it spawns (see `VtPane::spawn_env`), and calls [`rebalance`](Budget::rebalance) or
@@ -205,7 +221,10 @@ impl Budget {
     /// The core policy (see the module doc): sum every live pane's usage. If it's within
     /// `budget`, the normal case, leave every pane on the generous per-pane cap — and if
     /// nothing has been squeezed since the last time this was true, don't even touch a
-    /// pane's lock to re-assert it; there's nothing to do. Otherwise tighten each pane's
+    /// pane's lock to re-assert it; there's nothing to do. If something WAS squeezed
+    /// earlier, the generous cap is only handed back once usage has fallen below
+    /// `restore_threshold(budget)` (90% of it) — see `RESTORE_PERCENT_OF_BUDGET` for why
+    /// restoring at exactly the budget sawtooths forever. Otherwise tighten each pane's
     /// byte cap to its proportional share of `budget`, floored at this `Budget`'s
     /// `pane_floor`, and apply it via `set_scrollback` (which evicts, via its own
     /// `trim_history`, entirely under that pane's own lock).
@@ -254,10 +273,20 @@ impl Budget {
                 // squeezed anything since. Skip the apply pass entirely — no lock touched.
                 return;
             }
-            // Something WAS squeezed on an earlier call; the process has since come back
-            // under budget (a busy pane's output slowed, or a pane closed). Restore every
-            // pane to the generous cap once, then clear the flag so later calls
-            // short-circuit again above.
+            // Something WAS squeezed on an earlier call. Restoring the instant `total`
+            // is merely *at* the budget would oscillate forever: a squeeze lands the
+            // total at ≤ budget BY CONSTRUCTION, so the very next tick would restore
+            // every pane to the generous cap, the pane would grow past the budget again,
+            // and the tick after that would squeeze — a permanent 2-tick sawtooth, with
+            // a full apply pass (and its eviction) every other tick, for any process
+            // that genuinely wants more memory than the budget allows. Require the total
+            // to have fallen well clear of the budget first — real recovery (a busy
+            // pane's output stopped, or a pane closed), not the squeeze's own result.
+            if total > restore_threshold(budget) {
+                return; // still hovering at the ceiling: stay squeezed, touch no lock
+            }
+            // A genuine recovery. Restore every pane to the generous cap once, then clear
+            // the flag so later calls short-circuit above.
             for (term, _usage) in &usages {
                 try_with_term(term, |t| {
                     let lines = t.scrollback_lines(); // preserve the line cap — only the
@@ -412,6 +441,40 @@ mod tests {
             "the floor must leave a quiet pane strictly more than strict proportionality \
              would (floored {floored}, unfloored {unfloored}) — if these are equal the \
              floor is doing nothing and only `trim_history`'s last-line guard is showing"
+        );
+    }
+
+    #[test]
+    fn a_squeeze_is_not_lifted_while_usage_still_hugs_the_ceiling() {
+        // A squeeze lands the total at <= budget BY CONSTRUCTION. Without hysteresis the
+        // next tick therefore takes the restore branch, puts every pane back on the
+        // generous cap, and lets them grow over budget again — a permanent 2-tick
+        // sawtooth running a full apply pass (with its eviction) every other tick, for
+        // any process that genuinely wants more than the budget. This asserts the second
+        // tick does NOT restore. It is red without the `restore_threshold` check.
+        let coordinator = Budget::default();
+        let a = term_with_history(80, 10, 8000);
+        let b = term_with_history(80, 10, 8000);
+        coordinator.register(&a);
+        coordinator.register(&b);
+        let cap = coordinator.total_usage() / 2;
+
+        coordinator.rebalance(cap); // tick 1: squeeze
+        assert!(coordinator.squeezed.load(Ordering::SeqCst), "test setup: tick 1 must squeeze");
+        let after_squeeze = coordinator.total_usage();
+        assert!(after_squeeze <= cap, "test setup: {after_squeeze} should be under {cap}");
+        assert!(
+            after_squeeze > restore_threshold(cap),
+            "test setup: the squeeze must land the total in the hysteresis band \
+             ({after_squeeze} vs threshold {})",
+            restore_threshold(cap)
+        );
+
+        coordinator.rebalance(cap); // tick 2: nothing has changed, so nothing may change
+        assert!(
+            coordinator.squeezed.load(Ordering::SeqCst),
+            "the squeeze must survive a tick where usage is still hugging the budget — \
+             restoring here is exactly the sawtooth"
         );
     }
 
