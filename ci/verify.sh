@@ -55,7 +55,13 @@ if [ $BENCH = 1 ]; then eval "$bench_cmd"; fi
 
 for h in "${REMOTES[@]}"; do
   echo; echo "########## $h ##########"
-  if ! rsync -a --delete --exclude=target/ --exclude='*.swp' "$HOME/git/rt/" "$h:git/rt/"; then
+  # --exclude=.cargo/config.toml: that file is LOCAL-ONLY and gitignored — it path-overrides
+  # the `mullion` dep to ~/git/mullion. Pushing it makes the REMOTE demand its own
+  # ~/git/mullion; when that is missing or stale the remote's build breaks (seen 2026-07-25
+  # and again 2026-09-02). Without it the remote builds the published crate, which is what
+  # CI and releases build anyway. NOTE: an excluded file is not deleted on the receiver, so
+  # a previously-pushed copy must be removed by hand once.
+  if ! rsync -a --delete --exclude=target/ --exclude='*.swp' --exclude=.cargo/config.toml "$HOME/git/rt/" "$h:git/rt/"; then
     echo "$h: rsync FAILED"; FAIL=1; continue
   fi
   out=$(ssh "$h" ". ~/.cargo/env 2>/dev/null||true; cd ~/git/rt; $tests_cmd" 2>&1)
