@@ -35,9 +35,19 @@ Wiring:
   then `EIO` forever, so a write-then-exit child (`sh -c "printf hi"`) lost its output
   entirely. Now a hard error with bytes staged records the error, blocks for the lock
   rather than re-reading a dead fd, parses, and reports the error afterwards.
-  Deterministic on riscv64 (0/12 → 12/12); never reproduced on x86_64, where
-  `snapshot()` is too fast to hold the lock long enough. Covered by
-  `crates/rt-engine/tests/exit_race.rs`.
+  Covered by `crates/rt-engine/tests/exit_race.rs`.
+
+  This was first written up as "deterministic on riscv64, never reproduced on
+  x86_64, where `snapshot()` is too fast to hold the lock long enough". That was
+  wrong, and the correction matters because it retires an imagined architecture
+  dependency. **The bug is architecture-independent** — with the fix reverted it
+  loses 40/40 on x86_64. What actually differed was the engine, not the CPU:
+  `TermPane::spawn` reads `RT_ENGINE`, the interactive shell on dop561 exports
+  `RT_ENGINE=vtterm`, and a non-login `ssh milkv 'cargo test'` does not. So the
+  x86_64 runs were exercising the in-house engine (which has no such bug — its
+  reader takes a *blocking* lock and can only be delayed, never made to skip a
+  parse) while the riscv64 runs exercised the vendored one. The test now pins
+  each engine explicitly instead of inheriting the ambient variable.
 
 The `alacritty_terminal` Cargo.toml had `edition`/`rust-version` inlined from the
 alacritty workspace root (they were `.workspace = true` in the monorepo).
