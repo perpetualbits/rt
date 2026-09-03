@@ -61,7 +61,11 @@ for h in "${REMOTES[@]}"; do
   # and again 2026-09-02). Without it the remote builds the published crate, which is what
   # CI and releases build anyway. NOTE: an excluded file is not deleted on the receiver, so
   # a previously-pushed copy must be removed by hand once.
-  if ! rsync -a --delete --exclude=target/ --exclude='*.swp' --exclude=.cargo/config.toml "$HOME/git/rt/" "$h:git/rt/"; then
+  # -O (--omit-dir-times): milkv's ~/git is a symlink to an NFS mount whose server
+  # refuses utimes on directories ("failed to set times ... Operation not permitted",
+  # rsync exit 23). File contents transfer fine; only directory mtimes fail, and
+  # nothing here depends on them.
+  if ! rsync -a -O --delete --exclude=target/ --exclude='*.swp' --exclude=.cargo/config.toml "$HOME/git/rt/" "$h:git/rt/"; then
     echo "$h: rsync FAILED"; FAIL=1; continue
   fi
   out=$(ssh "$h" ". ~/.cargo/env 2>/dev/null||true; cd ~/git/rt; $tests_cmd" 2>&1)
