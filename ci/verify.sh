@@ -25,13 +25,19 @@ for a in "$@"; do
 done
 [ ${#args[@]} -gt 0 ] && REMOTES=("${args[@]}")
 
-PKGS=(-p vt-parser -p vt-conformance -p rt-handoff)
+# rt-engine and vt-term are in here deliberately: rt-engine owns the PTY read loop and
+# the vendored engine, and that is where the 2026-09-03 dead-child output-loss bug lived —
+# a bug that reproduced ONLY on riscv64. Leaving them out gave the arch-sensitive code no
+# multi-arch coverage at all. Neither crate pulls in Wayland/EGL, so both build on milkv.
+PKGS=(-p vt-parser -p vt-conformance -p rt-handoff -p vt-term -p rt-engine)
 FAIL=0
 
 # Keep error: (colon) alongside error[ so cargo/build errors (e.g. a dead path override →
 # "error: failed to update path override") stay VISIBLE in the filtered remote output
 # instead of being silently dropped and mistaken for a clean run.
-tests_cmd='cargo test -q -p vt-parser -p vt-conformance -p rt-handoff 2>&1 | grep -E "test result:|error\[|error:|FAILED|panicked"'
+# Built from PKGS so the remote list can never drift from the local one (it did before:
+# the package list was spelled out twice and only one copy got updated).
+tests_cmd="cargo test -q ${PKGS[*]} 2>&1 | grep -E \"test result:|error\\[|error:|FAILED|panicked\""
 bench_cmd='cargo run -q --release --example parser_bench -p vt-conformance 2>&1 | grep -vE "Compiling|Finished|Running|warning:"'
 
 # Evaluate one host's captured test output. A run PASSES only if it emitted at least one

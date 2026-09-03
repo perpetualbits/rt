@@ -5,11 +5,18 @@
 # supposed to run everywhere, which is why it gets its own workflow rather than
 # competing for generic riscv64 work.
 #
-# Scoped to the engine crates on purpose. rt itself is a Wayland/EGL application
-# and milkv is a slow X11-only board that will never display it — proving the GUI
-# links there costs a large dependency install and tells us nothing. What matters
-# is that the portable parsing/terminal code builds and passes on baseline
-# silicon.
+# Scoped to the engine crates on purpose. The `rt` BINARY is a Wayland/EGL
+# application and milkv is a slow X11-only board that will never display it —
+# proving the GUI links there costs a large dependency install and tells us
+# nothing. What matters is that the portable parsing/terminal code builds and
+# passes on baseline silicon.
+#
+# rt-engine IS such portable code and belongs here despite the name: it depends
+# only on the vendored engine, libc, vt-term and rt-handoff (no Wayland/EGL), and
+# it owns the PTY read loop. Omitting it cost us real coverage — the 2026-09-03
+# dead-child output-loss bug lived in that loop and reproduced ONLY on riscv64,
+# so no cell in the fleet could have caught it. crates/rt-engine/tests/exit_race.rs
+# is the regression test, and this is the only arch where it is meaningful.
 #
 # Advisory on push: a full build here takes minutes and must not gate the inner
 # loop. It becomes blocking in the tag pipeline (Stage 4).
@@ -44,5 +51,5 @@ steps:
     # No -C target-cpu=native anywhere: a natively tuned binary would SIGILL on
     # exactly the baseline hardware this cell exists to protect.
     commands:
-      - cargo build --release -p vt-parser -p vt-term -p rt-core -p rt-config
-      - cargo test -p vt-parser -p vt-term -p rt-core -p rt-config
+      - cargo build --release -p vt-parser -p vt-term -p rt-core -p rt-config -p rt-engine
+      - cargo test -p vt-parser -p vt-term -p rt-core -p rt-config -p rt-engine
