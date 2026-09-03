@@ -29,8 +29,12 @@ labels:
 
 variables:
   - &rust
-    CARGO_HOME: /var/cache/forge-ci/cargo
-    CARGO_TARGET_DIR: /var/cache/forge-ci/target
+    # On /mnt/build (117G, ~103G free), NOT the 15G root filesystem. Root filled
+    # to 100% on 2026-09-02 and 2026-09-03, which does not fail as a build error:
+    # it fails the CLONE step, so every later step is skipped and riscv64 silently
+    # contributes nothing while the pipeline still reports success.
+    CARGO_HOME: /mnt/build/forge-ci/cargo
+    CARGO_TARGET_DIR: /mnt/build/forge-ci/target
     RUSTUP_HOME: /var/lib/woodpecker/.rustup
     PATH: /var/lib/woodpecker/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -53,9 +57,9 @@ steps:
     # blocking: this is a report, not a gate.
     failure: ignore
     commands:
-      - df -h / /var/cache/forge-ci /tmp 2>/dev/null || df -h
-      - du -sh /var/cache/forge-ci/target /var/cache/forge-ci/cargo 2>/dev/null || true
-      - du -sh /var/cache/forge-ci/target/* 2>/dev/null | sort -h | tail -5 || true
+      - df -h / /mnt/build /tmp 2>/dev/null || df -h
+      - du -sh /mnt/build/forge-ci/target /mnt/build/forge-ci/cargo 2>/dev/null || true
+      - du -sh /mnt/build/forge-ci/target/* 2>/dev/null | sort -h | tail -5 || true
       # The CI cache is only ~1.2G of a 15G disk, so when this board fills up the
       # cause is somewhere else entirely. Show the whole root filesystem: -x keeps
       # it on one device so it cannot wander into /proc or a mount.
