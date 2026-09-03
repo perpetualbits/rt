@@ -122,7 +122,7 @@ to a different backend for debugging.
 | `present(_, damage)` | ignores `damage`, full present, returns `false` | see below |
 | `is_software()` | `false` | real GPU — do not throttle animated chrome |
 | `is_gl()` | `true` | see [naming wart](#a-naming-wart-left-alone-deliberately) |
-| `can_scroll_blit` | `false` | that is XRender's `ssh -X` optimisation |
+| `supports_scroll_blit()` | `false` (trait default) | that is XRender's `ssh -X` optimisation |
 
 **Accepted consequence:** with `partial_present_available()` false, `main.rs:5440`
 calls `damage.mark_full()`, so macOS redraws the whole window every frame. This
