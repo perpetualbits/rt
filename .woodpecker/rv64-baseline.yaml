@@ -44,6 +44,24 @@ steps:
       - test "$(uname -m)" = "riscv64" || { echo "wrong arch"; uname -m; exit 1; }
       - grep -m1 isa /proc/cpuinfo
 
+  - name: disk
+    image: bash
+    environment: *rust
+    # milkv has filled its disk twice (2026-09-02, 2026-09-03). cargo reports that
+    # only as a distant `exit status: 101` under a wall of rustc command lines, so
+    # print the state up front and make the real cause a one-line read. Never
+    # blocking: this is a report, not a gate.
+    failure: ignore
+    commands:
+      - df -h / /var/cache/forge-ci /tmp 2>/dev/null || df -h
+      - du -sh /var/cache/forge-ci/target /var/cache/forge-ci/cargo 2>/dev/null || true
+      - du -sh /var/cache/forge-ci/target/* 2>/dev/null | sort -h | tail -5 || true
+      # The CI cache is only ~1.2G of a 15G disk, so when this board fills up the
+      # cause is somewhere else entirely. Show the whole root filesystem: -x keeps
+      # it on one device so it cannot wander into /proc or a mount.
+      - du -xh --max-depth=1 / 2>/dev/null | sort -h | tail -12 || true
+      - du -xh --max-depth=2 /var 2>/dev/null | sort -h | tail -8 || true
+
   - name: build-and-test
     image: bash
     environment: *rust
