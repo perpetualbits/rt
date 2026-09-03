@@ -229,9 +229,16 @@ macOS the scrim sits *over* the vibrancy and `background_opacity` keeps its
 current meaning: lower opacity lets more frosted glass through. No new settings
 semantics — which is what parity should mean.
 
-Pick **one** material for v1 (`.underWindowBackground` is closest to how rt looks
-on KDE). A macOS-only material picker is deliberately out of scope; see
-[Non-goals](#non-goals).
+**Take the system default material for v1** — do not set `material` explicitly,
+and let `NSVisualEffectView` use whatever the system picks. The look can only be
+judged on screen, so choosing a specific material now would be guessing; refine
+it once rt actually runs on the Mac.
+
+One thing to check visually when it does: `NSVisualEffectView`'s historical
+default is `.appearanceBased`, deprecated since 10.14. If the default turns out
+to look wrong or flat, `.underWindowBackground` is the closest match to how rt
+looks on KDE and is the first thing to try. A macOS-only material *picker*
+remains out of scope; see [Non-goals](#non-goals).
 
 ### Surface alpha
 
