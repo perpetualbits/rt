@@ -112,6 +112,11 @@ where
     {
         let mut unprocessed = 0;
         let mut processed = 0;
+        // A hard read error that arrived while bytes were still staged in `buf`.
+        // Those bytes are already out of the kernel and cannot be re-read, so they
+        // MUST be parsed before the error is reported -- see the `pending_err`
+        // handling below.
+        let mut pending_err: Option<io::Error> = None;
 
         // Reserve the next terminal lock for PTY reading.
         let _terminal_lease = Some(self.terminal.lease());
@@ -130,7 +135,13 @@ where
                             break;
                         }
                     },
-                    _ => return Err(err),
+                    // Nothing staged: the error is all there is to report.
+                    _ if unprocessed == 0 => return Err(err),
+                    // Bytes ARE staged. Returning here would discard them: this is a
+                    // PTY whose child has exited, so `read` yields the final output and
+                    // then EIO forever. Record the error and fall through to parse what
+                    // we already hold; it is surfaced after the loop.
+                    _ => pending_err = Some(err),
                 },
             }
 
@@ -139,7 +150,12 @@ where
                 Some(terminal) => terminal,
                 None => terminal.insert(match self.terminal.try_lock_unfair() {
                     // Force block if we are at the buffer size limit.
-                    None if unprocessed >= READ_BUFFER_SIZE => self.terminal.lock_unfair(),
+                    None if unprocessed >= READ_BUFFER_SIZE || pending_err.is_some() => {
+                        self.terminal.lock_unfair()
+                    },
+                    // Only safe while the PTY is still alive: `continue` loops back to
+                    // read again, which on a dead PTY returns EIO and would strand the
+                    // staged bytes. Hence the `pending_err` arm above blocks instead.
                     None => continue,
                     Some(terminal) => terminal,
                 }),
@@ -156,6 +172,11 @@ where
             processed += unprocessed;
             unprocessed = 0;
 
+            // The staged bytes are parsed now, so the error can finally be reported.
+            if pending_err.is_some() {
+                break;
+            }
+
             // Assure we're not blocking the terminal too long unnecessarily.
             if processed >= MAX_LOCKED_READ {
                 break;
@@ -167,7 +188,10 @@ where
             self.event_proxy.send_event(Event::Wakeup);
         }
 
-        Ok(())
+        match pending_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     #[inline]

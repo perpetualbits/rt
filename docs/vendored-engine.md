@@ -26,6 +26,19 @@ Wiring:
   printable-ASCII run in one grid pass, with per-char fallback for wide/zero-width/
   non-ASCII/INSERT. Correctness pinned by the `input_run_matches_input` differential test.
 
+- **alacritty_terminal** (`event_loop.rs`, 2026-09-03): `pty_read` no longer discards
+  bytes it has already read. It stages reads in `buf` and only parses once it can take
+  the `Term` lock; if the lock was contended it did `continue`, looping back to read
+  again, and a hard read error there hit `_ => return Err(err)` and returned with
+  `unprocessed > 0` — throwing away bytes that were already out of the kernel and
+  unrecoverable. On a PTY whose child has exited, `read` yields the final output and
+  then `EIO` forever, so a write-then-exit child (`sh -c "printf hi"`) lost its output
+  entirely. Now a hard error with bytes staged records the error, blocks for the lock
+  rather than re-reading a dead fd, parses, and reports the error afterwards.
+  Deterministic on riscv64 (0/12 → 12/12); never reproduced on x86_64, where
+  `snapshot()` is too fast to hold the lock long enough. Covered by
+  `crates/rt-engine/tests/exit_race.rs`.
+
 The `alacritty_terminal` Cargo.toml had `edition`/`rust-version` inlined from the
 alacritty workspace root (they were `.workspace = true` in the monorepo).
 
