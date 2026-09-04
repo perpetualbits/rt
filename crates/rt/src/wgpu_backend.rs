@@ -168,6 +168,11 @@ impl Backend for WgpuBackend {
         let (w, h) = self.text.cell_size();
         self.cell_w = w;
         self.cell_h = h;
+        // Rebuilding TextPipeline resets `screen` to its [1.0, 1.0] placeholder
+        // (see `new`'s comment). `Backend::resize` is still a no-op (Task 6), so
+        // without re-seeding here a font-size change leaves text permanently
+        // off-screen: nothing else will ever call `set_screen` again.
+        self.text.set_screen(self.config.width as f32, self.config.height as f32);
         Ok(())
     }
 

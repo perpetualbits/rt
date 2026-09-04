@@ -296,9 +296,11 @@ impl TextPipeline {
             ubuf,
             verts: Vec::new(),
             atlas,
-            shelf_x: 1,
-            shelf_y: 0,
-            shelf_h: 1,
+            // Matches render.rs's initial shelf state: leave column 0/1 near the
+            // opaque seed texel, first shelf sits below the seed row.
+            shelf_x: 2,
+            shelf_y: 2,
+            shelf_h: 0,
             glyphs: HashMap::new(),
             screen: [1.0, 1.0],
             font_px,
@@ -327,17 +329,22 @@ impl TextPipeline {
     pub fn set_screen(&mut self, w: f32, h: f32) { self.screen = [w, h]; }
 
     /// Shelf packer: fill the current row left-to-right, start a new row when it
-    /// no longer fits. Same scheme render.rs uses; an atlas this size never fills
-    /// for a terminal's glyph repertoire.
-    fn pack(&mut self, queue: &wgpu::Queue, w: u32, h: u32, data: &[u8]) -> [f32; 4] {
-        if self.shelf_x + w > ATLAS_SIZE {
-            self.shelf_x = 0;
-            self.shelf_y += self.shelf_h;
-            self.shelf_h = 0;
+    /// no longer fits. Same scheme (and same 1px gutter, to keep a NEAREST
+    /// sampler from bleeding into a neighbouring glyph's texels) render.rs's
+    /// `pack_coverage` uses. Returns `None` when the atlas is full, same as
+    /// render.rs -- the caller must refuse the glyph rather than pack it, since
+    /// an out-of-bounds `write_texture` origin panics.
+    fn pack(&mut self, queue: &wgpu::Queue, w: u32, h: u32, data: &[u8]) -> Option<[f32; 4]> {
+        // Advance to a new shelf if this won't fit on the current one.
+        if self.shelf_x + w + 1 >= ATLAS_SIZE {
+            self.shelf_y += self.shelf_h + 1; // move down past the current shelf, +1 gutter
+            self.shelf_x = 2; // back to the left margin
+            self.shelf_h = 0; // new shelf starts empty
+        }
+        if self.shelf_y + h + 1 >= ATLAS_SIZE {
+            return None; // atlas full
         }
         let (x, y) = (self.shelf_x, self.shelf_y);
-        self.shelf_x += w;
-        self.shelf_h = self.shelf_h.max(h);
         if w > 0 && h > 0 {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -351,8 +358,10 @@ impl TextPipeline {
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
         }
+        self.shelf_x += w + 1; // 1px gutter
+        self.shelf_h = self.shelf_h.max(h);
         let s = ATLAS_SIZE as f32;
-        [x as f32 / s, y as f32 / s, (x + w) as f32 / s, (y + h) as f32 / s]
+        Some([x as f32 / s, y as f32 / s, (x + w) as f32 / s, (y + h) as f32 / s])
     }
 
     pub fn push_glyph(&mut self, queue: &wgpu::Queue, x: f32, y: f32, ch: char, fg: Color, bold: bool, italic: bool) {
@@ -369,7 +378,15 @@ impl TextPipeline {
                     self.glyphs.insert(key, g);
                     return;
                 }
-                let uv = self.pack(queue, m.width as u32, m.height as u32, &cov);
+                // Atlas full: refuse the glyph rather than pack it (an
+                // out-of-bounds write_texture origin would panic mid-frame) --
+                // matches render.rs's `pack_coverage(..)?` early return. Not
+                // cached, so a later frame may retry (harmless: atlas
+                // exhaustion is not expected for a terminal's glyph
+                // repertoire, per ATLAS_SIZE's doc comment).
+                let Some(uv) = self.pack(queue, m.width as u32, m.height as u32, &cov) else {
+                    return;
+                };
                 let g = Glyph {
                     u0: uv[0],
                     v0: uv[1],
@@ -389,8 +406,12 @@ impl TextPipeline {
         }
         // fontdue's ymin is the offset of the bitmap's BOTTOM from the baseline,
         // and our y grows downward, so the top edge is baseline - (h + ymin).
-        let px = x + g.bearing_x;
-        let py = y + self.ascent - (g.h + g.bearing_y);
+        // Both rounded to whole pixels, matching render.rs:762-763 exactly: with
+        // a NEAREST sampler, fractional placement makes edge fragments sample
+        // the neighbouring atlas texel (the "faint per-glyph outline" render.rs
+        // warns about at 754-761).
+        let px = (x + g.bearing_x).round();
+        let py = (y + self.ascent - (g.h + g.bearing_y)).round();
         self.push_uv_quad(px, py, g.w, g.h, [g.u0, g.v0, g.u1, g.v1], fg);
     }
 
