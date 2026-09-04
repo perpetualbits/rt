@@ -7132,8 +7132,11 @@ fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -
 /// The running build's identity — crate version plus the git commit stamped in
 /// by build.rs (e.g. `rt 0.2.8 (42c5ba7)`), so a from-source build is never
 /// mistaken for the release it sits ahead of. Shown by `--version` and in the
-/// menu, manual and preferences. `option_env!` keeps it compiling if build.rs
-/// didn't run (then it's just `rt <version>`).
+/// menu, manual and preferences. build.rs always sets `RT_GIT_DESC` — to a
+/// real commit, an `RT_GIT_DESC` override from the build environment, or
+/// `unknown` when git isn't usable (a packaged tarball, an rsynced worktree)
+/// — so the stamp is never silently empty; `option_env!` only falls back to a
+/// bare `rt <version>` in the never-expected case that build.rs didn't run.
 pub fn version_string() -> String {
     let v = env!("CARGO_PKG_VERSION");
     match option_env!("RT_GIT_DESC") {
