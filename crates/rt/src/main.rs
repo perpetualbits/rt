@@ -68,7 +68,10 @@ use glutin::display::{Display, DisplayApiPreference};
 use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, buffer_age, …)
 #[cfg(not(target_os = "macos"))]
 use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::HasDisplayHandle;
+// `window_handle()` is only needed to bind the GL context/surface — Linux-only.
+#[cfg(not(target_os = "macos"))]
+use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::event::{
     ButtonSource, ElementState, Ime, MouseButton, MouseScrollDelta, PointerKind, PointerSource,
@@ -81,13 +84,21 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 // winit itself target-gates its `platform::wayland` module to non-Apple unix.
 #[cfg(not(target_os = "macos"))]
 use winit::platform::wayland::ActiveEventLoopExtWayland;
-#[cfg(feature = "x11")]
+// Bare `feature = "x11"` is not enough on its own: the `x11` Cargo feature is
+// ON by default (universal binary) regardless of target, but winit itself
+// target-gates `platform::x11` to non-Apple unix, so on macOS the module does
+// not exist to import even with the feature enabled — hence `not(target_os)`.
+#[cfg(all(feature = "x11", not(target_os = "macos")))]
 use winit::platform::x11::ActiveEventLoopExtX11;
 use winit::cursor::{Cursor, CursorIcon, CustomCursor, CustomCursorSource};
 use winit::monitor::Fullscreen;
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use render::{Color, Renderer};
+use render::Color;
+// `Renderer` (the GL glyph-atlas renderer) is only constructed on the Linux GL
+// path; macOS builds no renderer yet (wgpu backend arrives in Task 4).
+#[cfg(not(target_os = "macos"))]
+use render::Renderer;
 use rt_config::Keymap;
 use rt_core::Rect;
 use rt_engine::TermPane;
@@ -362,7 +373,14 @@ struct Active {
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
     clip_history: clip_history::ClipHistory, // in-memory MRU ring of this session's copies
+    // Both blur mechanisms are Linux-only (Wayland ext-background-effect-v1 /
+    // KWin, and the X11 _KDE_NET_WM_BLUR_BEHIND_REGION property respectively):
+    // `bg_effect`/`x11_blur` modules are target-gated out on macOS, so these
+    // fields don't exist there either. Task 8 (vibrancy.rs) is the macOS
+    // equivalent.
+    #[cfg(not(target_os = "macos"))]
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
+    #[cfg(not(target_os = "macos"))]
     x11_blur: x11_blur::X11Blur,          // X11 background blur (inert on Wayland / no x11 feature)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
@@ -904,73 +922,86 @@ impl App {
         // created with the config's visual (see the transparency note below) and
         // a window's visual cannot be changed afterwards. On Wayland the order
         // is free, so one sequence serves both.
-        let raw_display = match event_loop.display_handle() {
-            Ok(h) => h.as_raw(),
-            Err(e) => {
-                log::error!("no display handle: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        // EGL is the path on Wayland and the preferred one on X11; the X11 build
-        // keeps GLX as a fallback for servers without the EGL platform extension,
-        // which is what glutin-winit's default preference gave us.
-        #[cfg(not(feature = "x11"))]
-        let api_preference = DisplayApiPreference::Egl;
-        #[cfg(feature = "x11")]
-        let api_preference = DisplayApiPreference::EglThenGlx(Box::new(
-            winit::platform::x11::register_xlib_error_hook,
-        ));
-        let gl_display = match unsafe { Display::new(raw_display, api_preference) } {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("failed to open the GL display: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
+        //
+        // Linux-only: `glutin` isn't even a dependency on macOS (see Cargo.toml),
+        // and opening a GL display doesn't apply there — Task 4 brings a
+        // wgpu/Metal backend instead. `gl_display`/`gl_config` feed the
+        // context/surface band below.
+        #[cfg(not(target_os = "macos"))]
+        let (gl_display, gl_config) = {
+            let raw_display = match event_loop.display_handle() {
+                Ok(h) => h.as_raw(),
+                Err(e) => {
+                    log::error!("no display handle: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            // EGL is the path on Wayland and the preferred one on X11; the X11 build
+            // keeps GLX as a fallback for servers without the EGL platform extension,
+            // which is what glutin-winit's default preference gave us.
+            #[cfg(not(feature = "x11"))]
+            let api_preference = DisplayApiPreference::Egl;
+            #[cfg(feature = "x11")]
+            let api_preference = DisplayApiPreference::EglThenGlx(Box::new(
+                winit::platform::x11::register_xlib_error_hook,
+            ));
+            let gl_display = match unsafe { Display::new(raw_display, api_preference) } {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("failed to open the GL display: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
 
-        let template = ConfigTemplateBuilder::new().with_alpha_size(8).build(); // want an alpha channel
-        let configs = match unsafe { gl_display.find_configs(template) } {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("no GL configs: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        let gl_config = configs.reduce(|a, b| {
-            // Prefer a config whose X11 VISUAL supports transparency, before any
-            // other criterion. On X11 the WINDOW's visual — not the GL drawable's
-            // alpha_size — decides transparency: a config can report alpha_size 8
-            // yet have a 24-bit visual, giving an OPAQUE window (background_opacity
-            // is then silently dropped over ssh -X). supports_transparency() is
-            // Some(true) only when the config's native visual is 32-bit ARGB, which
-            // is what a translucent window over Xwayland needs. Native Wayland
-            // already reports transparency-capable configs, so this is a no-op
-            // there; and where no such config exists (bare X, no compositor) we
-            // fall through to the alpha/sample preference and stay 24-bit.
-            let (at, bt) = (
-                a.supports_transparency().unwrap_or(false),
-                b.supports_transparency().unwrap_or(false),
-            );
-            if at != bt {
-                return if bt { b } else { a }; // the transparency-capable one wins
-            }
-            // Tie on transparency: prefer more alpha, then more samples.
-            let better_alpha = b.alpha_size() > a.alpha_size();
-            let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
-            if better_alpha || same_more_samples { b } else { a }
-        });
-        let gl_config = match gl_config {
-            Some(c) => c,
-            None => {
-                log::error!("no GL config matched the template");
-                return self.fail_build(event_loop);
-            }
+            let template = ConfigTemplateBuilder::new().with_alpha_size(8).build(); // want an alpha channel
+            let configs = match unsafe { gl_display.find_configs(template) } {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("no GL configs: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            let gl_config = configs.reduce(|a, b| {
+                // Prefer a config whose X11 VISUAL supports transparency, before any
+                // other criterion. On X11 the WINDOW's visual — not the GL drawable's
+                // alpha_size — decides transparency: a config can report alpha_size 8
+                // yet have a 24-bit visual, giving an OPAQUE window (background_opacity
+                // is then silently dropped over ssh -X). supports_transparency() is
+                // Some(true) only when the config's native visual is 32-bit ARGB, which
+                // is what a translucent window over Xwayland needs. Native Wayland
+                // already reports transparency-capable configs, so this is a no-op
+                // there; and where no such config exists (bare X, no compositor) we
+                // fall through to the alpha/sample preference and stay 24-bit.
+                let (at, bt) = (
+                    a.supports_transparency().unwrap_or(false),
+                    b.supports_transparency().unwrap_or(false),
+                );
+                if at != bt {
+                    return if bt { b } else { a }; // the transparency-capable one wins
+                }
+                // Tie on transparency: prefer more alpha, then more samples.
+                let better_alpha = b.alpha_size() > a.alpha_size();
+                let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
+                if better_alpha || same_more_samples { b } else { a }
+            });
+            let gl_config = match gl_config {
+                Some(c) => c,
+                None => {
+                    log::error!("no GL config matched the template");
+                    return self.fail_build(event_loop);
+                }
+            };
+            (gl_display, gl_config)
         };
 
         // --- per-backend window attributes -------------------------------
         // The X11 arm also pins the window to the chosen config's visual, which
-        // is the whole reason the config had to be picked first.
-        #[cfg(feature = "x11")]
+        // is the whole reason the config had to be picked first. `not(target_os
+        // = "macos")` is required alongside `feature = "x11"` here: the `x11`
+        // feature is on by default (universal binary) independent of target, so
+        // without it this arm would still be compiled on macOS, where there is
+        // no `gl_config` (and no glutin) to pull a visual from.
+        #[cfg(all(feature = "x11", not(target_os = "macos")))]
         if event_loop.is_x11() {
             use glutin::platform::x11::X11GlConfigExt;
             let mut x11_attrs =
@@ -997,72 +1028,89 @@ impl App {
         };
 
         // --- create the GL context and surface ---------------------------
-        // Raw handle needed to bind the context and surface to this window.
-        let raw_handle = match window.window_handle() {
-            Ok(h) => h.as_raw(),
-            Err(e) => {
-                log::error!("no window handle: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        let context_attrs = ContextAttributesBuilder::new().build(Some(raw_handle));
-        // Create a not-yet-current context, then a surface, then make current.
-        let not_current = match unsafe { gl_display.create_context(&gl_config, &context_attrs) } {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("GL context creation failed: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        // Build the window surface at the window's current size. `max(1)` because
-        // a zero-sized surface is not representable (and a compositor may hand us
-        // a 0-height window while it is still being mapped).
-        let surface_size = window.surface_size();
-        let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            raw_handle,
-            NonZeroU32::new(surface_size.width.max(1)).expect("max(1) is non-zero"),
-            NonZeroU32::new(surface_size.height.max(1)).expect("max(1) is non-zero"),
-        );
-        let surface = match unsafe { gl_display.create_window_surface(&gl_config, &attrs) } {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("GL surface creation failed: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        // Make the context current on the surface so GL calls target it.
-        let context = match not_current.make_current(&surface) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("make_current failed: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
+        // Linux-only, like the display/config band above: no `gl_display`/
+        // `gl_config` exist on macOS to create a context or surface from, and
+        // `Renderer` (render.rs) needs a live `glow::Context`, which here is
+        // loaded through `gl_display.get_proc_address` — also glutin. `renderer`,
+        // `surface` and `context` feed the (already macOS/Linux-split) backend
+        // construction further down, and `renderer` also feeds the cell-size
+        // measurement just below.
+        #[cfg(not(target_os = "macos"))]
+        let (mut renderer, surface, context) = {
+            // Raw handle needed to bind the context and surface to this window.
+            let raw_handle = match window.window_handle() {
+                Ok(h) => h.as_raw(),
+                Err(e) => {
+                    log::error!("no window handle: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            let context_attrs = ContextAttributesBuilder::new().build(Some(raw_handle));
+            // Create a not-yet-current context, then a surface, then make current.
+            let not_current = match unsafe { gl_display.create_context(&gl_config, &context_attrs) } {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("GL context creation failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            // Build the window surface at the window's current size. `max(1)` because
+            // a zero-sized surface is not representable (and a compositor may hand us
+            // a 0-height window while it is still being mapped).
+            let surface_size = window.surface_size();
+            let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+                raw_handle,
+                NonZeroU32::new(surface_size.width.max(1)).expect("max(1) is non-zero"),
+                NonZeroU32::new(surface_size.height.max(1)).expect("max(1) is non-zero"),
+            );
+            let surface = match unsafe { gl_display.create_window_surface(&gl_config, &attrs) } {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("GL surface creation failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            // Make the context current on the surface so GL calls target it.
+            let context = match not_current.make_current(&surface) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("make_current failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
 
-        // --- load GL function pointers into glow -------------------------
-        // Wrapped in an Arc (the renderer keeps a clone of the live GL context).
-        let gl = std::sync::Arc::new(unsafe {
-            glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
-        });
+            // --- load GL function pointers into glow ----------------------
+            // Wrapped in an Arc (the renderer keeps a clone of the live GL context).
+            let gl = std::sync::Arc::new(unsafe {
+                glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
+            });
 
-        // --- build the renderer ------------------------------------------
-        let mut renderer = match Renderer::new(gl.clone(), &font_blobs, settings.font_size) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("renderer init failed: {e}");
-                return self.fail_build(event_loop);
-            }
+            // --- build the renderer -----------------------------------------
+            let renderer = match Renderer::new(gl.clone(), &font_blobs, settings.font_size) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("renderer init failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            (renderer, surface, context)
         };
         // Ask KWin to blur behind us (true background blur on KDE). No-op
         // elsewhere (COSMIC/GNOME/sway use the ext protocol below, or nothing).
+        // Both blur mechanisms are Linux-only (see the `Active::bg_effect`/
+        // `x11_blur` field comment); Task 8 (vibrancy.rs) is the macOS
+        // equivalent, not part of this task.
+        #[cfg(not(target_os = "macos"))]
         blur::try_enable_kwin_blur(window.as_ref());
         // Cross-compositor blur via the ext-background-effect-v1 staging protocol
         // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
         // translucent — blur behind an opaque surface is wasted compositor work.
         // None on compositors without the protocol (the window is just translucent).
+        #[cfg(not(target_os = "macos"))]
         let bg_effect = bg_effect::BackgroundEffect::try_init(window.as_ref(), want_blur(&settings));
         // X11 counterpart: the _KDE_NET_WM_BLUR_BEHIND_REGION property (KWin-X11,
         // picom). Inert on Wayland and on a no-x11 build.
+        #[cfg(not(target_os = "macos"))]
         let x11_blur = x11_blur::X11Blur::try_init(window.as_ref(), want_blur(&settings));
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
@@ -1094,8 +1142,15 @@ impl App {
 
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.surface_size(); // physical pixel size
+        #[cfg(not(target_os = "macos"))]
         renderer.resize(size.width as f32, size.height as f32);
+        #[cfg(not(target_os = "macos"))]
         let cell = renderer.cell_size(); // (cell_w, cell_h) in pixels
+        // No renderer exists yet on macOS (wgpu backend arrives in Task 4); measure
+        // the cell straight from font metrics, the same GL-free helper used above
+        // for the `--cols`/`--rows` pre-sizing calculation.
+        #[cfg(target_os = "macos")]
+        let cell = render::cell_size_for(&font_blobs, settings.font_size);
 
         // --- build the session with real PTY panes -----------------------
         let bounds = content_bounds(size);
@@ -1181,7 +1236,12 @@ impl App {
         // only, so an extra window opened at runtime never re-applies them.)
 
         // Store the fully-initialised state and paint once.
+        #[cfg(not(target_os = "macos"))]
         let low_power = renderer.is_software(); // read before `renderer` is moved in
+        // No renderer exists yet on macOS (wgpu backend arrives in Task 4), so
+        // there is nothing to judge software-vs-hardware yet either.
+        #[cfg(target_os = "macos")]
+        let low_power = false;
         // Decide which backend *would* be used: a local unix-socket $DISPLAY (or
         // Wayland) keeps the existing GL path; a TCP/forwarded $DISPLAY (`ssh -X`
         // → `localhost:10.x`) picks XRender for mechanism C — unless overridden by
@@ -1241,7 +1301,9 @@ impl App {
             ime_preedit: false,
             clipboard,
             clip_history: clip_history::ClipHistory::new(),
+            #[cfg(not(target_os = "macos"))]
             bg_effect,
+            #[cfg(not(target_os = "macos"))]
             x11_blur,
             selection: None,
             selecting: false,
@@ -3151,6 +3213,7 @@ impl App {
                     active.backend.resize_surface(w, h); // back buffer + instrument layer
                 }
                 active.backend.resize(size.width as f32, size.height as f32); // viewport
+                #[cfg(not(target_os = "macos"))]
                 if let Some(fx) = &mut active.bg_effect {
                     fx.on_resize(size.width, size.height); // blur region follows the surface
                 }
@@ -7004,11 +7067,16 @@ fn want_blur(settings: &rt_config::Settings) -> bool {
 /// protocol and/or the X11 property. Both are no-ops when not applicable, so
 /// this is always safe to call after an opacity/blur change.
 fn apply_blur(active: &mut Active) {
-    let want = want_blur(&active.settings);
-    if let Some(fx) = &mut active.bg_effect {
-        fx.set_enabled(want);
+    // Both mechanisms are Linux-only (see the `Active::bg_effect`/`x11_blur`
+    // field comment); on macOS this is a no-op until Task 8 (vibrancy.rs).
+    #[cfg(not(target_os = "macos"))]
+    {
+        let want = want_blur(&active.settings);
+        if let Some(fx) = &mut active.bg_effect {
+            fx.set_enabled(want);
+        }
+        active.x11_blur.set_enabled(want);
     }
-    active.x11_blur.set_enabled(want);
 }
 
 fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
