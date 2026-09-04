@@ -9,10 +9,19 @@
 #      promise.
 #
 # `cargo tree --target` only RESOLVES the graph, so both run on Linux.
+# Paths are normalized to be independent of repo location (worktree, CI, machine).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 FAIL=0
 BASE=ci/linux-dep-baseline.txt
+
+# Get the repo root and normalize paths for comparison.
+# This makes the check work from any checkout location (main, worktree, CI).
+REPO_ROOT=$(git rev-parse --show-toplevel)
+normalize_paths() {
+  # Replace repo root path with (WORKSPACE) placeholder to make comparison location-independent.
+  sed "s|${REPO_ROOT}|(WORKSPACE)|g"
+}
 
 echo "########## macOS graph: must be free of Wayland/X11 ##########"
 mac=$(cargo tree --target aarch64-apple-darwin -p rt --edges normal 2>/dev/null \
@@ -26,12 +35,13 @@ fi
 
 echo "########## Linux graph: must match the baseline ##########"
 lin=$(cargo tree --target x86_64-unknown-linux-gnu -p rt --edges normal 2>/dev/null | sort -u)
+lin_normalized=$(printf '%s\n' "$lin" | normalize_paths)
 if [ ! -f "$BASE" ]; then
-  printf '%s\n' "$lin" > "$BASE"
+  printf '%s\n' "$lin_normalized" > "$BASE"
   echo "baseline created at $BASE -- commit it"
-elif ! diff -q <(printf '%s\n' "$lin") "$BASE" >/dev/null; then
+elif ! diff -q <(printf '%s\n' "$lin_normalized") "$BASE" >/dev/null; then
   echo "FAIL: the Linux dependency graph changed:"
-  diff <(printf '%s\n' "$lin") "$BASE" | head -20
+  diff <(printf '%s\n' "$lin_normalized") "$BASE" | head -20
   echo "If this change is intended, update $BASE in the same commit."
   FAIL=1
 else
