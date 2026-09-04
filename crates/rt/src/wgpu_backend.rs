@@ -156,12 +156,36 @@ impl WgpuBackend {
         self.frame = Some(frame);
         self.encoder = Some(encoder);
     }
+
+    /// One edge of `bell_stripe`: alternating yellow/black segments along the
+    /// band, giving the classic caution-tape look. Mirrors render.rs's private
+    /// `striped_edge` (render.rs:720-739) exactly.
+    fn striped_edge(&mut self, x: f32, y: f32, w: f32, h: f32, horizontal: bool) {
+        const SEG: f32 = 12.0; // stripe segment length
+        let yellow = Color::rgb(0xf2, 0xc9, 0x4c);
+        let black = Color::rgb(0x14, 0x14, 0x14);
+        let len = if horizontal { w } else { h };
+        let (mut o, mut i) = (0.0f32, 0u32);
+        while o < len {
+            let seg = SEG.min(len - o);
+            let c = if i % 2 == 0 { yellow } else { black };
+            if horizontal {
+                self.text.push_quad(x + o, y, seg, h, c);
+            } else {
+                self.text.push_quad(x, y + o, w, seg, c);
+            }
+            o += seg;
+            i += 1;
+        }
+    }
 }
 
 impl Backend for WgpuBackend {
     fn cell_size(&self) -> (f32, f32) { (self.cell_w, self.cell_h) }
 
-    fn resize(&mut self, _w: f32, _h: f32) {}
+    fn resize(&mut self, w: f32, h: f32) {
+        self.text.set_screen(w, h); // updates the uniform buffer's screen size
+    }
 
     fn reload_fonts(&mut self, blobs: &FontBlobs, font_px: f32) -> Result<(), String> {
         self.text = crate::wgpu_text::TextPipeline::new(&self.device, &self.queue, self.config.format, blobs, font_px)?;
@@ -180,21 +204,76 @@ impl Backend for WgpuBackend {
     fn begin_frame_scissored(&mut self, bg: Color, bbox: PxRect) { self.start(bg, Some(bbox)); }
     fn clear_scissor(&mut self) { self.scissor = None; }
 
-    // Drawing primitives arrive in Tasks 5-7. Empty, never `todo!()`: a stub that
-    // panics would take the whole window down mid-frame during bring-up.
-    fn fill_rect(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, _c: Color) {}
-    fn fill_cell(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
+    // Drawing primitives arrive in Tasks 5-7. Every rect-shaped one here is a
+    // quad through the glyph pipeline's `push_quad` -- no new pipeline, no
+    // extra draw call. Geometry mirrors render.rs's GL reference exactly (same
+    // thickness formulas, same offsets) so a cursor or underline is pixel-for-
+    // pixel identical to Linux; see render.rs:665-783 for the originals.
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        self.text.push_quad(x, y, w, h, c);
+    }
+    fn fill_cell(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let (x, y) = (ox + col as f32 * self.cell_w, oy + row as f32 * self.cell_h);
+        self.text.push_quad(x, y, self.cell_w, self.cell_h, color);
+    }
     fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color, bold: bool, italic: bool) {
         let x = ox + col as f32 * self.cell_w;
         let y = oy + row as f32 * self.cell_h;
         self.text.push_glyph(&self.queue, x, y, ch, fg, bold, italic);
     }
-    fn draw_underline(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
-    fn draw_strikeout(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
-    fn cursor_hollow(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
-    fn cursor_underline(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
-    fn cursor_beam(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
-    fn bell_stripe(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) {}
+    // render.rs:769-774: a thin bar just under the text baseline, not a fixed
+    // fraction of the cell -- ties the underline to where the glyphs actually
+    // sit.
+    fn draw_underline(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w;
+        let y = oy + row as f32 * self.cell_h + self.text.ascent() + 1.0;
+        let thick = (self.cell_h / 16.0).max(1.0);
+        self.text.push_quad(x, y, self.cell_w, thick, color);
+    }
+    // render.rs:778-783: through the x-height, ~60% of the ascent down from the
+    // cell top.
+    fn draw_strikeout(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w;
+        let y = oy + row as f32 * self.cell_h + self.text.ascent() * 0.6;
+        let thick = (self.cell_h / 16.0).max(1.0);
+        self.text.push_quad(x, y, self.cell_w, thick, color);
+    }
+    // render.rs:682-690: four thin quads, not a filled cell -- the glyph
+    // underneath must stay visible.
+    fn cursor_hollow(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w;
+        let y = oy + row as f32 * self.cell_h;
+        let (w, h) = (self.cell_w, self.cell_h);
+        let t = (h / 16.0).max(1.0);
+        self.text.push_quad(x, y, w, t, color); // top
+        self.text.push_quad(x, y + h - t, w, t, color); // bottom
+        self.text.push_quad(x, y, t, h, color); // left
+        self.text.push_quad(x + w - t, y, t, h, color); // right
+    }
+    // render.rs:694-699: a chunky bar on the cell bottom, distinct from a text
+    // underline.
+    fn cursor_underline(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w;
+        let th = (self.cell_h / 8.0).max(2.0);
+        let y = oy + row as f32 * self.cell_h + self.cell_h - th;
+        self.text.push_quad(x, y, self.cell_w, th, color);
+    }
+    // render.rs:702-707: a thin vertical bar at the cell's left.
+    fn cursor_beam(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w;
+        let y = oy + row as f32 * self.cell_h;
+        let bw = (self.cell_w / 8.0).max(2.0);
+        self.text.push_quad(x, y, bw, self.cell_h, color);
+    }
+    // render.rs:712-739: a yellow/black hazard-stripe frame just inside
+    // `(x,y,w,h)`, not a solid fill -- see `striped_edge` below.
+    fn bell_stripe(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        const T: f32 = 5.0; // band thickness
+        self.striped_edge(x, y, w, T, true); // top
+        self.striped_edge(x, y + h - T, w, T, true); // bottom
+        self.striped_edge(x, y, T, h, false); // left
+        self.striped_edge(x + w - T, y, T, h, false); // right
+    }
 
     fn end_frame(&mut self) {
         let (Some(frame), Some(mut encoder)) = (self.frame.as_ref(), self.encoder.take()) else { return };

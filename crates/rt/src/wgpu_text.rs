@@ -313,6 +313,11 @@ impl TextPipeline {
 
     pub fn cell_size(&self) -> (f32, f32) { (self.cell_w, self.cell_h) }
 
+    /// The regular face's ascent in pixels, matching render.rs's use of
+    /// `self.ascent` to place underline/strikeout bars relative to the
+    /// text baseline rather than an arbitrary fraction of the cell.
+    pub fn ascent(&self) -> f32 { self.ascent }
+
     /// The face for this style, falling back to regular when a set is absent --
     /// the same fallback render.rs uses, so a font pack missing an italic face
     /// renders upright rather than blank.
