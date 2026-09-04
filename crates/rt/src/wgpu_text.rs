@@ -166,6 +166,11 @@ pub struct TextPipeline {
     shelf_h: u32,
     /// Cached glyph placements: (char, bold, italic) -> uv rect + pixel offsets.
     glyphs: HashMap<(char, bool, bool), Glyph>,
+    /// Cached instrument coverage masks (disc/ring/bar): mirrors render.rs's
+    /// `shape_masks`. Keyed by [`mask_key`] -- see that function's doc comment
+    /// for why `f32` geometry is quantised to `u32` rather than hashed via
+    /// `to_bits()`.
+    shape_masks: HashMap<(u8, u32, u32), Glyph>,
     /// [width, height] in pixels, written into `ubuf` on flush.
     screen: [f32; 2],
     /// Per-style fallback chains, mirroring render.rs's `Renderer::fonts` /
@@ -183,6 +188,51 @@ pub struct TextPipeline {
     cell_w: f32,
     cell_h: f32,
     ascent: f32,
+}
+
+/// Cache key for an instrument coverage mask: `f32` is neither `Hash` nor
+/// `Eq`, so `r`/`width` are quantised to quarter-pixel units via
+/// `(x * 4.0).round() as u32` before hashing. This mirrors render.rs's
+/// `mask()` exactly (same formula, same quarter-pixel granularity) rather
+/// than an alternative like `to_bits()`: `to_bits()` would key on the exact
+/// bit pattern, so two calls that compute the same radius by slightly
+/// different floating-point paths (e.g. `r` derived from a different but
+/// equal-after-rounding pixel calculation upstream) would miss the cache and
+/// rasterise + pack a duplicate mask. Quarter-pixel quantisation is coarser
+/// than that on purpose -- it's finer than a screen pixel, so no visible
+/// geometry rounds differently, but coalesces float noise into one cache
+/// entry, matching the reference's cache-hit behaviour bit for bit.
+fn mask_key(kind: u8, r: f32, width: f32) -> (u8, u32, u32) {
+    (kind, (r * 4.0).round() as u32, (width * 4.0).round() as u32)
+}
+
+/// The four corners of a thick line segment's quad: `(x0,y0)`-`(x1,y1)`
+/// offset by the segment normal, scaled to half-width `hw`. Returns `None`
+/// for a degenerate (near-zero-length) segment, matching render.rs's
+/// `stroke_line` early return. Extracted as a free function -- separate from
+/// [`TextPipeline::stroke_line`] -- so this formula (the one the task brief
+/// calls out as the easy-to-get-wrong part: normal from `(-dy, dx)`, not
+/// `(dy, -dx)`; scaled by `hw`, not left unit-length) is unit-testable
+/// without a `wgpu::Device`.
+fn line_corners(x0: f32, y0: f32, x1: f32, y1: f32, hw: f32) -> Option<[(f32, f32); 4]> {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-6 {
+        return None;
+    }
+    let (nx, ny) = (-dy / len * hw, dx / len * hw);
+    Some([(x0 + nx, y0 + ny), (x1 + nx, y1 + ny), (x1 - nx, y1 - ny), (x0 - nx, y0 - ny)])
+}
+
+/// Turn four corners + their UVs + a colour into the 6 vertices (two
+/// triangles, `(a,b,c)` and `(a,c,d)`) `push_quad_corners` appends. A free
+/// function -- rather than inlined in `push_quad_corners` -- purely so the
+/// winding and UV-to-corner mapping are unit-testable without a
+/// `wgpu::Device`.
+fn corners_to_verts(p: [(f32, f32); 4], uv: [(f32, f32); 4], c: Color) -> [Vertex; 6] {
+    let col = [c.0, c.1, c.2, c.3];
+    let v = |i: usize| Vertex { pos: [p[i].0, p[i].1], uv: [uv[i].0, uv[i].1], color: col };
+    [v(0), v(1), v(2), v(0), v(2), v(3)]
 }
 
 impl TextPipeline {
@@ -359,6 +409,7 @@ impl TextPipeline {
             shelf_y: 2,
             shelf_h: 0,
             glyphs: HashMap::new(),
+            shape_masks: HashMap::new(),
             screen: [1.0, 1.0],
             font_px,
             cell_w,
@@ -494,6 +545,100 @@ impl TextPipeline {
         ]);
     }
 
+    /// Push a quad from four arbitrary corner positions + their UVs -- the
+    /// rotated quad `stroke_line` needs and the axis-aligned `push_uv_quad`
+    /// cannot express. Mirrors render.rs's `push_quad_corners` exactly: corners
+    /// `[a,b,c,d]` wind around the quad, split into triangles `(a,b,c)` and
+    /// `(a,c,d)`. Same vertex layout, same pipeline, same draw call as every
+    /// other quad in this file. The vertex construction itself is the free
+    /// function [`corners_to_verts`] so it's unit-testable without a
+    /// `wgpu::Device`.
+    fn push_quad_corners(&mut self, p: [(f32, f32); 4], uv: [(f32, f32); 4], c: Color) {
+        self.verts.extend_from_slice(&corners_to_verts(p, uv, c));
+    }
+
+    /// Rasterise (if needed) and cache an AA shape mask (disc/ring/bar),
+    /// returning its atlas placement. Mirrors render.rs's `mask(kind, r,
+    /// width)` field-for-field, including its packer-refusal handling: `pack`
+    /// returns `None` when the atlas is full, and that refusal is propagated
+    /// WITHOUT being cached (`?` before the `insert`), so a later frame -- once
+    /// something else's placement has freed room, or never, since instrument
+    /// masks don't expire -- may retry. Matches `push_glyph`'s refused-glyph
+    /// handling for the same reason: an out-of-bounds `write_texture` origin
+    /// panics, so packing must be optional, not asserted.
+    fn mask(&mut self, queue: &wgpu::Queue, kind: u8, r: f32, width: f32) -> Option<Glyph> {
+        let key = mask_key(kind, r, width);
+        if let Some(g) = self.shape_masks.get(&key) {
+            return Some(*g);
+        }
+        let (w, h, data) = match kind {
+            0 => crate::raster::rasterize_disc(r),
+            1 => crate::raster::rasterize_ring(r, width),
+            _ => crate::raster::rasterize_bar(width),
+        };
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let uv = self.pack(queue, w as u32, h as u32, &data)?;
+        let g = Glyph {
+            u0: uv[0],
+            v0: uv[1],
+            u1: uv[2],
+            v1: uv[3],
+            w: w as f32,
+            h: h as f32,
+            bearing_x: 0.0,
+            bearing_y: 0.0,
+        };
+        self.shape_masks.insert(key, g);
+        Some(g)
+    }
+
+    /// Filled anti-aliased disc of radius `r` centred at `(cx,cy)`, via a
+    /// cached coverage mask. Matches `render.rs:616` exactly.
+    pub fn fill_circle(&mut self, queue: &wgpu::Queue, cx: f32, cy: f32, r: f32, c: Color) {
+        if r <= 0.0 {
+            return;
+        }
+        if let Some(g) = self.mask(queue, 0, r, 0.0) {
+            let off = r.ceil(); // mask centre sits at (ceil r, ceil r)
+            self.push_uv_quad(cx - off, cy - off, g.w, g.h, [g.u0, g.v0, g.u1, g.v1], c);
+        }
+    }
+
+    /// Anti-aliased ring (outer radius `r`, stroke `width`) centred at
+    /// `(cx,cy)`. Matches `render.rs:627` exactly.
+    pub fn stroke_circle(&mut self, queue: &wgpu::Queue, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
+        if r <= 0.0 || width <= 0.0 {
+            return;
+        }
+        if let Some(g) = self.mask(queue, 1, r, width) {
+            let off = r.ceil();
+            self.push_uv_quad(cx - off, cy - off, g.w, g.h, [g.u0, g.v0, g.u1, g.v1], c);
+        }
+    }
+
+    /// Anti-aliased thick line from `(x0,y0)` to `(x1,y1)` (butt caps). Matches
+    /// `render.rs:640` exactly -- see [`line_corners`] for the normal/corner
+    /// formula, extracted as a free function so the subtle part (half-width is
+    /// half the MASK's height, not half `width`; the UV mapping runs the AA
+    /// gradient across the line's width, not along its length) is unit-testable
+    /// without a `wgpu::Device`.
+    pub fn stroke_line(&mut self, queue: &wgpu::Queue, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
+        if width <= 0.0 {
+            return;
+        }
+        let Some(g) = self.mask(queue, 2, 0.0, width) else { return };
+        // Half-width = half the mask's height (which carries the 1px AA margin
+        // each side), so the quad is a touch wider than `width` and the fringe
+        // shows -- NOT half of `width` itself.
+        let hw = g.h * 0.5;
+        let Some([a, b, cc, d]) = line_corners(x0, y0, x1, y1, hw) else { return };
+        // +normal edge (a,b) at the mask's top row (v0); -normal edge (c,d) at v1.
+        let (u0, v0, u1, v1) = (g.u0, g.v0, g.u1, g.v1);
+        self.push_quad_corners([a, b, cc, d], [(u0, v0), (u1, v0), (u1, v1), (u0, v1)], c);
+    }
+
     /// Upload this frame's vertices and issue ONE draw call, then reset.
     pub fn flush(&mut self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass) {
         if self.verts.is_empty() {
@@ -531,6 +676,84 @@ impl TextPipeline {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    // Pure-logic tests for the instrument-layer helpers (Task 7). These need
+    // no `wgpu::Device`: `mask_key`, `line_corners`, and `corners_to_verts`
+    // are free functions extracted from `TextPipeline::mask` /
+    // `stroke_line` / `push_quad_corners` for exactly this reason. The mask
+    // cache's OTHER half -- that `mask()` actually returns the SAME `Glyph`
+    // (atlas UV rect) on a repeated `(kind, r, width)` -- is not tested here:
+    // exercising that needs a live `wgpu::Texture`/`Queue` (mask() calls
+    // `pack()`, which calls `queue.write_texture`), and `TextPipeline::new`
+    // needs a real `wgpu::Device` to construct the pipeline/atlas/buffers
+    // around it. Faking those would either not compile (wgpu has no mock
+    // backend) or defeat the point of the test, so that half is left to the
+    // real render path.
+
+    #[test]
+    fn mask_key_matches_for_repeated_geometry() {
+        assert_eq!(mask_key(0, 6.0, 0.0), mask_key(0, 6.0, 0.0));
+        assert_eq!(mask_key(1, 6.0, 1.6), mask_key(1, 6.0, 1.6));
+    }
+
+    #[test]
+    fn mask_key_differs_by_kind_radius_or_width() {
+        let base = mask_key(1, 6.0, 1.6);
+        assert_ne!(base, mask_key(0, 6.0, 1.6), "kind must be part of the key");
+        assert_ne!(base, mask_key(1, 7.0, 1.6), "radius must be part of the key");
+        assert_ne!(base, mask_key(1, 6.0, 2.0), "width must be part of the key");
+    }
+
+    #[test]
+    fn mask_key_quantises_to_quarter_pixel_not_exact_bits() {
+        // Two f32s that are unequal but round to the same quarter-pixel unit
+        // must collide (a cache hit) -- unlike a `to_bits()` key, which would
+        // treat them as distinct and miss the cache.
+        assert_eq!(mask_key(2, 0.0, 1.6000001), mask_key(2, 0.0, 1.6));
+        // But a difference of a full quarter-pixel must NOT collide.
+        assert_ne!(mask_key(2, 0.0, 1.6), mask_key(2, 0.0, 1.85));
+    }
+
+    #[test]
+    fn line_corners_offsets_perpendicular_to_a_horizontal_segment() {
+        // A horizontal segment's normal points straight up/down (+y/-y), not
+        // along the line -- get the normal formula backwards (e.g. swap which
+        // component carries the sign) and this fails.
+        let [a, b, c, d] = line_corners(0.0, 0.0, 10.0, 0.0, 2.0).expect("non-degenerate");
+        assert_eq!(a, (0.0, 2.0));
+        assert_eq!(b, (10.0, 2.0));
+        assert_eq!(c, (10.0, -2.0));
+        assert_eq!(d, (0.0, -2.0));
+    }
+
+    #[test]
+    fn line_corners_offsets_perpendicular_to_a_vertical_segment() {
+        let [a, b, c, d] = line_corners(5.0, 0.0, 5.0, 10.0, 3.0).expect("non-degenerate");
+        assert_eq!(a, (2.0, 0.0));
+        assert_eq!(b, (2.0, 10.0));
+        assert_eq!(c, (8.0, 10.0));
+        assert_eq!(d, (8.0, 0.0));
+    }
+
+    #[test]
+    fn line_corners_rejects_a_degenerate_segment() {
+        assert!(line_corners(1.0, 1.0, 1.0 + 1e-9, 1.0, 2.0).is_none());
+    }
+
+    #[test]
+    fn corners_to_verts_winds_two_triangles_over_all_four_corners() {
+        let p = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let uv = [(0.1, 0.2), (0.3, 0.2), (0.3, 0.4), (0.1, 0.4)];
+        let verts = corners_to_verts(p, uv, Color(1.0, 0.0, 0.0, 1.0));
+        // Triangle 1: a, b, c. Triangle 2: a, c, d.
+        let want_order = [p[0], p[1], p[2], p[0], p[2], p[3]];
+        let want_uv = [uv[0], uv[1], uv[2], uv[0], uv[2], uv[3]];
+        for i in 0..6 {
+            assert_eq!(verts[i].pos, [want_order[i].0, want_order[i].1], "vertex {i} position");
+            assert_eq!(verts[i].uv, [want_uv[i].0, want_uv[i].1], "vertex {i} uv");
+            assert_eq!(verts[i].color, [1.0, 0.0, 0.0, 1.0], "vertex {i} color");
+        }
+    }
 
     #[test]
     fn coverage_fallback_resolves_a_character_the_primary_lacks() {

@@ -275,6 +275,27 @@ impl Backend for WgpuBackend {
         self.striped_edge(x + w - T, y, T, h, false); // right
     }
 
+    // Instrument shapes (Task 7): anti-aliased circles/lines for the
+    // patchbay/gauges, via `TextPipeline`'s cached coverage masks -- same
+    // atlas, same pipeline, same draw call as glyphs and solid quads. Geometry
+    // mirrors render.rs's GL reference exactly; see wgpu_text.rs's `mask`,
+    // `fill_circle`, `stroke_circle`, `stroke_line` for the formulas.
+    fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: Color) {
+        self.text.fill_circle(&self.queue, cx, cy, r, c);
+    }
+    fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
+        self.text.stroke_circle(&self.queue, cx, cy, r, width, c);
+    }
+    fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
+        self.text.stroke_line(&self.queue, x0, y0, x1, y1, width, c);
+    }
+
+    // Left as the trait's no-op defaults, deliberately: that split exists so
+    // XRenderBackend can keep instruments on a persistent surface redrawn at
+    // 6fps, avoiding re-shipping geometry over `ssh -X` (xrender_backend.rs:839
+    // / :859). wgpu repaints instruments inline every frame like GlBackend does
+    // (see `is_gl()` below), so it has nothing to do between them.
+
     fn end_frame(&mut self) {
         let (Some(frame), Some(mut encoder)) = (self.frame.as_ref(), self.encoder.take()) else { return };
         let view = frame.texture.create_view(&Default::default());
