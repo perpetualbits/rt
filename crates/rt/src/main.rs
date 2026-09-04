@@ -468,7 +468,21 @@ struct Active {
     // stands down entirely: a carry outlives motion, so nothing may reset the
     // shape until the carry ends. Cleared for every window by `cancel_carry`.
     carry_cursor: bool,
-    window: Box<dyn Window>, // the OS window — LAST so it outlives everything that references it on Drop
+    // The OS window — LAST so it outlives everything that references it on
+    // Drop (see the comment at the top of this struct). On macOS it is an
+    // `Arc<dyn Window>` instead of `Box<dyn Window>`: `WgpuBackend::new` (Task
+    // 4) needs a clonable, independently-owned handle to hand to
+    // `wgpu::Instance::create_surface`, whose `Surface<'static>` return type
+    // requires the window target to be `'static`-owned (an `Arc` clone, not a
+    // borrow) — a plain `&dyn Window` borrow would only yield a
+    // lifetime-bound `Surface<'_>`. `Arc`'s shared ownership also makes the
+    // "window must outlive its GPU resources" invariant automatic (refcounted)
+    // rather than order-of-drop-dependent, which is what the Linux/GLX comment
+    // above is compensating for with strict field ordering.
+    #[cfg(target_os = "macos")]
+    window: std::sync::Arc<dyn Window>,
+    #[cfg(not(target_os = "macos"))]
+    window: Box<dyn Window>,
 }
 
 /// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
@@ -1277,11 +1291,21 @@ impl App {
             let xr: Option<Box<dyn backend::Backend>> = None;
             xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, window.as_ref())))
         };
-        // Task 4 replaces this with the wgpu/Metal backend; Task 1 only needs the
-        // Wayland/X11 dependency graph gone from the macOS build, not a working
-        // macOS backend yet (there is no Mac available to build one against).
+        // wgpu/Metal backend (Task 4). `window` here is still the plain
+        // `Box<dyn Window>` returned by `event_loop.create_window` above; it is
+        // converted to an `Arc<dyn Window>` (shadowing the binding) because
+        // `wgpu::Instance::create_surface` needs an owned, clonable handle to
+        // produce a `Surface<'static>` (see the field comment on `Active::window`
+        // for why). The `Arc` — not a fresh Box — is what then gets stored in
+        // `Active` below, so the surface and the window share the same
+        // allocation for the rest of their lives.
         #[cfg(target_os = "macos")]
-        let backend: Box<dyn backend::Backend> = unimplemented!("wgpu backend arrives in Task 4");
+        let window: std::sync::Arc<dyn Window> = std::sync::Arc::from(window);
+        #[cfg(target_os = "macos")]
+        let backend: Box<dyn backend::Backend> = Box::new(
+            wgpu_backend::WgpuBackend::new(window.clone(), &font_blobs, settings.font_size)
+                .expect("wgpu backend"),
+        );
         let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
         Some(Active {
             window,
