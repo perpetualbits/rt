@@ -27,6 +27,56 @@ use crate::render::{Color, FontBlobs};
 
 pub const ATLAS_SIZE: u32 = 2048;
 
+/// Parse every blob in a fallback chain that fontdue can read, skipping (not
+/// failing on) any it can't -- e.g. CFF/OTF, which fontdue doesn't support.
+/// Mirrors `render.rs`'s `parse_chain`; unlike it, this returns `Vec<Font>`
+/// unconditionally (never a `Result`) because the ONE fatal case -- an empty
+/// `regular` chain -- is checked by the caller against the parsed result,
+/// exactly as render.rs checks `fonts.is_empty()` after calling its version.
+fn parse_chain(blobs: &[Vec<u8>]) -> Vec<Font> {
+    let mut out = Vec::new();
+    for (i, blob) in blobs.iter().enumerate() {
+        match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
+            Ok(f) => out.push(f),
+            Err(e) => log::warn!("wgpu_text: skipping unparseable font #{i}: {e}"),
+        }
+    }
+    out
+}
+
+/// Resolve the face that should draw `c` at `(bold, italic)`, exactly as
+/// render.rs's `Renderer::glyph()` does: build preference-ordered chains
+/// (exact style first, progressively looser, ending at `fonts` -- the
+/// regular chain, which carries the widest coverage), then within each chain
+/// take the first font that actually covers the character
+/// (`lookup_glyph_index(c) != 0`). If nothing covers it, fall back to
+/// `fonts[0]` (the primary), which draws notdef. Free-standing (not a method)
+/// so the coverage fallback chain is unit-testable without a `wgpu::Device`
+/// -- see the `tests` module below.
+fn resolve_face<'a>(
+    fonts: &'a [Font],
+    bold_fonts: &'a [Font],
+    italic_fonts: &'a [Font],
+    bold_italic_fonts: &'a [Font],
+    c: char,
+    bold: bool,
+    italic: bool,
+) -> &'a Font {
+    let prefs: &[&[Font]] = match (bold, italic) {
+        (true, true) => &[bold_italic_fonts, bold_fonts, italic_fonts, fonts],
+        (true, false) => &[bold_fonts, fonts],
+        (false, true) => &[italic_fonts, fonts],
+        (false, false) => &[fonts],
+    };
+    for chain in prefs {
+        if let Some(i) = chain.iter().position(|f| f.lookup_glyph_index(c) != 0) {
+            return &chain[i];
+        }
+    }
+    // Nobody covers it: fall back to the primary (draws notdef/blank).
+    &fonts[0]
+}
+
 /// Initial vertex-buffer capacity, in vertices (6 per quad). Generous for a
 /// terminal grid plus chrome; `flush` grows it by doubling if a frame ever
 /// needs more.
@@ -118,10 +168,17 @@ pub struct TextPipeline {
     glyphs: HashMap<(char, bool, bool), Glyph>,
     /// [width, height] in pixels, written into `ubuf` on flush.
     screen: [f32; 2],
-    /// The four faces, indexed by `font_for(bold, italic)`. Bold/italic/bold-italic
-    /// are `Option` because a font set may not supply them; `font_for` falls back
-    /// to regular, matching what render.rs does.
-    fonts: (Font, Option<Font>, Option<Font>, Option<Font>),
+    /// Per-style fallback chains, mirroring render.rs's `Renderer::fonts` /
+    /// `bold_fonts` / `italic_fonts` / `bold_italic_fonts`: `fonts[0]` is the
+    /// primary and defines the cell metrics; the rest (and every entry of the
+    /// other three chains) are coverage fallbacks consulted per glyph in
+    /// `push_glyph` so a character the primary lacks (braille, box-drawing,
+    /// CJK, …) still renders instead of notdef. Bold/italic/bold_italic may be
+    /// empty; `fonts` (regular) must be non-empty.
+    fonts: Vec<Font>,
+    bold_fonts: Vec<Font>,
+    italic_fonts: Vec<Font>,
+    bold_italic_fonts: Vec<Font>,
     font_px: f32,
     cell_w: f32,
     cell_h: f32,
@@ -136,16 +193,12 @@ impl TextPipeline {
         blobs: &FontBlobs,
         font_px: f32,
     ) -> Result<Self, String> {
-        // Mirrors render.rs: take the first blob in each set that fontdue can
-        // actually read (some CFF/OTF files it cannot), regular being required.
-        let pick = |set: &Vec<Vec<u8>>| -> Option<Font> {
-            set.iter()
-                .find_map(|b| Font::from_bytes(b.as_slice(), fontdue::FontSettings::default()).ok())
-        };
-        let regular = pick(&blobs.regular).ok_or("wgpu_text: no usable regular font")?;
-        let bold = pick(&blobs.bold);
-        let italic = pick(&blobs.italic);
-        let bold_italic = pick(&blobs.bold_italic);
+        // Mirrors render.rs's `parse_chain`: parse EVERY blob in a chain that
+        // fontdue can actually read (some CFF/OTF files it cannot skip rather
+        // than fail the whole chain), regular's primary (index 0) being the
+        // one required entry.
+        let fonts = parse_chain(&blobs.regular);
+        let regular = fonts.first().ok_or("wgpu_text: no usable regular font")?;
 
         let lm = regular
             .horizontal_line_metrics(font_px)
@@ -153,6 +206,10 @@ impl TextPipeline {
         let cell_h = (lm.ascent - lm.descent + lm.line_gap).ceil();
         // Monospace: every advance is the same, so 'M' is representative.
         let cell_w = regular.metrics('M', font_px).advance_width.ceil();
+
+        let bold_fonts = parse_chain(&blobs.bold);
+        let italic_fonts = parse_chain(&blobs.italic);
+        let bold_italic_fonts = parse_chain(&blobs.bold_italic);
 
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rt glyph atlas"),
@@ -307,7 +364,10 @@ impl TextPipeline {
             cell_w,
             cell_h,
             ascent: lm.ascent,
-            fonts: (regular, bold, italic, bold_italic),
+            fonts,
+            bold_fonts,
+            italic_fonts,
+            bold_italic_fonts,
         })
     }
 
@@ -318,17 +378,11 @@ impl TextPipeline {
     /// text baseline rather than an arbitrary fraction of the cell.
     pub fn ascent(&self) -> f32 { self.ascent }
 
-    /// The face for this style, falling back to regular when a set is absent --
-    /// the same fallback render.rs uses, so a font pack missing an italic face
-    /// renders upright rather than blank.
-    fn font_for(&self, bold: bool, italic: bool) -> &Font {
-        let (r, b, i, bi) = &self.fonts;
-        match (bold, italic) {
-            (true, true) => bi.as_ref().or(b.as_ref()).or(i.as_ref()).unwrap_or(r),
-            (true, false) => b.as_ref().unwrap_or(r),
-            (false, true) => i.as_ref().unwrap_or(r),
-            (false, false) => r,
-        }
+    /// Resolve the face that should draw `c` at this style. Thin wrapper around
+    /// the free function [`resolve_face`] (kept free-standing so the coverage
+    /// fallback chain is unit-testable without a `wgpu::Device`).
+    fn face_for(&self, c: char, bold: bool, italic: bool) -> &Font {
+        resolve_face(&self.fonts, &self.bold_fonts, &self.italic_fonts, &self.bold_italic_fonts, c, bold, italic)
     }
 
     pub fn set_screen(&mut self, w: f32, h: f32) { self.screen = [w, h]; }
@@ -374,7 +428,7 @@ impl TextPipeline {
         let g = match self.glyphs.get(&key) {
             Some(g) => *g,
             None => {
-                let font = self.font_for(bold, italic);
+                let font = self.face_for(ch, bold, italic);
                 let (m, cov) = font.rasterize(ch, self.font_px);
                 if m.width == 0 || m.height == 0 {
                     // Empty glyph (space etc): cache a blank placement so we
@@ -465,5 +519,60 @@ impl TextPipeline {
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.draw(0..self.verts.len() as u32, 0..1);
         self.verts.clear();
+    }
+}
+
+// Runs on kiku only (`cargo test -p rt --bin rt`): needs the real macOS system
+// fonts on disk, which Linux CI does not have. Proves the coverage fallback
+// chain actually falls through -- not just that it builds -- by picking a
+// character the primary face (Courier New) genuinely lacks and asserting
+// `resolve_face` returns a DIFFERENT, covering face rather than silently
+// drawing notdef from index 0.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_fallback_resolves_a_character_the_primary_lacks() {
+        let blobs = crate::load_fonts().expect("macOS system fonts (see REGULAR_FONTS in main.rs)");
+        let regular = parse_chain(&blobs.regular);
+        let bold = parse_chain(&blobs.bold);
+        let italic = parse_chain(&blobs.italic);
+        let bold_italic = parse_chain(&blobs.bold_italic);
+        assert!(!regular.is_empty(), "no usable primary font parsed from FontBlobs.regular");
+
+        // U+28FF, FULL BRAILLE PATTERN (also probed: box-drawing U+2500, which
+        // Courier New/SF Mono/Andale Mono in fact DO cover, so it wouldn't make
+        // the test capable of failing). Courier New (the primary, chosen so
+        // regular/bold/italic/bold-italic share one advance width -- see
+        // REGULAR_FONTS's doc comment in main.rs) has no braille glyphs; Apple
+        // Braille.ttf, appended to the regular chain as a coverage fallback,
+        // does.
+        let probe = '⣿';
+
+        let primary_covers = regular[0].lookup_glyph_index(probe) != 0;
+        assert!(
+            !primary_covers,
+            "primary face unexpectedly covers U+28FF -- pick a probe character it genuinely lacks"
+        );
+
+        let covering_idx = regular
+            .iter()
+            .position(|f| f.lookup_glyph_index(probe) != 0)
+            .expect(
+                "no loaded macOS face covers U+28FF -- is Apple Braille.ttf missing from this machine?",
+            );
+
+        let resolved = resolve_face(&regular, &bold, &italic, &bold_italic, probe, false, false);
+        assert!(
+            resolved.lookup_glyph_index(probe) != 0,
+            "resolve_face returned a face that does not cover the probe character"
+        );
+        assert!(
+            std::ptr::eq(resolved, &regular[covering_idx]),
+            "chain fell through to the wrong face instead of the one that actually covers U+28FF"
+        );
+        // Specifically must not be index 0 (the notdef fallback path).
+        assert_ne!(covering_idx, 0, "test setup bug: primary already covers the probe character");
     }
 }
