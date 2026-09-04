@@ -11,16 +11,26 @@
 //! `encode_key` fed to `Session::feed_input` (respecting broadcast mode).
 
 mod backend; // rendering backend abstraction (GL today, XRender in mechanism C)
+#[cfg(not(target_os = "macos"))]
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
+#[cfg(not(target_os = "macos"))]
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
 mod chrome; // native (XRender) chrome: menu/search/manual/instruments draw + hit-test
+#[cfg(not(target_os = "macos"))]
 mod gl_backend; // the default GL backend: wraps render.rs's Renderer + present resources
+#[cfg(not(target_os = "macos"))]
 mod x11_blur; // X11 background blur via _KDE_NET_WM_BLUR_BEHIND_REGION (no-op elsewhere)
-#[cfg(feature = "x11")]
+#[cfg(all(feature = "x11", not(target_os = "macos")))]
 mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
-#[cfg(feature = "x11")]
+#[cfg(all(feature = "x11", not(target_os = "macos")))]
 mod xrender_backend; // mechanism C: XRender backend
-mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
+#[cfg(target_os = "macos")]
+mod vibrancy; // NSVisualEffectView frosted glass (best-effort, like blur.rs)
+#[cfg(target_os = "macos")]
+mod wgpu_backend; // the macOS backend: wgpu/Metal
+#[cfg(target_os = "macos")]
+mod wgpu_text; // glyph atlas + pipeline for wgpu_backend
+mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard / macOS arboard)
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 mod damage; // pure pixel-rect damage accumulator
 mod dragdrop; // pure drop-target resolver for cross-window pane/tab drag-and-drop
@@ -46,10 +56,17 @@ use std::path::{Path, PathBuf}; // fifo paths
 use std::rc::Rc; // shared jacks map
 use std::time::{Duration, Instant}; // frame pacing for async PTY updates
 
+// glutin (GL context/surface setup) is Linux-only: see the target-cfg dependency
+// block in Cargo.toml. The macOS backend (Task 4) uses wgpu instead.
+#[cfg(not(target_os = "macos"))]
 use glutin::config::ConfigTemplateBuilder;
+#[cfg(not(target_os = "macos"))]
 use glutin::context::ContextAttributesBuilder;
+#[cfg(not(target_os = "macos"))]
 use glutin::display::{Display, DisplayApiPreference};
+#[cfg(not(target_os = "macos"))]
 use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, buffer_age, …)
+#[cfg(not(target_os = "macos"))]
 use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
@@ -61,6 +78,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 // `is_wayland()` / `is_x11()` — which backend winit picked at runtime, so the
 // per-backend window attributes (app_id vs WM_CLASS) go to the right one.
+// winit itself target-gates its `platform::wayland` module to non-Apple unix.
+#[cfg(not(target_os = "macos"))]
 use winit::platform::wayland::ActiveEventLoopExtWayland;
 #[cfg(feature = "x11")]
 use winit::platform::x11::ActiveEventLoopExtX11;
@@ -961,6 +980,7 @@ impl App {
             }
             window_attrs = window_attrs.with_platform_attributes(Box::new(x11_attrs));
         }
+        #[cfg(not(target_os = "macos"))]
         if event_loop.is_wayland() {
             window_attrs = window_attrs.with_platform_attributes(Box::new(
                 winit::platform::wayland::WindowAttributesWayland::default()
@@ -1178,6 +1198,7 @@ impl App {
         // the default backend. `&window` is borrowed here, before it moves into
         // `Active` below. XRender is not yet wired (Task 3): `GlBackend` is built
         // unconditionally, even when `backend_kind` is `XRender`.
+        #[cfg(not(target_os = "macos"))]
         let backend: Box<dyn backend::Backend> = {
             // Mechanism C: on the XRender path, build the command-based backend
             // that draws into this X11 window via x11rb (no GL used at render
@@ -1196,6 +1217,11 @@ impl App {
             let xr: Option<Box<dyn backend::Backend>> = None;
             xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, window.as_ref())))
         };
+        // Task 4 replaces this with the wgpu/Metal backend; Task 1 only needs the
+        // Wayland/X11 dependency graph gone from the macOS build, not a working
+        // macOS backend yet (there is no Mac available to build one against).
+        #[cfg(target_os = "macos")]
+        let backend: Box<dyn backend::Backend> = unimplemented!("wgpu backend arrives in Task 4");
         let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
         Some(Active {
             window,
@@ -7251,7 +7277,10 @@ fn client_origin(window: &dyn Window) -> Option<winit::dpi::PhysicalPosition<i32
 /// `WINIT_UNIX_BACKEND` still wins (we don't override an explicit choice).
 fn build_event_loop() -> EventLoop {
     let mut builder = EventLoop::builder();
-    #[cfg(feature = "x11")]
+    // winit target-gates `platform::wayland`/`platform::x11` to non-Apple unix,
+    // so this whole backend-preference dance is meaningless (and non-compiling)
+    // on macOS regardless of whether the `x11` feature happens to be enabled.
+    #[cfg(all(feature = "x11", not(target_os = "macos")))]
     {
         use winit::platform::wayland::EventLoopBuilderExtWayland;
         use winit::platform::x11::EventLoopBuilderExtX11;

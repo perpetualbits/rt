@@ -53,6 +53,15 @@ steps:
     commands:
       - cargo clippy --no-deps -p rt-core -p rt-engine -p rt-config -p rt-session -p rt -p rt-mux -p vt-parser -p vt-term -p vt-conformance --all-targets
 
+  - name: target-deps
+    image: bash
+    environment: *rust
+    # Guards the macOS port from Linux CI: no Mac, no macOS SDK needed, because
+    # `cargo tree --target` only resolves the graph. Blocking on purpose -- this
+    # is the only automated macOS coverage that exists (see the port spec).
+    commands:
+      - ./ci/check-target-deps.sh
+
   - name: test
     image: bash
     environment: *rust
