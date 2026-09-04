@@ -792,10 +792,81 @@ fn font_blobs(db: &fontdb::Database, family: &str) -> render::FontBlobs {
     }
 }
 
+// Regular chain: a monospace primary (first match) then coverage fallbacks
+// for ranges DejaVu Sans Mono lacks (e.g. braille). TrueType only (fontdue
+// can't read CFF/OTF); the renderer skips any that fail to parse.
+#[cfg(not(target_os = "macos"))]
+const REGULAR_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    // coverage fallbacks (appended after the primary):
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+];
+// macOS: fontdue reads TrueType only, and most system fonts (incl. Menlo) ship
+// as `.ttc` collections, which are unusable here. Courier New is a complete,
+// self-consistent four-weight TrueType monospace family (regular/bold/italic/
+// bold-italic all share the same advance width), so it is the primary rather
+// than SF Mono — mixing SF Mono (regular) with Courier New (bold/italic) would
+// give the bold/italic faces a different advance width than the grid cell,
+// which is sized from the regular face, and glyphs would overflow their cell.
+// SF Mono is kept as a secondary regular fallback. Apple Braille/Symbol/
+// ZapfDingbats are appended as coverage fallbacks (`.ttc` collections excluded).
+#[cfg(target_os = "macos")]
+const REGULAR_FONTS: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+    // coverage fallbacks (appended after the primary):
+    "/System/Library/Fonts/Apple Braille.ttf",
+    "/System/Library/Fonts/Symbol.ttf",
+    "/System/Library/Fonts/ZapfDingbats.ttf",
+];
+
+// Bold, italic, and bold-italic chains — all optional; each falls back to
+// the regular face when absent.
+#[cfg(not(target_os = "macos"))]
+const BOLD_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+];
+#[cfg(target_os = "macos")]
+const BOLD_FONTS: &[&str] = &["/System/Library/Fonts/Supplemental/Courier New Bold.ttf"];
+
+#[cfg(not(target_os = "macos"))]
+const ITALIC_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+];
+#[cfg(target_os = "macos")]
+const ITALIC_FONTS: &[&str] = &[
+    "/System/Library/Fonts/SFNSMonoItalic.ttf",
+    "/System/Library/Fonts/Supplemental/Courier New Italic.ttf",
+];
+
+#[cfg(not(target_os = "macos"))]
+const BOLD_ITALIC_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+];
+#[cfg(target_os = "macos")]
+const BOLD_ITALIC_FONTS: &[&str] =
+    &["/System/Library/Fonts/Supplemental/Courier New Bold Italic.ttf"];
+
 /// Locate a monospace font (plus fallback fonts for coverage gaps) on the
 /// system. rt does not ship fonts (to avoid bundling a binary in git); it probes
-/// the usual Linux locations. Returns `[primary, fallback…]` bytes, or `None` if
-/// no primary is found (the app then exits with a helpful message).
+/// the usual Linux locations (macOS: the usual system locations). Returns
+/// `[primary, fallback…]` bytes, or `None` if no primary is found (the app then
+/// exits with a helpful message).
 ///
 /// The fallbacks matter because the usual primary — DejaVu Sans Mono — lacks
 /// some ranges (notably braille U+2800–U+28FF, used by `spiral_stress`). We add
@@ -812,54 +883,13 @@ fn load_fonts() -> Option<render::FontBlobs> {
         }
         out
     };
-    // Regular chain: a monospace primary (first match) then coverage fallbacks
-    // for ranges DejaVu Sans Mono lacks (e.g. braille). TrueType only (fontdue
-    // can't read CFF/OTF); the renderer skips any that fail to parse.
-    let regular = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-            // coverage fallbacks (appended after the primary):
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-        ],
-        "regular",
-    );
+    let regular = load(REGULAR_FONTS, "regular");
     if regular.is_empty() {
         return None; // no primary → the app cannot render text
     }
-    // Bold, italic, and bold-italic chains — all optional; each falls back to
-    // the regular face when absent.
-    let bold = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ],
-        "bold",
-    );
-    let italic = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
-        ],
-        "italic",
-    );
-    let bold_italic = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
-        ],
-        "bold-italic",
-    );
+    let bold = load(BOLD_FONTS, "bold");
+    let italic = load(ITALIC_FONTS, "italic");
+    let bold_italic = load(BOLD_ITALIC_FONTS, "bold-italic");
     Some(render::FontBlobs { regular, bold, italic, bold_italic })
 }
 
