@@ -942,9 +942,21 @@ impl App {
         // cell without a GL context (the renderer doesn't exist yet).
         // Only the FIRST window: an extra window opened at runtime should get
         // the default size, not re-apply a benchmark harness's exact grid.
+        // HiDPI: `settings.font_size` is a LOGICAL size (what the user configured
+        // or passed via --font-size); every place that turns it into a PHYSICAL
+        // pixel count for the rasteriser must scale it by the display's scale
+        // factor, via `physical_font_px` (defined below, next to
+        // `window_size_for_grid`). The window doesn't exist yet here, so there is
+        // no `window.scale_factor()` to read; the primary monitor's factor is the
+        // best available estimate for this PRE-SIZING measurement only (it just
+        // seeds the initial window's --cols/--rows geometry — once the window
+        // exists, `window.scale_factor()` below is the authoritative value used
+        // for the actual renderer/backend). Falls back to 1.0 (unscaled, today's
+        // behaviour) when there is no monitor info yet.
+        let pre_size_scale = event_loop.primary_monitor().map(|m| m.scale_factor()).unwrap_or(1.0);
         let initial_size: winit::dpi::Size = match (self.cli.cols, self.cli.rows) {
             (Some(cols), Some(rows)) if self.windows.is_empty() && cols > 0 && rows > 0 => {
-                let cell = render::cell_size_for(&font_blobs, settings.font_size);
+                let cell = render::cell_size_for(&font_blobs, physical_font_px(settings.font_size, pre_size_scale));
                 window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
             }
             _ => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
@@ -1074,6 +1086,15 @@ impl App {
                 return self.fail_build(event_loop);
             }
         };
+        // HiDPI: the authoritative scale factor for this window (1.0 on every
+        // Linux setup so far; 2.0 on a Retina Mac). Used below to turn
+        // `settings.font_size` (LOGICAL) into the PHYSICAL pixel size handed to
+        // the renderer/backend — see `physical_font_px`. All LAYOUT stays in
+        // physical pixels exactly as before; only the font rasterisation size is
+        // scaled, so cell metrics (and everything measured from them: instrument
+        // discs, jack ports, cursors, borders) come out the same APPARENT size on
+        // a 2x display as on a 1x one.
+        let scale_factor = window.scale_factor();
 
         // --- create the GL context and surface ---------------------------
         // Linux-only, like the display/config band above: no `gl_display`/
@@ -1134,7 +1155,7 @@ impl App {
             });
 
             // --- build the renderer -----------------------------------------
-            let renderer = match Renderer::new(gl.clone(), &font_blobs, settings.font_size) {
+            let renderer = match Renderer::new(gl.clone(), &font_blobs, physical_font_px(settings.font_size, scale_factor)) {
                 Ok(r) => r,
                 Err(e) => {
                     log::error!("renderer init failed: {e}");
@@ -1198,7 +1219,7 @@ impl App {
         // the cell straight from font metrics, the same GL-free helper used above
         // for the `--cols`/`--rows` pre-sizing calculation.
         #[cfg(target_os = "macos")]
-        let cell = render::cell_size_for(&font_blobs, settings.font_size);
+        let cell = render::cell_size_for(&font_blobs, physical_font_px(settings.font_size, scale_factor));
 
         // --- build the session with real PTY panes -----------------------
         let bounds = content_bounds(size);
@@ -1316,7 +1337,7 @@ impl App {
             #[cfg(feature = "x11")]
             let xr: Option<Box<dyn backend::Backend>> =
                 if matches!(backend_kind, backend::BackendKind::XRender) {
-                    xrender_backend::XRenderBackend::try_new(window.as_ref(), &font_blobs, settings.font_size)
+                    xrender_backend::XRenderBackend::try_new(window.as_ref(), &font_blobs, physical_font_px(settings.font_size, scale_factor))
                         .map(|b| Box::new(b) as Box<dyn backend::Backend>)
                 } else {
                     None
@@ -1341,7 +1362,7 @@ impl App {
         // then gets rt's normal failure reporting instead of a panic backtrace.
         #[cfg(target_os = "macos")]
         let backend: Box<dyn backend::Backend> =
-            match wgpu_backend::WgpuBackend::new(window.clone(), &font_blobs, settings.font_size) {
+            match wgpu_backend::WgpuBackend::new(window.clone(), &font_blobs, physical_font_px(settings.font_size, scale_factor)) {
                 Ok(b) => Box::new(b),
                 Err(e) => {
                     log::error!("wgpu backend: {e}");
@@ -3036,6 +3057,29 @@ impl ApplicationHandler for App {
             // Time to paint.
             WindowEvent::RedrawRequested => {
                 self.redraw(id);
+            }
+
+            // HiDPI: the window moved to a display with a different scale factor
+            // (e.g. dragged from a Retina panel to an external 1x monitor, or
+            // back). Deliberately NOT wired to a live re-scale here: doing that
+            // correctly means re-measuring the cell, resizing the backend and
+            // relayout-ing the session (the same work `refresh_fonts` does), and
+            // that interacts with the deferred-resize/settle machinery
+            // (`surface_pending`/`RESIZE_SETTLE`) that this same event usually
+            // fires alongside — a combination that can't be verified without a
+            // real multi-monitor Retina setup, which this task explicitly forbids
+            // launching a GUI to test against. So: logged (never silently
+            // dropped), and cell metrics stay at the previous scale until the
+            // user next triggers a font reload (zoom in/out/reset, or opening
+            // Preferences) — `refresh_fonts` reads `window.scale_factor()` FRESH
+            // each time (see its comment), so that next reload self-heals to the
+            // new display's scale rather than staying wrong indefinitely.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                log::info!(
+                    "scale factor changed to {scale_factor}; cell metrics stay at the \
+                     previous scale until fonts are next reloaded (zoom, Preferences, \
+                     or a restart)"
+                );
             }
 
             _ => {} // ignore the many other window events for now
@@ -5349,7 +5393,16 @@ impl App {
         if family_changed {
             active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
         }
-        let px = active.settings.font_size;
+        // HiDPI: read the window's CURRENT scale factor fresh (never cached),
+        // same helper and same source as `build_active` uses for the initial
+        // load — that consistency is what stops the window changing apparent
+        // size just from opening Preferences or hitting zoom. Reading it fresh
+        // here (rather than from a field captured once at startup) also means
+        // that if the window was dragged to a display with a different scale
+        // factor since startup, the very next font reload (zoom, Preferences)
+        // picks up the new value — see the `ScaleFactorChanged` handler in
+        // `window_event` for why that's not done proactively.
+        let px = physical_font_px(active.settings.font_size, active.window.scale_factor());
         match active.backend.reload_fonts(&active.font_blobs, px) {
             Ok(()) => {
                 let cell = active.backend.cell_size(); // new cell metrics
@@ -7187,6 +7240,31 @@ fn apply_blur(active: &mut Active) {
     }
 }
 
+/// HiDPI: convert a LOGICAL font size (as configured in `Settings::font_size`,
+/// typed via `--font-size`, or stepped by zoom) into the PHYSICAL pixel size
+/// the rasteriser (`render::cell_size_for`, `Renderer::new`,
+/// `XRenderBackend::try_new`, `WgpuBackend::new`, `Backend::reload_fonts`)
+/// should measure/draw at. `scale_factor` is `winit::window::Window::
+/// scale_factor()` (or a monitor's, before the window exists) — 1.0 on every
+/// Linux setup this has run on so far, 2.0 on a Retina Mac. At 1.0 this is
+/// exactly a no-op (`font_size * 1.0 == font_size`), which is what keeps
+/// Linux bit-for-bit unchanged.
+///
+/// All LAYOUT (window/pane/content rects, `content_bounds`,
+/// `window_size_for_grid`'s own `WINDOW_MARGIN`/`pane_chrome` terms) stays in
+/// PHYSICAL pixels exactly as before this change and is NOT touched here —
+/// only the rasterised glyph size is scaled. Everything measured FROM the
+/// resulting cell size (instrument discs, jack ports, cursors, borders, and
+/// `window_size_for_grid`'s cols/rows terms) scales automatically because it
+/// is derived from `cell`, not from `font_size` directly. `WINDOW_MARGIN`
+/// (8px) and `rt_session::PANE_PAD`/`TITLEBAR_PAD` are flat chrome constants,
+/// not derived from font metrics; they are deliberately left unscaled — they
+/// are hairline-sized either way and scaling them would be guessing at an
+/// "intended logical size" for values that were never expressed as one.
+fn physical_font_px(font_size: f32, scale_factor: f64) -> f32 {
+    (font_size as f64 * scale_factor) as f32
+}
+
 fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
     let m = WINDOW_MARGIN;
     Rect::new(
@@ -7707,5 +7785,63 @@ mod autoscroll_tests {
         let (s, st) = autoscroll_step((1, 50), -1, true, 10);
         assert_eq!(s, 1);
         assert_eq!(st, (-1, 1));
+    }
+}
+
+#[cfg(test)]
+mod hidpi_tests {
+    use super::*;
+
+    /// The bug this task fixes: rt rasterised `font_size` as a PHYSICAL pixel
+    /// count regardless of the window's scale factor, so a 2x (Retina) display
+    /// got glyphs — and everything measured from the cell (instrument discs,
+    /// jack ports, cursors) — at HALF their intended apparent size. This is the
+    /// core discriminating assertion: scale 2 must rasterise at exactly double
+    /// the pixel size of scale 1 for the same configured (logical) font size.
+    /// A no-op implementation (`physical_font_px` returning `font_size`
+    /// unchanged) would fail this, since 16.0 != 32.0.
+    #[test]
+    fn physical_font_px_doubles_at_scale_2() {
+        let logical = 16.0_f32;
+        let at_1x = physical_font_px(logical, 1.0);
+        let at_2x = physical_font_px(logical, 2.0);
+        assert_eq!(at_1x, 16.0, "scale 1.0 must be a no-op (Linux today)");
+        assert_eq!(at_2x, 32.0, "scale 2.0 (Retina) must rasterise at double the pixel size");
+        assert_eq!(at_2x, at_1x * 2.0);
+    }
+
+    /// Every scale factor a real display can report, not just a round 2.0 —
+    /// guards against an implementation that special-cases 2.0 rather than
+    /// actually multiplying.
+    #[test]
+    fn physical_font_px_scales_linearly() {
+        for &(logical, scale) in &[(12.0_f32, 1.25_f64), (14.0, 1.5), (18.0, 1.75), (20.0, 3.0)] {
+            let got = physical_font_px(logical, scale);
+            let want = (logical as f64 * scale) as f32;
+            assert_eq!(got, want, "logical {logical} @ scale {scale}");
+        }
+    }
+
+    /// `--cols`/`--rows` pre-sizing (`window_size_for_grid`) is fed a `cell`
+    /// that must already reflect the scaled font pixel size — confirm that
+    /// doubling the cell (as scaling font_size 1x -> 2x would do, since cell
+    /// size is derived from the rasterised glyph) roughly doubles the resulting
+    /// window's content area, not just adds a constant. Uses two cell sizes
+    /// standing in for "measured at scale 1" and "measured at scale 2" for the
+    /// same (cols, rows) grid.
+    #[test]
+    fn window_size_for_grid_grows_with_a_doubled_cell() {
+        let cols = 80;
+        let rows = 24;
+        let cell_1x = (8.0_f32, 16.0_f32);
+        let cell_2x = (16.0_f32, 32.0_f32);
+        let size_1x = window_size_for_grid(cols, rows, cell_1x, false);
+        let size_2x = window_size_for_grid(cols, rows, cell_2x, false);
+        // Not exactly 2x (WINDOW_MARGIN/pane padding are flat, unscaled
+        // constants — see `physical_font_px`'s doc comment) but the grid term
+        // dominates, so the 2x cell must produce a visibly larger window, well
+        // over half again as large in both dimensions.
+        assert!(size_2x.width > size_1x.width * 3 / 2, "{} vs {}", size_2x.width, size_1x.width);
+        assert!(size_2x.height > size_1x.height * 3 / 2, "{} vs {}", size_2x.height, size_1x.height);
     }
 }
