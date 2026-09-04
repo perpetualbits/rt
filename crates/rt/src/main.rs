@@ -846,10 +846,14 @@ const ITALIC_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
 ];
+// Courier New Italic first, deliberately: regular/bold are Courier New, and
+// cell_w is derived only from the regular face's advance width (wgpu_text.rs),
+// so italic must stay in the same family or its glyphs can overflow the cell.
+// SF Mono Italic is kept only as a fallback if Courier New Italic is missing.
 #[cfg(target_os = "macos")]
 const ITALIC_FONTS: &[&str] = &[
-    "/System/Library/Fonts/SFNSMonoItalic.ttf",
     "/System/Library/Fonts/Supplemental/Courier New Italic.ttf",
+    "/System/Library/Fonts/SFNSMonoItalic.ttf",
 ];
 
 #[cfg(not(target_os = "macos"))]
