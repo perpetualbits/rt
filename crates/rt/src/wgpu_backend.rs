@@ -34,10 +34,11 @@ pub struct WgpuBackend {
     pub(crate) scissor: Option<PxRect>,
     pub(crate) cell_w: f32,
     pub(crate) cell_h: f32,
+    text: crate::wgpu_text::TextPipeline,
 }
 
 impl WgpuBackend {
-    pub fn new(window: Arc<dyn Window>, _font_blobs: &FontBlobs, font_px: f32) -> Result<Self, String> {
+    pub fn new(window: Arc<dyn Window>, font_blobs: &FontBlobs, font_px: f32) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::METAL,
             ..Default::default()
@@ -81,6 +82,16 @@ impl WgpuBackend {
         };
         surface.configure(&device, &config);
 
+        let mut text = crate::wgpu_text::TextPipeline::new(&device, &queue, config.format, font_blobs, font_px)?;
+        let (cell_w, cell_h) = text.cell_size();
+        // Seed the uniform buffer's screen size from the surface's configured
+        // (physical-pixel) size now. `Backend::resize` (Task 6) keeps it in sync
+        // on later window resizes, but nothing calls `resize` on macOS between
+        // construction and the first frame -- without this, `screen` stays at
+        // `TextPipeline::new`'s default [1.0, 1.0] and every glyph's NDC position
+        // divides by that, putting text far off-screen on the very first draw.
+        text.set_screen(config.width as f32, config.height as f32);
+
         Ok(Self {
             device,
             queue,
@@ -90,9 +101,9 @@ impl WgpuBackend {
             encoder: None,
             clear: Color(0.0, 0.0, 0.0, 1.0),
             scissor: None,
-            // Replaced by the real font metrics in Task 5.
-            cell_w: font_px * 0.6,
-            cell_h: font_px * 1.2,
+            cell_w,
+            cell_h,
+            text,
         })
     }
 
@@ -152,7 +163,13 @@ impl Backend for WgpuBackend {
 
     fn resize(&mut self, _w: f32, _h: f32) {}
 
-    fn reload_fonts(&mut self, _blobs: &FontBlobs, _font_px: f32) -> Result<(), String> { Ok(()) }
+    fn reload_fonts(&mut self, blobs: &FontBlobs, font_px: f32) -> Result<(), String> {
+        self.text = crate::wgpu_text::TextPipeline::new(&self.device, &self.queue, self.config.format, blobs, font_px)?;
+        let (w, h) = self.text.cell_size();
+        self.cell_w = w;
+        self.cell_h = h;
+        Ok(())
+    }
 
     fn begin_frame(&mut self, bg: Color) { self.start(bg, None); }
     fn begin_frame_scissored(&mut self, bg: Color, bbox: PxRect) { self.start(bg, Some(bbox)); }
@@ -162,7 +179,11 @@ impl Backend for WgpuBackend {
     // panics would take the whole window down mid-frame during bring-up.
     fn fill_rect(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, _c: Color) {}
     fn fill_cell(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
-    fn draw_char(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _ch: char, _fg: Color, _bold: bool, _italic: bool) {}
+    fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color, bold: bool, italic: bool) {
+        let x = ox + col as f32 * self.cell_w;
+        let y = oy + row as f32 * self.cell_h;
+        self.text.push_glyph(&self.queue, x, y, ch, fg, bold, italic);
+    }
     fn draw_underline(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
     fn draw_strikeout(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
     fn cursor_hollow(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _color: Color) {}
@@ -171,9 +192,27 @@ impl Backend for WgpuBackend {
     fn bell_stripe(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) {}
 
     fn end_frame(&mut self) {
-        if let Some(encoder) = self.encoder.take() {
-            self.queue.submit(Some(encoder.finish()));
+        let (Some(frame), Some(mut encoder)) = (self.frame.as_ref(), self.encoder.take()) else { return };
+        let view = frame.texture.create_view(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("text"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    // Load, NOT Clear: begin_frame already cleared, and clearing
+                    // again here would erase it.
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            if let Some(r) = self.scissor {
+                pass.set_scissor_rect(r.x as u32, r.y as u32, r.w as u32, r.h as u32);
+            }
+            self.text.flush(&self.queue, &mut pass);
         }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     fn resize_surface(&mut self, w: NonZeroU32, h: NonZeroU32) {

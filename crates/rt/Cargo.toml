@@ -121,6 +121,7 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor"] }
 objc2-foundation = "0.3"
 pollster = "0.4"   # block_on for wgpu's async adapter/device request
+bytemuck = { version = "1", features = ["derive"] }  # Pod/Zeroable for TextPipeline's Vertex
 
 [dev-dependencies]
 

@@ -1797,6 +1797,7 @@ name = "rt"
 version = "0.3.19"
 dependencies = [
  "arboard",
+ "bytemuck",
  "env_logger",
  "fontdb",
  "fontdue",
