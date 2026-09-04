@@ -5447,12 +5447,16 @@ impl App {
         let mods = active.mods; // current modifier state
         // Is this chord bound to an rt action?
         if let Some(chord) = input::chord_from_winit(&key_event.logical_key, mods) {
-            if let Some(action) = active.keymap.action_for(&chord) {
-                let cmd = Self::apply_action(active, action); // shared with the menu
-                // The `active` borrow ends here; window-level commands (close/
-                // new window/detach) re-borrow the map via &mut self.
-                self.run_window_cmd(event_loop, id, cmd);
-                return; // consumed
+            match active.keymap.action_for(&chord) {
+                Some(action) => {
+                    log::debug!("keymap: chord={chord:?} -> action={action:?}");
+                    let cmd = Self::apply_action(active, action); // shared with the menu
+                    // The `active` borrow ends here; window-level commands (close/
+                    // new window/detach) re-borrow the map via &mut self.
+                    self.run_window_cmd(event_loop, id, cmd);
+                    return; // consumed
+                }
+                None => log::debug!("keymap: chord={chord:?} -> no binding"),
             }
         }
         // Not a binding: ordinary typing. Navigation/editing/function keys become
@@ -5717,6 +5721,10 @@ impl App {
         // history), so a stale rect from a previous frame must not survive the
         // pane unfocusing or the history emptying.
         active.clip_affordance = None;
+        // Once per call (i.e. once per window paint), decide whether this frame
+        // logs the cursor-presence diagnostic below — cheap to check even when
+        // debug logging is off, so it costs nothing at default log levels.
+        let log_cursor_diag = log::log_enabled!(log::Level::Debug) && cursor_diag_due();
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.) Iterates the pre-fetched
         // snapshots so the engine's damage state is not advanced again here.
@@ -5877,6 +5885,22 @@ impl App {
                 if let Some(cur) = snap.cursor {
                     let in_range = cur.line < snap.rows.len() && (n <= 1 || cur.line / per_col < geom.count as usize);
                     let (_, cur_sub) = place(cur.line);
+                    if log_cursor_diag {
+                        // Same alpha the draw path below would use, computed here purely
+                        // for diagnostics (no effect on what's actually drawn) so we can
+                        // tell "absent from snapshot" from "filtered by in_range" from
+                        // "drawn but invisible" (e.g. alpha ~0, or off the visible rect).
+                        let focused = id == focus;
+                        let blink = if !focused || active.low_power {
+                            1.0
+                        } else {
+                            cursor_blink_alpha(active.last_input.elapsed().as_secs_f32())
+                        };
+                        log::debug!(
+                            "cursor: pane={id:?} cursor=Some shape={:?} line={} col={} in_range={in_range} focused={focused} blink={blink:.2}",
+                            cur.shape, cur.line, cur.col
+                        );
+                    }
                     // Also honour the mid-resize clamp so a stale cursor can't sit past the
                     // new right/bottom edge (over the scrollbar or the neighbour).
                     if in_range && cur.col < clamp_cols && cur_sub < clamp_rows {
@@ -5918,6 +5942,8 @@ impl App {
                             }
                         }
                     }
+                } else if log_cursor_diag {
+                    log::debug!("cursor: pane={id:?} cursor=None (snapshot has no cursor)");
                 }
 
                 // Thin separators between newspaper columns, drawn in each gap.
@@ -7116,6 +7142,22 @@ fn cursor_blink_alpha(seconds: f32) -> f32 {
     }
     let s = 0.5 + 0.5 * (seconds / CURSOR_BLINK_PERIOD * std::f32::consts::TAU).cos();
     CURSOR_BLINK_MIN + (1.0 - CURSOR_BLINK_MIN) * s
+}
+
+/// Rate-limits the `draw_panes` cursor-presence diagnostic (see its `cursor:`
+/// debug log) to about once every 500ms, shared across every window/pane, so a
+/// `ControlFlow::Poll` loop repainting at 60fps doesn't flood the log. Called
+/// once per `draw_panes` invocation (i.e. once per window paint); returns
+/// `true` for at most one call per ~500ms window.
+fn cursor_diag_due() -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    let now = std::time::Instant::now();
+    let due = last.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(500));
+    if due {
+        *last = Some(now);
+    }
+    due
 }
 
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
