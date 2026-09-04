@@ -2067,9 +2067,10 @@ impl ApplicationHandler for App {
                                     if let Some(a) =
                                         rows.into_iter().nth(i).and_then(|r| r.action)
                                     {
+                                        let mut group_echo = None;
                                         let cmd = match a.into_pick() {
                                             menu::MenuPick::Do(act) => {
-                                                Self::apply_action(active, act)
+                                                Self::apply_action(active, act, &mut group_echo)
                                             }
                                             menu::MenuPick::OpenUrl(u) => {
                                                 Self::open_url(&u);
@@ -2108,6 +2109,9 @@ impl ApplicationHandler for App {
                                         // The `active` borrow ends here; window-
                                         // level commands re-borrow via &mut self.
                                         self.run_window_cmd(event_loop, id, cmd);
+                                        if let Some((grp, bytes)) = group_echo {
+                                            self.broadcast_group_paste(id, grp, &bytes);
+                                        }
                                     }
                                 }
                             }
@@ -2152,7 +2156,11 @@ impl ApplicationHandler for App {
                             active.force_full = true;
                             active.window.request_redraw();
                         }
-                        Key::Named(NamedKey::Enter) => Self::pick_clip(active, sel),
+                        Key::Named(NamedKey::Enter) => {
+                            if let Some((grp, bytes)) = Self::pick_clip(active, sel) {
+                                self.broadcast_group_paste(id, grp, &bytes);
+                            }
+                        }
                         Key::Named(NamedKey::ArrowDown) => {
                             active.clip_overlay = Some((sel + 1).min(g.clear_row));
                             active.force_full = true;
@@ -2180,7 +2188,11 @@ impl ApplicationHandler for App {
                     if ptr_button == Some(MouseButton::Left) =>
                 {
                     match chrome::clip_history::hit_row(&g, active.mouse) {
-                        Some(i) => Self::pick_clip(active, i),
+                        Some(i) => {
+                            if let Some((grp, bytes)) = Self::pick_clip(active, i) {
+                                self.broadcast_group_paste(id, grp, &bytes);
+                            }
+                        }
                         None => {
                             // click outside
                             active.clip_overlay = None;
@@ -2270,6 +2282,11 @@ impl ApplicationHandler for App {
                     active.ime_preedit = false; // composition finished
                     if !text.is_empty() {
                         active.session.feed_input(text.as_bytes()); // send the composed text (e.g. "ó")
+                        // `Group` also reaches matching panes in every OTHER
+                        // window — see `App::broadcast_group_input`'s doc.
+                        if let Some(g) = Self::group_echo(active) {
+                            self.broadcast_group_input(id, g, text.as_bytes());
+                        }
                     }
                 }
                 Ime::Preedit(text, _cursor) => {
@@ -3042,6 +3059,11 @@ impl ApplicationHandler for App {
                         if let Ok(text) = cb.load_primary() {
                             if !text.is_empty() {
                                 active.session.feed_input(text.as_bytes());
+                                // `Group` also reaches matching panes in every
+                                // OTHER window — see `broadcast_group_input`.
+                                if let Some(g) = Self::group_echo(active) {
+                                    self.broadcast_group_input(id, g, text.as_bytes());
+                                }
                             }
                         }
                     }
@@ -4249,6 +4271,71 @@ impl App {
         t.wires.extend(travelling);
     }
 
+    /// If `active`'s window is in `Broadcast::Group` with a GROUPED focus,
+    /// the group id to also broadcast to sibling windows — `None` otherwise.
+    /// That covers `Off`/`All` (unaffected: `Session::feed_input`/
+    /// `feed_paste` already do the right window-local thing for them) AND
+    /// the "focus has no group" case under `Group`, which is today's "just
+    /// me" and must stay that way — `Session::group_of` returning `None` is
+    /// exactly what makes that fall through to `None` here too, so nothing
+    /// extra is delivered and the caller's ordinary local
+    /// `feed_input`/`feed_paste` call is the only thing that ran.
+    fn group_echo(active: &Active) -> Option<u32> {
+        match active.session.broadcast() {
+            Broadcast::Group => active.session.group_of(active.session.focus()),
+            _ => None,
+        }
+    }
+
+    /// The cross-window half of `Broadcast::Group` delivery: reach the
+    /// matching panes of every window EXCEPT `from`. `Session` stays pure —
+    /// it only ever knows its own panes (`Session::write_to_group`) — so
+    /// `App` does the walk across `self.windows`, exactly like
+    /// `migrate_pane_extras` above already does for a moved pane's wires and
+    /// jacks.
+    ///
+    /// `from` is excluded deliberately, not incidentally: every call site
+    /// already delivers to `from`'s own local group members (including the
+    /// focused pane itself) via the ordinary, UNCHANGED
+    /// `Session::feed_input`/`feed_paste` call it makes first — see
+    /// `group_echo`'s doc, which every call site consults before calling
+    /// this. Walking `from` again here too would deliver the SAME keystroke
+    /// to the SAME focused pane a second time — a double-delivered keystroke
+    /// is a visible, infuriating bug, and this exclusion is precisely what
+    /// prevents it (not any property of `PaneId`, since that's a
+    /// process-wide counter and would make a double local+cross write to the
+    /// origin window just as possible as a cross-window one).
+    ///
+    /// `Broadcast::All` deliberately gets NO equivalent of this method:
+    /// "every pane in every window" is a blast radius the typist can't see,
+    /// so `All` stays scoped to `feed_input`'s existing per-window fan-out —
+    /// do not "fix" that into matching `Group`'s reach.
+    ///
+    /// In-process only: a pane can be handed to a DIFFERENT rt process
+    /// (`PanePackage`/`adopt`, see `migrate_pane_extras`'s neighbourhood);
+    /// a group spanning processes would need that handoff protocol to also
+    /// carry live delivery (a new IPC path) — out of scope here.
+    fn broadcast_group_input(&self, from: WindowId, group: u32, bytes: &[u8]) {
+        for (wid, w) in &self.windows {
+            if *wid != from {
+                w.session.write_to_group(group, bytes);
+            }
+        }
+    }
+
+    /// Paste equivalent of [`broadcast_group_input`](Self::broadcast_group_input):
+    /// same exclusion of `from`, same reasoning — see its doc. Uses
+    /// `Session::paste_to_group` so each sibling window's panes still get
+    /// the per-pane bracketed-paste decision `feed_paste`'s doc comment
+    /// records as load-bearing, unchanged by crossing windows.
+    fn broadcast_group_paste(&self, from: WindowId, group: u32, text: &[u8]) {
+        for (wid, w) in &self.windows {
+            if *wid != from {
+                w.session.paste_to_group(group, text);
+            }
+        }
+    }
+
     /// Wipe one window's per-frame drag cues and repaint it. Only the window's
     /// half of a cancel — the App-level `drag`/`armed_drag` are the caller's to
     /// clear (they are unreachable through `&mut Active`).
@@ -4640,7 +4727,15 @@ impl App {
         }
     }
 
-    fn apply_action(active: &mut Active, action: rt_config::Action) -> WindowCmd {
+    /// `group_echo` is an out-parameter (not a return value: `apply_action`
+    /// already returns `WindowCmd`, and only ONE arm below — the paste one —
+    /// ever has anything to put in it) carrying the group id + raw text to
+    /// ALSO broadcast to sibling windows, exactly like `do_paste`'s own
+    /// return — see its doc. The caller applies it via
+    /// `App::broadcast_group_paste` once `active`'s borrow has ended (this
+    /// free fn only has `&mut Active`, not `&mut self`, so it cannot reach
+    /// other windows itself).
+    fn apply_action(active: &mut Active, action: rt_config::Action, group_echo: &mut Option<(u32, Vec<u8>)>) -> WindowCmd {
         use rt_config::Action;
         match action {
             // Window-owner level actions: this window's Active can't create or
@@ -4772,7 +4867,7 @@ impl App {
                 // drops this window (close_window).
                 Some(SessionEvent::CloseWindow) => return WindowCmd::CloseWindow,
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
-                Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
+                Some(SessionEvent::Paste) => *group_echo = Self::do_paste(active), // clipboard → focused PTY
                 Some(SessionEvent::Redraw) => {
                     // A session action that changed what's on screen — a tab
                     // switch, split, zoom, rotate, columns, etc. These change the
@@ -4812,8 +4907,15 @@ impl App {
     }
 
     /// Paste the clipboard's text into the focused pane(s). No-op if the
-    /// clipboard is empty/unavailable.
-    fn do_paste(active: &mut Active) {
+    /// clipboard is empty/unavailable. Returns the group id + raw text to
+    /// ALSO broadcast to sibling windows when this window is in `Group` mode
+    /// with a grouped focus — `feed_paste` below only ever reaches this
+    /// window's own panes (`Session` stays pure; see `write_to_group`'s doc),
+    /// so the caller (which has `&mut self`, unlike this free fn) is the one
+    /// that can reach every window — see `App::broadcast_group_paste`.
+    /// `None` otherwise, including the "focus has no group" case, which
+    /// stays "just me" exactly as before.
+    fn do_paste(active: &mut Active) -> Option<(u32, Vec<u8>)> {
         if let Some(cb) = &active.clipboard {
             if let Ok(text) = cb.load() {
                 if !text.is_empty() {
@@ -4824,9 +4926,11 @@ impl App {
                     // `feed_paste` also strips embedded end-markers (paste-injection guard)
                     // and respects the broadcast mode.
                     active.session.feed_paste(text.as_bytes());
+                    return Self::group_echo(active).map(|g| (g, text.into_bytes()));
                 }
             }
         }
+        None
     }
 
     /// Copy the current selection to the clipboard (and PRIMARY for middle-click
@@ -4863,14 +4967,18 @@ impl App {
 
     /// Act on a picked overlay row: the Clear row empties the history; a clip row
     /// pastes that clip into the focused pane, promotes it to CLIPBOARD+PRIMARY,
-    /// and moves it to the front. Always closes the overlay.
-    fn pick_clip(active: &mut Active, row: usize) {
+    /// and moves it to the front. Always closes the overlay. Returns the same
+    /// group-echo (group id + raw text) as `do_paste`, for the same reason —
+    /// see its doc.
+    fn pick_clip(active: &mut Active, row: usize) -> Option<(u32, Vec<u8>)> {
         let n = active.clip_history.len();
+        let mut echo = None;
         if row >= n {
             // the Clear row
             active.clip_history.clear();
         } else if let Some(text) = active.clip_history.get(row).map(str::to_string) {
             active.session.feed_paste(text.as_bytes()); // per-pane bracketed paste
+            echo = Self::group_echo(active).map(|g| (g, text.clone().into_bytes()));
             if let Some(cb) = &active.clipboard {
                 cb.store(text.clone());
                 cb.store_primary(text.clone());
@@ -4880,6 +4988,7 @@ impl App {
         active.clip_overlay = None;
         active.force_full = true;
         active.window.request_redraw();
+        echo
     }
 
     /// Extract the selected text from its pane's grid, row by row, trimming
@@ -5503,10 +5612,14 @@ impl App {
             match active.keymap.action_for(&chord) {
                 Some(action) => {
                     log::debug!("keymap: chord={chord:?} -> action={action:?}");
-                    let cmd = Self::apply_action(active, action); // shared with the menu
+                    let mut group_echo = None;
+                    let cmd = Self::apply_action(active, action, &mut group_echo); // shared with the menu
                     // The `active` borrow ends here; window-level commands (close/
                     // new window/detach) re-borrow the map via &mut self.
                     self.run_window_cmd(event_loop, id, cmd);
+                    if let Some((grp, bytes)) = group_echo {
+                        self.broadcast_group_paste(id, grp, &bytes);
+                    }
                     return; // consumed
                 }
                 None => log::debug!("keymap: chord={chord:?} -> no binding"),
@@ -5556,14 +5669,27 @@ impl App {
                     1
                 }
             };
+            // `Group` also reaches matching panes in every OTHER window (see
+            // `App::broadcast_group_input`'s doc); `None` here covers both
+            // Off/All (unaffected: `feed_input` below stays local for them,
+            // exactly as before) and an ungrouped focus under `Group`, which
+            // stays "just me" exactly as before.
+            let group = Self::group_echo(active);
+            let mut echo_bytes: Option<Vec<u8>> = None;
             if step > 1 {
                 let mut payload = Vec::with_capacity(bytes.len() * step);
                 for _ in 0..step {
                     payload.extend_from_slice(&bytes);
                 }
                 active.session.feed_input(&payload); // N moves this repeat
+                if group.is_some() {
+                    echo_bytes = Some(payload);
+                }
             } else {
                 active.session.feed_input(&bytes); // send to the shell(s)
+                if group.is_some() {
+                    echo_bytes = Some(bytes.clone());
+                }
             }
             active.last_input = now; // restart the cursor blink window
             // Typing returns you to the live prompt: if the focused pane was
@@ -5575,6 +5701,11 @@ impl App {
                     active.force_full = true;
                 }
                 pane.scroll_to_bottom();
+            }
+            // `active`'s borrow (of `self.windows`) ends above; from here this
+            // needs only `self`, which is what lets it reach every window.
+            if let (Some(g), Some(bytes)) = (group, echo_bytes) {
+                self.broadcast_group_input(id, g, &bytes);
             }
         }
     }
