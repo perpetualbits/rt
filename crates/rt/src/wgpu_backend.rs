@@ -180,6 +180,27 @@ impl WgpuBackend {
     }
 }
 
+/// Whether `end_frame` needs to open a render pass and submit, given whether
+/// this call still owns `begin_frame`'s encoder (`had_encoder` -- `true`
+/// only for the FIRST `end_frame` in a frame) and how many vertices
+/// `self.text` has queued. Extracted as a free function -- mirroring
+/// `wgpu_text.rs`'s `mask_key`/`line_corners`/`corners_to_verts` pattern of
+/// pulling logic out of `wgpu::Device`-touching methods -- so the decision
+/// that was the actual bug is unit-testable without a live GPU:
+/// `WgpuBackend` itself can't be constructed in a test (`new` needs a real
+/// `Arc<dyn Window>` and Metal adapter), so this is the strongest testable
+/// surface for that decision.
+///
+/// The first call must always submit: its encoder carries `begin_frame`'s
+/// clear, and returning early would mean the clear itself is never
+/// submitted (a black/stale window), even if nothing has been drawn yet. A
+/// LATER call has no clear riding along -- only submit it if there is new
+/// geometry to flush; an empty later call would cost a wasted command
+/// buffer for a pass that draws nothing.
+fn end_frame_should_submit(had_encoder: bool, pending_verts: usize) -> bool {
+    had_encoder || pending_verts > 0
+}
+
 impl Backend for WgpuBackend {
     fn cell_size(&self) -> (f32, f32) { (self.cell_w, self.cell_h) }
 
@@ -296,8 +317,43 @@ impl Backend for WgpuBackend {
     // / :859). wgpu repaints instruments inline every frame like GlBackend does
     // (see `is_gl()` below), so it has nothing to do between them.
 
+    // `main.rs`'s `redraw_full` calls `end_frame` TWICE per frame by design:
+    // once after `draw_panes` to flush pane geometry, and again after
+    // `paint_overlays_or_instruments` to flush menu/preferences-dialog
+    // geometry that pass batches on top. `GlBackend::end_frame` handles this
+    // by simply re-flushing its GL vertex buffer both times (it has no
+    // encoder to consume) -- see gl_backend.rs. This backend must produce the
+    // same result: EVERY call flushes whatever has accumulated in `self.text`
+    // since the previous call, into the CURRENT frame, in painter's order.
+    //
+    // The wrinkle wgpu adds is the encoder. `begin_frame` creates one and
+    // records the clear into it, but does not submit -- submission is this
+    // function's job, so the clear rides along with the first flush. Only
+    // ONE encoder can hold that clear, and it must be consumed on the FIRST
+    // call (`self.encoder.take()` is `Some` then, `None` on every call after).
+    // The old code returned immediately when `encoder` was `None` -- i.e. on
+    // every call after the first -- which silently dropped any geometry
+    // pushed since: it stayed in `self.text`'s vertex buffer (nothing ever
+    // called `flush`, so nothing cleared it) and was drawn at the START of
+    // the NEXT frame's first `end_frame`, ahead of that frame's own content.
+    // That's the reported bug: a pane's menu/title-bar geometry, batched
+    // after the content flush, appearing one frame late and underneath
+    // everything painted since.
     fn end_frame(&mut self) {
-        let (Some(frame), Some(mut encoder)) = (self.frame.as_ref(), self.encoder.take()) else { return };
+        let Some(frame) = self.frame.as_ref() else { return };
+        // `Some` only for the call that still owns `begin_frame`'s encoder
+        // (and therefore its unsubmitted clear) -- see `end_frame_should_submit`.
+        let had_encoder = self.encoder.is_some();
+        let pending = self.text.pending_vertex_count();
+        if !end_frame_should_submit(had_encoder, pending) {
+            return;
+        }
+        // First call this frame: take the encoder `begin_frame` built (it
+        // carries the clear). Any later call: that encoder is already gone
+        // (submitted by the first call), so open a fresh one -- there is new
+        // geometry to flush (`end_frame_should_submit` guarantees that for a
+        // `None` encoder) but nothing else queued on it.
+        let mut encoder = self.encoder.take().unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
         let view = frame.texture.create_view(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -306,8 +362,10 @@ impl Backend for WgpuBackend {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    // Load, NOT Clear: begin_frame already cleared, and clearing
-                    // again here would erase it.
+                    // Load, NOT Clear, on every call including this fresh
+                    // encoder's: begin_frame's clear (or an earlier end_frame's
+                    // geometry) is already on the texture, and clearing again
+                    // would erase it.
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 ..Default::default()
@@ -356,4 +414,61 @@ impl Backend for WgpuBackend {
     /// `main.rs`, breaking this port's "no Linux code path changes" guarantee;
     /// buying naming clarity with Linux churn is a bad trade.
     fn is_gl(&self) -> bool { true }
+}
+
+// Runs on kiku only (`cargo test -p rt --bin rt`): this whole module is
+// `cfg(target_os = "macos")`'d out of the tree everywhere else (see main.rs),
+// so there is no way to compile, let alone run, these tests on Linux CI.
+//
+// `end_frame_should_submit` is a pure function precisely so this doesn't need
+// a `wgpu::Device` -- see its doc comment for why `WgpuBackend` itself can't
+// be built in a test. This test module is what would have caught the
+// double-`end_frame`-per-frame regression: the OLD `end_frame` decided
+// whether to proceed with `self.encoder.take().is_some()` alone, i.e.
+// `had_encoder` with `pending_verts` never even consulted. Reproduce that on
+// `end_frame_should_submit`'s inputs and
+// `end_frame_must_flush_a_later_call_with_pending_geometry` below fails: a
+// later call (no encoder left -- the first call already took and submitted
+// it) with geometry queued (the overlay/menu batch) returns `false`, so
+// `end_frame` bails out without ever calling `TextPipeline::flush`. That
+// geometry then sits in `self.text`'s vertex buffer, undrawn and
+// un-cleared, until the NEXT frame's first `end_frame` finally flushes it --
+// ahead of that next frame's own content. That's the reported bug: a pane's
+// menu/title-bar drawn one frame late and underneath everything painted
+// since.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_frame_must_submit_the_first_call_even_with_no_geometry() {
+        // The first call's encoder carries begin_frame's clear. Even if
+        // nothing has been pushed since (a blank frame), it must still be
+        // submitted -- otherwise the clear itself is silently dropped.
+        assert!(end_frame_should_submit(true, 0), "the clear-carrying first call must always submit");
+    }
+
+    #[test]
+    fn end_frame_must_flush_a_later_call_with_pending_geometry() {
+        // The actual bug. A second end_frame in the same frame (main.rs
+        // calls it after paint_overlays_or_instruments) has already had its
+        // encoder taken and submitted by the first call -- had_encoder is
+        // false here -- but DOES have geometry queued (the menu/title-bar
+        // batch). It must still flush. Under the OLD logic (`had_encoder`
+        // alone, pending_verts never consulted) this input returns `false`:
+        // this assertion is RED against that logic and GREEN against the fix.
+        assert!(
+            end_frame_should_submit(false, 3),
+            "a later call with pending geometry must still flush it into the current frame"
+        );
+    }
+
+    #[test]
+    fn end_frame_may_skip_a_later_call_with_nothing_pending() {
+        // No encoder left to carry a clear, and nothing new was pushed since
+        // the previous flush -- opening a pass and submitting would draw
+        // nothing. Not required for correctness, just avoids a wasted
+        // command buffer every such call.
+        assert!(!end_frame_should_submit(false, 0));
+    }
 }

@@ -639,6 +639,13 @@ impl TextPipeline {
         self.push_quad_corners([a, b, cc, d], [(u0, v0), (u1, v0), (u1, v1), (u0, v1)], c);
     }
 
+    /// How many vertices are queued but not yet drawn. `WgpuBackend::end_frame`
+    /// uses this to decide whether a call that no longer owns `begin_frame`'s
+    /// encoder still has something worth opening a pass and submitting for --
+    /// see that function's doc comment. Zero after `flush` runs (whether or
+    /// not it actually drew anything).
+    pub fn pending_vertex_count(&self) -> usize { self.verts.len() }
+
     /// Upload this frame's vertices and issue ONE draw call, then reset.
     pub fn flush(&mut self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass) {
         if self.verts.is_empty() {
