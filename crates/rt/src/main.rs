@@ -2067,20 +2067,19 @@ impl ApplicationHandler for App {
                                     if let Some(a) =
                                         rows.into_iter().nth(i).and_then(|r| r.action)
                                     {
-                                        let mut group_echo = None;
-                                        let cmd = match a.into_pick() {
+                                        let (cmd, group_echo) = match a.into_pick() {
                                             menu::MenuPick::Do(act) => {
-                                                Self::apply_action(active, act, &mut group_echo)
+                                                Self::apply_action(active, act)
                                             }
                                             menu::MenuPick::OpenUrl(u) => {
                                                 Self::open_url(&u);
-                                                WindowCmd::None
+                                                (WindowCmd::None, None)
                                             }
                                             menu::MenuPick::CopyUrl(u) => {
                                                 if let Some(cb) = &active.clipboard {
                                                     cb.store(u);
                                                 }
-                                                WindowCmd::None
+                                                (WindowCmd::None, None)
                                             }
                                             // Index into the snapshot taken when the
                                             // menu opened — stale-safe: an out-of-
@@ -2092,13 +2091,13 @@ impl ApplicationHandler for App {
                                             // is caught by `move_pane_to_window`.
                                             menu::MenuPick::MoveToWindow(i) => {
                                                 match active.menu_windows.get(i).copied() {
-                                                    Some(target) => WindowCmd::MoveToWindow(target),
+                                                    Some(target) => (WindowCmd::MoveToWindow(target), None),
                                                     None => {
                                                         log::debug!(
                                                             "move-to-window: menu index {i} out of range ({} targets)",
                                                             active.menu_windows.len()
                                                         );
-                                                        WindowCmd::None
+                                                        (WindowCmd::None, None)
                                                     }
                                                 }
                                             }
@@ -4287,24 +4286,41 @@ impl App {
         }
     }
 
-    /// The cross-window half of `Broadcast::Group` delivery: reach the
-    /// matching panes of every window EXCEPT `from`. `Session` stays pure —
-    /// it only ever knows its own panes (`Session::write_to_group`) — so
-    /// `App` does the walk across `self.windows`, exactly like
-    /// `migrate_pane_extras` above already does for a moved pane's wires and
-    /// jacks.
+    /// Which windows a `Broadcast::Group` fan-out from `from` should reach:
+    /// every OPEN window in `all` EXCEPT `from` itself. Pure and independent
+    /// of `Active`/`Session`/`self` on purpose — this is the ONE decision
+    /// that keeps a keystroke from reaching the focused pane twice (see
+    /// `broadcast_group_input`'s doc for why), and a pure function over
+    /// plain `WindowId`s is what lets a test break exactly this line and
+    /// watch it fail, instead of resting on a careful reading of a loop
+    /// buried inside an `&self` method that also does the I/O.
     ///
     /// `from` is excluded deliberately, not incidentally: every call site
     /// already delivers to `from`'s own local group members (including the
     /// focused pane itself) via the ordinary, UNCHANGED
     /// `Session::feed_input`/`feed_paste` call it makes first — see
     /// `group_echo`'s doc, which every call site consults before calling
-    /// this. Walking `from` again here too would deliver the SAME keystroke
-    /// to the SAME focused pane a second time — a double-delivered keystroke
-    /// is a visible, infuriating bug, and this exclusion is precisely what
-    /// prevents it (not any property of `PaneId`, since that's a
-    /// process-wide counter and would make a double local+cross write to the
-    /// origin window just as possible as a cross-window one).
+    /// `broadcast_group_input`/`_paste`. Targeting `from` again here too
+    /// would deliver the SAME keystroke to the SAME focused pane a second
+    /// time — a double-delivered keystroke is a visible, infuriating bug,
+    /// and this exclusion is precisely what prevents it (not any property of
+    /// `PaneId`, since that's a process-wide counter and would make a double
+    /// local+cross write to the origin window just as possible as a
+    /// cross-window one).
+    ///
+    /// Order is whatever `all`'s iteration order is (today, a `HashMap`'s,
+    /// same as the pre-existing `Broadcast::All` fan-out) — unspecified, and
+    /// this makes no attempt to fix that; it only removes `from`.
+    fn group_broadcast_targets(from: WindowId, all: impl Iterator<Item = WindowId>) -> Vec<WindowId> {
+        all.filter(|&w| w != from).collect()
+    }
+
+    /// The cross-window half of `Broadcast::Group` delivery: reach the
+    /// matching panes of every window `group_broadcast_targets` names.
+    /// `Session` stays pure — it only ever knows its own panes
+    /// (`Session::write_to_group`) — so `App` does the walk across
+    /// `self.windows`, exactly like `migrate_pane_extras` above already does
+    /// for a moved pane's wires and jacks.
     ///
     /// `Broadcast::All` deliberately gets NO equivalent of this method:
     /// "every pane in every window" is a blast radius the typist can't see,
@@ -4316,21 +4332,21 @@ impl App {
     /// a group spanning processes would need that handoff protocol to also
     /// carry live delivery (a new IPC path) — out of scope here.
     fn broadcast_group_input(&self, from: WindowId, group: u32, bytes: &[u8]) {
-        for (wid, w) in &self.windows {
-            if *wid != from {
+        for wid in Self::group_broadcast_targets(from, self.windows.keys().copied()) {
+            if let Some(w) = self.windows.get(&wid) {
                 w.session.write_to_group(group, bytes);
             }
         }
     }
 
     /// Paste equivalent of [`broadcast_group_input`](Self::broadcast_group_input):
-    /// same exclusion of `from`, same reasoning — see its doc. Uses
+    /// same targeting, same reasoning — see its doc. Uses
     /// `Session::paste_to_group` so each sibling window's panes still get
     /// the per-pane bracketed-paste decision `feed_paste`'s doc comment
     /// records as load-bearing, unchanged by crossing windows.
     fn broadcast_group_paste(&self, from: WindowId, group: u32, text: &[u8]) {
-        for (wid, w) in &self.windows {
-            if *wid != from {
+        for wid in Self::group_broadcast_targets(from, self.windows.keys().copied()) {
+            if let Some(w) = self.windows.get(&wid) {
                 w.session.paste_to_group(group, text);
             }
         }
@@ -4727,26 +4743,29 @@ impl App {
         }
     }
 
-    /// `group_echo` is an out-parameter (not a return value: `apply_action`
-    /// already returns `WindowCmd`, and only ONE arm below — the paste one —
-    /// ever has anything to put in it) carrying the group id + raw text to
-    /// ALSO broadcast to sibling windows, exactly like `do_paste`'s own
-    /// return — see its doc. The caller applies it via
+    /// The second element of the return is the same group-echo `do_paste`
+    /// returns (group id + raw text to ALSO broadcast to sibling windows) —
+    /// see its doc. Returned rather than taken as an out-parameter
+    /// (`&mut Option<...>`, the first cut of this) SPECIFICALLY because an
+    /// out-parameter is silent to forget: a caller that stops reading it
+    /// loses cross-window paste with no compile error. A second return value
+    /// forces both call sites to destructure it. The caller applies it via
     /// `App::broadcast_group_paste` once `active`'s borrow has ended (this
     /// free fn only has `&mut Active`, not `&mut self`, so it cannot reach
     /// other windows itself).
-    fn apply_action(active: &mut Active, action: rt_config::Action, group_echo: &mut Option<(u32, Vec<u8>)>) -> WindowCmd {
+    fn apply_action(active: &mut Active, action: rt_config::Action) -> (WindowCmd, Option<(u32, Vec<u8>)>) {
         use rt_config::Action;
+        let mut group_echo: Option<(u32, Vec<u8>)> = None;
         match action {
             // Window-owner level actions: this window's Active can't create or
             // close OS windows, so hand the request up to run_window_cmd.
-            Action::NewWindow => return WindowCmd::NewWindow,
-            Action::DetachPane => return WindowCmd::DetachPane,
-            Action::DetachTab => return WindowCmd::DetachTab,
+            Action::NewWindow => return (WindowCmd::NewWindow, None),
+            Action::DetachPane => return (WindowCmd::DetachPane, None),
+            Action::DetachTab => return (WindowCmd::DetachTab, None),
             // Carry mode: picking up needs the event loop (to build the cursor
             // card) and every window (they all wear it), so it goes up too.
-            Action::PickUpPane => return WindowCmd::PickUpPane,
-            Action::PickUpTab => return WindowCmd::PickUpTab,
+            Action::PickUpPane => return (WindowCmd::PickUpPane, None),
+            Action::PickUpTab => return (WindowCmd::PickUpTab, None),
             // Reorder the focused tab within its strip (Terminator's move_tab).
             Action::MoveTabLeft => Self::move_focused_tab(active, -1),
             Action::MoveTabRight => Self::move_focused_tab(active, 1),
@@ -4865,9 +4884,9 @@ impl App {
                 // Last pane closed: the whole window goes. The App level
                 // decides whether that ends the process (last window) or just
                 // drops this window (close_window).
-                Some(SessionEvent::CloseWindow) => return WindowCmd::CloseWindow,
+                Some(SessionEvent::CloseWindow) => return (WindowCmd::CloseWindow, None),
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
-                Some(SessionEvent::Paste) => *group_echo = Self::do_paste(active), // clipboard → focused PTY
+                Some(SessionEvent::Paste) => group_echo = Self::do_paste(active), // clipboard → focused PTY
                 Some(SessionEvent::Redraw) => {
                     // A session action that changed what's on screen — a tab
                     // switch, split, zoom, rotate, columns, etc. These change the
@@ -4882,7 +4901,7 @@ impl App {
                 None => {}
             },
         }
-        WindowCmd::None
+        (WindowCmd::None, group_echo)
     }
 
     /// Move the focused tab one slot left/right within its strip (`delta` = ±1,
@@ -5612,8 +5631,7 @@ impl App {
             match active.keymap.action_for(&chord) {
                 Some(action) => {
                     log::debug!("keymap: chord={chord:?} -> action={action:?}");
-                    let mut group_echo = None;
-                    let cmd = Self::apply_action(active, action, &mut group_echo); // shared with the menu
+                    let (cmd, group_echo) = Self::apply_action(active, action); // shared with the menu
                     // The `active` borrow ends here; window-level commands (close/
                     // new window/detach) re-borrow the map via &mut self.
                     self.run_window_cmd(event_loop, id, cmd);
@@ -7974,5 +7992,36 @@ mod hidpi_tests {
         // over half again as large in both dimensions.
         assert!(size_2x.width > size_1x.width * 3 / 2, "{} vs {}", size_2x.width, size_1x.width);
         assert!(size_2x.height > size_1x.height * 3 / 2, "{} vs {}", size_2x.height, size_1x.height);
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    /// The one property that keeps a `Broadcast::Group` keystroke from
+    /// reaching the focused pane twice (see `broadcast_group_input`'s doc):
+    /// the origin window is never among its own targets. Breaking the
+    /// `filter` in `group_broadcast_targets` (e.g. deleting it, or flipping
+    /// `!=` to `==`) makes this fail — WindowId::from_raw needs no real
+    /// window, so the check is a pure function over plain ids.
+    #[test]
+    fn group_broadcast_targets_excludes_the_origin_window() {
+        let a = WindowId::from_raw(1);
+        let b = WindowId::from_raw(2);
+        let c = WindowId::from_raw(3);
+        let targets = App::group_broadcast_targets(a, [a, b, c].into_iter());
+        assert!(!targets.contains(&a), "the origin window must never target itself: {targets:?}");
+        assert_eq!(targets.len(), 2, "exactly the two OTHER windows: {targets:?}");
+        assert!(targets.contains(&b) && targets.contains(&c));
+    }
+
+    /// A window with no siblings (the common case: one open rt window) must
+    /// end up with an EMPTY target list, not a panic or a stray self-target.
+    #[test]
+    fn group_broadcast_targets_is_empty_with_no_other_windows() {
+        let a = WindowId::from_raw(1);
+        let targets = App::group_broadcast_targets(a, [a].into_iter());
+        assert!(targets.is_empty(), "a lone window has no cross-window targets: {targets:?}");
     }
 }
