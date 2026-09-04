@@ -835,6 +835,15 @@ pub struct TextPipeline {
     shelf_h: u32,
     /// Cached glyph placements: (char, bold, italic) -> uv rect + pixel offsets.
     glyphs: std::collections::HashMap<(char, bool, bool), Glyph>,
+    /// Cached instrument coverage masks (Task 7), sharing the same atlas.
+    masks: std::collections::HashMap<MaskKey, [f32; 4]>,
+    /// [width, height] in pixels, written into `ubuf` on flush.
+    screen: [f32; 2],
+    /// The four faces, indexed by `font_for(bold, italic)`. Bold/italic/bold-italic
+    /// are `Option` because a font set may not supply them; `font_for` falls back
+    /// to regular, matching what render.rs does.
+    fonts: (Font, Option<Font>, Option<Font>, Option<Font>),
+    font_px: f32,
     cell_w: f32,
     cell_h: f32,
     ascent: f32,
@@ -944,11 +953,24 @@ impl TextPipeline {
         Ok(Self { /* pipeline, bind_group, vbuf, ubuf, atlas, ... */
                   verts: Vec::new(), shelf_x: 1, shelf_y: 0, shelf_h: 1,
                   glyphs: Default::default(), masks: Default::default(),
-                  cell_w, cell_h, ascent: lm.ascent,
-                  fonts: [regular, bold, italic, bold_italic] })
+                  screen: [1.0, 1.0], font_px, cell_w, cell_h, ascent: lm.ascent,
+                  fonts: (regular, bold, italic, bold_italic) })
     }
 
     pub fn cell_size(&self) -> (f32, f32) { (self.cell_w, self.cell_h) }
+
+    /// The face for this style, falling back to regular when a set is absent —
+    /// the same fallback render.rs uses, so a font pack missing an italic face
+    /// renders upright rather than blank.
+    fn font_for(&self, bold: bool, italic: bool) -> &Font {
+        let (r, b, i, bi) = &self.fonts;
+        match (bold, italic) {
+            (true, true) => bi.as_ref().or(b.as_ref()).or(i.as_ref()).unwrap_or(r),
+            (true, false) => b.as_ref().unwrap_or(r),
+            (false, true) => i.as_ref().unwrap_or(r),
+            (false, false) => r,
+        }
+    }
 
     pub fn set_screen(&mut self, w: f32, h: f32) { self.screen = [w, h]; /* written in flush */ }
 
@@ -1408,24 +1430,22 @@ pub fn try_enable(window: &dyn Window) {
 }
 ```
 
-- [ ] **Step 2: Let the clear colour carry alpha**
+- [ ] **Step 2: Confirm the clear alpha already flows (no code change expected)**
 
-In `wgpu_backend.rs`'s `start`, replace the hardcoded `a: 1.0` with the configured opacity so the glass shows through:
+Task 4 already clears with `a: bg.3 as f64`, because `render.rs`'s `Color` carries
+alpha. So there is most likely nothing to change here — the opacity the user sets
+should already reach the surface exactly as it does on the GL path.
 
-```rust
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg.r as f64 / 255.0,
-                            g: bg.g as f64 / 255.0,
-                            b: bg.b as f64 / 255.0,
-                            // The window is transparent (main.rs:878) and the
-                            // surface is PostMultiplied, so this alpha is what
-                            // lets the NSVisualEffectView beneath show through.
-                            // At 1.0 the glass is there but invisible.
-                            a: self.bg_alpha as f64,
-                        }),
+Verify rather than assume. Check that `main.rs` folds `settings.background_opacity`
+into the `Color` it hands `begin_frame`, as it must for Linux transparency to work:
+
+```bash
+grep -n "background_opacity" crates/rt/src/main.rs
 ```
 
-Add `pub(crate) bg_alpha: f32` to `WgpuBackend`, defaulting to 1.0, and set it from `settings.background_opacity` where `main.rs` already applies opacity.
+If it does, this step is a no-op — say so and move on. If the opacity is applied
+somewhere the wgpu path bypasses, thread it into the clear colour's alpha, and say
+in the commit which of the two it turned out to be.
 
 - [ ] **Step 3: Call it, with the fallback chain**
 
