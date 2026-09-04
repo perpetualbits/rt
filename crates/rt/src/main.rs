@@ -1301,11 +1301,19 @@ impl App {
         // allocation for the rest of their lives.
         #[cfg(target_os = "macos")]
         let window: std::sync::Arc<dyn Window> = std::sync::Arc::from(window);
+        // Route construction failure through `fail_build`, same as the Linux
+        // display-handle/GL-context failures above (e.g. the `display_handle()`
+        // arm): log it and hand back `None` rather than panicking. A macOS user
+        // then gets rt's normal failure reporting instead of a panic backtrace.
         #[cfg(target_os = "macos")]
-        let backend: Box<dyn backend::Backend> = Box::new(
-            wgpu_backend::WgpuBackend::new(window.clone(), &font_blobs, settings.font_size)
-                .expect("wgpu backend"),
-        );
+        let backend: Box<dyn backend::Backend> =
+            match wgpu_backend::WgpuBackend::new(window.clone(), &font_blobs, settings.font_size) {
+                Ok(b) => Box::new(b),
+                Err(e) => {
+                    log::error!("wgpu backend: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
         let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
         Some(Active {
             window,

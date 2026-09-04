@@ -108,7 +108,14 @@ impl WgpuBackend {
                 self.surface.configure(&self.device, &self.config);
                 match self.surface.get_current_texture() {
                     Ok(f) => f,
-                    Err(_) => return,
+                    // Still failing after a reconfigure: log it. Silently
+                    // skipping every frame here is otherwise indistinguishable
+                    // from "the clear colour is wrong" — the worst failure mode
+                    // during bring-up, when there's no other diagnostic signal.
+                    Err(e) => {
+                        log::warn!("wgpu: get_current_texture failed after reconfigure: {e}");
+                        return;
+                    }
                 }
             }
         };
