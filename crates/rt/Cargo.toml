@@ -122,6 +122,8 @@ objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEf
 objc2-foundation = "0.3"
 
 [dev-dependencies]
+
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
 # The offscreen pixel-identity gate (tests/damage_pixel_identity.rs) drives the
 # real GL renderer into a headless framebuffer. Integration tests link the lib
 # only, so the crates the test itself names must be dev-dependencies even though
@@ -133,5 +135,7 @@ objc2-foundation = "0.3"
 #     exactly the software-GL path damage rendering optimises. `static` links
 #     libEGL via pkg-config; default features include the 1.5 API we need for
 #     eglGetPlatformDisplay.
+# These move behind cfg(not(target_os = "macos")) because khronos-egl's build
+# script requires pkg-config and a system EGL, neither available on macOS.
 glow = "0.17"
 khronos-egl = { version = "6", features = ["static"] }
