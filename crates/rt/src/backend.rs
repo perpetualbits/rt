@@ -174,20 +174,32 @@ pub fn choose_backend_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn unix_socket_selects_gl() {
         assert!(matches!(choose_backend(Some(":0"), true, None), BackendKind::Gl));
         assert!(matches!(choose_backend(Some(":1.0"), true, None), BackendKind::Gl));
     }
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn tcp_forwarded_selects_xrender() {
         assert!(matches!(choose_backend(Some("localhost:10.0"), true, None), BackendKind::XRender));
         assert!(matches!(choose_backend(Some("192.168.1.5:0"), true, None), BackendKind::XRender));
     }
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn wayland_selects_gl() {
         assert!(matches!(choose_backend(None, false, None), BackendKind::Gl));
     }
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn override_wins() {
         assert!(matches!(choose_backend(Some(":0"), true, Some("xrender")), BackendKind::XRender));
@@ -207,6 +219,16 @@ mod tests {
         // Honouring "xrender" here would name a module that is cfg'd out.
         assert!(matches!(choose_backend_on(Some(":0"), true, Some("xrender"), true), BackendKind::Wgpu));
         assert!(matches!(choose_backend_on(None, false, Some("gl"), true), BackendKind::Wgpu));
+    }
+
+    /// The wrapper's cfg! wiring, on the platform where it matters. The other
+    /// macOS tests drive the pure core directly and would pass even if
+    /// `choose_backend` forgot to consult the platform at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wrapper_selects_wgpu_on_macos() {
+        assert!(matches!(choose_backend(Some(":0"), true, None), BackendKind::Wgpu));
+        assert!(matches!(choose_backend(None, false, Some("xrender")), BackendKind::Wgpu));
     }
 
     #[test]
