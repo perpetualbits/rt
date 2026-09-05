@@ -22,6 +22,39 @@ use crate::backend::Backend;
 use crate::damage::PxRect;
 use crate::render::{Color, FontBlobs};
 
+/// The device-level wgpu objects, created ONCE and shared by every window.
+///
+/// rt is multi-window (new window, detach pane, tear-off), and only `Surface` is
+/// genuinely per-window: a `Surface` is a `CAMetalLayer` bound to one `NSView`, while
+/// `Instance`/`Adapter`/`Device`/`Queue` describe the GPU, which every window shares.
+/// Building them per window meant a second `MTLDevice` and `MTLCommandQueue` for the same
+/// GPU (so nothing could ever be shared between windows — wgpu resources belong to the
+/// device that made them) plus a blocking `request_adapter` + `request_device` round trip
+/// on every window open. All four are `Arc`-backed handles, so cloning one costs a
+/// refcount and the clones name the same object.
+///
+/// Owned by `App` (`main.rs`), like `budget` and the drag/carry state — the App is what
+/// sees every window. Lazily built by the first `WgpuBackend::new` and then kept for the
+/// process's life, so closing every window and opening a new one does not pay for the
+/// round trip again.
+///
+/// What is deliberately NOT in here: the glyph atlas, pipeline, bind group and vertex
+/// buffer (`TextPipeline`). Those look shareable and are not. The atlas caches glyphs
+/// under `(char, bold, italic)` with no font-size in the key, and font size is per window
+/// — `Active::settings.font_size` — multiplied by that window's own `scale_factor`, which
+/// differs between a Retina display and an external monitor. One shared atlas would serve
+/// a window the other window's pixel size for the same character. Sharing them needs the
+/// cache key to carry the rasterised size first; that is a design change to
+/// `wgpu_text.rs`, not a wiring change, so it is left alone here. Now that every window's
+/// `TextPipeline` is built on the SAME device, that change is possible at all — with a
+/// device per window it was not.
+pub struct WgpuShared {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
 pub struct WgpuBackend {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
@@ -29,8 +62,17 @@ pub struct WgpuBackend {
     pub(crate) config: wgpu::SurfaceConfiguration,
     /// The frame being built between `begin_frame` and `end_frame`.
     pub(crate) frame: Option<wgpu::SurfaceTexture>,
-    pub(crate) encoder: Option<wgpu::CommandEncoder>,
+    /// The colour `begin_frame` asked for, applied as the FIRST `end_frame` pass's
+    /// `LoadOp::Clear` — see `needs_clear`.
     pub(crate) clear: Color,
+    /// Set by `begin_frame`, cleared by the first `end_frame` pass of that frame: "the
+    /// clear has not reached the drawable yet". This is the whole of Metal's clear —
+    /// there is no separate clear pass, because on a tile-based deferred GPU an
+    /// otherwise-empty `LoadOp::Clear` + `StoreOp::Store` pass writes the entire
+    /// framebuffer out to memory only for the next pass's `LoadOp::Load` to read it
+    /// straight back (~23.8 MB each way at 3024×1964 — about 2.85 GB/s at 60fps) for a
+    /// pass that draws nothing.
+    pub(crate) needs_clear: bool,
     pub(crate) scissor: Option<PxRect>,
     pub(crate) cell_w: f32,
     pub(crate) cell_h: f32,
@@ -38,28 +80,67 @@ pub struct WgpuBackend {
 }
 
 impl WgpuBackend {
-    pub fn new(window: Arc<dyn Window>, font_blobs: &FontBlobs, font_px: f32) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL,
-            ..Default::default()
-        });
+    /// Build the backend for one window. `shared` is `App`'s process-wide
+    /// [`WgpuShared`]: empty on the first window (this fills it in), reused by every
+    /// window after — see that type for what is shared and what deliberately is not.
+    pub fn new(
+        shared: &mut Option<WgpuShared>,
+        window: Arc<dyn Window>,
+        font_blobs: &FontBlobs,
+        font_px: f32,
+    ) -> Result<Self, String> {
+        // The instance must exist before the surface, and the surface before the adapter
+        // (`compatible_surface`), so the three are threaded in that order rather than
+        // taken from `shared` in one go.
+        let instance = match shared.as_ref() {
+            Some(s) => s.instance.clone(),
+            None => wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::METAL,
+                ..Default::default()
+            }),
+        };
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("wgpu: create_surface failed: {e}"))?;
-        // wgpu 27's request_adapter/request_device already return `Result`
-        // (older wgpu returned `Option`), so no extra `.ok_or_else` is needed
-        // around the `pollster::block_on` — just `.map_err`.
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower, // a terminal is not a game
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .map_err(|e| format!("wgpu: no Metal adapter: {e}"))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("rt"),
-            ..Default::default()
-        }))
-        .map_err(|e| format!("wgpu: request_device failed: {e}"))?;
+        // Clone out of `shared` FIRST (owned handles, no borrow left outstanding) so the
+        // `None` arm below can write back into it.
+        let existing = shared.as_ref().map(|s| (s.adapter.clone(), s.device.clone(), s.queue.clone()));
+        let (adapter, device, queue) = match existing {
+            // Second and later windows: no adapter/device round trip, and — because
+            // every window's resources now come from one device — a future shared atlas
+            // is expressible at all.
+            Some(t) => t,
+            None => {
+                // wgpu 27's request_adapter/request_device already return `Result`
+                // (older wgpu returned `Option`), so no extra `.ok_or_else` is needed
+                // around the `pollster::block_on` — just `.map_err`.
+                let adapter =
+                    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::LowPower, // a terminal is not a game
+                        // Only the FIRST window's surface picks the adapter. On macOS
+                        // that is not a constraint in practice: Metal exposes one
+                        // adapter per GPU and every `CAMetalLayer` on the machine is
+                        // compatible with it, so a window opened later on a different
+                        // display resolves to the same adapter this one did.
+                        compatible_surface: Some(&surface),
+                        force_fallback_adapter: false,
+                    }))
+                    .map_err(|e| format!("wgpu: no Metal adapter: {e}"))?;
+                let (device, queue) =
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                        label: Some("rt"),
+                        ..Default::default()
+                    }))
+                    .map_err(|e| format!("wgpu: request_device failed: {e}"))?;
+                *shared = Some(WgpuShared {
+                    instance,
+                    adapter: adapter.clone(),
+                    device: device.clone(),
+                    queue: queue.clone(),
+                });
+                (adapter, device, queue)
+            }
+        };
 
         let size = window.surface_size();
         let caps = surface.get_capabilities(&adapter);
@@ -98,8 +179,8 @@ impl WgpuBackend {
             surface,
             config,
             frame: None,
-            encoder: None,
             clear: Color(0.0, 0.0, 0.0, 1.0),
+            needs_clear: false,
             scissor: None,
             cell_w,
             cell_h,
@@ -108,9 +189,20 @@ impl WgpuBackend {
     }
 
     /// Begin a frame, clearing to `bg`. `scissor` limits later draws.
+    ///
+    /// The clear is RECORDED here, not issued: it becomes the `LoadOp::Clear` of the
+    /// first render pass `end_frame` opens (see `needs_clear`). A pass of its own would
+    /// be a full framebuffer store + load on a tile-based GPU for a pass that draws
+    /// nothing.
     fn start(&mut self, bg: Color, scissor: Option<PxRect>) {
         self.clear = bg;
         self.scissor = scissor;
+        // Belt and braces against a frame that ended without a flush (a `present` that
+        // never ran, a caller that pushed geometry after the last `end_frame`): a new
+        // frame starts from an empty vertex list, never with the tail of an older one.
+        // `end_frame` already discards on the path that can produce it -- see
+        // `EndFrameAction::DiscardGeometry` -- so in the healthy case this is a no-op.
+        self.text.discard_pending();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             // Lost/outdated surface: reconfigure and skip this frame rather than
@@ -125,36 +217,17 @@ impl WgpuBackend {
                     // during bring-up, when there's no other diagnostic signal.
                     Err(e) => {
                         log::warn!("wgpu: get_current_texture failed after reconfigure: {e}");
+                        // No drawable: `frame` stays None. The caller (`redraw_full`)
+                        // cannot know that and will draw a whole frame's geometry into
+                        // `self.text` regardless; `end_frame` discards it rather than
+                        // letting it survive into the next frame that does acquire.
                         return;
                     }
                 }
             }
         };
-        let view = frame.texture.create_view(&Default::default());
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // render.rs's Color is already normalised 0..1 AND
-                        // carries alpha, so this is a straight widen. The alpha
-                        // matters in Task 8: it is what lets the vibrancy show
-                        // through, and at 1.0 the frosted glass is invisible.
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg.0 as f64, g: bg.1 as f64, b: bg.2 as f64, a: bg.3 as f64,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-        }
         self.frame = Some(frame);
-        self.encoder = Some(encoder);
+        self.needs_clear = true; // the first end_frame pass applies it
     }
 
     /// One edge of `bell_stripe`: alternating yellow/black segments along the
@@ -178,27 +251,6 @@ impl WgpuBackend {
             i += 1;
         }
     }
-}
-
-/// Whether `end_frame` needs to open a render pass and submit, given whether
-/// this call still owns `begin_frame`'s encoder (`had_encoder` -- `true`
-/// only for the FIRST `end_frame` in a frame) and how many vertices
-/// `self.text` has queued. Extracted as a free function -- mirroring
-/// `wgpu_text.rs`'s `mask_key`/`line_corners`/`corners_to_verts` pattern of
-/// pulling logic out of `wgpu::Device`-touching methods -- so the decision
-/// that was the actual bug is unit-testable without a live GPU:
-/// `WgpuBackend` itself can't be constructed in a test (`new` needs a real
-/// `Arc<dyn Window>` and Metal adapter), so this is the strongest testable
-/// surface for that decision.
-///
-/// The first call must always submit: its encoder carries `begin_frame`'s
-/// clear, and returning early would mean the clear itself is never
-/// submitted (a black/stale window), even if nothing has been drawn yet. A
-/// LATER call has no clear riding along -- only submit it if there is new
-/// geometry to flush; an empty later call would cost a wasted command
-/// buffer for a pass that draws nothing.
-fn end_frame_should_submit(had_encoder: bool, pending_verts: usize) -> bool {
-    had_encoder || pending_verts > 0
 }
 
 impl Backend for WgpuBackend {
@@ -326,34 +378,46 @@ impl Backend for WgpuBackend {
     // same result: EVERY call flushes whatever has accumulated in `self.text`
     // since the previous call, into the CURRENT frame, in painter's order.
     //
-    // The wrinkle wgpu adds is the encoder. `begin_frame` creates one and
-    // records the clear into it, but does not submit -- submission is this
-    // function's job, so the clear rides along with the first flush. Only
-    // ONE encoder can hold that clear, and it must be consumed on the FIRST
-    // call (`self.encoder.take()` is `Some` then, `None` on every call after).
-    // The old code returned immediately when `encoder` was `None` -- i.e. on
-    // every call after the first -- which silently dropped any geometry
-    // pushed since: it stayed in `self.text`'s vertex buffer (nothing ever
-    // called `flush`, so nothing cleared it) and was drawn at the START of
-    // the NEXT frame's first `end_frame`, ahead of that frame's own content.
-    // That's the reported bug: a pane's menu/title-bar geometry, batched
-    // after the content flush, appearing one frame late and underneath
-    // everything painted since.
+    // The wrinkle wgpu adds is the clear. `begin_frame` does not issue one --
+    // it records `needs_clear`, and the FIRST pass this function opens carries
+    // it as its `LoadOp::Clear`; every later pass in the same frame LOADS, so
+    // the clear (and the earlier pass's geometry) survives. An earlier version
+    // opened a clear-only pass in `begin_frame` instead: on a tile-based
+    // deferred GPU that stores the whole framebuffer and the next pass loads it
+    // straight back, ~23.8 MB each way per frame at 3024x1964, for a pass that
+    // draws nothing.
+    //
+    // Two exits from this function have now shipped the same bug, so both are
+    // named in `EndFrameAction` and neither is decided here:
+    //
+    //  * returning when the encoder was `None` -- i.e. on every call after the
+    //    first -- dropped the overlay batch into the next frame;
+    //  * returning when `self.frame` was `None` -- a frame whose drawable could
+    //    not be acquired -- did the same with a whole grid of pane geometry.
+    //
+    // In both cases the geometry stayed in `self.text`'s vertex buffer (nothing
+    // called `flush`, and `flush` is the only thing that clears it) and was
+    // drawn at the START of the next frame that did paint, ahead of that
+    // frame's own content: a pane's menu/title-bar one frame late and
+    // underneath everything painted since ("menu under panes, disks under
+    // titlebars"), double-blending through rt's translucent background.
     fn end_frame(&mut self) {
-        let Some(frame) = self.frame.as_ref() else { return };
-        // `Some` only for the call that still owns `begin_frame`'s encoder
-        // (and therefore its unsubmitted clear) -- see `end_frame_should_submit`.
-        let had_encoder = self.encoder.is_some();
-        let pending = self.text.pending_vertex_count();
-        if !end_frame_should_submit(had_encoder, pending) {
-            return;
-        }
-        // First call this frame: take the encoder `begin_frame` built (it
-        // carries the clear). Any later call: that encoder is already gone
-        // (submitted by the first call), so open a fresh one -- there is new
-        // geometry to flush (`end_frame_should_submit` guarantees that for a
-        // `None` encoder) but nothing else queued on it.
-        let mut encoder = self.encoder.take().unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
+        use crate::wgpu_frame::{end_frame_action, EndFrameAction};
+        let action =
+            end_frame_action(self.frame.is_some(), self.needs_clear, self.text.pending_vertex_count());
+        let clear = match action {
+            // No drawable: this frame will never be presented, so its geometry
+            // must not survive into the one that is. See the enum's doc comment.
+            EndFrameAction::DiscardGeometry => {
+                self.text.discard_pending();
+                self.needs_clear = false;
+                return;
+            }
+            EndFrameAction::Skip => return,
+            EndFrameAction::Submit { clear } => clear,
+        };
+        let Some(frame) = self.frame.as_ref() else { return }; // Submit implies Some
+        let mut encoder = self.device.create_command_encoder(&Default::default());
         let view = frame.texture.create_view(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -362,11 +426,29 @@ impl Backend for WgpuBackend {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    // Load, NOT Clear, on every call including this fresh
-                    // encoder's: begin_frame's clear (or an earlier end_frame's
-                    // geometry) is already on the texture, and clearing again
-                    // would erase it.
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: if clear {
+                            // render.rs's Color is already normalised 0..1 AND carries
+                            // alpha, so this is a straight widen. The alpha matters in
+                            // Task 8: it is what lets the vibrancy show through, and at
+                            // 1.0 the frosted glass is invisible. A load op is not
+                            // affected by the scissor rect set below -- the clear covers
+                            // the whole attachment either way, exactly as the separate
+                            // clear pass did.
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: self.clear.0 as f64,
+                                g: self.clear.1 as f64,
+                                b: self.clear.2 as f64,
+                                a: self.clear.3 as f64,
+                            })
+                        } else {
+                            // Later passes of the same frame: the clear and the earlier
+                            // pass's geometry are already on the texture, and clearing
+                            // again would erase them.
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 ..Default::default()
             });
@@ -376,6 +458,7 @@ impl Backend for WgpuBackend {
             self.text.flush(&self.queue, &mut pass);
         }
         self.queue.submit(Some(encoder.finish()));
+        self.needs_clear = false; // the clear is on the drawable now
     }
 
     fn resize_surface(&mut self, w: NonZeroU32, h: NonZeroU32) {
@@ -416,59 +499,11 @@ impl Backend for WgpuBackend {
     fn is_gl(&self) -> bool { true }
 }
 
-// Runs on kiku only (`cargo test -p rt --bin rt`): this whole module is
-// `cfg(target_os = "macos")`'d out of the tree everywhere else (see main.rs),
-// so there is no way to compile, let alone run, these tests on Linux CI.
-//
-// `end_frame_should_submit` is a pure function precisely so this doesn't need
-// a `wgpu::Device` -- see its doc comment for why `WgpuBackend` itself can't
-// be built in a test. This test module is what would have caught the
-// double-`end_frame`-per-frame regression: the OLD `end_frame` decided
-// whether to proceed with `self.encoder.take().is_some()` alone, i.e.
-// `had_encoder` with `pending_verts` never even consulted. Reproduce that on
-// `end_frame_should_submit`'s inputs and
-// `end_frame_must_flush_a_later_call_with_pending_geometry` below fails: a
-// later call (no encoder left -- the first call already took and submitted
-// it) with geometry queued (the overlay/menu batch) returns `false`, so
-// `end_frame` bails out without ever calling `TextPipeline::flush`. That
-// geometry then sits in `self.text`'s vertex buffer, undrawn and
-// un-cleared, until the NEXT frame's first `end_frame` finally flushes it --
-// ahead of that next frame's own content. That's the reported bug: a pane's
-// menu/title-bar drawn one frame late and underneath everything painted
-// since.
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn end_frame_must_submit_the_first_call_even_with_no_geometry() {
-        // The first call's encoder carries begin_frame's clear. Even if
-        // nothing has been pushed since (a blank frame), it must still be
-        // submitted -- otherwise the clear itself is silently dropped.
-        assert!(end_frame_should_submit(true, 0), "the clear-carrying first call must always submit");
-    }
-
-    #[test]
-    fn end_frame_must_flush_a_later_call_with_pending_geometry() {
-        // The actual bug. A second end_frame in the same frame (main.rs
-        // calls it after paint_overlays_or_instruments) has already had its
-        // encoder taken and submitted by the first call -- had_encoder is
-        // false here -- but DOES have geometry queued (the menu/title-bar
-        // batch). It must still flush. Under the OLD logic (`had_encoder`
-        // alone, pending_verts never consulted) this input returns `false`:
-        // this assertion is RED against that logic and GREEN against the fix.
-        assert!(
-            end_frame_should_submit(false, 3),
-            "a later call with pending geometry must still flush it into the current frame"
-        );
-    }
-
-    #[test]
-    fn end_frame_may_skip_a_later_call_with_nothing_pending() {
-        // No encoder left to carry a clear, and nothing new was pushed since
-        // the previous flush -- opening a pass and submitting would draw
-        // nothing. Not required for correctness, just avoids a wasted
-        // command buffer every such call.
-        assert!(!end_frame_should_submit(false, 0));
-    }
-}
+// The `end_frame` decision that was the actual bug -- twice -- is NOT tested here.
+// It lives in `wgpu_frame.rs` as a pure function over three booleans/counts, with no
+// wgpu types, precisely so Linux CI runs its tests: this module is
+// `cfg(target_os = "macos")`'d out of the tree everywhere else (see main.rs), so a test
+// placed here would run only on a Mac someone remembered to run it on. `WgpuBackend`
+// itself cannot be constructed in a test either way (`new` needs a real
+// `Arc<dyn Window>` and a Metal adapter), so the pure decision is the strongest
+// testable surface regardless of where it sits -- and off the Mac is strictly better.

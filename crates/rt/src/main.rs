@@ -30,6 +30,10 @@ mod vibrancy; // NSVisualEffectView frosted glass (best-effort, like blur.rs)
 mod wgpu_backend; // the macOS backend: wgpu/Metal
 #[cfg(target_os = "macos")]
 mod wgpu_text; // glyph atlas + pipeline for wgpu_backend
+// Deliberately NOT cfg'd to macOS: it holds the wgpu backend's frame-sequencing
+// decisions as plain data (no wgpu types), so Linux CI can run the tests for a bug that
+// has already been introduced twice in a file no Linux build can even compile.
+mod wgpu_frame; // pure end_frame decision table for wgpu_backend
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard / macOS arboard)
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 mod damage; // pure pixel-rect damage accumulator
@@ -696,6 +700,15 @@ struct App {
     /// it to roughly once a second here so `about_to_wait`'s own per-wake cost stays a
     /// single `Instant::elapsed()` comparison the rest of the time.
     budget_last_rebalance: Instant,
+    /// The wgpu `Instance`/`Adapter`/`Device`/`Queue` every window's backend draws with.
+    /// App-level for the same reason `budget` is: the GPU is a process-wide resource, not
+    /// a per-window one, and only the App sees every window. `None` until the first
+    /// window builds it (`WgpuBackend::new` fills it in); every window after that clones
+    /// the handles instead of creating a second `MTLDevice` and paying another blocking
+    /// `request_adapter`/`request_device` round trip. See `wgpu_backend::WgpuShared` for
+    /// what stays per window (the surface, and the glyph atlas — deliberately).
+    #[cfg(target_os = "macos")]
+    wgpu_shared: Option<wgpu_backend::WgpuShared>,
 }
 
 /// A left-press on a pane titlebar or a tab label. It is not a drag yet — it
@@ -1483,7 +1496,12 @@ impl App {
         // then gets rt's normal failure reporting instead of a panic backtrace.
         #[cfg(target_os = "macos")]
         let backend: Box<dyn backend::Backend> =
-            match wgpu_backend::WgpuBackend::new(window.clone(), &font_blobs, physical_font_px(settings.font_size, scale_factor)) {
+            match wgpu_backend::WgpuBackend::new(
+                &mut self.wgpu_shared,
+                window.clone(),
+                &font_blobs,
+                physical_font_px(settings.font_size, scale_factor),
+            ) {
                 Ok(b) => Box::new(b),
                 Err(e) => {
                     log::error!("wgpu backend: {e}");
@@ -7937,6 +7955,8 @@ fn main() {
         carry: None,
         budget: std::sync::Arc::new(rt_engine::budget::Budget::default()),
         budget_last_rebalance: Instant::now(),
+        #[cfg(target_os = "macos")]
+        wgpu_shared: None, // built by the first window, shared by the rest
     };
     if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure

@@ -27,6 +27,7 @@ pub use rt_handoff;
 
 use std::borrow::Cow; // Msg::Input takes a Cow<[u8]>; we always own our bytes
 use std::collections::VecDeque; // FIFO queue of high-level events for the GUI to drain
+use std::sync::atomic::{AtomicU8, Ordering}; // the kitty-keyboard flags last reported to the app
 use std::sync::{Arc, Mutex}; // shared, lock-guarded state between us and the I/O thread
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
@@ -281,6 +282,35 @@ struct Proxy {
     // *after* the EventLoop is built (chicken-and-egg: the sender comes from the
     // loop), hence the Mutex<Option<..>>.
     sender: Arc<Mutex<Option<EventLoopSender>>>,
+    // The kitty-keyboard flags this pane last REPORTED to the application (already
+    // masked to what rt honours), or `KITTY_NEVER_REPORTED` if it has never asked.
+    // Written here — this is the one place rt sees the reply — and read by
+    // `AlacPane::kitty_keyboard_flags`; see that method for why the two must agree.
+    kbd_reported: Arc<AtomicU8>,
+}
+
+/// `kbd_reported` sentinel: the application has never sent `CSI ? u`, so rt has made it
+/// no promise to keep. Not a valid flag set (rt honours bit 0 only), so it cannot
+/// collide with a real report.
+const KITTY_NEVER_REPORTED: u8 = 0xFF;
+
+/// The kitty-keyboard flags rt may act on, given the engine's `active` mode and what the
+/// last `CSI ? u` reply told the application (`None` = it never asked).
+///
+/// Never more than rt has admitted to: an application that was told `0` is parsing legacy
+/// keys, and sending it `ESC [ 13 ; 2 u` for Shift+Enter would hand it escape sequences it
+/// is not decoding. Never more than is active either: an application that pushed, queried,
+/// then popped was told `1` but has since turned the protocol off.
+///
+/// The remaining `active & !reported` case — flags negotiated after the last query, or with
+/// no query at all — degrades the safe way round: rt encodes legacy for an application that
+/// asked for CSI-u, which is the encoding that application handled before it ever
+/// negotiated. See `docs/engine-divergence.md`.
+fn honoured_kitty_flags(active: u8, reported: Option<u8>) -> u8 {
+    match reported {
+        Some(r) => active & r,
+        None => active, // nothing promised, nothing to contradict
+    }
 }
 
 /// Reduce a kitty-keyboard query reply to the flags rt's key encoder actually honours.
@@ -309,6 +339,18 @@ fn mask_kitty_keyboard_reply(text: String) -> String {
     }
 }
 
+/// The flag value a masked reply announces, or `None` if this reply is not a kitty
+/// keyboard report at all. The mirror of [`mask_kitty_keyboard_reply`] — run on its
+/// OUTPUT, so what is recorded is exactly what went down the PTY, not what the engine
+/// wanted to send. Kept separate rather than folded into the mask so that function stays
+/// a pure `String -> String` with its own tests.
+fn reported_kitty_flags(masked: &str) -> Option<u8> {
+    masked
+        .strip_prefix("\x1b[?")
+        .and_then(|rest| rest.strip_suffix('u'))
+        .and_then(|digits| digits.parse::<u8>().ok())
+}
+
 impl EventListener for Proxy {
     /// Called by the engine's I/O thread for every terminal event. We keep this
     /// fast and non-blocking: translate-and-enqueue, or reply to the PTY. It
@@ -335,6 +377,15 @@ impl EventListener for Proxy {
                     if let Some(sender) = guard.as_ref() {
                         // Owned bytes → 'static Cow, as Msg::Input requires.
                         let text = mask_kitty_keyboard_reply(text);
+                        // Remember what the application is being told about the kitty
+                        // keyboard protocol, so the key encoder can honour exactly that
+                        // and no more (see `honoured_kitty_flags`). Recorded before the
+                        // send: the application cannot act on the reply until it has the
+                        // bytes, so this can never be read stale by a key press caused by
+                        // the reply itself.
+                        if let Some(f) = reported_kitty_flags(&text) {
+                            self.kbd_reported.store(f, Ordering::Relaxed);
+                        }
                         let _ = sender.send(Msg::Input(Cow::Owned(text.into_bytes())));
                     }
                 }
@@ -386,6 +437,9 @@ pub struct AlacPane {
     // render loop then skips it (frozen at its last frame) so a deterministic render
     // bug can't re-panic every frame.
     crashed: std::sync::atomic::AtomicBool,
+    // The kitty-keyboard flags last reported to the application (same Arc the Proxy
+    // writes), or `KITTY_NEVER_REPORTED`. See `kitty_keyboard_flags`.
+    kbd_reported: Arc<AtomicU8>,
 }
 
 impl AlacPane {
@@ -424,7 +478,12 @@ impl AlacPane {
         // Shared state between this struct and the proxy/I/O thread.
         let events = Arc::new(Mutex::new(VecDeque::new())); // event FIFO
         let sender_slot = Arc::new(Mutex::new(None)); // filled in below
-        let proxy = Proxy { queue: events.clone(), sender: sender_slot.clone() };
+        let kbd_reported = Arc::new(AtomicU8::new(KITTY_NEVER_REPORTED)); // nothing promised yet
+        let proxy = Proxy {
+            queue: events.clone(),
+            sender: sender_slot.clone(),
+            kbd_reported: kbd_reported.clone(),
+        };
 
         // Build the terminal grid + parser. `scrolling_history` is the buffer the
         // user can grow for long-running output (see rt's Preferences).
@@ -508,6 +567,7 @@ impl AlacPane {
             pid,
             scrollback_limit: scrollback,
             crashed: std::sync::atomic::AtomicBool::new(false),
+            kbd_reported,
         })
     }
 
@@ -906,10 +966,28 @@ impl AlacPane {
     /// this accessor and that filter are the two halves of one guarantee, and neither is
     /// safe alone. See `docs/engine-divergence.md` for what this leaves diverging from
     /// the oracle's own state.
+    ///
+    /// The active mode alone is NOT that answer. The vendored engine replies to `CSI ? u`
+    /// from its keyboard-mode *stack* (`report_keyboard_mode`, vendor's term/mod.rs), and
+    /// `CSI = 1 u` sets the active mode *without pushing* — so an application that
+    /// negotiates that way is told `ESC [ ? 0 u` and stays legacy while the active mode
+    /// says the protocol is on. Encoding against the active mode there sends `ESC [ 13 ;
+    /// 2 u` (Shift+Enter) to an application that is not parsing it. rt cannot fix the
+    /// reply (it is generated inside vendored code, under the terminal lock, so nothing
+    /// on rt's side can consult the mode at that instant) — so it honours the reply
+    /// instead: never a flag rt has told this application it does not have. See
+    /// [`honoured_kitty_flags`].
     pub fn kitty_keyboard_flags(&self) -> u8 {
         use alacritty_terminal::term::TermMode;
-        let term = self.term.lock();
-        u8::from(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES))
+        let reported = match self.kbd_reported.load(Ordering::Relaxed) {
+            KITTY_NEVER_REPORTED => None, // the application has never asked
+            f => Some(f),
+        };
+        let active = {
+            let term = self.term.lock();
+            u8::from(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES))
+        };
+        honoured_kitty_flags(active, reported)
     }
 
     /// Whether the program has enabled *any* mouse reporting (click, drag, or
@@ -1453,6 +1531,36 @@ mod kitty_reply_tests {
     }
 
     #[test]
+    fn the_recorded_report_is_the_masked_one_and_only_for_this_sequence() {
+        use super::reported_kitty_flags;
+        // Run on the mask's OUTPUT, so what is remembered is what the application got.
+        assert_eq!(reported_kitty_flags(&mask_kitty_keyboard_reply("\x1b[?31u".into())), Some(1));
+        assert_eq!(reported_kitty_flags(&mask_kitty_keyboard_reply("\x1b[?30u".into())), Some(0));
+        // Nothing else may move the recorded value: a DA or CPR reply says nothing about
+        // the keyboard protocol, and treating one as a report would silently disable
+        // (or enable) CSI-u encoding for the pane.
+        for other in ["\x1b[?6c", "\x1b[>0;10300;1c", "\x1b[12;5R", "\x1b[?1;1$y", "\x1b[0n", ""] {
+            assert_eq!(reported_kitty_flags(other), None, "{other:?} is not a keyboard report");
+        }
+    }
+
+    #[test]
+    fn rt_honours_no_more_than_it_told_the_application() {
+        use super::honoured_kitty_flags;
+        // The bug: `CSI = 1 u` sets the active mode without pushing, the vendored engine
+        // answers the query from its (still empty) stack, and the application stays
+        // legacy. rt must stay legacy with it.
+        assert_eq!(honoured_kitty_flags(1, Some(0)), 0, "told 0, so encode legacy");
+        // Pushed and queried: both sides agree the protocol is on.
+        assert_eq!(honoured_kitty_flags(1, Some(1)), 1);
+        // Pushed, queried, then popped: told 1 once, but it is off now.
+        assert_eq!(honoured_kitty_flags(0, Some(1)), 0);
+        // Never queried: rt has promised nothing, so the engine's view stands.
+        assert_eq!(honoured_kitty_flags(1, None), 1);
+        assert_eq!(honoured_kitty_flags(0, None), 0);
+    }
+
+    #[test]
     fn every_other_query_reply_passes_through_untouched() {
         // DA1, DA2, CPR, DECRQM and DECRPM must not be rewritten by a filter aimed at
         // one sequence — the `?` prefix alone is shared by several of them.
@@ -1698,6 +1806,61 @@ mod vtpane_tests {
             }
             other => panic!("expected a named refusal, got {other:?}"),
         }
+    }
+
+    /// rt must never encode a kitty flag it has just told the application it does not
+    /// have. The vendored engine answers `CSI ? u` from its keyboard-mode STACK
+    /// (`vendor/alacritty_terminal/src/term/mod.rs`'s `report_keyboard_mode`), while
+    /// `CSI = 1 u` sets the ACTIVE mode without pushing anything — so an application
+    /// that negotiates with `CSI = 1 u` and then asks is told `ESC [ ? 0 u`, concludes
+    /// the protocol is unavailable, and keeps parsing legacy keys. If rt's encoder went
+    /// on reading the active mode it would start sending `ESC [ 13 ; 2 u` for
+    /// Shift+Enter into an application that is not parsing it.
+    ///
+    /// Proved end to end with a real child on a real PTY, like
+    /// `a_real_child_gets_its_keyboard_query_answered` does for vt-term: the child
+    /// negotiates, asks, reads the 5-byte reply and prints it as hex where the test can
+    /// read it off the grid — so the assertion is against the bytes the APPLICATION
+    /// actually received, not against rt's own idea of them.
+    #[test]
+    fn the_alac_engine_never_encodes_a_kitty_flag_it_told_the_app_it_lacks() {
+        let pane = TermPane::spawn_env_with_engine_for_test_alac(
+            Some((
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    // Raw mode: the reply carries no newline, so a cooked line
+                    // discipline would never hand it to `head`, and echo would print it
+                    // back at us.
+                    "stty raw -echo; printf '\\033[=1u\\033[?u'; \
+                     head -c 5 | od -An -tx1 | tr -d ' \\n'; printf '_DONE\\r\\n'"
+                        .into(),
+                ],
+            )),
+            None,
+            60,
+            6,
+            &[],
+            1000,
+        );
+        let Some(pane) = pane else {
+            return; // built without the vendored engine; nothing to assert
+        };
+        wait_for_text(&pane, "_DONE");
+        let screen = pane.snapshot().to_text();
+        // ESC [ ? 0 u == 1b 5b 3f 30 75. This is what the engine tells the application
+        // after `CSI = 1 u`; it is the vendored behaviour, and rt cannot change it
+        // without editing vendor/.
+        assert!(
+            screen.contains("1b5b3f3075"),
+            "the application was told something other than ESC[?0u: {screen:?}"
+        );
+        // ...therefore rt must encode legacy keys for this pane.
+        assert_eq!(
+            pane.kitty_keyboard_flags(),
+            0,
+            "rt would encode CSI-u keys for an application it just told the protocol is off"
+        );
     }
 }
 

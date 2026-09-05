@@ -264,13 +264,36 @@ divergences, all of them narrowing:
   divergence an application can observe directly, and it is the point of the design.
   The vendored backend (`RT_ENGINE=alacritty`) reaches the same answer from the other
   end: its `Term` keeps storing all five faithfully, and rt masks the `CSI ? u` reply on
-  its way out of the engine (`mask_kitty_keyboard_reply`). So the two engines agree on
-  the observable contract — one masks on the way in, the other on the way out — while
-  their internal state legitimately differs.
+  its way out of the engine (`mask_kitty_keyboard_reply`). So on *which flags* may be
+  named, the two engines agree — one masks on the way in, the other on the way out —
+  while their internal state legitimately differs. On *when* the protocol is on at all
+  they do not; see the next bullet.
 - **`CSI ? u` reports the ACTIVE flags, the oracle reports the top of the stack.** They
   differ only after a bare `CSI = flags u`, which changes the active flags without
   touching the stack: the oracle then answers with the stale stack top. The protocol
   says the reply is the flags in effect, so vt-term answers with those.
+
+  This is a real, application-visible divergence between rt's two engines, and it is
+  **not** reconcilable from rt's side: the oracle's reply is generated inside vendored
+  code (`report_keyboard_mode`) while the terminal lock is held by that same thread, so
+  nothing on rt's side can consult the active mode at that instant and correct the
+  number. Under `RT_ENGINE=alacritty`, an application that negotiates with `CSI = 1 u`
+  and then queries is therefore told `ESC [ ? 0 u`, and stays legacy; under the default
+  in-house engine the same application is told `ESC [ ? 1 u` and gets CSI-u keys.
+
+  What rt *does* guarantee on both engines is **self-consistency**: it never encodes a
+  flag it has just told the application it does not have. `AlacPane::kitty_keyboard_flags`
+  intersects the engine's active mode with the last value reported by `CSI ? u`
+  (`honoured_kitty_flags`; `Proxy::send_event` records it as the reply goes out). Without
+  that intersection rt read the active mode and sent `ESC [ 13 ; 2 u` for Shift+Enter
+  into an application it had just told the protocol was unavailable — escape sequences
+  that application was not parsing. Flags negotiated *after* the last query (or with no
+  query at all) are honoured as before, and the residual `active & !reported` case
+  degrades the safe way round: legacy bytes to an application that asked for CSI-u, which
+  is the encoding it handled before it ever negotiated. Covered by
+  `the_alac_engine_never_encodes_a_kitty_flag_it_told_the_app_it_lacks` (a real child on a
+  real PTY, asserting on the bytes the application actually received) and the
+  `honoured_kitty_flags` unit tests, both in `crates/rt-engine/src/lib.rs`.
 - **The mode stack is bounded at 4096 and drops its oldest entry on overflow.** Same
   depth as the oracle's `KEYBOARD_MODE_STACK_MAX_DEPTH`, but the oracle's overflow branch
   removes an entry from `title_stack` (an upstream slip) and lets the keyboard stack grow
@@ -284,7 +307,9 @@ Not covered by the differential harness: `vt-conformance`'s `ScreenState` captur
 grid, cursor, `alt_screen`, `app_cursor`, `display_offset` and `history` — it has no
 keyboard-mode field, and the report differential's reply stream does not generate `CSI u`
 sequences. So none of the above is fuzz-visible; the unit tests in `vt-term`
-(`kitty_keyboard_*`) and `rt` (`crates/rt/tests/input.rs`) are the whole coverage. Adding
+(`kitty_keyboard_*`), `rt-engine` (`kitty_reply_tests`, plus the live-PTY
+`the_alac_engine_never_encodes_a_kitty_flag_it_told_the_app_it_lacks`) and `rt`
+(`crates/rt/tests/input.rs`) are the whole coverage. Adding
 a `kitty_kbd` field to `ScreenState` would immediately fail the differential on the
 masking divergence above, which is why it was left out rather than added and masked.
 

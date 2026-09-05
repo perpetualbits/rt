@@ -646,6 +646,19 @@ impl TextPipeline {
     /// not it actually drew anything).
     pub fn pending_vertex_count(&self) -> usize { self.verts.len() }
 
+    /// Throw away everything queued since the last flush, without drawing it.
+    ///
+    /// For a frame that will never be presented: `begin_frame` could not acquire a
+    /// drawable, but the caller had already drawn a whole grid into this buffer. The
+    /// buffer is one painter's-order list with no frame boundary in it, so geometry left
+    /// behind is drawn FIRST in the next frame that does paint -- underneath everything
+    /// painted since. It is also the only bound on the buffer across repeated skips: a
+    /// skipped frame has no vsync backpressure, so an occluded window would otherwise
+    /// grow it without limit. See `wgpu_frame::EndFrameAction::DiscardGeometry`.
+    pub fn discard_pending(&mut self) {
+        self.verts.clear();
+    }
+
     /// Upload this frame's vertices and issue ONE draw call, then reset.
     pub fn flush(&mut self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass) {
         if self.verts.is_empty() {
@@ -655,6 +668,21 @@ impl TextPipeline {
             let mut cap = self.vbuf_cap.max(1);
             while cap < self.verts.len() {
                 cap *= 2;
+            }
+            // `create_buffer` past `max_buffer_size` (256 MB by default) is a wgpu
+            // VALIDATION error, and wgpu's default error handler panics -- rt would die
+            // rather than drop a frame. A terminal grid never comes close, so reaching
+            // here means something upstream queued without bound; drop the frame's
+            // geometry, say so once, and keep the window alive.
+            let max = self.device.limits().max_buffer_size as usize;
+            if (cap * std::mem::size_of::<Vertex>()) > max {
+                log::error!(
+                    "wgpu_text: {} vertices exceed the device's {max}-byte buffer limit; \
+                     dropping this frame's geometry",
+                    self.verts.len()
+                );
+                self.verts.clear();
+                return;
             }
             self.vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rt text vbuf"),
