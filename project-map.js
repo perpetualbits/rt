@@ -52,12 +52,12 @@ window.PROJECT_MAP = {
       id: "render-wgpu", label: "wgpu/Metal renderer", layer: "frontend", status: "done",
       tags: ["wgpu", "Metal", "macOS"],
       desc: "The macOS rendering backend. Same Backend trait as the GL and XRender paths, but on wgpu over Metal, with its own glyph atlas mirroring render.rs (one WGSL shader, one R8Unorm atlas, texel (0,0) forced opaque so solid fills share the glyph pipeline). Compiled only on macOS: the Linux crate graph is byte-identical, enforced by ci/check-target-deps.sh. Exposes no damage capabilities (no partial present, no buffer age, no scroll blit), so it always redraws the full frame.",
-      files: ["crates/rt/src/wgpu_backend.rs", "crates/rt/src/wgpu_text.rs", "crates/rt/src/vibrancy.rs"],
+      files: ["crates/rt/src/wgpu_backend.rs", "crates/rt/src/wgpu_text.rs", "crates/rt/src/vibrancy.rs", "crates/rt/src/vibrancy_policy.rs"],
       specs: ["docs/superpowers/specs/2026-09-03-macos-port-design.md"],
       parts: [
         { label: "Glyph atlas", status: "done", desc: "fontdue rasterisation + preference-chain face resolution, mirroring render.rs." },
         { label: "HiDPI scaling", status: "done", desc: "Cell metrics follow the backing scale factor, so Retina text is not half-size." },
-        { label: "Frosted glass", status: "done", desc: "NSVisualEffectView as a sibling below the content view; falls back to winit set_blur, then plain transparency." }
+        { label: "Frosted glass", status: "done", desc: "NSVisualEffectView as a sibling below the content view; falls back to winit set_blur, then plain transparency. Gated on the same wants_background_blur() predicate as the Wayland/X11 blur paths and re-applied live on every opacity/settings change, so the preference actually turns it off. Material is chosen (default .underWindowBackground, not AppKit's deprecated .appearanceBased) and switchable live from Preferences; the install/remove/retarget decision is pure data in vibrancy_policy.rs so Linux CI tests it." }
       ],
       deps: []
     },

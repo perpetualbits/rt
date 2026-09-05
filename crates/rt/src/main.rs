@@ -26,6 +26,10 @@ mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
 mod xrender_backend; // mechanism C: XRender backend
 #[cfg(target_os = "macos")]
 mod vibrancy; // NSVisualEffectView frosted glass (best-effort, like blur.rs)
+// Deliberately NOT cfg'd to macOS, for the same reason as `wgpu_frame` below: it holds
+// the frosted glass's install/remove/retarget decision as plain data (no objc2 types),
+// so Linux CI can run the tests for a gate that lives in a file no Linux build compiles.
+mod vibrancy_policy; // pure decision table for vibrancy.rs
 #[cfg(target_os = "macos")]
 mod wgpu_backend; // the macOS backend: wgpu/Metal
 #[cfg(target_os = "macos")]
@@ -964,6 +968,19 @@ impl App {
         if let Ok(v) = std::env::var("RT_FOCUS") {
             settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
         }
+        // macOS frosted-glass material, for one run, without touching config.toml.
+        // Parsed (and reported) on every platform so the name means the same
+        // thing everywhere; only `vibrancy.rs` ever acts on it. See
+        // `rt_config::GlassMaterial` for the list of names.
+        if let Ok(v) = std::env::var("RT_GLASS_MATERIAL") {
+            match rt_config::GlassMaterial::from_name(&v) {
+                Some(m) => settings.macos_glass_material = m,
+                None => eprintln!(
+                    "rt: RT_GLASS_MATERIAL={v:?} is not a known material; keeping {}",
+                    settings.macos_glass_material.name()
+                ),
+            }
+        }
         // CLI overrides win over the persisted config (and over the env knobs
         // above), so a benchmark harness can pin the font without editing config.
         if let Some(family) = &self.cli.font {
@@ -1242,13 +1259,20 @@ impl App {
         //      vibrancy and no adaptation, but better than nothing;
         //   3. plain transparency, which already works and needs no call.
         // Only one of 1/2 is applied, so what the user sees identifies which
-        // path ran (the log line says so too). Unconditional, not gated on
-        // `want_blur`: the glass is simply invisible at opacity 1.0, and there
-        // is then nothing to re-apply when the opacity slider moves.
+        // path ran (the log line says so too). Gated on `want_blur` — the SAME
+        // predicate the Wayland and X11 paths below use — so `background_blur =
+        // false` turns the glass off on macOS exactly as it does on Linux. It
+        // was once unconditional, on the theory that the glass is invisible
+        // while the background is opaque; at 0.05 opacity it is anything but,
+        // and the preference had no effect at all. `apply_blur` re-runs this
+        // whole decision on every opacity step and settings commit.
         #[cfg(target_os = "macos")]
-        if !vibrancy::try_enable(window.as_ref()) {
-            log::info!("NSVisualEffectView unavailable; falling back to winit's window blur");
-            window.set_blur(true);
+        {
+            let want = want_blur(&settings);
+            if !vibrancy::set_enabled(window.as_ref(), want, settings.macos_glass_material) {
+                log::info!("NSVisualEffectView unavailable; falling back to winit's window blur");
+                window.set_blur(want);
+            }
         }
         // Cross-compositor blur via the ext-background-effect-v1 staging protocol
         // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
@@ -7043,7 +7067,12 @@ impl App {
         let fonts_changed = family_changed || new.font_size != active.settings.font_size;
         let titlebar_changed = new.show_titlebar != active.settings.show_titlebar;
         // The blur decision depends on both the toggle and the opacity slider.
-        let blur_changed = want_blur(&new) != want_blur(&active.settings);
+        // The macOS glass material rides the same re-apply: `apply_blur` pushes
+        // it at the live NSVisualEffectView, which is what makes the Preferences
+        // "Glass material" row change the look under the user rather than at the
+        // next launch. Inert on Linux, where the field is carried but unused.
+        let blur_changed = want_blur(&new) != want_blur(&active.settings)
+            || new.macos_glass_material != active.settings.macos_glass_material;
         active.settings = new; // commit
         Self::persist(&active.settings);
         // Scrollback: newly spawned panes read this live cell.
@@ -7558,22 +7587,36 @@ fn cursor_diag_due() -> bool {
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background
 /// clear still fills the whole window, so the margin shows the background.
-/// Whether to ask the compositor for background blur: only when the user has it
-/// enabled AND the background is translucent (blur behind a fully opaque surface
-/// is invisible and wasted compositor work). The single source of truth for the
-/// blur decision, shared by startup and every runtime opacity/config change.
+/// Whether to ask for background blur: only when the user has it enabled AND the
+/// background is translucent (blur behind a fully opaque surface is invisible and
+/// wasted compositor work). The single source of truth for the blur decision,
+/// shared by startup and every runtime opacity/config change, on every platform.
+///
+/// A thin alias for [`rt_config::Settings::wants_background_blur`]. The rule
+/// itself moved into `rt-config` so it can be unit-tested — `main.rs` needs a
+/// display and a GPU and never runs under `cargo test` — and so `prefs_model`
+/// can dim the glass-material row with the same predicate rather than a second
+/// copy of it.
 fn want_blur(settings: &rt_config::Settings) -> bool {
-    settings.background_blur && settings.background_opacity < 1.0
+    settings.wants_background_blur()
 }
 
-/// Push the current blur decision to whichever backend is live: the Wayland ext
-/// protocol and/or the X11 property. Both are no-ops when not applicable, so
-/// this is always safe to call after an opacity/blur change.
+/// Push the current blur decision to whichever backend is live: on Linux the
+/// Wayland ext protocol and/or the X11 property, on macOS the
+/// `NSVisualEffectView` frosted glass. Every one of them is a no-op when not
+/// applicable, so this is always safe to call after an opacity/blur/material
+/// change.
+///
+/// macOS is NOT the exception it used to be. The old comment here claimed the
+/// glass "needs no runtime toggle — the glass is simply invisible while the
+/// background is opaque". That is false, and the fix for it is this function:
+/// at low opacity the glass dominates the window, so `background_blur` and the
+/// opacity slider have to move it live, exactly as they do on Linux. See
+/// `vibrancy.rs`, whose `set_enabled` is idempotent and does the install /
+/// retarget / remove decision from `vibrancy_policy::glass_action`.
 fn apply_blur(active: &mut Active) {
-    // Both mechanisms are Linux-only (see the `Active::bg_effect`/`x11_blur`
-    // field comment). On macOS this is a no-op by design: `vibrancy.rs` installs
-    // the NSVisualEffectView once at startup and it needs no runtime toggle —
-    // the glass is simply invisible while the background is opaque.
+    // Both Linux mechanisms are Linux-only (see the `Active::bg_effect`/
+    // `x11_blur` field comment).
     #[cfg(not(target_os = "macos"))]
     {
         let want = want_blur(&active.settings);
@@ -7581,6 +7624,17 @@ fn apply_blur(active: &mut Active) {
             fx.set_enabled(want);
         }
         active.x11_blur.set_enabled(want);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let want = want_blur(&active.settings);
+        let material = active.settings.macos_glass_material;
+        // Same fallback chain as at window creation: when NSVisualEffectView is
+        // unreachable, drive winit's private-API blur with the same decision so
+        // the toggle still works on that path.
+        if !vibrancy::set_enabled(active.window.as_ref(), want, material) {
+            active.window.set_blur(want);
+        }
     }
 }
 

@@ -366,6 +366,22 @@ macOS — THE COMMAND (Cmd / ⌘) KEYS
   A Cmd chord rt does NOT bind types nothing at all, exactly as in
   Terminal.app — it will never leak a stray letter into your shell.
   Ctrl is untouched: Ctrl+C still interrupts.
+
+macOS — THE FROSTED GLASS
+  Turn "Background blur" off in Preferences (or slide Background opacity
+  back to 1.00) and the glass goes away, live. Turn it back on and it
+  returns; there is no restart in either direction.
+  "Glass material" in Preferences picks which frosted look the glass is:
+  Left/Right steps through 13 of them and the window changes as you step.
+  The row is dimmed while blur is off or the background is opaque —
+  there is no glass on screen to shape.
+  under-window-background is the default: the lightest of them, and the
+  one AppKit means for a view sitting under a window's content.
+  Prefer the config file? macos_glass_material = "hud-window" in
+  ~/.config/rt/config.toml (read at startup), or RT_GLASS_MATERIAL=hud-window
+  for one run. system-default is AppKit's own (deprecated, dense) material,
+  kept only for comparison — switching TO it is the one change needing a
+  restart.
 "#;
 
 /// Empty off macOS: there is no appendix to show.

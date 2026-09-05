@@ -119,6 +119,163 @@ pub enum Action {
     MoveTabRight,
 }
 
+/// Which `NSVisualEffectMaterial` the macOS frosted glass is made of.
+///
+/// **macOS-only in EFFECT, cross-platform in TYPE.** It lives here, unguarded by
+/// any `cfg`, so that one `config.toml` is portable: a Linux rt reading
+/// `macos_glass_material = "hud-window"` parses it, keeps it, writes it back
+/// unchanged on the next save, and ignores it. Nothing outside
+/// `rt/src/vibrancy.rs` reads it, and that file is `cfg(target_os = "macos")`.
+///
+/// ## Why this exists at all
+///
+/// `NSVisualEffectView`'s `material` property "Defaults to
+/// `NSVisualEffectMaterialAppearanceBased`" (AppKit's own header comment, still
+/// there in the objc2 bindings) — a material deprecated since 10.14 and far
+/// denser than anything Terminal.app uses. Leaving it unset is what produced the
+/// "heavily blurred, almost opaque … a vague light blue or grey" report: that
+/// grey-blue is the material's own tint, sitting under the user's configured
+/// background colour and reading as a second, unexplained layer.
+///
+/// ## Ordering
+///
+/// [`GlassMaterial::ALL`] is the cycle order used by the preferences row, run
+/// roughly lightest-to-heaviest so stepping right adds density. [`Self::SystemDefault`]
+/// is deliberately LAST: it is the only entry that is not a deliberate choice
+/// (it means "never call `setMaterial:`"), kept solely so the old look can be
+/// compared against the new one without rebuilding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GlassMaterial {
+    /// `.underWindowBackground` — "the material used under window backgrounds".
+    /// rt's effect view IS under the window's content view, so this is the one
+    /// material whose documented purpose is literally rt's placement. The
+    /// default.
+    #[default]
+    UnderWindowBackground,
+    /// `.underPageBackground` — the material behind document pages.
+    UnderPageBackground,
+    /// `.contentBackground` — the opaque background of scroll/table content.
+    ContentBackground,
+    /// `.windowBackground` — the material used by opaque window backgrounds.
+    WindowBackground,
+    /// `.sidebar` — the background of window sidebars (a familiar "frosted" look).
+    Sidebar,
+    /// `.headerView` — in-line header/footer views.
+    HeaderView,
+    /// `.titlebar` — the material used by window titlebars.
+    Titlebar,
+    /// `.menu` — the material used by menus.
+    Menu,
+    /// `.popover` — the background of `NSPopover` windows.
+    Popover,
+    /// `.sheet` — the background of sheet windows.
+    Sheet,
+    /// `.fullScreenUI` — the background of full-screen modal UI.
+    FullScreenUi,
+    /// `.hudWindow` — the background of heads-up-display windows. Dark and dense.
+    HudWindow,
+    /// Do not call `setMaterial:` at all: whatever AppKit defaults to, which is
+    /// the deprecated `.appearanceBased`. Present only as the control case for
+    /// comparing against the chosen default — not a recommended value.
+    SystemDefault,
+}
+
+impl GlassMaterial {
+    /// Every material, in preferences cycle order (see the type docs).
+    pub const ALL: &'static [GlassMaterial] = &[
+        GlassMaterial::UnderWindowBackground,
+        GlassMaterial::UnderPageBackground,
+        GlassMaterial::ContentBackground,
+        GlassMaterial::WindowBackground,
+        GlassMaterial::Sidebar,
+        GlassMaterial::HeaderView,
+        GlassMaterial::Titlebar,
+        GlassMaterial::Menu,
+        GlassMaterial::Popover,
+        GlassMaterial::Sheet,
+        GlassMaterial::FullScreenUi,
+        GlassMaterial::HudWindow,
+        GlassMaterial::SystemDefault,
+    ];
+
+    /// The name this material carries in `config.toml`, in `RT_GLASS_MATERIAL`,
+    /// and in the preferences row. Kebab-case, matching the AppKit constant.
+    pub fn name(self) -> &'static str {
+        match self {
+            GlassMaterial::UnderWindowBackground => "under-window-background",
+            GlassMaterial::UnderPageBackground => "under-page-background",
+            GlassMaterial::ContentBackground => "content-background",
+            GlassMaterial::WindowBackground => "window-background",
+            GlassMaterial::Sidebar => "sidebar",
+            GlassMaterial::HeaderView => "header-view",
+            GlassMaterial::Titlebar => "titlebar",
+            GlassMaterial::Menu => "menu",
+            GlassMaterial::Popover => "popover",
+            GlassMaterial::Sheet => "sheet",
+            GlassMaterial::FullScreenUi => "full-screen-ui",
+            GlassMaterial::HudWindow => "hud-window",
+            GlassMaterial::SystemDefault => "system-default",
+        }
+    }
+
+    /// Parse a name from the config file, the env override, or the CLI.
+    ///
+    /// Deliberately forgiving: case-insensitive, and `_` is accepted for `-`, so
+    /// `HUD_WINDOW` and `hud-window` both work. Returns `None` for anything else
+    /// — callers report it and fall back rather than failing, because a typo in
+    /// one cosmetic field must never cost the user the whole config file (see
+    /// the `Deserialize` impl).
+    pub fn from_name(s: &str) -> Option<GlassMaterial> {
+        let want = s.trim().to_ascii_lowercase().replace('_', "-");
+        // "default" is the obvious thing to type for "whatever AppKit does".
+        if want == "default" {
+            return Some(GlassMaterial::SystemDefault);
+        }
+        GlassMaterial::ALL.iter().copied().find(|m| m.name() == want)
+    }
+
+    /// Step `dir` (+1 / -1) places through [`Self::ALL`], wrapping at both ends.
+    /// The preferences row's whole behaviour.
+    pub fn step(self, dir: i32) -> GlassMaterial {
+        let n = GlassMaterial::ALL.len() as i32;
+        // `position` always succeeds: ALL covers every variant, which
+        // `all_variants_are_in_all_and_round_trip` pins.
+        let cur = GlassMaterial::ALL.iter().position(|m| *m == self).unwrap_or(0) as i32;
+        GlassMaterial::ALL[(cur + dir).rem_euclid(n) as usize]
+    }
+}
+
+impl serde::Serialize for GlassMaterial {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GlassMaterial {
+    /// Never fails. A derived enum `Deserialize` would reject an unknown name,
+    /// and `Config::load` turns ANY parse error into "ignoring malformed
+    /// config.toml" — i.e. one mistyped material would silently reset every
+    /// preference the user has. So an unrecognised (or non-string) value is
+    /// reported on stderr, exactly as `Settings::normalize` reports an
+    /// out-of-range number, and the default is used.
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let Ok(raw) = String::deserialize(de) else {
+            eprintln!(
+                "rt: config macos_glass_material is not a string; using {}",
+                GlassMaterial::default().name()
+            );
+            return Ok(GlassMaterial::default());
+        };
+        Ok(GlassMaterial::from_name(&raw).unwrap_or_else(|| {
+            eprintln!(
+                "rt: config macos_glass_material {raw:?} is not a known material; using {}",
+                GlassMaterial::default().name()
+            );
+            GlassMaterial::default()
+        }))
+    }
+}
+
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
 /// spirit). Kept minimal for now; a future preferences panel edits these and a
 /// config file persists them.
@@ -136,6 +293,20 @@ pub struct Settings {
     /// (`background_opacity == 1.0`), where blur would be wasted work. The blur
     /// radius is the compositor's to choose — the protocol offers only on/off.
     pub background_blur: bool,
+    /// **macOS only.** Which `NSVisualEffectMaterial` the frosted glass behind
+    /// the window is made of. Ignored everywhere else — on Linux the compositor
+    /// owns the blur and the protocol offers only on/off — but always parsed and
+    /// preserved, so a single `config.toml` stays portable between machines.
+    ///
+    /// Only consulted while [`Self::wants_background_blur`] is true: it selects
+    /// the *look* of the glass, `background_blur` decides whether there is any.
+    ///
+    /// Takes effect LIVE — the Preferences dialog's "Glass material" row (macOS
+    /// builds only) steps through [`GlassMaterial::ALL`] and the glass changes
+    /// under you, no restart needed. Editing this field in `config.toml` by hand
+    /// does need a restart, since rt reads the file once at startup;
+    /// `RT_GLASS_MATERIAL=<name>` overrides it for one run.
+    pub macos_glass_material: GlassMaterial,
     /// When true, moving the mouse over a pane focuses it (sloppy focus). When
     /// false (default), focus changes only on click. In rt sloppy and strict
     /// pointer-focus coincide, since a pane is always focused (over a gutter the
@@ -230,6 +401,14 @@ impl Default for Settings {
         Settings {
             background_opacity: 1.0,       // opaque until the user dials it down
             background_blur: true,         // request compositor blur when translucent (no-op if unsupported)
+            // macOS glass material. `.underWindowBackground` is the one whose
+            // documented job ("the material used under window backgrounds") is
+            // exactly where rt puts the effect view — under the content view —
+            // and it is the lightest of the behind-window materials, which is
+            // what "frosted glass you can still see the rocks through" needs.
+            // NOT AppKit's own default: that is the deprecated `.appearanceBased`,
+            // which is what made rt's glass read as an opaque grey-blue haze.
+            macos_glass_material: GlassMaterial::UnderWindowBackground,
             focus_follows_mouse: false,    // click-to-focus by default
             show_titlebar: true,           // Terminator-style per-pane titlebars on by default
             inst_output: true,             // border instruments on by default
@@ -267,6 +446,23 @@ impl Settings {
     /// Upper bound for the arrow-acceleration slider: the most cursor moves sent per held
     /// key-repeat. Effective top speed is this times the OS keyboard repeat rate.
     pub const MAX_ARROW_ACCEL: u32 = 30;
+
+    /// Does this settings state want background blur / frosted glass right now?
+    ///
+    /// Both halves matter: the user's toggle AND a translucent background. Blur
+    /// behind a fully opaque surface is invisible by construction and costs the
+    /// compositor (or, on macOS, the window server) real work for nothing.
+    ///
+    /// The SINGLE source of truth for that decision, shared by every backend —
+    /// Wayland `ext-background-effect-v1`, the X11
+    /// `_KDE_NET_WM_BLUR_BEHIND_REGION` property, and the macOS
+    /// `NSVisualEffectView` — at startup and on every runtime opacity/config
+    /// change. It lives here, not in `rt/src/main.rs`, because `main.rs` is the
+    /// binary's display-bound run-loop and cannot be unit-tested, while this is
+    /// plain data.
+    pub fn wants_background_blur(&self) -> bool {
+        self.background_blur && self.background_opacity < 1.0
+    }
 
     /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
     /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.
@@ -651,6 +847,80 @@ mod config_tests {
         s2.normalize();
         assert_eq!(s2.background_opacity, Settings::MIN_OPACITY);
         assert_eq!(s2.font_size, 14.0, "an in-range value is left alone");
+    }
+
+    #[test]
+    fn blur_is_wanted_only_when_enabled_and_translucent() {
+        // The gate every backend shares — Wayland, X11 and the macOS glass.
+        let mut s = Settings::default();
+        s.background_blur = true;
+        s.background_opacity = 1.0;
+        assert!(!s.wants_background_blur(), "blur behind an opaque window is invisible work");
+        s.background_opacity = 0.05;
+        assert!(s.wants_background_blur(), "enabled + translucent -> yes");
+        s.background_blur = false;
+        assert!(!s.wants_background_blur(), "the user's toggle must be able to turn it OFF");
+        s.background_opacity = 1.0;
+        assert!(!s.wants_background_blur());
+    }
+
+    #[test]
+    fn glass_material_defaults_to_under_window_background() {
+        // NOT AppKit's own default (.appearanceBased, deprecated and dense).
+        assert_eq!(Settings::default().macos_glass_material, GlassMaterial::UnderWindowBackground);
+        assert_eq!(GlassMaterial::default(), GlassMaterial::UnderWindowBackground);
+    }
+
+    #[test]
+    fn all_glass_materials_round_trip_through_their_names() {
+        for m in GlassMaterial::ALL {
+            assert_eq!(GlassMaterial::from_name(m.name()), Some(*m), "{}", m.name());
+        }
+        // Every name the brief promised the user can type is real.
+        for want in [
+            "under-window-background", "hud-window", "full-screen-ui",
+            "sidebar", "popover", "window-background", "system-default",
+        ] {
+            assert!(GlassMaterial::from_name(want).is_some(), "{want} must be a valid material");
+        }
+        // Forgiving spellings.
+        assert_eq!(GlassMaterial::from_name("HUD_WINDOW"), Some(GlassMaterial::HudWindow));
+        assert_eq!(GlassMaterial::from_name(" Sidebar "), Some(GlassMaterial::Sidebar));
+        assert_eq!(GlassMaterial::from_name("default"), Some(GlassMaterial::SystemDefault));
+        assert_eq!(GlassMaterial::from_name("frosted"), None);
+    }
+
+    #[test]
+    fn glass_material_steps_and_wraps_both_ways() {
+        let first = GlassMaterial::ALL[0];
+        let last = GlassMaterial::ALL[GlassMaterial::ALL.len() - 1];
+        assert_eq!(first.step(-1), last, "wraps backward off the front");
+        assert_eq!(last.step(1), first, "wraps forward off the end");
+        assert_eq!(first.step(1).step(-1), first, "a step and back is identity");
+    }
+
+    /// A config naming a material must load on EVERY platform. rt is one binary
+    /// per OS reading one `config.toml` the user may sync between them, and a
+    /// hard parse error here would not be a warning — `Config::load` discards the
+    /// whole file on any error, resetting every preference.
+    #[test]
+    fn a_config_naming_a_material_loads_and_survives_a_round_trip_on_any_platform() {
+        let cfg: Config = toml::from_str("[settings]\nmacos_glass_material = \"hud-window\"\n")
+            .expect("a material name must parse on Linux too");
+        assert_eq!(cfg.settings.macos_glass_material, GlassMaterial::HudWindow);
+        // And it is written back unchanged, so a Linux run does not silently
+        // rewrite a Mac's chosen material.
+        let text = toml::to_string_pretty(&cfg).expect("serialisable");
+        assert!(text.contains("macos_glass_material = \"hud-window\""), "{text}");
+
+        // An unknown or wrongly-typed value degrades to the default rather than
+        // failing the parse and taking every other setting down with it.
+        for bad in ["macos_glass_material = \"frosted-glass\"", "macos_glass_material = 7"] {
+            let cfg: Config = toml::from_str(&format!("[settings]\nfont_size = 21.0\n{bad}\n"))
+                .unwrap_or_else(|e| panic!("{bad} must not fail the load: {e}"));
+            assert_eq!(cfg.settings.macos_glass_material, GlassMaterial::default());
+            assert_eq!(cfg.settings.font_size, 21.0, "the rest of the file must survive");
+        }
     }
 
     #[test]
