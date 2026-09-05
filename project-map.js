@@ -46,7 +46,20 @@ window.PROJECT_MAP = {
         { label: "Frame scheduler", status: "done", desc: "Idle-throttled redraws; forces full frames only when needed." },
         { label: "Touch & stylus", status: "done", desc: "Tap = click, one-finger drag = drag/select, two-finger drag = scroll, stylus = mouse. The window decoration takes finger and pen as well, via a patched winit (vendor/winit-wayland) that routes touch and tablet events to the frame upstream drops." }
       ],
-      deps: ["rt-session", "render-gl", "render-xrender", "damage"]
+      deps: ["rt-session", "render-gl", "render-xrender", "render-wgpu", "damage"]
+    },
+    {
+      id: "render-wgpu", label: "wgpu/Metal renderer", layer: "frontend", status: "done",
+      tags: ["wgpu", "Metal", "macOS"],
+      desc: "The macOS rendering backend. Same Backend trait as the GL and XRender paths, but on wgpu over Metal, with its own glyph atlas mirroring render.rs (one WGSL shader, one R8Unorm atlas, texel (0,0) forced opaque so solid fills share the glyph pipeline). Compiled only on macOS: the Linux crate graph is byte-identical, enforced by ci/check-target-deps.sh. Exposes no damage capabilities (no partial present, no buffer age, no scroll blit), so it always redraws the full frame.",
+      files: ["crates/rt/src/wgpu_backend.rs", "crates/rt/src/wgpu_text.rs", "crates/rt/src/vibrancy.rs"],
+      specs: ["docs/superpowers/specs/2026-09-03-macos-port-design.md"],
+      parts: [
+        { label: "Glyph atlas", status: "done", desc: "fontdue rasterisation + preference-chain face resolution, mirroring render.rs." },
+        { label: "HiDPI scaling", status: "done", desc: "Cell metrics follow the backing scale factor, so Retina text is not half-size." },
+        { label: "Frosted glass", status: "done", desc: "NSVisualEffectView as a sibling below the content view; falls back to winit set_blur, then plain transparency." }
+      ],
+      deps: []
     },
     {
       id: "render-gl", label: "GL renderer", layer: "frontend", status: "done",
