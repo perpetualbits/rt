@@ -283,6 +283,32 @@ struct Proxy {
     sender: Arc<Mutex<Option<EventLoopSender>>>,
 }
 
+/// Reduce a kitty-keyboard query reply to the flags rt's key encoder actually honours.
+///
+/// The vendored engine implements all five enhancement flags and answers `CSI ? u` with
+/// whatever the application pushed — but rt's encoder honours flag 1 alone. Passing that
+/// reply through unchanged would tell an application it has, say, flag 8 ("report all
+/// keys as escape codes") while rt keeps sending plain text for letters, and the
+/// application would sit waiting for sequences that never come. Masking here is the one
+/// place both engines can be made to agree without touching the vendored source: vt-term
+/// masks on the way IN (it never stores a flag it does not honour), and this masks the
+/// vendored engine on the way OUT.
+///
+/// Only an exact `ESC [ ? <digits> u` is touched; every other reply is passed through
+/// untouched, which is all of them in practice — this event carries one reply at a time.
+fn mask_kitty_keyboard_reply(text: String) -> String {
+    let flags = text
+        .strip_prefix("\x1b[?")
+        .and_then(|rest| rest.strip_suffix('u'))
+        .and_then(|digits| digits.parse::<u32>().ok());
+    match flags {
+        // `& 1` is `vt_term::KITTY_KBD_SUPPORTED`, spelled out rather than imported so
+        // the vendored backend does not gain a dependency on the in-house engine.
+        Some(f) => format!("\x1b[?{}u", f & 1),
+        None => text,
+    }
+}
+
 impl EventListener for Proxy {
     /// Called by the engine's I/O thread for every terminal event. We keep this
     /// fast and non-blocking: translate-and-enqueue, or reply to the PTY. It
@@ -308,6 +334,7 @@ impl EventListener for Proxy {
                 if let Ok(guard) = self.sender.lock() {
                     if let Some(sender) = guard.as_ref() {
                         // Owned bytes → 'static Cow, as Msg::Input requires.
+                        let text = mask_kitty_keyboard_reply(text);
                         let _ = sender.send(Msg::Input(Cow::Owned(text.into_bytes())));
                     }
                 }
@@ -401,7 +428,13 @@ impl AlacPane {
 
         // Build the terminal grid + parser. `scrolling_history` is the buffer the
         // user can grow for long-running output (see rt's Preferences).
-        let config = Config { scrolling_history: scrollback, ..Config::default() };
+        // `kitty_keyboard` gates the vendored engine's whole keyboard-protocol state
+        // machine: with it at its `false` default every `CSI ? u` / `CSI > … u` is
+        // silently dropped, so an application would query, hear nothing, and conclude
+        // rt does not support the protocol. rt implements the host half (see
+        // `rt::input::encode_key_kitty`), so the engine half must be switched on.
+        let config =
+            Config { scrolling_history: scrollback, kitty_keyboard: true, ..Config::default() };
         let size = Size { cols, screen_lines: rows }; // initial dimensions
         // Term is shared behind alacritty's FairMutex so the I/O thread and the
         // renderer can both reach it without starving each other.
@@ -862,6 +895,21 @@ impl AlacPane {
         term.mode().contains(TermMode::APP_CURSOR) // set by DECCKM (\e[?1h)
     }
 
+    /// The kitty keyboard enhancement flags the program in this pane has negotiated.
+    /// The input layer encodes keys against them: 0 means nothing was negotiated and
+    /// the legacy bytes must go out unchanged.
+    ///
+    /// This engine already implements all five flags, but rt's key encoder honours only
+    /// flag 1 ("disambiguate escape codes"), so only that bit is reported — a caller
+    /// must never be told about a flag rt would not act on. The engine's own `CSI ? u`
+    /// reply is NOT filtered this way and can name flags rt does not encode; that is the
+    /// recorded divergence in `docs/engine-divergence.md`.
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        use alacritty_terminal::term::TermMode;
+        let term = self.term.lock();
+        u8::from(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES))
+    }
+
     /// Whether the program has enabled *any* mouse reporting (click, drag, or
     /// motion). A host multiplexer should only forward mouse events to the pane
     /// when this is true — otherwise the escape sequences would land as garbage
@@ -1267,6 +1315,12 @@ impl TermPane {
             Self::Vt(p) => p.app_cursor_keys(),
         }
     }
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        match self {
+            Self::Alac(p) => p.kitty_keyboard_flags(),
+            Self::Vt(p) => p.kitty_keyboard_flags(),
+        }
+    }
     pub fn wants_mouse(&self) -> bool {
         match self {
             Self::Alac(p) => p.wants_mouse(),
@@ -1379,6 +1433,30 @@ impl TermPane {
         _scrollback: usize,
     ) -> Option<Self> {
         None
+    }
+}
+
+#[cfg(test)]
+mod kitty_reply_tests {
+    use super::mask_kitty_keyboard_reply;
+
+    #[test]
+    fn a_query_reply_never_names_a_flag_rt_does_not_honour() {
+        // The vendored engine stores all five flags, so an application that pushed 31
+        // would be told it has 31 while rt only disambiguates.
+        assert_eq!(mask_kitty_keyboard_reply("\x1b[?31u".into()), "\x1b[?1u");
+        assert_eq!(mask_kitty_keyboard_reply("\x1b[?30u".into()), "\x1b[?0u");
+        assert_eq!(mask_kitty_keyboard_reply("\x1b[?1u".into()), "\x1b[?1u");
+        assert_eq!(mask_kitty_keyboard_reply("\x1b[?0u".into()), "\x1b[?0u");
+    }
+
+    #[test]
+    fn every_other_query_reply_passes_through_untouched() {
+        // DA1, DA2, CPR, DECRQM and DECRPM must not be rewritten by a filter aimed at
+        // one sequence — the `?` prefix alone is shared by several of them.
+        for reply in ["\x1b[?6c", "\x1b[>0;10300;1c", "\x1b[12;5R", "\x1b[?1;1$y", "\x1b[0n", ""] {
+            assert_eq!(mask_kitty_keyboard_reply(reply.into()), reply);
+        }
     }
 }
 

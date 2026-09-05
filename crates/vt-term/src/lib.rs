@@ -25,6 +25,24 @@ pub use state::SavedCursor;
 /// oracle exactly.
 const DEFAULT_SCROLLBACK: usize = 10_000;
 
+/// The kitty keyboard enhancement flags this terminal actually honours: flag 1 alone,
+/// "disambiguate escape codes".
+///
+/// Every flag an application pushes is masked through this before it is stored, so the
+/// protocol's query reply (`CSI ? u`) reports what is genuinely in effect — an
+/// application that asks for 31 reads back 1 and downgrades to a terminal that only
+/// disambiguates. That is the whole point of the mask: reporting flag 8 ("report all
+/// keys as escape codes") while still sending plain text for letters would leave the
+/// application waiting for sequences that never arrive, which is a worse terminal than
+/// one that never claimed the flag. The oracle stores all five faithfully because it
+/// implements all five; see `docs/engine-divergence.md`.
+pub const KITTY_KBD_SUPPORTED: u8 = 0b1;
+
+/// Bound on the kitty keyboard mode stack, matching the oracle's
+/// `KEYBOARD_MODE_STACK_MAX_DEPTH`. Pushing past it drops the oldest entry rather than
+/// growing without limit — a program in a loop pushing modes is a memory leak otherwise.
+const KITTY_KBD_STACK_MAX: usize = 4096;
+
 /// A cell colour: the terminal default, a 0–255 palette index (named colours 0–15
 /// included), or a direct RGB triple.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -491,6 +509,22 @@ pub struct Term {
     /// ANSI insert mode (SM/RM 4, IRM): when set, printing a character inserts at the
     /// cursor (shifting the row right, dropping the rightmost) instead of overwriting.
     insert_mode: bool,
+    /// Kitty keyboard protocol: the enhancement flags currently in effect. A host
+    /// reads this with [`kitty_keyboard_flags`](Term::kitty_keyboard_flags) and encodes
+    /// keys against it; while it is 0 (nothing negotiated) the host must send exactly
+    /// the bytes it always sent. Masked to [`KITTY_KBD_SUPPORTED`] on the way in — see
+    /// that constant for why reporting a flag we do not honour is worse than refusing it.
+    kbd_flags: u8,
+    /// The protocol's push/pop stack (`CSI > flags u` / `CSI < n u`), so an application
+    /// can restore whatever the previous one had set. `kbd_flags` is the top of this
+    /// stack except after a bare `CSI = flags u`, which changes the active flags without
+    /// touching the stack.
+    kbd_stack: Vec<u8>,
+    /// The *other* screen's stack, swapped with `kbd_stack` on every alt-screen
+    /// transition (the oracle's `inactive_keyboard_mode_stack`). Without this a
+    /// full-screen app that pushes flags and dies without popping them would leave the
+    /// shell it returns to encoding keys in a protocol the shell never asked for.
+    kbd_stack_inactive: Vec<u8>,
     /// Pending window title set via OSC 0/2, consumed by [`take_title`](Term::take_title).
     title: Option<String>,
     /// Bytes the terminal wants to send back to the host (query replies: DSR/CPR,
@@ -544,6 +578,9 @@ impl Term {
             urgency_hints: true, // oracle's TermMode::default() includes URGENCY_HINTS
             newline_mode: false,
             insert_mode: false,
+            kbd_flags: 0,
+            kbd_stack: Vec::new(),
+            kbd_stack_inactive: Vec::new(),
             title: None,
             output: Vec::new(),
             damage: GridDamage::new(cols, rows),
@@ -810,6 +847,28 @@ impl Term {
     /// in `\x1b[200~` … `\x1b[201~` so the app can tell paste from typing.
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+    /// The kitty keyboard enhancement flags in effect on the ACTIVE screen — always a
+    /// subset of [`KITTY_KBD_SUPPORTED`]. 0 means no application has negotiated, and the
+    /// host must encode keys exactly as it did before the protocol existed.
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.kbd_flags
+    }
+    /// The active screen's kitty keyboard mode stack, oldest first. Read by the handoff
+    /// exporter so tearing a pane out of a window carries the negotiated state with it.
+    pub fn kitty_keyboard_stack(&self) -> &[u8] {
+        &self.kbd_stack
+    }
+    /// Adopt a kitty keyboard mode stack wholesale — the handoff receiver's half of
+    /// [`kitty_keyboard_stack`](Term::kitty_keyboard_stack). Each entry is masked to the
+    /// flags this terminal honours, and the active flags become the top of the stack, so
+    /// a donor that supported more than rt does cannot smuggle an unhonoured flag in.
+    pub fn set_kitty_keyboard_stack(&mut self, stack: &[u8]) {
+        // Keep the NEWEST entries if a donor's stack is deeper than this one's bound:
+        // the top is what the running application is using right now.
+        let keep = stack.len().saturating_sub(KITTY_KBD_STACK_MAX);
+        self.kbd_stack = stack[keep..].iter().map(|f| f & KITTY_KBD_SUPPORTED).collect();
+        self.kbd_flags = self.kbd_stack.last().copied().unwrap_or(0);
     }
     /// Take the pending window title (OSC 0/2), clearing it. Returns `None` if unchanged
     /// since the last call.
@@ -1611,6 +1670,11 @@ impl Term {
     fn swap_alt(&mut self, to_alt: bool) {
         if to_alt != self.alt {
             self.damage.mark_full(); // the whole screen is replaced
+            // The kitty keyboard stacks are per-screen: swap them with the grid, so a
+            // full-screen app's negotiated flags belong to the alt screen and cannot
+            // follow it back to the shell when it exits (or dies without popping).
+            std::mem::swap(&mut self.kbd_stack, &mut self.kbd_stack_inactive);
+            self.kbd_flags = self.kbd_stack.last().copied().unwrap_or(0);
         }
         if to_alt && !self.alt {
             let saved = std::mem::replace(&mut self.grid, (0..self.rows).map(|_| Line::blank(self.cols)).collect());
@@ -2165,6 +2229,15 @@ impl Perform for Term {
                 (Some(&b'?'), 'p') if intermediates.last() == Some(&b'$') => self.report_mode(p.first().copied().unwrap_or(0), true),
                 // DECRQM: CSI Ps $ p (ANSI modes).
                 (Some(&b'$'), 'p') => self.report_mode(p.first().copied().unwrap_or(0), false),
+                // Kitty keyboard protocol. The private-parameter byte selects the
+                // operation, exactly as the oracle's parser dispatches them; a BARE
+                // `CSI u` (no intermediate) is SCORC and does not come through here.
+                (Some(&b'?'), 'u') => self.report_keyboard_mode(),
+                (Some(&b'>'), 'u') => self.push_keyboard_mode(p.first().copied().unwrap_or(0)),
+                (Some(&b'<'), 'u') => self.pop_keyboard_modes(count(&p, 0)),
+                (Some(&b'='), 'u') => {
+                    self.set_keyboard_mode(p.first().copied().unwrap_or(0), count(&p, 1))
+                }
                 _ => {}
             }
             return;
@@ -2286,6 +2359,58 @@ impl Term {
         } else {
             self.reply(b"\x1b[?6c");
         }
+    }
+
+    // ── Kitty keyboard protocol ───────────────────────────────────────────────
+    //
+    // The four operations an application uses to negotiate. Everything they touch is
+    // masked to [`KITTY_KBD_SUPPORTED`] first, so no path can leave a flag set that the
+    // host's key encoder does not honour.
+
+    /// A pushed/set flag word, reduced to what this terminal actually implements. The
+    /// `as u8` truncation is the oracle's `KeyboardModes::from_bits_truncate` behaviour:
+    /// the protocol's flags live in one byte, so a parameter above 255 is not a bigger
+    /// flag set, it is a malformed one.
+    fn supported_kbd_flags(param: u16) -> u8 {
+        (param as u8) & KITTY_KBD_SUPPORTED
+    }
+
+    /// `CSI ? u` — report the flags in effect. This is how an application discovers the
+    /// protocol exists at all: no reply means no protocol, and it stays on legacy keys.
+    /// Note it reports the ACTIVE flags rather than the top of the stack, so a bare
+    /// `CSI = flags u` is visible in the answer (see `docs/engine-divergence.md`).
+    fn report_keyboard_mode(&mut self) {
+        self.reply(format!("\x1b[?{}u", self.kbd_flags).as_bytes());
+    }
+
+    /// `CSI > flags u` — push a new flag set and make it current.
+    fn push_keyboard_mode(&mut self, param: u16) {
+        let flags = Self::supported_kbd_flags(param);
+        if self.kbd_stack.len() >= KITTY_KBD_STACK_MAX {
+            self.kbd_stack.remove(0); // drop the oldest; never grow without bound
+        }
+        self.kbd_stack.push(flags);
+        self.kbd_flags = flags;
+    }
+
+    /// `CSI < n u` — pop `n` entries (default 1) and fall back to whatever is now on
+    /// top, or to "nothing negotiated" when the stack empties. Popping an empty stack is
+    /// a no-op, not an error: an application is allowed to over-pop on the way out.
+    fn pop_keyboard_modes(&mut self, n: usize) {
+        let keep = self.kbd_stack.len().saturating_sub(n);
+        self.kbd_stack.truncate(keep);
+        self.kbd_flags = self.kbd_stack.last().copied().unwrap_or(0);
+    }
+
+    /// `CSI = flags ; mode u` — change the active flags without touching the stack.
+    /// `mode` 1 (or absent) replaces, 2 unions, 3 subtracts.
+    fn set_keyboard_mode(&mut self, param: u16, behaviour: usize) {
+        let flags = Self::supported_kbd_flags(param);
+        self.kbd_flags = match behaviour {
+            2 => self.kbd_flags | flags,
+            3 => self.kbd_flags & !flags,
+            _ => flags, // 1 and anything unrecognised: replace, the protocol's default
+        };
     }
 
     /// DECRQM — Request Mode (`CSI Ps $ p`, or `CSI ? Ps $ p` for private/DEC modes).
@@ -2474,6 +2599,130 @@ mod device_status_tests {
         let mut t = Term::new(80, 24);
         t.feed(b"\x1b[5c");
         assert_eq!(t.take_output(), Vec::<u8>::new());
+    }
+
+    // ── Kitty keyboard protocol negotiation ───────────────────────────────────
+
+    #[test]
+    fn kitty_keyboard_query_replies_with_the_active_flags() {
+        let mut t = Term::new(80, 24);
+        // A fresh terminal has negotiated nothing. The reply must still COME —
+        // silence is how an application concludes the protocol is unsupported and
+        // stays on legacy keys forever.
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.take_output(), b"\x1b[?0u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        // Push flag 1 and the query reports it.
+        t.feed(b"\x1b[>1u");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.take_output(), b"\x1b[?1u");
+        // Pop and it is gone again.
+        t.feed(b"\x1b[<1u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.take_output(), b"\x1b[?0u");
+    }
+
+    #[test]
+    fn an_unimplemented_flag_is_never_reported_as_active() {
+        let mut t = Term::new(80, 24);
+        // An application asking for everything (1|2|4|8|16) gets back 1: rt only
+        // disambiguates, and claiming "report all keys as escape codes" while still
+        // sending plain text for letters would leave the application waiting for
+        // sequences that never arrive.
+        t.feed(b"\x1b[>31u");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.take_output(), b"\x1b[?1u");
+        // Asking for only unimplemented flags reports nothing active, not a lie.
+        t.feed(b"\x1b[>30u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.take_output(), b"\x1b[?0u");
+        // A parameter that overflows the protocol's one flag byte is malformed, not a
+        // bigger flag set: it truncates exactly as the oracle's parser truncates it.
+        t.feed(b"\x1b[>257u"); // 257 & 0xff == 1
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn kitty_keyboard_stack_pushes_pops_and_restores() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[>1u"); // an outer application enables the protocol
+        t.feed(b"\x1b[>0u"); // an inner one turns it back off for itself
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert_eq!(t.kitty_keyboard_stack(), &[1, 0]);
+        t.feed(b"\x1b[<u"); // the inner one exits — the default pop count is 1
+        assert_eq!(t.kitty_keyboard_flags(), 1, "the outer application's flags come back");
+        assert_eq!(t.kitty_keyboard_stack(), &[1]);
+        // Over-popping on the way out is allowed and lands at "nothing negotiated".
+        t.feed(b"\x1b[<9u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert!(t.kitty_keyboard_stack().is_empty());
+        t.feed(b"\x1b[<3u"); // and popping an empty stack is a no-op, not a panic
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn kitty_keyboard_set_changes_flags_without_touching_the_stack() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[>1u");
+        t.feed(b"\x1b[=0;1u"); // replace: off
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert_eq!(t.kitty_keyboard_stack(), &[1], "set does not push or pop");
+        t.feed(b"\x1b[=1;2u"); // union: on
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        t.feed(b"\x1b[=1;3u"); // difference: off
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        t.feed(b"\x1b[=31u"); // no behaviour param = replace, and still masked
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn kitty_keyboard_stack_depth_is_bounded() {
+        let mut t = Term::new(80, 24);
+        // A program looping on push must not grow the stack without limit.
+        for _ in 0..(KITTY_KBD_STACK_MAX + 50) {
+            t.feed(b"\x1b[>1u");
+        }
+        assert_eq!(t.kitty_keyboard_stack().len(), KITTY_KBD_STACK_MAX);
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn the_alt_screen_keeps_its_own_kitty_keyboard_stack() {
+        let mut t = Term::new(80, 24);
+        // The shell negotiates nothing; a full-screen app takes the alt screen and
+        // pushes flag 1, then dies without popping it.
+        t.feed(b"\x1b[?1049h");
+        t.feed(b"\x1b[>1u");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the shell must not inherit the app's protocol");
+        assert!(t.kitty_keyboard_stack().is_empty());
+        // Going back to the alt screen finds the app's stack where it left it.
+        t.feed(b"\x1b[?1049h");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        assert_eq!(t.kitty_keyboard_stack(), &[1]);
+    }
+
+    #[test]
+    fn a_bare_csi_u_is_still_scorc_and_negotiates_nothing() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[>1u");
+        t.feed(b"\x1b[u"); // SCORC (restore cursor), not a keyboard-protocol op
+        assert_eq!(t.kitty_keyboard_flags(), 1, "unchanged");
+        assert_eq!(t.take_output(), Vec::<u8>::new(), "and it answers nothing");
+    }
+
+    #[test]
+    fn ris_clears_the_negotiated_keyboard_protocol() {
+        let mut t = Term::new(80, 24);
+        t.feed(b"\x1b[>1u");
+        t.feed(b"\x1bc"); // RIS — the pane is being reset out from under the app
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert!(t.kitty_keyboard_stack().is_empty());
     }
 
     #[test]

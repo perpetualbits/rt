@@ -273,7 +273,9 @@ pub fn scrollback_newest_first(term: &Term, budget: usize, styles: &mut StyleTab
     out
 }
 
-use rt_handoff::pane::{Charsets, CursorState, Margins, ModeEntry, PaneWire, SavedCursor};
+use rt_handoff::pane::{
+    Charsets, CursorState, KittyKbd, Margins, ModeEntry, PaneWire, SavedCursor,
+};
 
 /// DEC private mode numbers this engine can report. Kept as literals so the
 /// namespace is the VT spec's, not rt's — that is what lets a build years from
@@ -351,9 +353,18 @@ fn designator(c: vt_term::Charset) -> u8 {
 /// `cursor` and `margins` go out 0-based, margins inclusive, exactly as
 /// `Term` reports them.
 ///
+/// `kitty_kbd` carries the ACTIVE screen's kitty keyboard mode stack, and is
+/// absent when nothing has been negotiated (the receiver's documented default is
+/// an empty stack, which is the same thing). The wire type has room for one
+/// stack, so the *inactive* screen's stack — the one `Term` parks across an
+/// alt-screen switch — does not survive a move; a pane torn out while a
+/// full-screen app holds the alt screen comes back with the app's flags, and the
+/// shell underneath it reverts to legacy keys, which is the safe direction to
+/// lose. `modify_other_keys` stays 0: xterm's modifyOtherKeys is not implemented.
+///
 /// Everything else ships at its default because this engine cannot source it:
-/// `tab_stops`, `title_stack`, `uri_table`, `image_table`, `palette` and
-/// `kitty_kbd` are state vt-term does not track, and `pending_raw` is empty
+/// `tab_stops`, `title_stack`, `uri_table`, `image_table` and `palette` are
+/// state vt-term does not track, and `pending_raw` is empty
 /// because `vt_parser` offers no way to read back the bytes of a sequence it
 /// has half-consumed — a pane moved mid-sequence loses that sequence's tail.
 /// Phase 2b's freeze/thaw is what makes `pending_raw` sourceable.
@@ -423,6 +434,13 @@ pub fn export_term(
         }),
         pen: style_of(&term.pen()),
         active_screen: term.alt_screen() as u8,
+        // Absent, not an empty stack: "nothing negotiated" is the receiver's
+        // default for this field, so a pane that never saw the protocol keeps
+        // the exact wire bytes it had before this field was populated.
+        kitty_kbd: (!term.kitty_keyboard_stack().is_empty()).then(|| KittyKbd {
+            stack: term.kitty_keyboard_stack().iter().map(|f| *f as u32).collect(),
+            modify_other_keys: 0, // xterm modifyOtherKeys is not implemented
+        }),
         style_table: styles.into_vec(),
         screen_primary,
         screen_alt,
@@ -1032,11 +1050,11 @@ mod tests {
 
     #[test]
     fn the_unsupported_fields_ship_absent() {
-        // vt-term tracks no tab stops, title stack, hyperlinks, images, palette
-        // override or kitty keyboard stack, and `vt_parser` cannot hand back a
-        // half-consumed sequence, so `pending_raw` goes out empty too — it is
-        // sourceable only once phase 2b can freeze/thaw the parser. Rule R3
-        // means the receiver applies documented defaults for all of them.
+        // vt-term tracks no tab stops, title stack, hyperlinks, images or palette
+        // override, and `vt_parser` cannot hand back a half-consumed sequence, so
+        // `pending_raw` goes out empty too — it is sourceable only once phase 2b
+        // can freeze/thaw the parser. Rule R3 means the receiver applies
+        // documented defaults for all of them.
         let mut t = vt_term::Term::new(20, 4);
         t.feed(b"hello");
         let (p, _) = export_term(&t, 1, 99, 0);
@@ -1045,8 +1063,54 @@ mod tests {
         assert!(p.uri_table.is_empty());
         assert!(p.image_table.is_empty());
         assert!(p.palette.is_none());
-        assert!(p.kitty_kbd.is_none());
         assert!(p.pending_raw.is_empty(), "documented as not surviving a 2a move");
+    }
+
+    #[test]
+    fn a_pane_that_never_negotiated_ships_no_kitty_keyboard_state() {
+        // Absent, not an empty stack — the receiver's default for this field IS
+        // "nothing negotiated", so a plain shell's wire bytes do not grow.
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"hello");
+        let (p, _) = export_term(&t, 1, 99, 0);
+        assert!(p.kitty_kbd.is_none());
+    }
+
+    #[test]
+    fn the_kitty_keyboard_stack_survives_a_move() {
+        // Tear a pane out of a window while Claude Code (or any app that asked
+        // for the protocol) is running in it: without this the pane arrives with
+        // the protocol off and the app silently reverts to legacy keys.
+        let mut t = vt_term::Term::new(20, 4);
+        t.feed(b"\x1b[>1u"); // an outer application enables disambiguation
+        t.feed(b"\x1b[>0u"); // an inner one turns it off for itself
+        let (p, _) = export_term(&t, 1, 99, 0);
+        let kbd = p.kitty_kbd.clone().expect("the negotiated stack must ship");
+        assert_eq!(kbd.stack, vec![1, 0], "the whole stack, so the receiver can pop back");
+        assert_eq!(kbd.modify_other_keys, 0, "xterm modifyOtherKeys is out of scope");
+        // And it survives the wire itself, not just the export.
+        let back = rt_handoff::pane::PaneWire::decode(&p.encode()).unwrap();
+        assert_eq!(back.kitty_kbd, p.kitty_kbd);
+        // The receiving engine adopts it: flags come back as the top of stack, and
+        // popping restores the outer application's flags exactly as before the move.
+        let mut recv = vt_term::Term::new(20, 4);
+        recv.set_kitty_keyboard_stack(
+            &back.kitty_kbd.unwrap().stack.iter().map(|f| *f as u8).collect::<Vec<_>>(),
+        );
+        assert_eq!(recv.kitty_keyboard_flags(), 0);
+        recv.feed(b"\x1b[<u");
+        assert_eq!(recv.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn a_donor_flag_this_engine_does_not_honour_is_dropped_on_adoption() {
+        // A future rt (or another terminal speaking this wire format) may support
+        // more of the protocol than this build does. Adopting its stack must not
+        // leave this terminal reporting a flag its key encoder would ignore.
+        let mut recv = vt_term::Term::new(20, 4);
+        recv.set_kitty_keyboard_stack(&[0b11111]);
+        assert_eq!(recv.kitty_keyboard_flags(), 1);
+        assert_eq!(recv.kitty_keyboard_stack(), &[1]);
     }
 
     #[test]

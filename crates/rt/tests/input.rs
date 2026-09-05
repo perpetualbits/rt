@@ -1,6 +1,7 @@
 //! Tests for winit-key → Chord and typed-key → PTY-bytes translation. These are
 //! pure and need no display, so they guard the fiddliest part of the app.
 
+use rt_app::input::encode_key_kitty;
 use rt_app::{chord_from_winit, encode_key};
 use rt_config::{Action, Chord, Key as RtKey, Keymap, Mods};
 use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
@@ -202,4 +203,108 @@ fn legacy_character_keys_are_byte_identical() {
     }
     // A named key rt does not encode still produces nothing at all.
     assert_eq!(encode_key(&Key::Named(NamedKey::BrowserBack), ModifiersState::empty(), false), None);
+}
+
+#[test]
+fn shift_enter_is_distinguishable_once_the_protocol_is_negotiated() {
+    // The reported bug: in Claude Code (and any app that asks for the kitty
+    // keyboard protocol) Shift+Enter was byte-identical to Enter, so it could
+    // never be bound to "insert a newline" — it always submitted.
+    let enter = Key::Named(NamedKey::Enter);
+    // Un-negotiated: both are a bare carriage return, as they always were.
+    assert_eq!(encode_key(&enter, ModifiersState::empty(), false), Some(b"\r".to_vec()));
+    assert_eq!(encode_key(&enter, ModifiersState::SHIFT, false), Some(b"\r".to_vec()));
+    // With flag 1 ("disambiguate escape codes") pushed, Shift+Enter becomes the
+    // CSI-u form: unicode key code 13 (CR), modifier parameter shift(1) + 1 = 2.
+    assert_eq!(
+        encode_key_kitty(&enter, ModifiersState::SHIFT, false, 0b1),
+        Some(b"\x1b[13;2u".to_vec())
+    );
+    // Plain Enter under the same flag keeps the legacy byte: it is not ambiguous,
+    // so disambiguation leaves it alone and `\r` still submits.
+    assert_eq!(encode_key_kitty(&enter, ModifiersState::empty(), false, 0b1), Some(b"\r".to_vec()));
+}
+
+#[test]
+fn flag_one_encodes_exactly_the_ambiguous_keys() {
+    let (s, c, a) = (ModifiersState::SHIFT, ModifiersState::CONTROL, ModifiersState::ALT);
+    let named = |n| Key::Named(n);
+    // (key, modifiers, expected bytes with flag 1 active).
+    let table: &[(Key, ModifiersState, &[u8])] = &[
+        // The three control characters whose legacy byte has no room for a
+        // modifier switch to the CSI-u form as soon as ANY modifier is held.
+        (named(NamedKey::Enter), s, b"\x1b[13;2u"),
+        (named(NamedKey::Enter), c, b"\x1b[13;5u"),
+        (named(NamedKey::Enter), a, b"\x1b[13;3u"),
+        (named(NamedKey::Enter), c | s, b"\x1b[13;6u"),
+        (named(NamedKey::Tab), s, b"\x1b[9;2u"),
+        (named(NamedKey::Backspace), s, b"\x1b[127;2u"),
+        (named(NamedKey::Backspace), c, b"\x1b[127;5u"),
+        // Escape is disambiguated even bare — that is the ambiguity the flag is
+        // named for: a lone `\x1b` looks like the start of a sequence.
+        (named(NamedKey::Escape), ModifiersState::empty(), b"\x1b[27u"),
+        (named(NamedKey::Escape), s, b"\x1b[27;2u"),
+        // Keys that already own a legacy escape sequence keep its final byte and
+        // take the modifier as a parameter — they do NOT move to CSI-u.
+        (named(NamedKey::ArrowUp), c, b"\x1b[1;5A"),
+        (named(NamedKey::ArrowLeft), c, b"\x1b[1;5D"),
+        (named(NamedKey::ArrowRight), c | s, b"\x1b[1;6C"),
+        (named(NamedKey::Home), a, b"\x1b[1;3H"),
+        (named(NamedKey::End), c | s, b"\x1b[1;6F"),
+        (named(NamedKey::Delete), c, b"\x1b[3;5~"),
+        (named(NamedKey::PageUp), c, b"\x1b[5;5~"),
+        (named(NamedKey::F1), c, b"\x1b[1;5P"),
+        // F3's legacy final byte `R` collides with a cursor-position report, so
+        // the protocol re-spells it as `CSI 13 ~` rather than `CSI 1;5R`.
+        (named(NamedKey::F3), c, b"\x1b[13;5~"),
+        (named(NamedKey::F5), a, b"\x1b[15;3~"),
+        (named(NamedKey::F12), c, b"\x1b[24;5~"),
+        // Characters: the UNSHIFTED code point, with the shift bit in the
+        // parameter. Ctrl+Shift+C is 99 (`c`) + shift + ctrl, not 67.
+        (ch("c"), c, b"\x1b[99;5u"),
+        (ch("C"), c | s, b"\x1b[99;6u"),
+        (ch("a"), a, b"\x1b[97;3u"),
+        (ch(" "), c, b"\x1b[32;5u"),
+    ];
+    for (key, mods, want) in table {
+        assert_eq!(
+            encode_key_kitty(key, *mods, false, 0b1).as_deref(),
+            Some(*want),
+            "{key:?} + {mods:?} under flag 1"
+        );
+    }
+
+    // And the other half of the contract: with flag 1 active, everything that is
+    // NOT ambiguous is still exactly its legacy bytes.
+    let unchanged: &[(Key, ModifiersState, &[u8])] = &[
+        (named(NamedKey::Enter), ModifiersState::empty(), b"\r"),
+        (named(NamedKey::Tab), ModifiersState::empty(), b"\t"),
+        (named(NamedKey::Backspace), ModifiersState::empty(), &[0x7f]),
+        (named(NamedKey::ArrowUp), ModifiersState::empty(), b"\x1b[A"),
+        (named(NamedKey::F1), ModifiersState::empty(), b"\x1bOP"),
+        // Shift+letter is the guard that keeps ordinary typing out of the
+        // protocol: it stays the shifted character, not `CSI 65;2u`.
+        (ch("A"), s, b"A"),
+        (ch("!"), s, b"!"),
+        (ch("a"), ModifiersState::empty(), b"a"),
+        // Shift ALONE, on a key that is not Tab/Enter/Backspace, is likewise not
+        // an ambiguity flag 1 promises to resolve — alacritty's
+        // `should_build_sequence` excludes it, and rt follows. These keep the
+        // bytes rt has always sent for them, modifier and all thrown away.
+        (named(NamedKey::ArrowUp), s, b"\x1b[A"),
+        (named(NamedKey::Delete), s, b"\x1b[3~"),
+        (named(NamedKey::F5), s, b"\x1b[15~"),
+    ];
+    for (key, mods, want) in unchanged {
+        assert_eq!(
+            encode_key_kitty(key, *mods, false, 0b1).as_deref(),
+            Some(*want),
+            "{key:?} + {mods:?} must stay legacy under flag 1"
+        );
+    }
+    // An unmodified arrow still follows DECCKM; the protocol never sees it.
+    assert_eq!(
+        encode_key_kitty(&named(NamedKey::ArrowUp), ModifiersState::empty(), true, 0b1).as_deref(),
+        Some(&b"\x1bOA"[..])
+    );
 }

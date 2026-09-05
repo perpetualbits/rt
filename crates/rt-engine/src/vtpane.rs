@@ -607,6 +607,11 @@ impl VtPane {
     pub fn app_cursor_keys(&self) -> bool {
         self.lock_term().app_cursor()
     }
+    /// The kitty keyboard enhancement flags the program in this pane has negotiated
+    /// (0 = none, and the host must send the legacy key bytes).
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.lock_term().kitty_keyboard_flags()
+    }
     pub fn is_alt_screen(&self) -> bool {
         self.lock_term().alt_screen()
     }

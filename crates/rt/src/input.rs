@@ -179,6 +179,164 @@ fn cursor(app_cursor: bool, final_byte: u8) -> Vec<u8> {
     vec![0x1b, mid, final_byte]
 }
 
+// ── Kitty keyboard protocol ───────────────────────────────────────────────────
+//
+// The legacy encoding below throws modifiers away: Shift+Enter, Ctrl+Enter and
+// Enter are all `\r`, so no application can tell them apart. The kitty keyboard
+// protocol fixes that, but only for applications that ASK — an application
+// pushes the enhancement flags it wants, and until it does, the terminal must
+// keep sending the legacy bytes. Sending `\x1b[13;2u` unconditionally would make
+// Shift+Enter *undo* in vim (ESC leaves insert, `u` undoes) and leave literal
+// `3;2u` in the bash line buffer, which is why the negotiation is the feature.
+//
+// rt implements progressive-enhancement flag 1 only (see `kitty_disambiguates`).
+
+/// Progressive-enhancement flag 1, "disambiguate escape codes" — the only flag
+/// rt implements, and the only one it will ever report as active.
+pub const KITTY_DISAMBIGUATE: u8 = 0b1;
+
+/// The kitty modifier bitset for `mods`: shift 1, alt 2, ctrl 4, super 8. The
+/// escape sequence carries this value **plus one**, so an unmodified key has
+/// parameter 1 and can omit it entirely.
+fn kitty_mod_bits(mods: ModifiersState) -> u8 {
+    let mut bits = 0u8;
+    if mods.shift_key() {
+        bits |= 0b0001;
+    }
+    if mods.alt_key() {
+        bits |= 0b0010;
+    }
+    if mods.control_key() {
+        bits |= 0b0100;
+    }
+    // winit 0.31 spells Super as `meta`, exactly as `mods_from_winit` does.
+    if mods.meta_key() {
+        bits |= 0b1000;
+    }
+    bits
+}
+
+/// Whether this key press must be disambiguated — i.e. sent in the kitty
+/// protocol's form rather than its legacy bytes — given the pane's active
+/// enhancement flags.
+///
+/// This is alacritty's `should_build_sequence` (`alacritty/src/input/keyboard.rs`)
+/// restricted to flag 1, and it is deliberately narrow: under flag 1 alone the
+/// only keys that change are the ones whose legacy encoding is genuinely
+/// ambiguous. Shift+letter is *not* one of them — `A` already says everything
+/// there is to say — which is why plain typing survives the protocol untouched.
+///
+/// The one clause of alacritty's condition rt cannot express is
+/// `key.location == KeyLocation::Numpad`: rt's key path carries only the logical
+/// `Key`, never winit's `KeyLocation`, so an unmodified numpad key stays legacy
+/// here where alacritty would disambiguate it. That costs an application the
+/// ability to tell numpad `1` from row `1`; it costs nothing for the reported
+/// bug, and plumbing `KeyLocation` through four crates is not in this change.
+pub fn kitty_disambiguates(key: &Key, mods: ModifiersState, kbd_flags: u8) -> bool {
+    if kbd_flags & KITTY_DISAMBIGUATE == 0 {
+        return false; // nothing negotiated: legacy bytes, always
+    }
+    // Escape is disambiguated with or without modifiers: a bare `\x1b` is
+    // indistinguishable from the start of any escape sequence, which is the
+    // ambiguity the flag is named after.
+    if matches!(key, Key::Named(NamedKey::Escape)) {
+        return true;
+    }
+    if mods.is_empty() {
+        return false; // an unmodified key is never ambiguous
+    }
+    if mods == ModifiersState::SHIFT {
+        // Shift ALONE only matters for the three keys whose legacy byte has no
+        // room for a modifier — including Enter, which is the reported bug.
+        // Everything else shifted (letters, digits, symbols) is already carried
+        // faithfully by the character it produces.
+        return matches!(key, Key::Named(NamedKey::Tab | NamedKey::Enter | NamedKey::Backspace));
+    }
+    true // any ctrl/alt/super combination
+}
+
+/// Build the kitty-protocol sequence for a disambiguated key, or `None` if rt
+/// has no encoding for it (the caller then falls back to the legacy bytes).
+///
+/// Mirrors alacritty's `build_sequence`: a payload, an optional `;<modifiers>`
+/// parameter, and a terminator that is either the key's own legacy final byte
+/// (`A`, `~`, …) or `u` for the CSI-u form. Keys that already own a legacy escape
+/// sequence keep it and take the modifier as a parameter (`CSI 1;2A`); keys whose
+/// legacy encoding is a bare control byte switch to `CSI <code> u`.
+fn kitty_sequence(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
+    let bits = kitty_mod_bits(mods);
+    // The `1` in `CSI 1;2A` is the default parameter, omitted when there is no
+    // modifier parameter to follow it.
+    let one = if bits == 0 { "" } else { "1" };
+    let (payload, terminator): (String, char) = match key {
+        Key::Named(named) => match named {
+            // Keys with a legacy CSI form: keep the final byte, add the modifier.
+            // Note these are always CSI here, never SS3 — a modified arrow is CSI
+            // in every terminal, DECCKM or not, and only the *unmodified* arrow
+            // (which never reaches this function) follows application-cursor mode.
+            NamedKey::ArrowUp => (one.into(), 'A'),
+            NamedKey::ArrowDown => (one.into(), 'B'),
+            NamedKey::ArrowRight => (one.into(), 'C'),
+            NamedKey::ArrowLeft => (one.into(), 'D'),
+            NamedKey::Home => (one.into(), 'H'),
+            NamedKey::End => (one.into(), 'F'),
+            NamedKey::Insert => ("2".into(), '~'),
+            NamedKey::Delete => ("3".into(), '~'),
+            NamedKey::PageUp => ("5".into(), '~'),
+            NamedKey::PageDown => ("6".into(), '~'),
+            NamedKey::F1 => (one.into(), 'P'),
+            NamedKey::F2 => (one.into(), 'Q'),
+            // F3 is the one key the protocol re-spells: its legacy final byte is
+            // `R`, which is also the terminator of a cursor-position report, so
+            // `CSI 1;2R` would be unreadable. kitty (and alacritty, which notes
+            // the same divergence from its own terminfo) sends `CSI 13;2~`.
+            NamedKey::F3 => ("13".into(), '~'),
+            NamedKey::F4 => (one.into(), 'S'),
+            NamedKey::F5 => ("15".into(), '~'),
+            NamedKey::F6 => ("17".into(), '~'),
+            NamedKey::F7 => ("18".into(), '~'),
+            NamedKey::F8 => ("19".into(), '~'),
+            NamedKey::F9 => ("20".into(), '~'),
+            NamedKey::F10 => ("21".into(), '~'),
+            NamedKey::F11 => ("23".into(), '~'),
+            NamedKey::F12 => ("24".into(), '~'),
+            // Control characters: the CSI-u form, keyed on the code point the
+            // legacy encoding collapsed them to.
+            NamedKey::Tab => ("9".into(), 'u'),
+            NamedKey::Enter => ("13".into(), 'u'),
+            NamedKey::Escape => ("27".into(), 'u'),
+            NamedKey::Backspace => ("127".into(), 'u'),
+            // Space has no `NamedKey` in this winit: it arrives as
+            // `Key::Character(" ")` and is encoded as code point 32 below.
+            _ => return None, // a named key rt does not encode at all
+        },
+        Key::Character(s) => {
+            // Only a single-code-point key has a "unicode key code"; anything
+            // longer (a compose result) has no place in the protocol's key
+            // namespace and falls back to being sent as text.
+            let mut chars = s.chars();
+            let (c, rest) = (chars.next()?, chars.next());
+            if rest.is_some() {
+                return None;
+            }
+            // The protocol reports the key the user pressed, not what Shift made
+            // of it, so `Ctrl+Shift+C` is code point 99 (`c`) with the shift bit
+            // set — not 67. Base-layout keys like `!` -> `1` need winit's
+            // `key_without_modifiers`, which rt's `&Key` does not carry; those
+            // report their shifted code point instead.
+            let base = if mods.shift_key() { c.to_lowercase().next().unwrap_or(c) } else { c };
+            (u32::from(base).to_string(), 'u')
+        }
+        _ => return None, // dead/unidentified keys
+    };
+    let mut out = format!("\x1b[{payload}");
+    if bits != 0 {
+        out.push_str(&format!(";{}", bits + 1)); // the protocol's modifier param
+    }
+    out.push(terminator);
+    Some(out.into_bytes())
+}
+
 /// Encode a plain typed key (one that carried no rt binding) into the bytes to
 /// write to the PTY. Returns `None` for keys that produce no input (e.g. a lone
 /// modifier press, or a named key we do not translate).
@@ -189,6 +347,29 @@ fn cursor(app_cursor: bool, final_byte: u8) -> Vec<u8> {
 /// wrong is exactly why their arrow navigation appears dead. The sequences
 /// follow standard xterm conventions that `alacritty_terminal`'s parser expects.
 pub fn encode_key(key: &Key, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
+    encode_key_kitty(key, mods, app_cursor, 0)
+}
+
+/// As [`encode_key`], but honouring `kbd_flags` — the pane's active kitty
+/// keyboard enhancement flags, as pushed by the program running in it.
+///
+/// `kbd_flags == 0` (no program has negotiated) is byte-for-byte [`encode_key`];
+/// that equivalence is not incidental, it is the safety property of the whole
+/// feature and `crates/rt/tests/input.rs` pins it key by key.
+pub fn encode_key_kitty(
+    key: &Key,
+    mods: ModifiersState,
+    app_cursor: bool,
+    kbd_flags: u8,
+) -> Option<Vec<u8>> {
+    // A disambiguated key takes the protocol's form; if rt has no protocol
+    // encoding for it, fall through to the legacy bytes rather than send
+    // nothing — a key that used to type something must still type something.
+    if kitty_disambiguates(key, mods, kbd_flags) {
+        if let Some(bytes) = kitty_sequence(key, mods) {
+            return Some(bytes);
+        }
+    }
     match key {
         Key::Named(named) => match named {
             // Enter sends a carriage return (the shell converts to newline).

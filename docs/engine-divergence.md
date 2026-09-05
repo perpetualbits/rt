@@ -247,6 +247,47 @@ once the widened `gen_script` reached code paths the earlier fuzz never touched:
 
 See `docs/vt-term-design.md` for the design writeup of each of these.
 
+## Kitty keyboard protocol — implemented, deliberately narrower (2026-09-05)
+
+vt-term implements the protocol's negotiation (`CSI ? u` query, `CSI > flags u` push,
+`CSI < n u` pop, `CSI = flags ; mode u` set) with per-screen mode stacks, matching the
+oracle's `keyboard_mode_stack` / `inactive_keyboard_mode_stack`. Four **intentional**
+divergences, all of them narrowing:
+
+- **Only flag 1 (`DISAMBIGUATE_ESC_CODES`) is stored.** Every pushed or set flag word is
+  masked to `KITTY_KBD_SUPPORTED` (`0b1`) before it is stored, so `CSI > 31 u` followed
+  by `CSI ? u` answers `CSI ? 1 u`. The oracle stores all five faithfully because it
+  implements all five. rt's key encoder (`rt::input::encode_key_kitty`) honours flag 1
+  alone, and reporting a flag it would not act on is the worse failure: an application
+  told it has flag 8 ("report all keys as escape codes") waits for sequences that never
+  arrive, whereas one told it has only flag 1 downgrades correctly. This is the one
+  divergence an application can observe directly, and it is the point of the design.
+  The vendored backend (`RT_ENGINE=alacritty`) reaches the same answer from the other
+  end: its `Term` keeps storing all five faithfully, and rt masks the `CSI ? u` reply on
+  its way out of the engine (`mask_kitty_keyboard_reply`). So the two engines agree on
+  the observable contract — one masks on the way in, the other on the way out — while
+  their internal state legitimately differs.
+- **`CSI ? u` reports the ACTIVE flags, the oracle reports the top of the stack.** They
+  differ only after a bare `CSI = flags u`, which changes the active flags without
+  touching the stack: the oracle then answers with the stale stack top. The protocol
+  says the reply is the flags in effect, so vt-term answers with those.
+- **The mode stack is bounded at 4096 and drops its oldest entry on overflow.** Same
+  depth as the oracle's `KEYBOARD_MODE_STACK_MAX_DEPTH`, but the oracle's overflow branch
+  removes an entry from `title_stack` (an upstream slip) and lets the keyboard stack grow
+  without limit. vt-term drops from the keyboard stack, which is what the bound is for.
+- **The vendored engine as rt drives it now has `Config::kitty_keyboard = true`.** It
+  defaults to `false`, which silently discards every keyboard-protocol sequence; with it
+  off no application could ever negotiate, and the two engines would have disagreed about
+  whether the protocol exists at all.
+
+Not covered by the differential harness: `vt-conformance`'s `ScreenState` captures the
+grid, cursor, `alt_screen`, `app_cursor`, `display_offset` and `history` — it has no
+keyboard-mode field, and the report differential's reply stream does not generate `CSI u`
+sequences. So none of the above is fuzz-visible; the unit tests in `vt-term`
+(`kitty_keyboard_*`) and `rt` (`crates/rt/tests/input.rs`) are the whole coverage. Adding
+a `kitty_kbd` field to `ScreenState` would immediately fail the differential on the
+masking divergence above, which is why it was left out rather than added and masked.
+
 ## Known not-yet-implemented (will diverge when exercised)
 
 - **Colon sub-parameter SGR** beyond the extended-colour case.

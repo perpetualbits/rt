@@ -5334,12 +5334,22 @@ impl App {
         // ANSI escape sequences; everything else sends the key's *produced text*
         // (`key_event.text`), which already contains dead-key / compose results
         // (e.g. `'`+space → `'`) that the logical key alone would miss.
-        let app_cursor = active
-            .session
-            .pane(active.session.focus()) // the focused pane's backend
+        let focused = active.session.pane(active.session.focus()); // the focused pane's backend
+        let app_cursor = focused
             .map(|p| p.app_cursor_keys()) // its DECCKM state
             .unwrap_or(false); // default to normal cursor keys
+        // The kitty keyboard flags the program in that pane negotiated, if any. 0 —
+        // nothing negotiated — makes every branch below byte-identical to what rt sent
+        // before the protocol existed.
+        let kbd_flags = focused.map(|p| p.kitty_keyboard_flags()).unwrap_or(0);
         let bytes = match &key_event.logical_key {
+            // A key the negotiated protocol disambiguates takes the protocol's form,
+            // and must be tested BEFORE the produced-text branch: Ctrl-combos arrive
+            // with text (the C0 byte), and letting that win would silently give a
+            // negotiated application half a protocol.
+            k if input::kitty_disambiguates(k, mods, kbd_flags) => {
+                input::encode_key_kitty(k, mods, app_cursor, kbd_flags)
+            }
             Key::Named(n) if input::is_sequence_key(n) => {
                 input::encode_key(&key_event.logical_key, mods, app_cursor) // arrows/enter/…
             }
