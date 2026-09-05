@@ -98,9 +98,17 @@ pub enum Broadcast {
     /// Input goes only to the focused pane (the normal default).
     #[default]
     Off,
-    /// Input goes to every pane sharing the focused pane's group.
+    /// Input goes to every pane sharing the focused pane's group — INCLUDING
+    /// panes in other windows of this process. `Session` only ever delivers
+    /// to its own panes (this fans out locally, see `feed_input`); reaching
+    /// a group member that was torn out into a separate window is `App`'s
+    /// job (`main.rs`'s `broadcast_group_input`/`broadcast_group_paste`),
+    /// via `write_to_group`/`paste_to_group` below. In-process only.
     Group,
-    /// Input goes to every pane in the window.
+    /// Input goes to every pane in THIS window. Deliberately NOT extended
+    /// across windows like `Group` is: "every pane in every window" is a
+    /// blast radius the typist can't see, so `All` keeps meaning "every pane
+    /// here" — do not "fix" this into matching `Group`'s reach.
     All,
 }
 
@@ -619,16 +627,45 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
     /// from the body first so pasted content can't break out of the bracket (injection guard).
     pub fn feed_paste(&self, text: &[u8]) {
         // Built once and shared by every bracketed-paste target.
-        let bracketed = {
-            let body = strip_paste_end_marker(text);
-            let mut w = Vec::with_capacity(body.len() + 12);
-            w.extend_from_slice(b"\x1b[200~");
-            w.extend_from_slice(&body);
-            w.extend_from_slice(b"\x1b[201~");
-            w
-        };
+        let bracketed = wrap_bracketed_paste(text);
         for (id, p) in &self.panes {
             if self.receives_broadcast(*id) {
+                p.write(if p.bracketed_paste() { &bracketed } else { text });
+            }
+        }
+    }
+
+    /// Write `bytes` to every pane in THIS session carrying `group` — the
+    /// cross-window half of `Broadcast::Group` delivery. `Session` only
+    /// knows its own panes (see the module doc), so `App` (in `main.rs`)
+    /// calls this once per OPEN WINDOW after resolving the group id from the
+    /// window the user is actually typing in, so a pane that was torn out of
+    /// its group into a separate window still gets reached. Doesn't touch
+    /// `self.focus`/`self.broadcast` — a plain targeted write, same as one
+    /// arm of [`feed_input`](Session::feed_input).
+    ///
+    /// In-process only: a pane can be handed to a DIFFERENT rt process
+    /// (`PanePackage`/`adopt`); a group spanning processes would need that
+    /// handoff protocol to also carry live delivery (a new IPC path) — out
+    /// of scope, and `App` is where that limit would be lifted, not here.
+    pub fn write_to_group(&self, group: u32, bytes: &[u8]) {
+        for (id, p) in &self.panes {
+            if self.groups.get(id).copied() == Some(group) {
+                p.write(bytes);
+            }
+        }
+    }
+
+    /// Paste equivalent of [`write_to_group`](Session::write_to_group):
+    /// same group targeting, but wrapped in bracketed-paste markers PER PANE
+    /// exactly like [`feed_paste`](Session::feed_paste) — the per-pane
+    /// DECSET-2004 decision is load-bearing (see `feed_paste`'s doc) and
+    /// must not collapse into a single decision just because delivery now
+    /// crosses windows.
+    pub fn paste_to_group(&self, group: u32, text: &[u8]) {
+        let bracketed = wrap_bracketed_paste(text);
+        for (id, p) in &self.panes {
+            if self.groups.get(id).copied() == Some(group) {
                 p.write(if p.bracketed_paste() { &bracketed } else { text });
             }
         }
@@ -1116,6 +1153,19 @@ fn cells_in(rect: Rect, cell: (f32, f32)) -> (usize, usize) {
     (cols.max(1), rows.max(1)) // clamp to a minimum 1x1 grid
 }
 
+/// Wrap `text` in bracketed-paste markers (`\x1b[200~`…`\x1b[201~`), first
+/// stripping any embedded end marker from the body (paste-injection guard —
+/// see [`feed_paste`](Session::feed_paste)'s doc). Shared by `feed_paste` and
+/// [`Session::paste_to_group`] so the two build the identical wrapped form.
+fn wrap_bracketed_paste(text: &[u8]) -> Vec<u8> {
+    let body = strip_paste_end_marker(text);
+    let mut w = Vec::with_capacity(body.len() + 12);
+    w.extend_from_slice(b"\x1b[200~");
+    w.extend_from_slice(&body);
+    w.extend_from_slice(b"\x1b[201~");
+    w
+}
+
 /// Remove every embedded bracketed-paste END marker (`\x1b[201~`) from pasted text, so the
 /// content can't terminate the bracket early and inject commands (paste-injection guard).
 fn strip_paste_end_marker(text: &[u8]) -> Vec<u8> {
@@ -1217,6 +1267,123 @@ mod tests {
             &buf1.borrow()[..],
             b"\x1b[200~line1\nline2\x1b[201~",
             "grouped pane (ON) must get its OWN bracketed wrap",
+        );
+    }
+
+    // ----- Cross-window Group broadcast (Task 12) ---------------------------
+
+    /// A session with one pane (the focus, in the given bracketed-paste
+    /// state) whose writes are inspectable via the returned buffer.
+    /// `Session` never has cross-window knowledge itself (that's `App`'s
+    /// job — see `write_to_group`'s doc), so these tests just stand up
+    /// several `Session`s directly, one per simulated window, and call them
+    /// the way `App::broadcast_group_input`/`broadcast_group_paste` would.
+    /// `bracketed` is a parameter (not hardcoded) so a caller can build
+    /// sibling sessions in DIFFERENT bracketed-paste states — needed to
+    /// exercise `paste_to_group`'s per-pane decision below.
+    fn buffered_session(bracketed: bool) -> (
+        Session<MockPane, impl FnMut(PaneId, usize, usize) -> Option<MockPane>>,
+        PaneId,
+        std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let b = buf.clone();
+        let s = Session::new(
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            (8.0, 16.0),
+            move |_id, _c, _r| Some(MockPane { writes: b.clone(), bracketed }),
+        );
+        let focus = s.focus();
+        (s, focus, buf)
+    }
+
+    /// Membership already travelled correctly across windows before this
+    /// task (`PanePackage`/`adopt`); the reported bug was that DELIVERY
+    /// stayed window-scoped, so a pane torn out of a group into its own
+    /// window silently stopped receiving broadcast input. `write_to_group`
+    /// is the seam that fixes it: input "typed" in one window (`win_a`) must
+    /// reach a same-group pane living in a completely separate window
+    /// (`win_b`). Breaking the group-match condition inside
+    /// `write_to_group` (e.g. hardcoding it to `true`) still makes THIS
+    /// assertion pass — that's expected, it's `pane_in_a_different_group_
+    /// receives_nothing` below that catches that particular break.
+    #[test]
+    fn group_broadcast_reaches_a_pane_in_a_different_session() {
+        let (mut win_a, focus_a, _buf_a) = buffered_session(false);
+        win_a.groups.insert(focus_a, 7);
+        win_a.broadcast = Broadcast::Group;
+
+        let (mut win_b, pane_b, buf_b) = buffered_session(false);
+        win_b.groups.insert(pane_b, 7); // same group id, different session == different window
+
+        // What `App::broadcast_group_input` does: resolve the group from the
+        // window actually being typed in, then deliver into every OTHER window.
+        let group = win_a.group_of(focus_a).expect("focus is grouped");
+        win_b.write_to_group(group, b"sync");
+
+        assert_eq!(&buf_b.borrow()[..], b"sync", "pane in the OTHER window must receive group input");
+    }
+
+    /// A pane carrying a DIFFERENT group id must not receive input meant for
+    /// another group, even across windows.
+    #[test]
+    fn pane_in_a_different_group_receives_nothing() {
+        let (mut win_a, focus_a, _buf_a) = buffered_session(false);
+        win_a.groups.insert(focus_a, 1);
+        win_a.broadcast = Broadcast::Group;
+
+        let (mut win_b, pane_b, buf_b) = buffered_session(false);
+        win_b.groups.insert(pane_b, 2); // a DIFFERENT group
+
+        let group = win_a.group_of(focus_a).expect("focus is grouped");
+        win_b.write_to_group(group, b"sync");
+
+        assert!(buf_b.borrow().is_empty(), "a pane in a different group must receive nothing");
+    }
+
+    // A `broadcast_all_does_not_cross_windows` test previously lived here,
+    // asserting `Broadcast::All` in `win_a` never reaches `win_b`'s pane.
+    // Deleted on review: `feed_input`'s `All` arm only ever iterates
+    // `self.panes`, and `Session` holds no reference of any kind to another
+    // `Session` — there is no code change inside `Session` that could make
+    // that assertion fail, so it was proving nothing (the "false assurance"
+    // this project's test standard rules out). The actual guard against
+    // `All` growing `Group`'s cross-window reach is structural (`Session`'s
+    // pure, single-session API has nothing to route through) plus the doc
+    // comments on `Broadcast::All` above and `App::broadcast_group_input` in
+    // `main.rs`, which explicitly has no `All` equivalent.
+
+    /// `paste_to_group` must decide bracketed-paste PER PANE from that
+    /// pane's OWN state — the same load-bearing rule `feed_paste` enforces
+    /// locally (see its doc, and `broadcast_paste_wraps_per_pane_not_per_focus`
+    /// above) — even when the pane lives in a DIFFERENT window/session than
+    /// the one initiating the broadcast paste. Two sibling windows here are
+    /// in OPPOSITE bracketed states, so a "decide once" bug (using the
+    /// broadcasting window's own state, or always/never wrapping) would wrap
+    /// one of them wrong.
+    #[test]
+    fn group_paste_wraps_per_pane_not_per_session() {
+        let (mut win_a, focus_a, _buf_a) = buffered_session(false); // origin window, state irrelevant here
+        win_a.groups.insert(focus_a, 6);
+        win_a.broadcast = Broadcast::Group;
+
+        let (mut win_b, pane_b, buf_b) = buffered_session(false); // sibling: bracketed OFF
+        win_b.groups.insert(pane_b, 6);
+
+        let (mut win_c, pane_c, buf_c) = buffered_session(true); // sibling: bracketed ON
+        win_c.groups.insert(pane_c, 6);
+
+        let group = win_a.group_of(focus_a).expect("focus is grouped");
+        win_b.paste_to_group(group, b"line1\nline2");
+        win_c.paste_to_group(group, b"line1\nline2");
+
+        assert_eq!(&buf_b.borrow()[..], b"line1\nline2", "bracketed-OFF sibling pane must get RAW text");
+        assert_eq!(
+            &buf_c.borrow()[..],
+            b"\x1b[200~line1\nline2\x1b[201~",
+            "bracketed-ON sibling pane must get its OWN bracketed wrap",
         );
     }
 

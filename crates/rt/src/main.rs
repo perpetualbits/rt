@@ -11,16 +11,26 @@
 //! `encode_key` fed to `Session::feed_input` (respecting broadcast mode).
 
 mod backend; // rendering backend abstraction (GL today, XRender in mechanism C)
+#[cfg(not(target_os = "macos"))]
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
+#[cfg(not(target_os = "macos"))]
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
 mod chrome; // native (XRender) chrome: menu/search/manual/instruments draw + hit-test
+#[cfg(not(target_os = "macos"))]
 mod gl_backend; // the default GL backend: wraps render.rs's Renderer + present resources
+#[cfg(not(target_os = "macos"))]
 mod x11_blur; // X11 background blur via _KDE_NET_WM_BLUR_BEHIND_REGION (no-op elsewhere)
-#[cfg(feature = "x11")]
+#[cfg(all(feature = "x11", not(target_os = "macos")))]
 mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
-#[cfg(feature = "x11")]
+#[cfg(all(feature = "x11", not(target_os = "macos")))]
 mod xrender_backend; // mechanism C: XRender backend
-mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
+#[cfg(target_os = "macos")]
+mod vibrancy; // NSVisualEffectView frosted glass (best-effort, like blur.rs)
+#[cfg(target_os = "macos")]
+mod wgpu_backend; // the macOS backend: wgpu/Metal
+#[cfg(target_os = "macos")]
+mod wgpu_text; // glyph atlas + pipeline for wgpu_backend
+mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard / macOS arboard)
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 mod damage; // pure pixel-rect damage accumulator
 mod dragdrop; // pure drop-target resolver for cross-window pane/tab drag-and-drop
@@ -46,12 +56,22 @@ use std::path::{Path, PathBuf}; // fifo paths
 use std::rc::Rc; // shared jacks map
 use std::time::{Duration, Instant}; // frame pacing for async PTY updates
 
+// glutin (GL context/surface setup) is Linux-only: see the target-cfg dependency
+// block in Cargo.toml. The macOS backend (Task 4) uses wgpu instead.
+#[cfg(not(target_os = "macos"))]
 use glutin::config::ConfigTemplateBuilder;
+#[cfg(not(target_os = "macos"))]
 use glutin::context::ContextAttributesBuilder;
+#[cfg(not(target_os = "macos"))]
 use glutin::display::{Display, DisplayApiPreference};
+#[cfg(not(target_os = "macos"))]
 use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, buffer_age, …)
+#[cfg(not(target_os = "macos"))]
 use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::HasDisplayHandle;
+// `window_handle()` is only needed to bind the GL context/surface — Linux-only.
+#[cfg(not(target_os = "macos"))]
+use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::event::{
     ButtonSource, ElementState, Ime, MouseButton, MouseScrollDelta, PointerKind, PointerSource,
@@ -61,14 +81,24 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 // `is_wayland()` / `is_x11()` — which backend winit picked at runtime, so the
 // per-backend window attributes (app_id vs WM_CLASS) go to the right one.
+// winit itself target-gates its `platform::wayland` module to non-Apple unix.
+#[cfg(not(target_os = "macos"))]
 use winit::platform::wayland::ActiveEventLoopExtWayland;
-#[cfg(feature = "x11")]
+// Bare `feature = "x11"` is not enough on its own: the `x11` Cargo feature is
+// ON by default (universal binary) regardless of target, but winit itself
+// target-gates `platform::x11` to non-Apple unix, so on macOS the module does
+// not exist to import even with the feature enabled — hence `not(target_os)`.
+#[cfg(all(feature = "x11", not(target_os = "macos")))]
 use winit::platform::x11::ActiveEventLoopExtX11;
 use winit::cursor::{Cursor, CursorIcon, CustomCursor, CustomCursorSource};
 use winit::monitor::Fullscreen;
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use render::{Color, Renderer};
+use render::Color;
+// `Renderer` (the GL glyph-atlas renderer) is only constructed on the Linux GL
+// path; macOS builds no renderer yet (wgpu backend arrives in Task 4).
+#[cfg(not(target_os = "macos"))]
+use render::Renderer;
 use rt_config::Keymap;
 use rt_core::Rect;
 use rt_engine::TermPane;
@@ -370,7 +400,14 @@ struct Active {
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
     clip_history: clip_history::ClipHistory, // in-memory MRU ring of this session's copies
+    // Both blur mechanisms are Linux-only (Wayland ext-background-effect-v1 /
+    // KWin, and the X11 _KDE_NET_WM_BLUR_BEHIND_REGION property respectively):
+    // `bg_effect`/`x11_blur` modules are target-gated out on macOS, so these
+    // fields don't exist there either. Task 8 (vibrancy.rs) is the macOS
+    // equivalent.
+    #[cfg(not(target_os = "macos"))]
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
+    #[cfg(not(target_os = "macos"))]
     x11_blur: x11_blur::X11Blur,          // X11 background blur (inert on Wayland / no x11 feature)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
@@ -458,7 +495,21 @@ struct Active {
     // stands down entirely: a carry outlives motion, so nothing may reset the
     // shape until the carry ends. Cleared for every window by `cancel_carry`.
     carry_cursor: bool,
-    window: Box<dyn Window>, // the OS window — LAST so it outlives everything that references it on Drop
+    // The OS window — LAST so it outlives everything that references it on
+    // Drop (see the comment at the top of this struct). On macOS it is an
+    // `Arc<dyn Window>` instead of `Box<dyn Window>`: `WgpuBackend::new` (Task
+    // 4) needs a clonable, independently-owned handle to hand to
+    // `wgpu::Instance::create_surface`, whose `Surface<'static>` return type
+    // requires the window target to be `'static`-owned (an `Arc` clone, not a
+    // borrow) — a plain `&dyn Window` borrow would only yield a
+    // lifetime-bound `Surface<'_>`. `Arc`'s shared ownership also makes the
+    // "window must outlive its GPU resources" invariant automatic (refcounted)
+    // rather than order-of-drop-dependent, which is what the Linux/GLX comment
+    // above is compensating for with strict field ordering.
+    #[cfg(target_os = "macos")]
+    window: std::sync::Arc<dyn Window>,
+    #[cfg(not(target_os = "macos"))]
+    window: Box<dyn Window>,
 }
 
 /// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
@@ -768,10 +819,85 @@ fn font_blobs(db: &fontdb::Database, family: &str) -> render::FontBlobs {
     }
 }
 
+// Regular chain: a monospace primary (first match) then coverage fallbacks
+// for ranges DejaVu Sans Mono lacks (e.g. braille). TrueType only (fontdue
+// can't read CFF/OTF); the renderer skips any that fail to parse.
+#[cfg(not(target_os = "macos"))]
+const REGULAR_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    // coverage fallbacks (appended after the primary):
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+];
+// macOS: fontdue reads TrueType only, and most system fonts (incl. Menlo) ship
+// as `.ttc` collections, which are unusable here. Courier New is a complete,
+// self-consistent four-weight TrueType monospace family (regular/bold/italic/
+// bold-italic all share the same advance width), so it is the primary rather
+// than SF Mono — mixing SF Mono (regular) with Courier New (bold/italic) would
+// give the bold/italic faces a different advance width than the grid cell,
+// which is sized from the regular face, and glyphs would overflow their cell.
+// SF Mono is kept as a secondary regular fallback. Apple Braille/Symbol/
+// ZapfDingbats are appended as coverage fallbacks (`.ttc` collections excluded).
+#[cfg(target_os = "macos")]
+const REGULAR_FONTS: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+    // coverage fallbacks (appended after the primary):
+    "/System/Library/Fonts/Apple Braille.ttf",
+    "/System/Library/Fonts/Symbol.ttf",
+    "/System/Library/Fonts/ZapfDingbats.ttf",
+];
+
+// Bold, italic, and bold-italic chains — all optional; each falls back to
+// the regular face when absent.
+#[cfg(not(target_os = "macos"))]
+const BOLD_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+];
+#[cfg(target_os = "macos")]
+const BOLD_FONTS: &[&str] = &["/System/Library/Fonts/Supplemental/Courier New Bold.ttf"];
+
+#[cfg(not(target_os = "macos"))]
+const ITALIC_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+];
+// Courier New Italic first, deliberately: regular/bold are Courier New, and
+// cell_w is derived only from the regular face's advance width (wgpu_text.rs),
+// so italic must stay in the same family or its glyphs can overflow the cell.
+// SF Mono Italic is kept only as a fallback if Courier New Italic is missing.
+#[cfg(target_os = "macos")]
+const ITALIC_FONTS: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Courier New Italic.ttf",
+    "/System/Library/Fonts/SFNSMonoItalic.ttf",
+];
+
+#[cfg(not(target_os = "macos"))]
+const BOLD_ITALIC_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+];
+#[cfg(target_os = "macos")]
+const BOLD_ITALIC_FONTS: &[&str] =
+    &["/System/Library/Fonts/Supplemental/Courier New Bold Italic.ttf"];
+
 /// Locate a monospace font (plus fallback fonts for coverage gaps) on the
 /// system. rt does not ship fonts (to avoid bundling a binary in git); it probes
-/// the usual Linux locations. Returns `[primary, fallback…]` bytes, or `None` if
-/// no primary is found (the app then exits with a helpful message).
+/// the usual Linux locations (macOS: the usual system locations). Returns
+/// `[primary, fallback…]` bytes, or `None` if no primary is found (the app then
+/// exits with a helpful message).
 ///
 /// The fallbacks matter because the usual primary — DejaVu Sans Mono — lacks
 /// some ranges (notably braille U+2800–U+28FF, used by `spiral_stress`). We add
@@ -788,54 +914,13 @@ fn load_fonts() -> Option<render::FontBlobs> {
         }
         out
     };
-    // Regular chain: a monospace primary (first match) then coverage fallbacks
-    // for ranges DejaVu Sans Mono lacks (e.g. braille). TrueType only (fontdue
-    // can't read CFF/OTF); the renderer skips any that fail to parse.
-    let regular = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-            // coverage fallbacks (appended after the primary):
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-        ],
-        "regular",
-    );
+    let regular = load(REGULAR_FONTS, "regular");
     if regular.is_empty() {
         return None; // no primary → the app cannot render text
     }
-    // Bold, italic, and bold-italic chains — all optional; each falls back to
-    // the regular face when absent.
-    let bold = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ],
-        "bold",
-    );
-    let italic = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
-        ],
-        "italic",
-    );
-    let bold_italic = load(
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
-        ],
-        "bold-italic",
-    );
+    let bold = load(BOLD_FONTS, "bold");
+    let italic = load(ITALIC_FONTS, "italic");
+    let bold_italic = load(BOLD_ITALIC_FONTS, "bold-italic");
     Some(render::FontBlobs { regular, bold, italic, bold_italic })
 }
 
@@ -887,9 +972,21 @@ impl App {
         // cell without a GL context (the renderer doesn't exist yet).
         // Only the FIRST window: an extra window opened at runtime should get
         // the default size, not re-apply a benchmark harness's exact grid.
+        // HiDPI: `settings.font_size` is a LOGICAL size (what the user configured
+        // or passed via --font-size); every place that turns it into a PHYSICAL
+        // pixel count for the rasteriser must scale it by the display's scale
+        // factor, via `physical_font_px` (defined below, next to
+        // `window_size_for_grid`). The window doesn't exist yet here, so there is
+        // no `window.scale_factor()` to read; the primary monitor's factor is the
+        // best available estimate for this PRE-SIZING measurement only (it just
+        // seeds the initial window's --cols/--rows geometry — once the window
+        // exists, `window.scale_factor()` below is the authoritative value used
+        // for the actual renderer/backend). Falls back to 1.0 (unscaled, today's
+        // behaviour) when there is no monitor info yet.
+        let pre_size_scale = event_loop.primary_monitor().map(|m| m.scale_factor()).unwrap_or(1.0);
         let initial_size: winit::dpi::Size = match (self.cli.cols, self.cli.rows) {
             (Some(cols), Some(rows)) if self.windows.is_empty() && cols > 0 && rows > 0 => {
-                let cell = render::cell_size_for(&font_blobs, settings.font_size);
+                let cell = render::cell_size_for(&font_blobs, physical_font_px(settings.font_size, pre_size_scale));
                 window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
             }
             _ => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
@@ -915,73 +1012,86 @@ impl App {
         // created with the config's visual (see the transparency note below) and
         // a window's visual cannot be changed afterwards. On Wayland the order
         // is free, so one sequence serves both.
-        let raw_display = match event_loop.display_handle() {
-            Ok(h) => h.as_raw(),
-            Err(e) => {
-                log::error!("no display handle: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        // EGL is the path on Wayland and the preferred one on X11; the X11 build
-        // keeps GLX as a fallback for servers without the EGL platform extension,
-        // which is what glutin-winit's default preference gave us.
-        #[cfg(not(feature = "x11"))]
-        let api_preference = DisplayApiPreference::Egl;
-        #[cfg(feature = "x11")]
-        let api_preference = DisplayApiPreference::EglThenGlx(Box::new(
-            winit::platform::x11::register_xlib_error_hook,
-        ));
-        let gl_display = match unsafe { Display::new(raw_display, api_preference) } {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("failed to open the GL display: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
+        //
+        // Linux-only: `glutin` isn't even a dependency on macOS (see Cargo.toml),
+        // and opening a GL display doesn't apply there — Task 4 brings a
+        // wgpu/Metal backend instead. `gl_display`/`gl_config` feed the
+        // context/surface band below.
+        #[cfg(not(target_os = "macos"))]
+        let (gl_display, gl_config) = {
+            let raw_display = match event_loop.display_handle() {
+                Ok(h) => h.as_raw(),
+                Err(e) => {
+                    log::error!("no display handle: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            // EGL is the path on Wayland and the preferred one on X11; the X11 build
+            // keeps GLX as a fallback for servers without the EGL platform extension,
+            // which is what glutin-winit's default preference gave us.
+            #[cfg(not(feature = "x11"))]
+            let api_preference = DisplayApiPreference::Egl;
+            #[cfg(feature = "x11")]
+            let api_preference = DisplayApiPreference::EglThenGlx(Box::new(
+                winit::platform::x11::register_xlib_error_hook,
+            ));
+            let gl_display = match unsafe { Display::new(raw_display, api_preference) } {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("failed to open the GL display: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
 
-        let template = ConfigTemplateBuilder::new().with_alpha_size(8).build(); // want an alpha channel
-        let configs = match unsafe { gl_display.find_configs(template) } {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("no GL configs: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        let gl_config = configs.reduce(|a, b| {
-            // Prefer a config whose X11 VISUAL supports transparency, before any
-            // other criterion. On X11 the WINDOW's visual — not the GL drawable's
-            // alpha_size — decides transparency: a config can report alpha_size 8
-            // yet have a 24-bit visual, giving an OPAQUE window (background_opacity
-            // is then silently dropped over ssh -X). supports_transparency() is
-            // Some(true) only when the config's native visual is 32-bit ARGB, which
-            // is what a translucent window over Xwayland needs. Native Wayland
-            // already reports transparency-capable configs, so this is a no-op
-            // there; and where no such config exists (bare X, no compositor) we
-            // fall through to the alpha/sample preference and stay 24-bit.
-            let (at, bt) = (
-                a.supports_transparency().unwrap_or(false),
-                b.supports_transparency().unwrap_or(false),
-            );
-            if at != bt {
-                return if bt { b } else { a }; // the transparency-capable one wins
-            }
-            // Tie on transparency: prefer more alpha, then more samples.
-            let better_alpha = b.alpha_size() > a.alpha_size();
-            let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
-            if better_alpha || same_more_samples { b } else { a }
-        });
-        let gl_config = match gl_config {
-            Some(c) => c,
-            None => {
-                log::error!("no GL config matched the template");
-                return self.fail_build(event_loop);
-            }
+            let template = ConfigTemplateBuilder::new().with_alpha_size(8).build(); // want an alpha channel
+            let configs = match unsafe { gl_display.find_configs(template) } {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("no GL configs: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            let gl_config = configs.reduce(|a, b| {
+                // Prefer a config whose X11 VISUAL supports transparency, before any
+                // other criterion. On X11 the WINDOW's visual — not the GL drawable's
+                // alpha_size — decides transparency: a config can report alpha_size 8
+                // yet have a 24-bit visual, giving an OPAQUE window (background_opacity
+                // is then silently dropped over ssh -X). supports_transparency() is
+                // Some(true) only when the config's native visual is 32-bit ARGB, which
+                // is what a translucent window over Xwayland needs. Native Wayland
+                // already reports transparency-capable configs, so this is a no-op
+                // there; and where no such config exists (bare X, no compositor) we
+                // fall through to the alpha/sample preference and stay 24-bit.
+                let (at, bt) = (
+                    a.supports_transparency().unwrap_or(false),
+                    b.supports_transparency().unwrap_or(false),
+                );
+                if at != bt {
+                    return if bt { b } else { a }; // the transparency-capable one wins
+                }
+                // Tie on transparency: prefer more alpha, then more samples.
+                let better_alpha = b.alpha_size() > a.alpha_size();
+                let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
+                if better_alpha || same_more_samples { b } else { a }
+            });
+            let gl_config = match gl_config {
+                Some(c) => c,
+                None => {
+                    log::error!("no GL config matched the template");
+                    return self.fail_build(event_loop);
+                }
+            };
+            (gl_display, gl_config)
         };
 
         // --- per-backend window attributes -------------------------------
         // The X11 arm also pins the window to the chosen config's visual, which
-        // is the whole reason the config had to be picked first.
-        #[cfg(feature = "x11")]
+        // is the whole reason the config had to be picked first. `not(target_os
+        // = "macos")` is required alongside `feature = "x11"` here: the `x11`
+        // feature is on by default (universal binary) independent of target, so
+        // without it this arm would still be compiled on macOS, where there is
+        // no `gl_config` (and no glutin) to pull a visual from.
+        #[cfg(all(feature = "x11", not(target_os = "macos")))]
         if event_loop.is_x11() {
             use glutin::platform::x11::X11GlConfigExt;
             let mut x11_attrs =
@@ -991,6 +1101,7 @@ impl App {
             }
             window_attrs = window_attrs.with_platform_attributes(Box::new(x11_attrs));
         }
+        #[cfg(not(target_os = "macos"))]
         if event_loop.is_wayland() {
             window_attrs = window_attrs.with_platform_attributes(Box::new(
                 winit::platform::wayland::WindowAttributesWayland::default()
@@ -1005,74 +1116,116 @@ impl App {
                 return self.fail_build(event_loop);
             }
         };
+        // HiDPI: the authoritative scale factor for this window (1.0 on every
+        // Linux setup so far; 2.0 on a Retina Mac). Used below to turn
+        // `settings.font_size` (LOGICAL) into the PHYSICAL pixel size handed to
+        // the renderer/backend — see `physical_font_px`. All LAYOUT stays in
+        // physical pixels exactly as before; only the font rasterisation size is
+        // scaled, so cell metrics (and everything measured from them: instrument
+        // discs, jack ports, cursors, borders) come out the same APPARENT size on
+        // a 2x display as on a 1x one.
+        let scale_factor = window.scale_factor();
 
         // --- create the GL context and surface ---------------------------
-        // Raw handle needed to bind the context and surface to this window.
-        let raw_handle = match window.window_handle() {
-            Ok(h) => h.as_raw(),
-            Err(e) => {
-                log::error!("no window handle: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        let context_attrs = ContextAttributesBuilder::new().build(Some(raw_handle));
-        // Create a not-yet-current context, then a surface, then make current.
-        let not_current = match unsafe { gl_display.create_context(&gl_config, &context_attrs) } {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("GL context creation failed: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        // Build the window surface at the window's current size. `max(1)` because
-        // a zero-sized surface is not representable (and a compositor may hand us
-        // a 0-height window while it is still being mapped).
-        let surface_size = window.surface_size();
-        let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            raw_handle,
-            NonZeroU32::new(surface_size.width.max(1)).expect("max(1) is non-zero"),
-            NonZeroU32::new(surface_size.height.max(1)).expect("max(1) is non-zero"),
-        );
-        let surface = match unsafe { gl_display.create_window_surface(&gl_config, &attrs) } {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("GL surface creation failed: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
-        // Make the context current on the surface so GL calls target it.
-        let context = match not_current.make_current(&surface) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("make_current failed: {e}");
-                return self.fail_build(event_loop);
-            }
-        };
+        // Linux-only, like the display/config band above: no `gl_display`/
+        // `gl_config` exist on macOS to create a context or surface from, and
+        // `Renderer` (render.rs) needs a live `glow::Context`, which here is
+        // loaded through `gl_display.get_proc_address` — also glutin. `renderer`,
+        // `surface` and `context` feed the (already macOS/Linux-split) backend
+        // construction further down, and `renderer` also feeds the cell-size
+        // measurement just below.
+        #[cfg(not(target_os = "macos"))]
+        let (mut renderer, surface, context) = {
+            // Raw handle needed to bind the context and surface to this window.
+            let raw_handle = match window.window_handle() {
+                Ok(h) => h.as_raw(),
+                Err(e) => {
+                    log::error!("no window handle: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            let context_attrs = ContextAttributesBuilder::new().build(Some(raw_handle));
+            // Create a not-yet-current context, then a surface, then make current.
+            let not_current = match unsafe { gl_display.create_context(&gl_config, &context_attrs) } {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("GL context creation failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            // Build the window surface at the window's current size. `max(1)` because
+            // a zero-sized surface is not representable (and a compositor may hand us
+            // a 0-height window while it is still being mapped).
+            let surface_size = window.surface_size();
+            let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+                raw_handle,
+                NonZeroU32::new(surface_size.width.max(1)).expect("max(1) is non-zero"),
+                NonZeroU32::new(surface_size.height.max(1)).expect("max(1) is non-zero"),
+            );
+            let surface = match unsafe { gl_display.create_window_surface(&gl_config, &attrs) } {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("GL surface creation failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            // Make the context current on the surface so GL calls target it.
+            let context = match not_current.make_current(&surface) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("make_current failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
 
-        // --- load GL function pointers into glow -------------------------
-        // Wrapped in an Arc (the renderer keeps a clone of the live GL context).
-        let gl = std::sync::Arc::new(unsafe {
-            glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
-        });
+            // --- load GL function pointers into glow ----------------------
+            // Wrapped in an Arc (the renderer keeps a clone of the live GL context).
+            let gl = std::sync::Arc::new(unsafe {
+                glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
+            });
 
-        // --- build the renderer ------------------------------------------
-        let mut renderer = match Renderer::new(gl.clone(), &font_blobs, settings.font_size) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("renderer init failed: {e}");
-                return self.fail_build(event_loop);
-            }
+            // --- build the renderer -----------------------------------------
+            let renderer = match Renderer::new(gl.clone(), &font_blobs, physical_font_px(settings.font_size, scale_factor)) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("renderer init failed: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
+            (renderer, surface, context)
         };
         // Ask KWin to blur behind us (true background blur on KDE). No-op
         // elsewhere (COSMIC/GNOME/sway use the ext protocol below, or nothing).
+        // Both blur mechanisms are Linux-only (see the `Active::bg_effect`/
+        // `x11_blur` field comment); `vibrancy.rs` is the macOS equivalent,
+        // installed just below.
+        #[cfg(not(target_os = "macos"))]
         blur::try_enable_kwin_blur(window.as_ref());
+        // macOS frosted glass, as a fallback chain:
+        //   1. a public NSVisualEffectView under the content view (vibrancy,
+        //      material, light/dark adaptation — the look Apple ships);
+        //   2. winit's set_blur(), i.e. the PRIVATE CGSSetWindowBackgroundBlurRadius
+        //      at a hardcoded radius 80: a plain gaussian backdrop blur, no
+        //      vibrancy and no adaptation, but better than nothing;
+        //   3. plain transparency, which already works and needs no call.
+        // Only one of 1/2 is applied, so what the user sees identifies which
+        // path ran (the log line says so too). Unconditional, not gated on
+        // `want_blur`: the glass is simply invisible at opacity 1.0, and there
+        // is then nothing to re-apply when the opacity slider moves.
+        #[cfg(target_os = "macos")]
+        if !vibrancy::try_enable(window.as_ref()) {
+            log::info!("NSVisualEffectView unavailable; falling back to winit's window blur");
+            window.set_blur(true);
+        }
         // Cross-compositor blur via the ext-background-effect-v1 staging protocol
         // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
         // translucent — blur behind an opaque surface is wasted compositor work.
         // None on compositors without the protocol (the window is just translucent).
+        #[cfg(not(target_os = "macos"))]
         let bg_effect = bg_effect::BackgroundEffect::try_init(window.as_ref(), want_blur(&settings));
         // X11 counterpart: the _KDE_NET_WM_BLUR_BEHIND_REGION property (KWin-X11,
         // picom). Inert on Wayland and on a no-x11 build.
+        #[cfg(not(target_os = "macos"))]
         let x11_blur = x11_blur::X11Blur::try_init(window.as_ref(), want_blur(&settings));
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
@@ -1104,8 +1257,15 @@ impl App {
 
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.surface_size(); // physical pixel size
+        #[cfg(not(target_os = "macos"))]
         renderer.resize(size.width as f32, size.height as f32);
+        #[cfg(not(target_os = "macos"))]
         let cell = renderer.cell_size(); // (cell_w, cell_h) in pixels
+        // No renderer exists yet on macOS (wgpu backend arrives in Task 4); measure
+        // the cell straight from font metrics, the same GL-free helper used above
+        // for the `--cols`/`--rows` pre-sizing calculation.
+        #[cfg(target_os = "macos")]
+        let cell = render::cell_size_for(&font_blobs, physical_font_px(settings.font_size, scale_factor));
 
         // --- build the session with real PTY panes -----------------------
         let bounds = content_bounds(size);
@@ -1191,7 +1351,12 @@ impl App {
         // only, so an extra window opened at runtime never re-applies them.)
 
         // Store the fully-initialised state and paint once.
+        #[cfg(not(target_os = "macos"))]
         let low_power = renderer.is_software(); // read before `renderer` is moved in
+        // No renderer exists yet on macOS (wgpu backend arrives in Task 4), so
+        // there is nothing to judge software-vs-hardware yet either.
+        #[cfg(target_os = "macos")]
+        let low_power = false;
         // Decide which backend *would* be used: a local unix-socket $DISPLAY (or
         // Wayland) keeps the existing GL path; a TCP/forwarded $DISPLAY (`ssh -X`
         // → `localhost:10.x`) picks XRender for mechanism C — unless overridden by
@@ -1208,6 +1373,7 @@ impl App {
         // the default backend. `&window` is borrowed here, before it moves into
         // `Active` below. XRender is not yet wired (Task 3): `GlBackend` is built
         // unconditionally, even when `backend_kind` is `XRender`.
+        #[cfg(not(target_os = "macos"))]
         let backend: Box<dyn backend::Backend> = {
             // Mechanism C: on the XRender path, build the command-based backend
             // that draws into this X11 window via x11rb (no GL used at render
@@ -1217,7 +1383,7 @@ impl App {
             #[cfg(feature = "x11")]
             let xr: Option<Box<dyn backend::Backend>> =
                 if matches!(backend_kind, backend::BackendKind::XRender) {
-                    xrender_backend::XRenderBackend::try_new(window.as_ref(), &font_blobs, settings.font_size)
+                    xrender_backend::XRenderBackend::try_new(window.as_ref(), &font_blobs, physical_font_px(settings.font_size, scale_factor))
                         .map(|b| Box::new(b) as Box<dyn backend::Backend>)
                 } else {
                     None
@@ -1226,6 +1392,29 @@ impl App {
             let xr: Option<Box<dyn backend::Backend>> = None;
             xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, window.as_ref())))
         };
+        // wgpu/Metal backend (Task 4). `window` here is still the plain
+        // `Box<dyn Window>` returned by `event_loop.create_window` above; it is
+        // converted to an `Arc<dyn Window>` (shadowing the binding) because
+        // `wgpu::Instance::create_surface` needs an owned, clonable handle to
+        // produce a `Surface<'static>` (see the field comment on `Active::window`
+        // for why). The `Arc` — not a fresh Box — is what then gets stored in
+        // `Active` below, so the surface and the window share the same
+        // allocation for the rest of their lives.
+        #[cfg(target_os = "macos")]
+        let window: std::sync::Arc<dyn Window> = std::sync::Arc::from(window);
+        // Route construction failure through `fail_build`, same as the Linux
+        // display-handle/GL-context failures above (e.g. the `display_handle()`
+        // arm): log it and hand back `None` rather than panicking. A macOS user
+        // then gets rt's normal failure reporting instead of a panic backtrace.
+        #[cfg(target_os = "macos")]
+        let backend: Box<dyn backend::Backend> =
+            match wgpu_backend::WgpuBackend::new(window.clone(), &font_blobs, physical_font_px(settings.font_size, scale_factor)) {
+                Ok(b) => Box::new(b),
+                Err(e) => {
+                    log::error!("wgpu backend: {e}");
+                    return self.fail_build(event_loop);
+                }
+            };
         let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
         Some(Active {
             window,
@@ -1245,7 +1434,9 @@ impl App {
             ime_preedit: false,
             clipboard,
             clip_history: clip_history::ClipHistory::new(),
+            #[cfg(not(target_os = "macos"))]
             bg_effect,
+            #[cfg(not(target_os = "macos"))]
             x11_blur,
             selection: None,
             selecting: false,
@@ -1922,19 +2113,19 @@ impl ApplicationHandler for App {
                                     if let Some(a) =
                                         rows.into_iter().nth(i).and_then(|r| r.action)
                                     {
-                                        let cmd = match a.into_pick() {
+                                        let (cmd, group_echo) = match a.into_pick() {
                                             menu::MenuPick::Do(act) => {
                                                 Self::apply_action(active, act)
                                             }
                                             menu::MenuPick::OpenUrl(u) => {
                                                 Self::open_url(&u);
-                                                WindowCmd::None
+                                                (WindowCmd::None, None)
                                             }
                                             menu::MenuPick::CopyUrl(u) => {
                                                 if let Some(cb) = &active.clipboard {
                                                     cb.store(u);
                                                 }
-                                                WindowCmd::None
+                                                (WindowCmd::None, None)
                                             }
                                             // Index into the snapshot taken when the
                                             // menu opened — stale-safe: an out-of-
@@ -1946,13 +2137,13 @@ impl ApplicationHandler for App {
                                             // is caught by `move_pane_to_window`.
                                             menu::MenuPick::MoveToWindow(i) => {
                                                 match active.menu_windows.get(i).copied() {
-                                                    Some(target) => WindowCmd::MoveToWindow(target),
+                                                    Some(target) => (WindowCmd::MoveToWindow(target), None),
                                                     None => {
                                                         log::debug!(
                                                             "move-to-window: menu index {i} out of range ({} targets)",
                                                             active.menu_windows.len()
                                                         );
-                                                        WindowCmd::None
+                                                        (WindowCmd::None, None)
                                                     }
                                                 }
                                             }
@@ -1963,6 +2154,9 @@ impl ApplicationHandler for App {
                                         // The `active` borrow ends here; window-
                                         // level commands re-borrow via &mut self.
                                         self.run_window_cmd(event_loop, id, cmd);
+                                        if let Some((grp, bytes)) = group_echo {
+                                            self.broadcast_group_paste(id, grp, &bytes);
+                                        }
                                     }
                                 }
                             }
@@ -2007,7 +2201,11 @@ impl ApplicationHandler for App {
                             active.force_full = true;
                             active.window.request_redraw();
                         }
-                        Key::Named(NamedKey::Enter) => Self::pick_clip(active, sel),
+                        Key::Named(NamedKey::Enter) => {
+                            if let Some((grp, bytes)) = Self::pick_clip(active, sel) {
+                                self.broadcast_group_paste(id, grp, &bytes);
+                            }
+                        }
                         Key::Named(NamedKey::ArrowDown) => {
                             active.clip_overlay = Some((sel + 1).min(g.clear_row));
                             active.force_full = true;
@@ -2035,7 +2233,11 @@ impl ApplicationHandler for App {
                     if ptr_button == Some(MouseButton::Left) =>
                 {
                     match chrome::clip_history::hit_row(&g, active.mouse) {
-                        Some(i) => Self::pick_clip(active, i),
+                        Some(i) => {
+                            if let Some((grp, bytes)) = Self::pick_clip(active, i) {
+                                self.broadcast_group_paste(id, grp, &bytes);
+                            }
+                        }
                         None => {
                             // click outside
                             active.clip_overlay = None;
@@ -2125,6 +2327,11 @@ impl ApplicationHandler for App {
                     active.ime_preedit = false; // composition finished
                     if !text.is_empty() {
                         active.session.feed_input(text.as_bytes()); // send the composed text (e.g. "ó")
+                        // `Group` also reaches matching panes in every OTHER
+                        // window — see `App::broadcast_group_input`'s doc.
+                        if let Some(g) = Self::group_echo(active) {
+                            self.broadcast_group_input(id, g, text.as_bytes());
+                        }
                     }
                 }
                 Ime::Preedit(text, _cursor) => {
@@ -2897,6 +3104,11 @@ impl ApplicationHandler for App {
                         if let Ok(text) = cb.load_primary() {
                             if !text.is_empty() {
                                 active.session.feed_input(text.as_bytes());
+                                // `Group` also reaches matching panes in every
+                                // OTHER window — see `broadcast_group_input`.
+                                if let Some(g) = Self::group_echo(active) {
+                                    self.broadcast_group_input(id, g, text.as_bytes());
+                                }
                             }
                         }
                     }
@@ -2912,6 +3124,29 @@ impl ApplicationHandler for App {
             // Time to paint.
             WindowEvent::RedrawRequested => {
                 self.redraw(id);
+            }
+
+            // HiDPI: the window moved to a display with a different scale factor
+            // (e.g. dragged from a Retina panel to an external 1x monitor, or
+            // back). Deliberately NOT wired to a live re-scale here: doing that
+            // correctly means re-measuring the cell, resizing the backend and
+            // relayout-ing the session (the same work `refresh_fonts` does), and
+            // that interacts with the deferred-resize/settle machinery
+            // (`surface_pending`/`RESIZE_SETTLE`) that this same event usually
+            // fires alongside — a combination that can't be verified without a
+            // real multi-monitor Retina setup, which this task explicitly forbids
+            // launching a GUI to test against. So: logged (never silently
+            // dropped), and cell metrics stay at the previous scale until the
+            // user next triggers a font reload (zoom in/out/reset, or opening
+            // Preferences) — `refresh_fonts` reads `window.scale_factor()` FRESH
+            // each time (see its comment), so that next reload self-heals to the
+            // new display's scale rather than staying wrong indefinitely.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                log::info!(
+                    "scale factor changed to {scale_factor}; cell metrics stay at the \
+                     previous scale until fonts are next reloaded (zoom, Preferences, \
+                     or a restart)"
+                );
             }
 
             _ => {} // ignore the many other window events for now
@@ -3155,6 +3390,7 @@ impl App {
                     active.backend.resize_surface(w, h); // back buffer + instrument layer
                 }
                 active.backend.resize(size.width as f32, size.height as f32); // viewport
+                #[cfg(not(target_os = "macos"))]
                 if let Some(fx) = &mut active.bg_effect {
                     fx.on_resize(size.width, size.height); // blur region follows the surface
                 }
@@ -4080,6 +4316,88 @@ impl App {
         t.wires.extend(travelling);
     }
 
+    /// If `active`'s window is in `Broadcast::Group` with a GROUPED focus,
+    /// the group id to also broadcast to sibling windows — `None` otherwise.
+    /// That covers `Off`/`All` (unaffected: `Session::feed_input`/
+    /// `feed_paste` already do the right window-local thing for them) AND
+    /// the "focus has no group" case under `Group`, which is today's "just
+    /// me" and must stay that way — `Session::group_of` returning `None` is
+    /// exactly what makes that fall through to `None` here too, so nothing
+    /// extra is delivered and the caller's ordinary local
+    /// `feed_input`/`feed_paste` call is the only thing that ran.
+    fn group_echo(active: &Active) -> Option<u32> {
+        match active.session.broadcast() {
+            Broadcast::Group => active.session.group_of(active.session.focus()),
+            _ => None,
+        }
+    }
+
+    /// Which windows a `Broadcast::Group` fan-out from `from` should reach:
+    /// every OPEN window in `all` EXCEPT `from` itself. Pure and independent
+    /// of `Active`/`Session`/`self` on purpose — this is the ONE decision
+    /// that keeps a keystroke from reaching the focused pane twice (see
+    /// `broadcast_group_input`'s doc for why), and a pure function over
+    /// plain `WindowId`s is what lets a test break exactly this line and
+    /// watch it fail, instead of resting on a careful reading of a loop
+    /// buried inside an `&self` method that also does the I/O.
+    ///
+    /// `from` is excluded deliberately, not incidentally: every call site
+    /// already delivers to `from`'s own local group members (including the
+    /// focused pane itself) via the ordinary, UNCHANGED
+    /// `Session::feed_input`/`feed_paste` call it makes first — see
+    /// `group_echo`'s doc, which every call site consults before calling
+    /// `broadcast_group_input`/`_paste`. Targeting `from` again here too
+    /// would deliver the SAME keystroke to the SAME focused pane a second
+    /// time — a double-delivered keystroke is a visible, infuriating bug,
+    /// and this exclusion is precisely what prevents it (not any property of
+    /// `PaneId`, since that's a process-wide counter and would make a double
+    /// local+cross write to the origin window just as possible as a
+    /// cross-window one).
+    ///
+    /// Order is whatever `all`'s iteration order is (today, a `HashMap`'s,
+    /// same as the pre-existing `Broadcast::All` fan-out) — unspecified, and
+    /// this makes no attempt to fix that; it only removes `from`.
+    fn group_broadcast_targets(from: WindowId, all: impl Iterator<Item = WindowId>) -> Vec<WindowId> {
+        all.filter(|&w| w != from).collect()
+    }
+
+    /// The cross-window half of `Broadcast::Group` delivery: reach the
+    /// matching panes of every window `group_broadcast_targets` names.
+    /// `Session` stays pure — it only ever knows its own panes
+    /// (`Session::write_to_group`) — so `App` does the walk across
+    /// `self.windows`, exactly like `migrate_pane_extras` above already does
+    /// for a moved pane's wires and jacks.
+    ///
+    /// `Broadcast::All` deliberately gets NO equivalent of this method:
+    /// "every pane in every window" is a blast radius the typist can't see,
+    /// so `All` stays scoped to `feed_input`'s existing per-window fan-out —
+    /// do not "fix" that into matching `Group`'s reach.
+    ///
+    /// In-process only: a pane can be handed to a DIFFERENT rt process
+    /// (`PanePackage`/`adopt`, see `migrate_pane_extras`'s neighbourhood);
+    /// a group spanning processes would need that handoff protocol to also
+    /// carry live delivery (a new IPC path) — out of scope here.
+    fn broadcast_group_input(&self, from: WindowId, group: u32, bytes: &[u8]) {
+        for wid in Self::group_broadcast_targets(from, self.windows.keys().copied()) {
+            if let Some(w) = self.windows.get(&wid) {
+                w.session.write_to_group(group, bytes);
+            }
+        }
+    }
+
+    /// Paste equivalent of [`broadcast_group_input`](Self::broadcast_group_input):
+    /// same targeting, same reasoning — see its doc. Uses
+    /// `Session::paste_to_group` so each sibling window's panes still get
+    /// the per-pane bracketed-paste decision `feed_paste`'s doc comment
+    /// records as load-bearing, unchanged by crossing windows.
+    fn broadcast_group_paste(&self, from: WindowId, group: u32, text: &[u8]) {
+        for wid in Self::group_broadcast_targets(from, self.windows.keys().copied()) {
+            if let Some(w) = self.windows.get(&wid) {
+                w.session.paste_to_group(group, text);
+            }
+        }
+    }
+
     /// Wipe one window's per-frame drag cues and repaint it. Only the window's
     /// half of a cancel — the App-level `drag`/`armed_drag` are the caller's to
     /// clear (they are unreachable through `&mut Active`).
@@ -4471,18 +4789,29 @@ impl App {
         }
     }
 
-    fn apply_action(active: &mut Active, action: rt_config::Action) -> WindowCmd {
+    /// The second element of the return is the same group-echo `do_paste`
+    /// returns (group id + raw text to ALSO broadcast to sibling windows) —
+    /// see its doc. Returned rather than taken as an out-parameter
+    /// (`&mut Option<...>`, the first cut of this) SPECIFICALLY because an
+    /// out-parameter is silent to forget: a caller that stops reading it
+    /// loses cross-window paste with no compile error. A second return value
+    /// forces both call sites to destructure it. The caller applies it via
+    /// `App::broadcast_group_paste` once `active`'s borrow has ended (this
+    /// free fn only has `&mut Active`, not `&mut self`, so it cannot reach
+    /// other windows itself).
+    fn apply_action(active: &mut Active, action: rt_config::Action) -> (WindowCmd, Option<(u32, Vec<u8>)>) {
         use rt_config::Action;
+        let mut group_echo: Option<(u32, Vec<u8>)> = None;
         match action {
             // Window-owner level actions: this window's Active can't create or
             // close OS windows, so hand the request up to run_window_cmd.
-            Action::NewWindow => return WindowCmd::NewWindow,
-            Action::DetachPane => return WindowCmd::DetachPane,
-            Action::DetachTab => return WindowCmd::DetachTab,
+            Action::NewWindow => return (WindowCmd::NewWindow, None),
+            Action::DetachPane => return (WindowCmd::DetachPane, None),
+            Action::DetachTab => return (WindowCmd::DetachTab, None),
             // Carry mode: picking up needs the event loop (to build the cursor
             // card) and every window (they all wear it), so it goes up too.
-            Action::PickUpPane => return WindowCmd::PickUpPane,
-            Action::PickUpTab => return WindowCmd::PickUpTab,
+            Action::PickUpPane => return (WindowCmd::PickUpPane, None),
+            Action::PickUpTab => return (WindowCmd::PickUpTab, None),
             // Reorder the focused tab within its strip (Terminator's move_tab).
             Action::MoveTabLeft => Self::move_focused_tab(active, -1),
             Action::MoveTabRight => Self::move_focused_tab(active, 1),
@@ -4601,9 +4930,9 @@ impl App {
                 // Last pane closed: the whole window goes. The App level
                 // decides whether that ends the process (last window) or just
                 // drops this window (close_window).
-                Some(SessionEvent::CloseWindow) => return WindowCmd::CloseWindow,
+                Some(SessionEvent::CloseWindow) => return (WindowCmd::CloseWindow, None),
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
-                Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
+                Some(SessionEvent::Paste) => group_echo = Self::do_paste(active), // clipboard → focused PTY
                 Some(SessionEvent::Redraw) => {
                     // A session action that changed what's on screen — a tab
                     // switch, split, zoom, rotate, columns, etc. These change the
@@ -4618,7 +4947,7 @@ impl App {
                 None => {}
             },
         }
-        WindowCmd::None
+        (WindowCmd::None, group_echo)
     }
 
     /// Move the focused tab one slot left/right within its strip (`delta` = ±1,
@@ -4643,8 +4972,15 @@ impl App {
     }
 
     /// Paste the clipboard's text into the focused pane(s). No-op if the
-    /// clipboard is empty/unavailable.
-    fn do_paste(active: &mut Active) {
+    /// clipboard is empty/unavailable. Returns the group id + raw text to
+    /// ALSO broadcast to sibling windows when this window is in `Group` mode
+    /// with a grouped focus — `feed_paste` below only ever reaches this
+    /// window's own panes (`Session` stays pure; see `write_to_group`'s doc),
+    /// so the caller (which has `&mut self`, unlike this free fn) is the one
+    /// that can reach every window — see `App::broadcast_group_paste`.
+    /// `None` otherwise, including the "focus has no group" case, which
+    /// stays "just me" exactly as before.
+    fn do_paste(active: &mut Active) -> Option<(u32, Vec<u8>)> {
         if let Some(cb) = &active.clipboard {
             if let Ok(text) = cb.load() {
                 if !text.is_empty() {
@@ -4655,9 +4991,11 @@ impl App {
                     // `feed_paste` also strips embedded end-markers (paste-injection guard)
                     // and respects the broadcast mode.
                     active.session.feed_paste(text.as_bytes());
+                    return Self::group_echo(active).map(|g| (g, text.into_bytes()));
                 }
             }
         }
+        None
     }
 
     /// Copy the current selection to the clipboard (and PRIMARY for middle-click
@@ -4694,14 +5032,18 @@ impl App {
 
     /// Act on a picked overlay row: the Clear row empties the history; a clip row
     /// pastes that clip into the focused pane, promotes it to CLIPBOARD+PRIMARY,
-    /// and moves it to the front. Always closes the overlay.
-    fn pick_clip(active: &mut Active, row: usize) {
+    /// and moves it to the front. Always closes the overlay. Returns the same
+    /// group-echo (group id + raw text) as `do_paste`, for the same reason —
+    /// see its doc.
+    fn pick_clip(active: &mut Active, row: usize) -> Option<(u32, Vec<u8>)> {
         let n = active.clip_history.len();
+        let mut echo = None;
         if row >= n {
             // the Clear row
             active.clip_history.clear();
         } else if let Some(text) = active.clip_history.get(row).map(str::to_string) {
             active.session.feed_paste(text.as_bytes()); // per-pane bracketed paste
+            echo = Self::group_echo(active).map(|g| (g, text.clone().into_bytes()));
             if let Some(cb) = &active.clipboard {
                 cb.store(text.clone());
                 cb.store_primary(text.clone());
@@ -4711,6 +5053,7 @@ impl App {
         active.clip_overlay = None;
         active.force_full = true;
         active.window.request_redraw();
+        echo
     }
 
     /// Extract the selected text from its pane's grid, row by row, trimming
@@ -5224,7 +5567,16 @@ impl App {
         if family_changed {
             active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
         }
-        let px = active.settings.font_size;
+        // HiDPI: read the window's CURRENT scale factor fresh (never cached),
+        // same helper and same source as `build_active` uses for the initial
+        // load — that consistency is what stops the window changing apparent
+        // size just from opening Preferences or hitting zoom. Reading it fresh
+        // here (rather than from a field captured once at startup) also means
+        // that if the window was dragged to a display with a different scale
+        // factor since startup, the very next font reload (zoom, Preferences)
+        // picks up the new value — see the `ScaleFactorChanged` handler in
+        // `window_event` for why that's not done proactively.
+        let px = physical_font_px(active.settings.font_size, active.window.scale_factor());
         match active.backend.reload_fonts(&active.font_blobs, px) {
             Ok(()) => {
                 let cell = active.backend.cell_size(); // new cell metrics
@@ -5322,12 +5674,19 @@ impl App {
         let mods = active.mods; // current modifier state
         // Is this chord bound to an rt action?
         if let Some(chord) = input::chord_from_winit(&key_event.logical_key, mods) {
-            if let Some(action) = active.keymap.action_for(&chord) {
-                let cmd = Self::apply_action(active, action); // shared with the menu
-                // The `active` borrow ends here; window-level commands (close/
-                // new window/detach) re-borrow the map via &mut self.
-                self.run_window_cmd(event_loop, id, cmd);
-                return; // consumed
+            match active.keymap.action_for(&chord) {
+                Some(action) => {
+                    log::debug!("keymap: chord={chord:?} -> action={action:?}");
+                    let (cmd, group_echo) = Self::apply_action(active, action); // shared with the menu
+                    // The `active` borrow ends here; window-level commands (close/
+                    // new window/detach) re-borrow the map via &mut self.
+                    self.run_window_cmd(event_loop, id, cmd);
+                    if let Some((grp, bytes)) = group_echo {
+                        self.broadcast_group_paste(id, grp, &bytes);
+                    }
+                    return; // consumed
+                }
+                None => log::debug!("keymap: chord={chord:?} -> no binding"),
             }
         }
         // Not a binding: ordinary typing. Navigation/editing/function keys become
@@ -5384,14 +5743,27 @@ impl App {
                     1
                 }
             };
+            // `Group` also reaches matching panes in every OTHER window (see
+            // `App::broadcast_group_input`'s doc); `None` here covers both
+            // Off/All (unaffected: `feed_input` below stays local for them,
+            // exactly as before) and an ungrouped focus under `Group`, which
+            // stays "just me" exactly as before.
+            let group = Self::group_echo(active);
+            let mut echo_bytes: Option<Vec<u8>> = None;
             if step > 1 {
                 let mut payload = Vec::with_capacity(bytes.len() * step);
                 for _ in 0..step {
                     payload.extend_from_slice(&bytes);
                 }
                 active.session.feed_input(&payload); // N moves this repeat
+                if group.is_some() {
+                    echo_bytes = Some(payload);
+                }
             } else {
                 active.session.feed_input(&bytes); // send to the shell(s)
+                if group.is_some() {
+                    echo_bytes = Some(bytes.clone());
+                }
             }
             active.last_input = now; // restart the cursor blink window
             // Typing returns you to the live prompt: if the focused pane was
@@ -5403,6 +5775,11 @@ impl App {
                     active.force_full = true;
                 }
                 pane.scroll_to_bottom();
+            }
+            // `active`'s borrow (of `self.windows`) ends above; from here this
+            // needs only `self`, which is what lets it reach every window.
+            if let (Some(g), Some(bytes)) = (group, echo_bytes) {
+                self.broadcast_group_input(id, g, &bytes);
             }
         }
     }
@@ -5602,6 +5979,10 @@ impl App {
         // history), so a stale rect from a previous frame must not survive the
         // pane unfocusing or the history emptying.
         active.clip_affordance = None;
+        // Once per call (i.e. once per window paint), decide whether this frame
+        // logs the cursor-presence diagnostic below — cheap to check even when
+        // debug logging is off, so it costs nothing at default log levels.
+        let log_cursor_diag = log::log_enabled!(log::Level::Debug) && cursor_diag_due();
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.) Iterates the pre-fetched
         // snapshots so the engine's damage state is not advanced again here.
@@ -5762,6 +6143,22 @@ impl App {
                 if let Some(cur) = snap.cursor {
                     let in_range = cur.line < snap.rows.len() && (n <= 1 || cur.line / per_col < geom.count as usize);
                     let (_, cur_sub) = place(cur.line);
+                    if log_cursor_diag {
+                        // Same alpha the draw path below would use, computed here purely
+                        // for diagnostics (no effect on what's actually drawn) so we can
+                        // tell "absent from snapshot" from "filtered by in_range" from
+                        // "drawn but invisible" (e.g. alpha ~0, or off the visible rect).
+                        let focused = id == focus;
+                        let blink = if !focused || active.low_power {
+                            1.0
+                        } else {
+                            cursor_blink_alpha(active.last_input.elapsed().as_secs_f32())
+                        };
+                        log::debug!(
+                            "cursor: pane={id:?} cursor=Some shape={:?} line={} col={} in_range={in_range} focused={focused} blink={blink:.2}",
+                            cur.shape, cur.line, cur.col
+                        );
+                    }
                     // Also honour the mid-resize clamp so a stale cursor can't sit past the
                     // new right/bottom edge (over the scrollbar or the neighbour).
                     if in_range && cur.col < clamp_cols && cur_sub < clamp_rows {
@@ -5803,6 +6200,8 @@ impl App {
                             }
                         }
                     }
+                } else if log_cursor_diag {
+                    log::debug!("cursor: pane={id:?} cursor=None (snapshot has no cursor)");
                 }
 
                 // Thin separators between newspaper columns, drawn in each gap.
@@ -7003,6 +7402,22 @@ fn cursor_blink_alpha(seconds: f32) -> f32 {
     CURSOR_BLINK_MIN + (1.0 - CURSOR_BLINK_MIN) * s
 }
 
+/// Rate-limits the `draw_panes` cursor-presence diagnostic (see its `cursor:`
+/// debug log) to about once every 500ms, shared across every window/pane, so a
+/// `ControlFlow::Poll` loop repainting at 60fps doesn't flood the log. Called
+/// once per `draw_panes` invocation (i.e. once per window paint); returns
+/// `true` for at most one call per ~500ms window.
+fn cursor_diag_due() -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    let now = std::time::Instant::now();
+    let due = last.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(500));
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background
 /// clear still fills the whole window, so the margin shows the background.
@@ -7018,11 +7433,43 @@ fn want_blur(settings: &rt_config::Settings) -> bool {
 /// protocol and/or the X11 property. Both are no-ops when not applicable, so
 /// this is always safe to call after an opacity/blur change.
 fn apply_blur(active: &mut Active) {
-    let want = want_blur(&active.settings);
-    if let Some(fx) = &mut active.bg_effect {
-        fx.set_enabled(want);
+    // Both mechanisms are Linux-only (see the `Active::bg_effect`/`x11_blur`
+    // field comment). On macOS this is a no-op by design: `vibrancy.rs` installs
+    // the NSVisualEffectView once at startup and it needs no runtime toggle —
+    // the glass is simply invisible while the background is opaque.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let want = want_blur(&active.settings);
+        if let Some(fx) = &mut active.bg_effect {
+            fx.set_enabled(want);
+        }
+        active.x11_blur.set_enabled(want);
     }
-    active.x11_blur.set_enabled(want);
+}
+
+/// HiDPI: convert a LOGICAL font size (as configured in `Settings::font_size`,
+/// typed via `--font-size`, or stepped by zoom) into the PHYSICAL pixel size
+/// the rasteriser (`render::cell_size_for`, `Renderer::new`,
+/// `XRenderBackend::try_new`, `WgpuBackend::new`, `Backend::reload_fonts`)
+/// should measure/draw at. `scale_factor` is `winit::window::Window::
+/// scale_factor()` (or a monitor's, before the window exists) — 1.0 on every
+/// Linux setup this has run on so far, 2.0 on a Retina Mac. At 1.0 this is
+/// exactly a no-op (`font_size * 1.0 == font_size`), which is what keeps
+/// Linux bit-for-bit unchanged.
+///
+/// All LAYOUT (window/pane/content rects, `content_bounds`,
+/// `window_size_for_grid`'s own `WINDOW_MARGIN`/`pane_chrome` terms) stays in
+/// PHYSICAL pixels exactly as before this change and is NOT touched here —
+/// only the rasterised glyph size is scaled. Everything measured FROM the
+/// resulting cell size (instrument discs, jack ports, cursors, borders, and
+/// `window_size_for_grid`'s cols/rows terms) scales automatically because it
+/// is derived from `cell`, not from `font_size` directly. `WINDOW_MARGIN`
+/// (8px) and `rt_session::PANE_PAD`/`TITLEBAR_PAD` are flat chrome constants,
+/// not derived from font metrics; they are deliberately left unscaled — they
+/// are hairline-sized either way and scaling them would be guessing at an
+/// "intended logical size" for values that were never expressed as one.
+fn physical_font_px(font_size: f32, scale_factor: f64) -> f32 {
+    (font_size as f64 * scale_factor) as f32
 }
 
 fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
@@ -7294,7 +7741,10 @@ fn client_origin(window: &dyn Window) -> Option<winit::dpi::PhysicalPosition<i32
 /// `WINIT_UNIX_BACKEND` still wins (we don't override an explicit choice).
 fn build_event_loop() -> EventLoop {
     let mut builder = EventLoop::builder();
-    #[cfg(feature = "x11")]
+    // winit target-gates `platform::wayland`/`platform::x11` to non-Apple unix,
+    // so this whole backend-preference dance is meaningless (and non-compiling)
+    // on macOS regardless of whether the `x11` feature happens to be enabled.
+    #[cfg(all(feature = "x11", not(target_os = "macos")))]
     {
         use winit::platform::wayland::EventLoopBuilderExtWayland;
         use winit::platform::x11::EventLoopBuilderExtX11;
@@ -7545,6 +7995,95 @@ mod autoscroll_tests {
         let (s, st) = autoscroll_step((1, 50), -1, true, 10);
         assert_eq!(s, 1);
         assert_eq!(st, (-1, 1));
+    }
+}
+
+#[cfg(test)]
+mod hidpi_tests {
+    use super::*;
+
+    /// The bug this task fixes: rt rasterised `font_size` as a PHYSICAL pixel
+    /// count regardless of the window's scale factor, so a 2x (Retina) display
+    /// got glyphs — and everything measured from the cell (instrument discs,
+    /// jack ports, cursors) — at HALF their intended apparent size. This is the
+    /// core discriminating assertion: scale 2 must rasterise at exactly double
+    /// the pixel size of scale 1 for the same configured (logical) font size.
+    /// A no-op implementation (`physical_font_px` returning `font_size`
+    /// unchanged) would fail this, since 16.0 != 32.0.
+    #[test]
+    fn physical_font_px_doubles_at_scale_2() {
+        let logical = 16.0_f32;
+        let at_1x = physical_font_px(logical, 1.0);
+        let at_2x = physical_font_px(logical, 2.0);
+        assert_eq!(at_1x, 16.0, "scale 1.0 must be a no-op (Linux today)");
+        assert_eq!(at_2x, 32.0, "scale 2.0 (Retina) must rasterise at double the pixel size");
+        assert_eq!(at_2x, at_1x * 2.0);
+    }
+
+    /// Every scale factor a real display can report, not just a round 2.0 —
+    /// guards against an implementation that special-cases 2.0 rather than
+    /// actually multiplying.
+    #[test]
+    fn physical_font_px_scales_linearly() {
+        for &(logical, scale) in &[(12.0_f32, 1.25_f64), (14.0, 1.5), (18.0, 1.75), (20.0, 3.0)] {
+            let got = physical_font_px(logical, scale);
+            let want = (logical as f64 * scale) as f32;
+            assert_eq!(got, want, "logical {logical} @ scale {scale}");
+        }
+    }
+
+    /// `--cols`/`--rows` pre-sizing (`window_size_for_grid`) is fed a `cell`
+    /// that must already reflect the scaled font pixel size — confirm that
+    /// doubling the cell (as scaling font_size 1x -> 2x would do, since cell
+    /// size is derived from the rasterised glyph) roughly doubles the resulting
+    /// window's content area, not just adds a constant. Uses two cell sizes
+    /// standing in for "measured at scale 1" and "measured at scale 2" for the
+    /// same (cols, rows) grid.
+    #[test]
+    fn window_size_for_grid_grows_with_a_doubled_cell() {
+        let cols = 80;
+        let rows = 24;
+        let cell_1x = (8.0_f32, 16.0_f32);
+        let cell_2x = (16.0_f32, 32.0_f32);
+        let size_1x = window_size_for_grid(cols, rows, cell_1x, false);
+        let size_2x = window_size_for_grid(cols, rows, cell_2x, false);
+        // Not exactly 2x (WINDOW_MARGIN/pane padding are flat, unscaled
+        // constants — see `physical_font_px`'s doc comment) but the grid term
+        // dominates, so the 2x cell must produce a visibly larger window, well
+        // over half again as large in both dimensions.
+        assert!(size_2x.width > size_1x.width * 3 / 2, "{} vs {}", size_2x.width, size_1x.width);
+        assert!(size_2x.height > size_1x.height * 3 / 2, "{} vs {}", size_2x.height, size_1x.height);
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    /// The one property that keeps a `Broadcast::Group` keystroke from
+    /// reaching the focused pane twice (see `broadcast_group_input`'s doc):
+    /// the origin window is never among its own targets. Breaking the
+    /// `filter` in `group_broadcast_targets` (e.g. deleting it, or flipping
+    /// `!=` to `==`) makes this fail — WindowId::from_raw needs no real
+    /// window, so the check is a pure function over plain ids.
+    #[test]
+    fn group_broadcast_targets_excludes_the_origin_window() {
+        let a = WindowId::from_raw(1);
+        let b = WindowId::from_raw(2);
+        let c = WindowId::from_raw(3);
+        let targets = App::group_broadcast_targets(a, [a, b, c].into_iter());
+        assert!(!targets.contains(&a), "the origin window must never target itself: {targets:?}");
+        assert_eq!(targets.len(), 2, "exactly the two OTHER windows: {targets:?}");
+        assert!(targets.contains(&b) && targets.contains(&c));
+    }
+
+    /// A window with no siblings (the common case: one open rt window) must
+    /// end up with an EMPTY target list, not a panic or a stray self-target.
+    #[test]
+    fn group_broadcast_targets_is_empty_with_no_other_windows() {
+        let a = WindowId::from_raw(1);
+        let targets = App::group_broadcast_targets(a, [a].into_iter());
+        assert!(targets.is_empty(), "a lone window has no cross-window targets: {targets:?}");
     }
 }
 

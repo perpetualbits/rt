@@ -1,3 +1,8 @@
+// The offscreen pixel-identity gate needs a real GL context via EGL, which macOS
+// does not provide (no EGL, no pkg-config). Its dev-dependencies are target-gated
+// to match, so on macOS this file must vanish entirely rather than fail to link.
+#![cfg(not(target_os = "macos"))]
+
 //! Correctness gate for damage-based rendering: a scissored single-cell redraw
 //! must produce a byte-identical framebuffer to a full redraw. Damage may change
 //! only HOW MUCH is drawn, never WHAT ends up on screen.

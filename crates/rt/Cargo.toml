@@ -31,13 +31,14 @@ vtterm-default = ["rt-engine/vtterm-default"]  # the in-house engine as the buil
 # runs the in-house `vt-parser` + `vt-term` engine (RT_ENGINE=alacritty still
 # selects the vendored engine at runtime for a comparison).
 default = ["x11", "vtterm-default"]
-# First-class X11 support: adds the X11/XWayland backends (winit/glutin) AND an
-# X11 clipboard (arboard) so copy/paste + PRIMARY work, not just rendering. The
-# same code runs on either backend — winit auto-selects from WAYLAND_DISPLAY /
-# DISPLAY at runtime, so `--features x11` is a universal binary. The DEFAULT
-# build omits this feature, keeping the dependency tree Wayland-only (zero X11
-# crates). Build/install universal: cargo install --path crates/rt --features x11
-x11 = ["winit/x11", "glutin/glx", "glutin/x11", "dep:arboard", "dep:x11rb"]
+# First-class X11 support: adds the X11/XWayland backends (winit/glutin) and
+# X11 background blur (x11rb); arboard (clipboard) is unconditional now that it
+# also backs macOS, so it is no longer named here. The same code runs on either
+# backend — winit auto-selects from WAYLAND_DISPLAY / DISPLAY at runtime, so
+# `--features x11` is a universal binary. The DEFAULT build omits this feature,
+# keeping the dependency tree Wayland-only (zero X11 crates). Build/install
+# universal: cargo install --path crates/rt --features x11
+x11 = ["winit/x11", "glutin/glx", "glutin/x11", "dep:x11rb"]
 
 [dependencies]
 rt-core = { path = "../rt-core" }
@@ -60,43 +61,74 @@ rt-session = { path = "../rt-session" }
 #
 # The default build stays Wayland-only (dlopen so we don't hard-link libwayland);
 # the `x11` feature adds the X11/XWayland backends on both winit and glutin.
+# winit needs no gating here -- it already target-gates winit-x11/winit-wayland
+# to all(unix, not(target_vendor = "apple")) and selects winit-appkit itself.
 winit = { version = "=0.31.0-beta.2", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
-# glutin is joined to winit directly, by raw handle: `glutin-winit` is still
-# pinned to winit 0.30 and cannot bridge 0.31. Both speak raw-window-handle 0.6,
-# which is the only interface the join actually needs.
-glutin = { version = "0.32.2", default-features = false, features = ["egl", "wayland"] }
 raw-window-handle = "0.6"            # handle types passed between winit and glutin
 glow = "0.17"                        # OpenGL wrapper for the custom glyph/atlas renderer
 fontdue = "0.9"                      # CPU glyph rasteriser feeding the GL atlas
 fontdb = "0.23"                      # pure-Rust system font discovery (family picker; no X11)
 log = "0.4"                          # diagnostics
 env_logger = "0.11"                  # RUST_LOG-driven logging for the binary
+# X11 AND macOS clipboard; no longer optional. default-features off, as before
+# (arboard's default pulls in `image-data`, which drags the `image` crate and
+# its codec tree into every build for a capability rt never uses -- text only).
+arboard = { version = "3.6", default-features = false }
+# For the patch-bay pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).
+libc = "0.2"
+
+# Wayland/X11 stack: Linux-only by construction. These were unconditional until
+# the macOS port; smithay-client-toolkit uses rustix::pipe::pipe_with, which is
+# #[cfg(not(apple))] upstream, so merely RESOLVING them on Darwin broke the build.
+#
+# Target cfg rather than a feature: the `x11` feature is a genuine choice
+# (universal vs lean binary), but macOS is not a choice, it is the platform.
+# winit needs no gating here -- it already target-gates winit-x11/winit-wayland
+# to all(unix, not(target_vendor = "apple")) and selects winit-appkit itself.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# glutin is joined to winit directly, by raw handle: `glutin-winit` is still
+# pinned to winit 0.30 and cannot bridge 0.31. Both speak raw-window-handle 0.6,
+# which is the only interface the join actually needs.
+glutin = { version = "0.32.2", default-features = false, features = ["egl", "wayland"] }
+# khronos-egl is NOT listed here as a direct dependency (unlike the brief's
+# literal Step 3 snippet): glutin's "egl" feature already pulls it in
+# transitively, so it disappears from the macOS graph along with glutin with
+# no explicit entry needed. Adding one directly shifted khronos-egl's (and its
+# libc child's) position in `cargo tree`'s output, which failed the
+# byte-identical-Linux-graph check even though no crate was actually added or
+# removed -- see the report for details.
 # KDE/KWin background-blur request (org_kde_kwin_blur). Both crates are already
 # in the tree via winit, so depending on them directly adds no new crates; it
 # just lets rt ask KWin to blur behind its surface. No-op on non-KDE. The
 # versions must match winit's so the shared wl_surface object is compatible.
 wayland-client = "0.31"
-wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 # Standard staging blur protocol (ext-background-effect-v1): KDE 6.7+, COSMIC,
 # niri. Already in the tree via winit; the `staging` feature exposes the binding.
 # The KWin dep above is kept for older Plasma; this is the cross-compositor path.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 # Clipboard + PRIMARY selection over the Wayland connection: pure Wayland, ties
 # into the window's wl_display, keeps the default tree free of X11 crates. The
-# X11 build pairs this with arboard (below) via the cross-backend `clipboard`
-# module — arboard is only pulled in by the `x11` feature.
+# X11 build pairs this with arboard (above) via the cross-backend `clipboard`
+# module.
 smithay-clipboard = "0.7"
-# X11 clipboard (CLIPBOARD + PRIMARY), only under the `x11` feature. default-
-# features off so it's x11-only (no image-data, no wayland-data-control) — the
-# X11 crates it pulls are exactly what that feature is opting into.
-arboard = { version = "3", default-features = false, optional = true }
 # X11 background blur (`_KDE_NET_WM_BLUR_BEHIND_REGION`), only under `x11`.
-# Already in the tree via arboard, so naming it here adds no new crate.
 x11rb = { version = "0.13", optional = true }
-# For the patch-bay pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).
-libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = "27"
+objc2 = "0.6"
+# `NSGraphics` is what carries `NSWindowOrderingMode`, and objc2 gates
+# `addSubview:positioned:relativeTo:` on it -- vibrancy.rs needs that exact
+# method to slide the effect view UNDER the content view.
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics"] }
+objc2-foundation = "0.3"
+pollster = "0.4"   # block_on for wgpu's async adapter/device request
+bytemuck = { version = "1", features = ["derive"] }  # Pod/Zeroable for TextPipeline's Vertex
 
 [dev-dependencies]
+
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
 # The offscreen pixel-identity gate (tests/damage_pixel_identity.rs) drives the
 # real GL renderer into a headless framebuffer. Integration tests link the lib
 # only, so the crates the test itself names must be dev-dependencies even though
@@ -108,5 +140,7 @@ libc = "0.2"
 #     exactly the software-GL path damage rendering optimises. `static` links
 #     libEGL via pkg-config; default features include the 1.5 API we need for
 #     eglGetPlatformDisplay.
+# These move behind cfg(not(target_os = "macos")) because khronos-egl's build
+# script requires pkg-config and a system EGL, neither available on macOS.
 glow = "0.17"
 khronos-egl = { version = "6", features = ["static"] }

@@ -250,11 +250,12 @@ window.PROJECT_MAP = {
     {
       id: "broadcast", label: "Broadcast & groups", layer: "control", status: "done",
       tags: ["Phase 3"],
-      desc: "Type once, reach a pane group or every pane. Broadcast off/group/all with a window-border indicator and per-pane colour-coded corner markers; input fans out on the same predicate the paste path uses so it can't drift. Remaining polish (a per-pane group titlebar for naming / drag-assignment) is planned.",
-      files: ["crates/rt-session/src/lib.rs"],
+      desc: "Type once, reach a pane group or every pane. Broadcast off/group/all with a window-border indicator and per-pane colour-coded corner markers; input fans out on the same predicate the paste path uses so it can't drift. Group membership and its delivery both now span every window of the process (a pane torn out of a group into its own window keeps receiving broadcast input); All stays deliberately window-scoped. Remaining polish (a per-pane group titlebar for naming / drag-assignment) is planned.",
+      files: ["crates/rt-session/src/lib.rs", "crates/rt/src/main.rs"],
       specs: [],
       parts: [
         { label: "Broadcast off / group / all", status: "done", desc: "Group-scoped input fan-out with a live indicator." },
+        { label: "Group broadcast spans windows", status: "done", desc: "Session::write_to_group/paste_to_group (pure, per-session) plus App::broadcast_group_input/_paste (main.rs) walk every OTHER open window so a pane torn out of its group keeps receiving broadcast input; All is unaffected (per-window only, by design). In-process only." },
         { label: "Group titlebar (name / drag-assign)", status: "planned", desc: "Per-pane group header for naming and drag-to-group." }
       ],
       deps: ["rt-session"]

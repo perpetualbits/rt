@@ -82,8 +82,17 @@ fn key_from_winit(key: &Key) -> Option<RtKey> {
 /// result is looked up in the keymap for an [`Action`], and only if that misses
 /// do we fall back to [`encode_key`] for plain typing.
 pub fn chord_from_winit(key: &Key, mods: ModifiersState) -> Option<Chord> {
-    let rt_key = key_from_winit(key)?; // the non-modifier key, or bail
-    Some(Chord::new(mods_from_winit(mods), rt_key)) // combine with modifiers
+    let Some(rt_key) = key_from_winit(key) else {
+        // key_from_winit bailed: this is a key rt has no RtKey mapping for
+        // (dead key, unidentified, or a NamedKey we don't bind). Log the raw
+        // winit key/mods so a platform that delivers an unexpected Key variant
+        // (e.g. macOS sending something Linux never does) shows up here.
+        log::debug!("chord_from_winit: key={key:?} mods={mods:?} -> None (key_from_winit bailed)");
+        return None;
+    };
+    let chord = Chord::new(mods_from_winit(mods), rt_key); // combine with modifiers
+    log::debug!("chord_from_winit: key={key:?} mods={mods:?} -> {chord:?}");
+    Some(chord)
 }
 
 /// Whether a named key must be sent as an ANSI escape sequence (via

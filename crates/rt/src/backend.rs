@@ -121,27 +121,49 @@ pub trait Backend {
     fn scroll_blit(&mut self, _rect: PxRect, _dy: i32) {}
 }
 
-/// Which [`Backend`] implementation to use. `Gl` is the existing local-rendering
-/// path; `XRender` is the mechanism-C remote-friendly path (arrives in a later
-/// task — see [`choose_backend`]).
+/// Which [`Backend`] implementation to use. `Gl` is the local-rendering path,
+/// `XRender` the remote-friendly one (`ssh -X`), `Wgpu` the macOS Metal path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Gl,
     XRender,
+    Wgpu,
 }
 
-/// Pick the backend. Override wins; else Wayland/non-X11 → Gl; else a DISPLAY with
-/// a host part before `:` (TCP / ssh -X forward) → XRender; a bare `:N` (local unix
-/// socket) → Gl.
-///
-/// Pure and unit-tested: no env/CLI reads happen here — the caller (`main.rs`)
-/// gathers `display`/`is_x11`/`override_env` from `$DISPLAY`, the winit backend
-/// choice, `$RT_BACKEND`, and `--backend`, then calls this.
+/// Pick the backend. See [`choose_backend_on`]; this reads the platform from
+/// `cfg!` so callers do not have to. The signature is unchanged from before the
+/// macOS port, so `main.rs`'s call site did not move.
 pub fn choose_backend(display: Option<&str>, is_x11: bool, override_env: Option<&str>) -> BackendKind {
+    choose_backend_on(display, is_x11, override_env, cfg!(target_os = "macos"))
+}
+
+/// The pure core, with the platform passed in.
+///
+/// Split out from [`choose_backend`] so the macOS arm is unit-testable ON LINUX
+/// — the Mac is not in CI, and a `cfg!` buried in the body would make this the
+/// one selection rule nothing could check.
+///
+/// Override wins on Linux; else Wayland/non-X11 → Gl; else a DISPLAY with a host
+/// part before `:` (TCP / ssh -X forward) → XRender; a bare `:N` (local unix
+/// socket) → Gl.
+pub fn choose_backend_on(
+    display: Option<&str>,
+    is_x11: bool,
+    override_env: Option<&str>,
+    is_macos: bool,
+) -> BackendKind {
+    // Checked BEFORE the override: macOS builds contain exactly one backend, so
+    // there is nothing to switch to, and `RT_BACKEND=xrender` there would select
+    // a module that `cfg` removed.
+    if is_macos {
+        return BackendKind::Wgpu;
+    }
     if let Some(o) = override_env {
         return if o.eq_ignore_ascii_case("xrender") { BackendKind::XRender } else { BackendKind::Gl };
     }
-    if !is_x11 { return BackendKind::Gl; } // Wayland etc.
+    if !is_x11 {
+        return BackendKind::Gl;
+    }
     match display {
         // "host:N" (host non-empty) is TCP/forwarded; ":N" is a local unix socket.
         Some(d) if d.split(':').next().map_or(false, |h| !h.is_empty()) => BackendKind::XRender,
@@ -152,23 +174,68 @@ pub fn choose_backend(display: Option<&str>, is_x11: bool, override_env: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn unix_socket_selects_gl() {
         assert!(matches!(choose_backend(Some(":0"), true, None), BackendKind::Gl));
         assert!(matches!(choose_backend(Some(":1.0"), true, None), BackendKind::Gl));
     }
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn tcp_forwarded_selects_xrender() {
         assert!(matches!(choose_backend(Some("localhost:10.0"), true, None), BackendKind::XRender));
         assert!(matches!(choose_backend(Some("192.168.1.5:0"), true, None), BackendKind::XRender));
     }
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn wayland_selects_gl() {
         assert!(matches!(choose_backend(None, false, None), BackendKind::Gl));
     }
+    /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
+    /// on macOS which has exactly one backend.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn override_wins() {
         assert!(matches!(choose_backend(Some(":0"), true, Some("xrender")), BackendKind::XRender));
         assert!(matches!(choose_backend(Some("localhost:10.0"), true, Some("gl")), BackendKind::Gl));
+    }
+
+    #[test]
+    fn macos_always_selects_wgpu() {
+        // Wayland-shaped and X11-shaped inputs alike: on macOS neither exists.
+        assert!(matches!(choose_backend_on(None, false, None, true), BackendKind::Wgpu));
+        assert!(matches!(choose_backend_on(Some(":0"), true, None, true), BackendKind::Wgpu));
+    }
+
+    #[test]
+    fn macos_ignores_the_override() {
+        // macOS has exactly one backend, so there is nothing to select between.
+        // Honouring "xrender" here would name a module that is cfg'd out.
+        assert!(matches!(choose_backend_on(Some(":0"), true, Some("xrender"), true), BackendKind::Wgpu));
+        assert!(matches!(choose_backend_on(None, false, Some("gl"), true), BackendKind::Wgpu));
+    }
+
+    /// The wrapper's cfg! wiring, on the platform where it matters. The other
+    /// macOS tests drive the pure core directly and would pass even if
+    /// `choose_backend` forgot to consult the platform at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wrapper_selects_wgpu_on_macos() {
+        assert!(matches!(choose_backend(Some(":0"), true, None), BackendKind::Wgpu));
+        assert!(matches!(choose_backend(None, false, Some("xrender")), BackendKind::Wgpu));
+    }
+
+    #[test]
+    fn linux_selection_is_unaffected_by_the_macos_arm() {
+        assert!(matches!(choose_backend_on(Some(":0"), true, None, false), BackendKind::Gl));
+        assert!(matches!(choose_backend_on(Some("localhost:10.0"), true, None, false), BackendKind::XRender));
+        assert!(matches!(choose_backend_on(None, false, None, false), BackendKind::Gl));
+        assert!(matches!(choose_backend_on(Some(":0"), true, Some("xrender"), false), BackendKind::XRender));
     }
 }
