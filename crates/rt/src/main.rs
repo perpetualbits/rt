@@ -4385,6 +4385,32 @@ impl App {
         }
     }
 
+    /// [`broadcast_group_input`](Self::broadcast_group_input) for input whose
+    /// BYTES depend on the receiving pane — every keystroke. Same targeting and
+    /// the same origin-window exclusion (so the focused pane is still delivered
+    /// to exactly once); the difference is that what crosses the window boundary
+    /// is the ENCODER, not one already-encoded sequence.
+    ///
+    /// That distinction is the bug this method exists to fix: a keystroke's form
+    /// is decided by the receiving pane's DECCKM state and kitty keyboard flags,
+    /// both negotiated by the program running in it, and a group deliberately
+    /// spans windows — so the pane at the other end is exactly the one most
+    /// likely to be in a different state from the pane being typed into. See
+    /// `Session::feed_input_with`. `broadcast_group_input` remains for the
+    /// genuinely pane-independent case (composed IME text).
+    fn broadcast_group_input_with(
+        &self,
+        from: WindowId,
+        group: u32,
+        encode: impl Fn(&TermPane) -> Option<Vec<u8>>,
+    ) {
+        for wid in Self::group_broadcast_targets(from, self.windows.keys().copied()) {
+            if let Some(w) = self.windows.get(&wid) {
+                w.session.write_to_group_with(group, &encode);
+            }
+        }
+    }
+
     /// Paste equivalent of [`broadcast_group_input`](Self::broadcast_group_input):
     /// same targeting, same reasoning — see its doc. Uses
     /// `Session::paste_to_group` so each sibling window's panes still get
@@ -5693,30 +5719,33 @@ impl App {
         // ANSI escape sequences; everything else sends the key's *produced text*
         // (`key_event.text`), which already contains dead-key / compose results
         // (e.g. `'`+space → `'`) that the logical key alone would miss.
-        let focused = active.session.pane(active.session.focus()); // the focused pane's backend
-        let app_cursor = focused
-            .map(|p| p.app_cursor_keys()) // its DECCKM state
-            .unwrap_or(false); // default to normal cursor keys
-        // The kitty keyboard flags the program in that pane negotiated, if any. 0 —
-        // nothing negotiated — makes every branch below byte-identical to what rt sent
-        // before the protocol existed.
-        let kbd_flags = focused.map(|p| p.kitty_keyboard_flags()).unwrap_or(0);
-        let bytes = match &key_event.logical_key {
-            // A key the negotiated protocol disambiguates takes the protocol's form,
-            // and must be tested BEFORE the produced-text branch: Ctrl-combos arrive
-            // with text (the C0 byte), and letting that win would silently give a
-            // negotiated application half a protocol.
-            k if input::kitty_disambiguates(k, mods, kbd_flags) => {
-                input::encode_key_kitty(k, mods, app_cursor, kbd_flags)
-            }
-            Key::Named(n) if input::is_sequence_key(n) => {
-                input::encode_key(&key_event.logical_key, mods, app_cursor) // arrows/enter/…
-            }
-            _ => match key_event.text.as_ref().filter(|t| !t.is_empty()) {
-                Some(text) => Some(input::encode_text(text, mods)), // the composed text
-                None => input::encode_key(&key_event.logical_key, mods, app_cursor), // fallback (Ctrl combos, etc.)
-            },
+        //
+        // Which BYTES a key produces is a property of the pane that receives it,
+        // not of the keystroke: DECCKM (`app_cursor_keys`) decides whether an
+        // arrow is `CSI A` or `SS3 A`, and the kitty keyboard flags decide
+        // whether Shift+Enter is `\r` or `\x1b[13;2u`. Under broadcast one
+        // keypress reaches several panes whose programs negotiated differently,
+        // so the encode happens PER TARGET PANE below (`feed_input_with`), never
+        // once from the focus — that was the bug, the same one `feed_paste`'s doc
+        // records for bracketed paste: a shell that negotiated nothing got
+        // `\x1b[13;2u` where it used to get `\r` (the line never submits) and
+        // `\x1b[99;5u` where it used to get the 0x03 that raises SIGINT.
+        let encode_for = |app_cursor: bool, kbd_flags: u8| {
+            input::encode_key_event(&key_event.logical_key, key_event.text.as_deref(), mods, app_cursor, kbd_flags)
         };
+        // The focused pane's own state, and its own encode. The encode decides
+        // whether this key produces input at all (the gate below) and drives the
+        // focus-centric bookkeeping — arrow acceleration, blink reset, scroll
+        // snap-back — all of which were, and stay, questions about the focus.
+        // The fan-out then REUSES this result for every pane in the same state,
+        // which is what keeps `Broadcast::Off` — whose single target *is* the
+        // focus — at exactly one encode per keystroke, as before.
+        let focus_state = active
+            .session
+            .pane(active.session.focus())
+            .map(|p| (p.app_cursor_keys(), p.kitty_keyboard_flags()))
+            .unwrap_or((false, 0)); // no pane: normal cursor keys, nothing negotiated
+        let bytes = encode_for(focus_state.0, focus_state.1);
         if let Some(bytes) = bytes {
             // Arrow-key acceleration: while an arrow is HELD (a run of auto-repeats), send
             // several cursor moves per repeat so it speeds up the longer you hold. A single
@@ -5744,27 +5773,29 @@ impl App {
                 }
             };
             // `Group` also reaches matching panes in every OTHER window (see
-            // `App::broadcast_group_input`'s doc); `None` here covers both
-            // Off/All (unaffected: `feed_input` below stays local for them,
+            // `App::broadcast_group_input_with`'s doc); `None` here covers both
+            // Off/All (unaffected: `feed_input_with` below stays local for them,
             // exactly as before) and an ungrouped focus under `Group`, which
             // stays "just me" exactly as before.
             let group = Self::group_echo(active);
-            let mut echo_bytes: Option<Vec<u8>> = None;
-            if step > 1 {
-                let mut payload = Vec::with_capacity(bytes.len() * step);
-                for _ in 0..step {
-                    payload.extend_from_slice(&bytes);
+            // `step` repeats are pane-independent, so fold them into whatever a
+            // pane's own encode produced.
+            let repeat = |b: Vec<u8>| if step > 1 { b.repeat(step) } else { b };
+            let focus_payload = repeat(bytes); // the focus's N moves this repeat
+            // One encode per DISTINCT terminal state this keystroke actually
+            // meets. A pane in the focus's state reuses the encode already done
+            // above — so `Broadcast::Off` (one target: the focus) does exactly
+            // one, and a broadcast to N panes that all negotiated the same thing
+            // still does exactly one. Only a genuinely differing pane pays for a
+            // second encode, which is the entire point.
+            let encode_pane = |p: &TermPane| -> Option<Vec<u8>> {
+                let state = (p.app_cursor_keys(), p.kitty_keyboard_flags());
+                if state == focus_state {
+                    return Some(focus_payload.clone());
                 }
-                active.session.feed_input(&payload); // N moves this repeat
-                if group.is_some() {
-                    echo_bytes = Some(payload);
-                }
-            } else {
-                active.session.feed_input(&bytes); // send to the shell(s)
-                if group.is_some() {
-                    echo_bytes = Some(bytes.clone());
-                }
-            }
+                encode_for(state.0, state.1).map(&repeat)
+            };
+            active.session.feed_input_with(&encode_pane); // send to the shell(s)
             active.last_input = now; // restart the cursor blink window
             // Typing returns you to the live prompt: if the focused pane was
             // scrolled up in history, snap it back to the bottom.
@@ -5777,9 +5808,12 @@ impl App {
                 pane.scroll_to_bottom();
             }
             // `active`'s borrow (of `self.windows`) ends above; from here this
-            // needs only `self`, which is what lets it reach every window.
-            if let (Some(g), Some(bytes)) = (group, echo_bytes) {
-                self.broadcast_group_input(id, g, &bytes);
+            // needs only `self`, which is what lets it reach every window. The
+            // SAME closure crosses the window boundary, so a group member torn
+            // out into another window is still encoded for its own negotiated
+            // state rather than the typist's.
+            if let Some(g) = group {
+                self.broadcast_group_input_with(id, g, &encode_pane);
             }
         }
     }
