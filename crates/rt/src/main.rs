@@ -3338,76 +3338,6 @@ enum FramePlan {
 /// How many past frames' damage we retain to satisfy an EGL buffer age > 1.
 const HISTORY_DEPTH: u32 = 2;
 
-/// [colourdbg] diagnostics: log `plan_frame`'s outcome, but only when the plan
-/// KIND changes (Full <-> Partial) or at most once every 500ms — this runs
-/// every frame under `ControlFlow::Poll`, so logging unconditionally would
-/// flood `RUST_LOG=debug` output. Process-wide (not per-window) rate limit:
-/// this is a diagnostic aid, not a correctness-sensitive path, so a shared
-/// limiter across windows is fine and avoids growing `Active`.
-fn log_plan_ratelimited(plan: &FramePlan, chrome_moved: bool, force_full: bool) {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-    use std::sync::OnceLock;
-    static LAST_KIND: AtomicU8 = AtomicU8::new(u8::MAX);
-    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-    static START: OnceLock<Instant> = OnceLock::new();
-    let start = *START.get_or_init(Instant::now);
-    let (kind, desc) = match plan {
-        FramePlan::Full => (0u8, "Full".to_string()),
-        FramePlan::Partial(bbox, hints) => (1u8, format!("Partial(bbox={bbox:?}, hints={})", hints.len())),
-    };
-    let now_ms = start.elapsed().as_millis() as u64;
-    let last_kind = LAST_KIND.swap(kind, Ordering::Relaxed);
-    let last_ms = LAST_LOG_MS.load(Ordering::Relaxed);
-    if kind != last_kind || now_ms.saturating_sub(last_ms) >= 500 {
-        LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
-        log::debug!(
-            "[colourdbg] plan_frame: plan={desc} chrome_moved={chrome_moved} force_full={force_full}"
-        );
-    }
-}
-
-/// [colourdbg] diagnostics: log one pane's background-fill decision once per
-/// frame per pane, rate-limited to at most once every 500ms per pane (this
-/// runs in `draw_panes`, i.e. every redraw). `first_row_bg` is the `bg` of the
-/// first few cells of the pane's first visible row; `filled`/`skipped` count
-/// how many cells this frame took the opaque `fill_cell` branch (cell.bg !=
-/// cfg_bg) vs were left translucent (cell.bg == cfg_bg). Comparing `cfg_bg`
-/// here to `first_row_bg` after a colour-preference commit is the decisive
-/// check: if `first_row_bg` still shows the OLD colour, the SNAPSHOT is stale;
-/// if it already shows the NEW colour but `filled`/`skipped` didn't change
-/// (or the interior still looks old on screen), the snapshot is fine and the
-/// bug is downstream (clear colour or frame plan).
-fn log_pane_bg_ratelimited(
-    id: rt_core::PaneId,
-    cfg_bg: [u8; 3],
-    first_row_bg: Option<&[[u8; 3]]>,
-    filled: u32,
-    skipped: u32,
-) {
-    use std::sync::{Mutex, OnceLock};
-    static LAST_LOG_MS: OnceLock<Mutex<std::collections::HashMap<rt_core::PaneId, u64>>> = OnceLock::new();
-    static START: OnceLock<Instant> = OnceLock::new();
-    let start = *START.get_or_init(Instant::now);
-    let now_ms = start.elapsed().as_millis() as u64;
-    let map_mutex = LAST_LOG_MS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    // A poisoned mutex (a prior panic while holding it) must not take down a
-    // diagnostics-only probe; recover the inner map and carry on.
-    let mut map = map_mutex.lock().unwrap_or_else(|e| e.into_inner());
-    let due = match map.get(&id) {
-        Some(&last_ms) => now_ms.saturating_sub(last_ms) >= 500,
-        None => true,
-    };
-    if !due {
-        return;
-    }
-    map.insert(id, now_ms);
-    drop(map);
-    log::debug!(
-        "[colourdbg] draw_panes: pane={id:?} cfg_bg={cfg_bg:?} first_row_bg={first_row_bg:?} \
-         filled={filled} skipped={skipped}"
-    );
-}
-
 /// What an action needs the App (window-owner) level to do afterwards.
 /// Active-level code can't create or close OS windows — it has no event loop.
 #[derive(Clone, Copy, PartialEq)]
@@ -5626,7 +5556,6 @@ impl App {
         let frame_damage = active.damage.finish();
         // Fold in recent frames' damage per the back-buffer age, and decide.
         let plan = Self::plan_frame(active, frame_damage);
-        log_plan_ratelimited(&plan, chrome_moved, active.force_full);
 
         let force_next = match plan {
             FramePlan::Full => {
@@ -5770,12 +5699,6 @@ impl App {
                     (usize::MAX, usize::MAX)
                 };
 
-                // [colourdbg]: how many cells this pane's grid actually filled
-                // (non-default bg) vs skipped (bg == cfg_bg, left translucent),
-                // plus the first row's first few cells' bg — see log_pane_bg_ratelimited.
-                let mut colourdbg_filled: u32 = 0;
-                let mut colourdbg_skipped: u32 = 0;
-                let mut colourdbg_first_row_bg: Option<Vec<[u8; 3]>> = None;
                 // Draw each cell: an opaque background quad only when the cell's
                 // background differs from the default (so ordinary text keeps the
                 // translucent window background), then the glyph in its colour.
@@ -5787,20 +5710,9 @@ impl App {
                     if sub >= clamp_rows {
                         continue; // stale row past the current (smaller) height
                     }
-                    if r == 0 {
-                        colourdbg_first_row_bg = Some(row.iter().take(6).map(|c| c.bg).collect());
-                    }
                     for (col_idx, cell) in row.iter().enumerate() {
                         if col_idx >= clamp_cols {
                             break; // stale col past the current width (kept clear of the scrollbar)
-                        }
-                        // [colourdbg]: precomputed once so the tally below matches
-                        // exactly the condition the fill/skip decision uses.
-                        let differs = cell.bg != cfg_bg;
-                        if differs {
-                            colourdbg_filled += 1;
-                        } else {
-                            colourdbg_skipped += 1;
                         }
                         // Selection highlight wins over the cell's own background;
                         // otherwise draw an explicit (non-default) background.
@@ -5810,7 +5722,7 @@ impl App {
                             active.backend.fill_cell(ox, rect.y, col_idx, sub, other_hl);
                         } else if pane_sel.map_or(false, |s| s.contains(col_idx, sub as i32 - sel_offset)) {
                             active.backend.fill_cell(ox, rect.y, col_idx, sub, sel_bg);
-                        } else if differs {
+                        } else if cell.bg != cfg_bg {
                             // A non-default background: draw it opaque (default-bg
                             // cells stay translucent via the window clear).
                             let c = cell.bg;
@@ -5831,7 +5743,6 @@ impl App {
                         }
                     }
                 }
-                log_pane_bg_ratelimited(id, cfg_bg, colourdbg_first_row_bg.as_deref(), colourdbg_filled, colourdbg_skipped);
 
                 // Cursor: shape depends on what the app requested (block/
                 // underline/beam) and on focus — an UNFOCUSED pane always shows a
@@ -6355,7 +6266,6 @@ impl App {
     /// egui, full swap. Byte-for-byte the pre-damage behaviour.
     fn redraw_full(&mut self, id: WindowId, bg: Color, bounds: Rect, snapshots: Vec<(rt_core::PaneId, PxRectSnap)>) {
         let Some(active) = self.windows.get_mut(&id) else { return };
-        log::debug!("[colourdbg] redraw_full: begin_frame bg={bg:?} (r,g,b in 0..1, 4th=alpha)");
         active.backend.begin_frame(bg); // translucent clear
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame(); // upload + draw call
@@ -6588,12 +6498,6 @@ impl App {
         let titlebar_changed = new.show_titlebar != active.settings.show_titlebar;
         // The blur decision depends on both the toggle and the opacity slider.
         let blur_changed = want_blur(&new) != want_blur(&active.settings);
-        log::debug!(
-            "[colourdbg] commit_settings: old_bg={:?} new_bg={:?} old_fg={:?} new_fg={:?} \
-             colours_changed={colours_changed} fonts_changed={fonts_changed} \
-             titlebar_changed={titlebar_changed}",
-            active.settings.background, new.background, active.settings.foreground, new.foreground,
-        );
         active.settings = new; // commit
         Self::persist(&active.settings);
         // Scrollback: newly spawned panes read this live cell.
@@ -6627,7 +6531,6 @@ impl App {
             Self::refresh_fonts(active, family_changed);
         }
         active.force_full = true; // chrome + metrics changed: repaint the lot
-        log::debug!("[colourdbg] commit_settings: done, force_full={}", active.force_full);
     }
 
     /// Draw the preferences dialog from the PENDING settings, so the value you
