@@ -1134,6 +1134,19 @@ impl App {
         // `surface` and `context` feed the (already macOS/Linux-split) backend
         // construction further down, and `renderer` also feeds the cell-size
         // measurement just below.
+        //
+        // `renderer` is an OPTION because a GL renderer that will not initialise
+        // is no longer fatal: on hardware whose driver offers only OpenGL ES too
+        // old (or no GL at all) rt falls back to the XRender backend rather than
+        // exiting — see the fallback chain at the backend-construction band
+        // below. The surface/context are kept either way; they are cheap, and
+        // only `GlBackend` consumes them.
+        //
+        // `gl_init_error` carries WHY the renderer refused, so the fallback band
+        // can name the real cause ("this context is OpenGL ES 3.0, rt needs …")
+        // instead of the useless "renderer init failed" this used to exit with.
+        #[cfg(not(target_os = "macos"))]
+        let mut gl_init_error: Option<String> = None;
         #[cfg(not(target_os = "macos"))]
         let (mut renderer, surface, context) = {
             // Raw handle needed to bind the context and surface to this window.
@@ -1185,11 +1198,18 @@ impl App {
             });
 
             // --- build the renderer -----------------------------------------
+            // NOT fatal on failure: `None` means "no GL renderer on this box",
+            // and the backend band below turns that into an XRender fallback (or,
+            // if there is no X11 display to fall back onto, a clear exit).
             let renderer = match Renderer::new(gl.clone(), &font_blobs, physical_font_px(settings.font_size, scale_factor)) {
-                Ok(r) => r,
+                Ok(r) => Some(r),
                 Err(e) => {
-                    log::error!("renderer init failed: {e}");
-                    return self.fail_build(event_loop);
+                    // Recorded at warn! here and repeated at the point the
+                    // fallback engages, so the log always says *why* rt is on a
+                    // slower renderer. A silent downgrade is its own bug report.
+                    log::warn!("GL renderer init failed: {e}");
+                    gl_init_error = Some(e);
+                    None
                 }
             };
             (renderer, surface, context)
@@ -1258,9 +1278,18 @@ impl App {
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.surface_size(); // physical pixel size
         #[cfg(not(target_os = "macos"))]
-        renderer.resize(size.width as f32, size.height as f32);
+        if let Some(r) = renderer.as_mut() {
+            r.resize(size.width as f32, size.height as f32);
+        }
+        // With no GL renderer (it failed and XRender is about to take over)
+        // measure the cell straight from font metrics — `cell_size_for` mirrors
+        // exactly what `Renderer::new` measures, and it is also what
+        // `XRenderBackend` measures for itself, so the grid comes out the same.
         #[cfg(not(target_os = "macos"))]
-        let cell = renderer.cell_size(); // (cell_w, cell_h) in pixels
+        let cell = match renderer.as_ref() {
+            Some(r) => r.cell_size(), // (cell_w, cell_h) in pixels
+            None => render::cell_size_for(&font_blobs, physical_font_px(settings.font_size, scale_factor)),
+        };
         // No renderer exists yet on macOS (wgpu backend arrives in Task 4); measure
         // the cell straight from font metrics, the same GL-free helper used above
         // for the `--cols`/`--rows` pre-sizing calculation.
@@ -1352,7 +1381,7 @@ impl App {
 
         // Store the fully-initialised state and paint once.
         #[cfg(not(target_os = "macos"))]
-        let low_power = renderer.is_software(); // read before `renderer` is moved in
+        let low_power = renderer.as_ref().is_some_and(|r| r.is_software()); // read before `renderer` is moved in
         // No renderer exists yet on macOS (wgpu backend arrives in Task 4), so
         // there is nothing to judge software-vs-hardware yet either.
         #[cfg(target_os = "macos")]
@@ -1366,13 +1395,22 @@ impl App {
         let display_env = std::env::var("DISPLAY").ok();
         let is_x11 = display_env.is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none();
         let backend_override = self.cli.backend.clone().or_else(|| std::env::var("RT_BACKEND").ok());
-        let backend_kind = backend::choose_backend(display_env.as_deref(), is_x11, backend_override.as_deref());
+        #[allow(unused_mut)] // only the Linux arm below can re-point this
+        let mut backend_kind = backend::choose_backend(display_env.as_deref(), is_x11, backend_override.as_deref());
+        // A GL renderer that would not initialise takes the GL backend off the
+        // table entirely, whatever `choose_backend` (or `--backend gl`) wanted:
+        // XRender is then the only thing that can draw. This is what keeps rt
+        // alive on boards whose driver is OpenGL-ES-only and too old for even the
+        // GLES shader path (see `render::ShaderDialect`).
+        #[cfg(not(target_os = "macos"))]
+        if renderer.is_none() {
+            backend_kind = backend::BackendKind::XRender;
+        }
         log::info!("backend: {backend_kind:?}");
 
         // Wrap the GL renderer + present resources (surface/context/X11 present) as
         // the default backend. `&window` is borrowed here, before it moves into
-        // `Active` below. XRender is not yet wired (Task 3): `GlBackend` is built
-        // unconditionally, even when `backend_kind` is `XRender`.
+        // `Active` below.
         #[cfg(not(target_os = "macos"))]
         let backend: Box<dyn backend::Backend> = {
             // Mechanism C: on the XRender path, build the command-based backend
@@ -1390,7 +1428,44 @@ impl App {
                 };
             #[cfg(not(feature = "x11"))]
             let xr: Option<Box<dyn backend::Backend>> = None;
-            xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, window.as_ref())))
+            // The fallback chain. `xr` is `None` unless the XRender path was both
+            // selected and available (`try_new` returns `None` on Wayland, on a
+            // server without RENDER, and in a build without the `x11` feature).
+            match (xr, renderer) {
+                // XRender it is. Say out loud when this is a DOWNGRADE rather
+                // than the deliberate `ssh -X` choice — silently dropping to a
+                // slower renderer is its own bug report.
+                (Some(b), _) => {
+                    if let Some(why) = &gl_init_error {
+                        log::warn!(
+                            "GL is unavailable on this display, falling back to the XRender backend: {why}. \
+                             Drawing now goes through the X server — correct, but slower than GL, \
+                             and animated chrome is throttled."
+                        );
+                    }
+                    b
+                }
+                // The normal local path: a working GL renderer.
+                (None, Some(r)) => Box::new(gl_backend::GlBackend::new(r, surface, context, window.as_ref())),
+                // Neither backend can draw. Name the real cause — "renderer init
+                // failed" alone taught nobody anything — and say what each of the
+                // two paths would have needed.
+                (None, None) => {
+                    log::error!(
+                        "renderer init failed: {}",
+                        gl_init_error.as_deref().unwrap_or("the GL renderer did not initialise")
+                    );
+                    log::error!(
+                        "no usable rendering backend. rt's GL renderer needs desktop OpenGL 3.3+ \
+                         or OpenGL ES 3.0+; the XRender fallback needs an X11 display{} — it cannot \
+                         draw on a native Wayland session. Try running under X11/XWayland (unset \
+                         WAYLAND_DISPLAY with an X server running), or install a GL driver \
+                         providing one of those versions.",
+                        if cfg!(feature = "x11") { "" } else { ", and this binary was built without the `x11` feature" }
+                    );
+                    return self.fail_build(event_loop);
+                }
+            }
         };
         // wgpu/Metal backend (Task 4). `window` here is still the plain
         // `Box<dyn Window>` returned by `event_loop.create_window` above; it is
