@@ -381,6 +381,50 @@ pub fn encode_key(key: &Key, mods: ModifiersState, app_cursor: bool) -> Option<V
     encode_key_kitty(key, mods, app_cursor, 0)
 }
 
+/// The whole "ordinary typing" rule for one winit key event, as a pure function
+/// of the key, the text winit produced for it, and **the receiving pane's**
+/// terminal state — `app_cursor` (DECCKM) and `kbd_flags` (the kitty keyboard
+/// enhancement flags the program in that pane pushed).
+///
+/// Those last two are per-PANE, not per-keystroke: under broadcast one keypress
+/// reaches several panes whose programs negotiated differently, so the caller
+/// runs this once per target pane (`Session::feed_input_with`). That is exactly
+/// why it lives here as a function of `(app_cursor, kbd_flags)` rather than
+/// inline in the event handler over one pane's values — see the doc on
+/// `Session::feed_input_with` for the bug that shape caused.
+///
+/// Order matters and is load-bearing:
+///   1. A key the negotiated protocol disambiguates takes the protocol's form,
+///      tested BEFORE the produced-text branch — Ctrl-combos arrive *with* text
+///      (the C0 byte), and letting that win would silently give a negotiated
+///      application half a protocol.
+///   2. Navigation/editing/function keys become their ANSI escape sequences.
+///   3. Everything else sends the key's produced text, which already carries
+///      dead-key / compose results (`'` + space → `'`) the logical key misses;
+///      with no text (lone Ctrl combos, etc.) it falls back to `encode_key`.
+///
+/// `None` means the key produces no input at all (a lone modifier press, say).
+pub fn encode_key_event(
+    key: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    app_cursor: bool,
+    kbd_flags: u8,
+) -> Option<Vec<u8>> {
+    if kitty_disambiguates(key, mods, kbd_flags) {
+        return encode_key_kitty(key, mods, app_cursor, kbd_flags);
+    }
+    if let Key::Named(n) = key {
+        if is_sequence_key(n) {
+            return encode_key(key, mods, app_cursor); // arrows/enter/…
+        }
+    }
+    match text.filter(|t| !t.is_empty()) {
+        Some(text) => Some(encode_text(text, mods)), // the composed text
+        None => encode_key(key, mods, app_cursor),   // fallback (Ctrl combos, etc.)
+    }
+}
+
 /// As [`encode_key`], but honouring `kbd_flags` — the pane's active kitty
 /// keyboard enhancement flags, as pushed by the program running in it.
 ///

@@ -586,33 +586,47 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
     /// * `Group` → every pane sharing the focused pane's group id (or just the
     ///   focus if it has no group).
     /// * `All`   → every pane in the window.
+    ///
+    /// For bytes that are the SAME for every pane (composed IME text, say).
+    /// Anything whose encoding depends on what the receiving pane negotiated —
+    /// every keystroke — must go through
+    /// [`feed_input_with`](Session::feed_input_with) instead; see its doc.
+    ///
+    /// Targeting is [`receives_broadcast`](Session::receives_broadcast), the
+    /// single copy of the fan-out rule (the UI's "your typing goes here"
+    /// indicator reads the same function, so the two cannot drift).
     pub fn feed_input(&self, bytes: &[u8]) {
-        match self.broadcast {
-            Broadcast::Off => {
-                // Single target: the focused pane (if it still exists).
-                if let Some(p) = self.panes.get(&self.focus) {
-                    p.write(bytes); // deliver only here
-                }
+        for (id, p) in &self.panes {
+            if self.receives_broadcast(*id) {
+                p.write(bytes); // deliver to every target of the current mode
             }
-            Broadcast::All => {
-                // Fan out to every live pane.
-                for p in self.panes.values() {
-                    p.write(bytes); // deliver everywhere
-                }
-            }
-            Broadcast::Group => {
-                // Determine the focus's group; None means "just me".
-                let group = self.groups.get(&self.focus).copied();
-                for (id, p) in &self.panes {
-                    // A pane receives input if it shares the focus's group, or
-                    // if the focus is ungrouped and this is the focus itself.
-                    let same_group = match group {
-                        Some(g) => self.groups.get(id).copied() == Some(g),
-                        None => *id == self.focus,
-                    };
-                    if same_group {
-                        p.write(bytes); // deliver to group members
-                    }
+        }
+    }
+
+    /// [`feed_input`](Session::feed_input) for input whose BYTES depend on the
+    /// receiving pane: `encode` is called once per target pane and may return a
+    /// different sequence for each (`None` = nothing to send to that pane).
+    ///
+    /// A keystroke's encoding is a property of the program in the pane, not of
+    /// the keyboard: DECCKM (application cursor keys) decides whether an arrow
+    /// is `CSI A` or `SS3 A`, and the kitty keyboard flags decide whether
+    /// Shift+Enter is `\r` or `\x1b[13;2u`. Under broadcast one keystroke
+    /// reaches panes in different states, so encoding it ONCE from the focused
+    /// pane — the old bug, exactly the one [`feed_paste`](Session::feed_paste)'s
+    /// doc records for bracketed paste — fed the wrong form to every mismatched
+    /// pane: a shell that negotiated nothing got `\x1b[13;2u` where it used to
+    /// get `\r`, and `\x1b[99;5u` where it used to get the 0x03 that raises
+    /// SIGINT. The whole safety property of the kitty keyboard protocol is that
+    /// a program which never negotiated sees byte-identical input to before it
+    /// existed, and only a per-pane decision keeps that true under broadcast.
+    ///
+    /// `Broadcast::Off` has exactly ONE target (the focus), so it makes exactly
+    /// ONE call — the common path does not turn into N encodes.
+    pub fn feed_input_with(&self, encode: impl Fn(&B) -> Option<Vec<u8>>) {
+        for (id, p) in &self.panes {
+            if self.receives_broadcast(*id) {
+                if let Some(bytes) = encode(p) {
+                    p.write(&bytes); // this pane's own encoding of the keystroke
                 }
             }
         }
@@ -652,6 +666,25 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
         for (id, p) in &self.panes {
             if self.groups.get(id).copied() == Some(group) {
                 p.write(bytes);
+            }
+        }
+    }
+
+    /// [`write_to_group`](Session::write_to_group) for input whose bytes depend
+    /// on the receiving pane — the cross-window half of
+    /// [`feed_input_with`](Session::feed_input_with), and the key equivalent of
+    /// [`paste_to_group`](Session::paste_to_group).
+    ///
+    /// The per-pane encode is load-bearing for exactly the reason spelled out on
+    /// `feed_input_with`, and crossing a window boundary does not make it less
+    /// so: a group member torn out into another window has its own DECCKM state
+    /// and its own kitty keyboard flags, negotiated by its own program.
+    pub fn write_to_group_with(&self, group: u32, encode: impl Fn(&B) -> Option<Vec<u8>>) {
+        for (id, p) in &self.panes {
+            if self.groups.get(id).copied() == Some(group) {
+                if let Some(bytes) = encode(p) {
+                    p.write(&bytes);
+                }
             }
         }
     }

@@ -367,3 +367,52 @@ fn unbound_command_chord_types_nothing_on_macos() {
     assert!(!rt_app::input::swallows_unbound(ModifiersState::empty()));
     assert_eq!(encode_key(&ch("c"), ModifiersState::CONTROL, false), Some(vec![0x03]));
 }
+
+// ----- The per-pane encode: one key event, two panes, two answers ----------
+
+/// `encode_key_event` is the whole ordinary-typing rule as a function of the
+/// RECEIVING pane's terminal state, which is what lets rt encode a broadcast
+/// keystroke once per target pane instead of once from the focus. These pin
+/// that the state arguments genuinely change the answer for the same event, and
+/// that the branch ORDER holds: a key the negotiated protocol disambiguates
+/// must be decided before winit's produced text, because a Ctrl-combo arrives
+/// carrying text (the C0 byte) and letting that win would hand a negotiating
+/// application half a protocol.
+#[test]
+fn encode_key_event_answers_per_pane_state() {
+    use rt_app::input::encode_key_event;
+    let ctrl = ModifiersState::CONTROL;
+    let shift = ModifiersState::SHIFT;
+    let enter = Key::Named(NamedKey::Enter);
+    let up = Key::Named(NamedKey::ArrowUp);
+
+    // Ctrl+C. winit hands us the produced text — the 0x03 byte itself.
+    let ctrl_c_text = Some("\u{3}");
+    // A pane that negotiated NOTHING must still get exactly 0x03, or it never
+    // sees SIGINT. This is the safety property the whole feature rests on.
+    assert_eq!(
+        encode_key_event(&ch("c"), ctrl_c_text, ctrl, false, 0),
+        Some(vec![0x03]),
+        "un-negotiated pane: Ctrl+C is the bare control byte",
+    );
+    // The SAME event, for a pane that pushed flag 1, is the CSI-u form.
+    assert_eq!(
+        encode_key_event(&ch("c"), ctrl_c_text, ctrl, false, 1),
+        Some(b"\x1b[99;5u".to_vec()),
+        "negotiating pane: the protocol form wins over the produced text",
+    );
+
+    // Shift+Enter: `\r` (submits) vs the CSI-u form (bindable), same event.
+    assert_eq!(encode_key_event(&enter, Some("\r"), shift, false, 0), Some(b"\r".to_vec()));
+    assert_eq!(encode_key_event(&enter, Some("\r"), shift, false, 1), Some(b"\x1b[13;2u".to_vec()));
+
+    // And DECCKM, which predates the protocol: an unmodified arrow is CSI for a
+    // plain shell and SS3 for a full-screen app, decided by the pane's state.
+    assert_eq!(encode_key_event(&up, None, ModifiersState::empty(), false, 0), Some(b"\x1b[A".to_vec()));
+    assert_eq!(encode_key_event(&up, None, ModifiersState::empty(), true, 0), Some(b"\x1bOA".to_vec()));
+
+    // A key that produces nothing produces nothing in every state.
+    let dead = Key::Named(NamedKey::BrowserBack);
+    assert_eq!(encode_key_event(&dead, None, ModifiersState::empty(), false, 0), None);
+    assert_eq!(encode_key_event(&dead, None, ModifiersState::empty(), true, 1), None);
+}

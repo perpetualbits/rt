@@ -17,10 +17,23 @@ struct PaneLog {
     size: (usize, usize),  // last (cols, rows) it was resized to
 }
 
+/// What the program running in a mock pane has negotiated — the two per-pane
+/// facts a real keystroke's encoding depends on. `Session` never reads these
+/// itself (it stays pure; the encoder lives above this crate); they exist so a
+/// test's encode closure can read them off the pane it is handed, exactly the
+/// way `App`'s closure reads `TermPane::app_cursor_keys` /
+/// `TermPane::kitty_keyboard_flags`.
+#[derive(Clone, Copy, Default)]
+struct KeyState {
+    app_cursor: bool, // DECCKM: arrows are SS3 rather than CSI
+    kbd_flags: u8,    // kitty keyboard enhancement flags the program pushed
+}
+
 /// A fake terminal backend that just records into a shared `PaneLog`.
 #[derive(Clone)]
 struct MockBackend {
     log: Rc<RefCell<PaneLog>>, // shared with the test harness
+    keys: KeyState,            // what "the program in this pane" negotiated
 }
 
 impl Backend for MockBackend {
@@ -43,7 +56,7 @@ fn spawner(logs: Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>) -> impl FnMut(rt_core::
         // Create this pane's log, pre-seeded with its initial size.
         let log = Rc::new(RefCell::new(PaneLog { writes: Vec::new(), size: (cols, rows) }));
         logs.borrow_mut().push(log.clone()); // remember it for the test
-        Some(MockBackend { log }) // the backend the session will own
+        Some(MockBackend { log, keys: KeyState::default() }) // the backend the session will own
     }
 }
 
@@ -302,7 +315,7 @@ fn spawn_failure_refuses_split_without_losing_panes() {
         calls_f.set(n + 1);
         if n == 0 {
             let log = Rc::new(RefCell::new(PaneLog { writes: Vec::new(), size: (cols, rows) }));
-            Some(MockBackend { log })
+            Some(MockBackend { log, keys: KeyState::default() })
         } else {
             None // simulate PTY/fd exhaustion for the split's pane
         }
@@ -322,4 +335,174 @@ fn spawn_failure_refuses_split_without_losing_panes() {
     // A new tab under the same failure is refused the same way.
     session.apply(Action::NewTab);
     assert_eq!(session.tree().all_panes().len(), 1, "failed new-tab must not add a pane");
+}
+
+// ----- Per-pane keystroke ENCODING under broadcast -------------------------
+//
+// A keystroke's bytes are not a property of the keyboard, they are a property
+// of the program in the pane that receives them: DECCKM decides whether an
+// arrow is `CSI A` or `SS3 A`, and the kitty keyboard flags decide whether
+// Shift+Enter is `\r` or `\x1b[13;2u`. Broadcast sends ONE keypress to several
+// panes, which may have negotiated differently, so the encode must happen per
+// TARGET pane — the same rule `feed_paste` already follows for bracketed paste
+// (see its doc: deciding once from the focus was "the old bug"). These tests
+// pin that for the key path, through `feed_input_with`/`write_to_group_with`.
+
+/// Build a session whose panes take their negotiated `KeyState` from `states`,
+/// in spawn order (pane 0 is the session's initial pane). Panes spawned past
+/// the end of `states` get the default (nothing negotiated).
+fn make_with_keys(
+    states: Vec<KeyState>,
+) -> (
+    Session<MockBackend, impl FnMut(rt_core::PaneId, usize, usize) -> Option<MockBackend>>,
+    Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>,
+) {
+    let logs = Rc::new(RefCell::new(Vec::new()));
+    let logs_s = logs.clone();
+    let mut n = 0usize;
+    let spawn = move |_id: rt_core::PaneId, cols, rows| {
+        let log = Rc::new(RefCell::new(PaneLog { writes: Vec::new(), size: (cols, rows) }));
+        logs_s.borrow_mut().push(log.clone());
+        let keys = states.get(n).copied().unwrap_or_default();
+        n += 1;
+        Some(MockBackend { log, keys })
+    };
+    let session = Session::new(Rect::new(0.0, 0.0, 1000.0, 800.0), (10.0, 20.0), spawn);
+    (session, logs)
+}
+
+/// Stand-in for rt's real encoder (`rt_app::input::encode_key_kitty`, which
+/// lives in the `rt` crate above this one — `rt-session` must not depend on
+/// winit to be testable). Only the property under test is modelled: Shift+Enter
+/// is the legacy `\r` for a program that negotiated nothing, and the CSI-u form
+/// for one that pushed `CSI > 1 u`.
+fn shift_enter(st: KeyState) -> Option<Vec<u8>> {
+    Some(if st.kbd_flags != 0 { b"\x1b[13;2u".to_vec() } else { b"\r".to_vec() })
+}
+
+/// Ditto for an unmodified Up arrow, whose form is decided by DECCKM.
+fn arrow_up(st: KeyState) -> Option<Vec<u8>> {
+    Some(if st.app_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() })
+}
+
+/// Two panes, `Broadcast::All`, DIFFERENT kitty keyboard flags: one Shift+Enter
+/// must reach the negotiating pane as `\x1b[13;2u` and the non-negotiating one
+/// as `\r`. Encoding once from the focus (the bug) sent the CSI-u form to a
+/// plain shell, where the line never submits and the escape lands in the buffer.
+#[test]
+fn broadcast_all_encodes_per_pane_not_per_focus() {
+    // Pane 0 negotiated nothing; pane 1 (which the split focuses) pushed flag 1.
+    let (mut session, logs) = make_with_keys(vec![
+        KeyState { app_cursor: false, kbd_flags: 0 },
+        KeyState { app_cursor: false, kbd_flags: 1 },
+    ]);
+    session.apply(Action::SplitVert); // pane1 spawns and takes the focus
+    session.apply(Action::BroadcastAll);
+
+    session.feed_input_with(|p: &MockBackend| shift_enter(p.keys)); // ONE keypress
+
+    assert_eq!(
+        logs.borrow()[0].borrow().writes,
+        vec![b"\r".to_vec()],
+        "the pane that negotiated NOTHING must get the legacy byte, whatever the focus negotiated",
+    );
+    assert_eq!(
+        logs.borrow()[1].borrow().writes,
+        vec![b"\x1b[13;2u".to_vec()],
+        "the negotiating (focused) pane must still get the protocol form",
+    );
+}
+
+/// The same, for `app_cursor` (DECCKM). This defect predates the kitty
+/// protocol: a broadcast arrow key used the FOCUSED pane's application-cursor
+/// state for every pane, so a full-screen app (`vim`, `mc`) sharing a broadcast
+/// with a plain shell got the wrong arrow form in one of the two.
+#[test]
+fn broadcast_all_encodes_app_cursor_per_pane() {
+    // Pane 0 is a plain shell (DECCKM off); pane 1 is a full-screen app.
+    let (mut session, logs) = make_with_keys(vec![
+        KeyState { app_cursor: false, kbd_flags: 0 },
+        KeyState { app_cursor: true, kbd_flags: 0 },
+    ]);
+    session.apply(Action::SplitVert); // focus lands on the app_cursor pane
+    session.apply(Action::BroadcastAll);
+
+    session.feed_input_with(|p: &MockBackend| arrow_up(p.keys)); // ONE arrow press
+
+    assert_eq!(logs.borrow()[0].borrow().writes, vec![b"\x1b[A".to_vec()], "normal-cursor pane: CSI form");
+    assert_eq!(logs.borrow()[1].borrow().writes, vec![b"\x1bOA".to_vec()], "DECCKM pane: SS3 form");
+}
+
+/// A group spans WINDOWS, and each window is its own `Session` (see
+/// `write_to_group`'s doc: `Session` only ever knows its own panes, so `App`
+/// walks the windows). The per-pane encode must survive that crossing — the
+/// sibling window's pane negotiated on its own, and `write_to_group_with` is
+/// what carries the decision across.
+#[test]
+fn group_broadcast_encodes_per_pane_across_sessions() {
+    // Window A: the typist's window; its pane pushed the kitty flag.
+    let (mut a, a_logs) = make_with_keys(vec![KeyState { app_cursor: false, kbd_flags: 1 }]);
+    // Window B: two panes torn out into another window, in OPPOSITE states —
+    // two, so that a `write_to_group_with` which encoded once and reused the
+    // bytes for the whole group could not accidentally be right.
+    let (mut b, b_logs) = make_with_keys(vec![
+        KeyState { app_cursor: false, kbd_flags: 0 },
+        KeyState { app_cursor: false, kbd_flags: 1 },
+    ]);
+    a.set_group(5); // every pane involved joins group 5
+    b.set_group(5); // window B's pane0 (its focus)
+    b.apply(Action::SplitVert); // spawn pane1, which takes B's focus
+    b.set_group(5); // ...and put that one in the group too
+    a.apply(Action::BroadcastGroup);
+
+    // Exactly what `App` does for one keypress: the local fan-out first, then
+    // the sibling windows (which exclude the origin window, so the focused pane
+    // is never delivered to twice — see `App::group_broadcast_targets`).
+    let encode = |p: &MockBackend| shift_enter(p.keys);
+    a.feed_input_with(&encode);
+    b.write_to_group_with(5, &encode);
+
+    assert_eq!(
+        a_logs.borrow()[0].borrow().writes,
+        vec![b"\x1b[13;2u".to_vec()],
+        "the typist's negotiating pane keeps the protocol form",
+    );
+    assert_eq!(
+        b_logs.borrow()[0].borrow().writes,
+        vec![b"\r".to_vec()],
+        "the other window's non-negotiating pane must get the legacy byte",
+    );
+    assert_eq!(
+        b_logs.borrow()[1].borrow().writes,
+        vec![b"\x1b[13;2u".to_vec()],
+        "...while its negotiating neighbour, same group and same window, gets the protocol form",
+    );
+}
+
+/// `Broadcast::Off` is the common path: exactly one target (the focus), so
+/// exactly ONE encode and ONE delivery. Fixing the broadcast case must not turn
+/// every keystroke into an encode per pane, nor deliver to the focus twice.
+#[test]
+fn broadcast_off_encodes_once_and_only_for_the_focus() {
+    let (mut session, logs) = make_with_keys(vec![
+        KeyState { app_cursor: false, kbd_flags: 0 },
+        KeyState { app_cursor: false, kbd_flags: 1 },
+    ]);
+    session.apply(Action::SplitVert); // two panes; focus is pane1
+    session.apply(Action::SplitHoriz); // three panes; focus is pane2
+
+    let calls = std::cell::Cell::new(0usize);
+    session.feed_input_with(|p: &MockBackend| {
+        calls.set(calls.get() + 1);
+        shift_enter(p.keys)
+    });
+
+    assert_eq!(calls.get(), 1, "one target means exactly one encode, not one per pane");
+    assert!(logs.borrow()[0].borrow().writes.is_empty(), "unfocused pane must get nothing");
+    assert!(logs.borrow()[1].borrow().writes.is_empty(), "unfocused pane must get nothing");
+    assert_eq!(
+        logs.borrow()[2].borrow().writes,
+        vec![b"\r".to_vec()],
+        "the focus receives the keystroke exactly once",
+    );
 }
