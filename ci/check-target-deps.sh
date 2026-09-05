@@ -46,6 +46,32 @@ elif [ "$mac_resolved" = 1 ]; then
   echo "OK: no Wayland/X11/glutin crates on macOS"
 fi
 
+echo "########## Lean build: --no-default-features must stay X11-free ##########"
+# README advertises `cargo install --path crates/rt --no-default-features` as
+# "lean, Wayland-only (zero X11 crates)". Nothing checked that, and the macOS
+# port quietly broke it by making arboard unconditional -- arboard depends on
+# x11rb on Linux, so four X11 crates entered the build README calls X11-free.
+# The two checks above resolve the DEFAULT feature set only and cannot see it.
+#
+# `xcursor` is deliberately NOT in this list: it arrives via wayland-cursor and
+# parses Xcursor THEME FILES, which Wayland uses too. It is not an X11 client.
+if ! lean_tree=$(cargo tree -p rt --no-default-features --edges normal 2>&1); then
+  echo "FAIL: cargo tree could not resolve the lean graph -- this gate checked NOTHING:"
+  printf '%s\n' "$lean_tree" | tail -5 | sed 's/^/  /'
+  FAIL=1
+else
+  lean=$(printf '%s\n' "$lean_tree" \
+         | grep -oE '\b(x11rb|x11rb-protocol|as-raw-xcb-connection|arboard|x11-dl|xcb)\b' | sort -u)
+  if [ -n "$lean" ]; then
+    echo "FAIL: --no-default-features must not pull X11 crates, but it pulls:"
+    printf '%s\n' "$lean" | sed 's/^/  /'
+    echo "Either re-gate the dependency behind the \`x11\` feature, or fix README's claim."
+    FAIL=1
+  else
+    echo "OK: lean build is X11-free"
+  fi
+fi
+
 echo "########## Linux graph: must match the baseline ##########"
 if ! lin_tree=$(cargo tree --target x86_64-unknown-linux-gnu -p rt --edges normal 2>&1); then
   echo "FAIL: cargo tree could not resolve the Linux graph -- this gate checked NOTHING:"

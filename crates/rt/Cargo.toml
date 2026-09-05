@@ -31,14 +31,16 @@ vtterm-default = ["rt-engine/vtterm-default"]  # the in-house engine as the buil
 # runs the in-house `vt-parser` + `vt-term` engine (RT_ENGINE=alacritty still
 # selects the vendored engine at runtime for a comparison).
 default = ["x11", "vtterm-default"]
-# First-class X11 support: adds the X11/XWayland backends (winit/glutin) and
-# X11 background blur (x11rb); arboard (clipboard) is unconditional now that it
-# also backs macOS, so it is no longer named here. The same code runs on either
-# backend — winit auto-selects from WAYLAND_DISPLAY / DISPLAY at runtime, so
-# `--features x11` is a universal binary. The DEFAULT build omits this feature,
-# keeping the dependency tree Wayland-only (zero X11 crates). Build/install
-# universal: cargo install --path crates/rt --features x11
-x11 = ["winit/x11", "glutin/glx", "glutin/x11", "dep:x11rb"]
+# First-class X11 support: adds the X11/XWayland backends (winit/glutin), X11
+# background blur (x11rb) and the X11 clipboard (arboard, whose Linux build
+# depends on x11rb -- which is why it hangs off this feature rather than being
+# unconditional; see the per-target dependency sections below). The same code
+# runs on either backend -- winit auto-selects from WAYLAND_DISPLAY / DISPLAY at
+# runtime, so `--features x11` is a universal binary. Without this feature the
+# dependency tree is Wayland-only: no x11rb, no arboard. (`xcursor` remains, via
+# wayland-cursor -- it parses Xcursor THEME FILES, which Wayland uses too.)
+# Build/install universal: cargo install --path crates/rt --features x11
+x11 = ["winit/x11", "glutin/glx", "glutin/x11", "dep:arboard", "dep:x11rb"]
 
 [dependencies]
 rt-core = { path = "../rt-core" }
@@ -70,10 +72,6 @@ fontdue = "0.9"                      # CPU glyph rasteriser feeding the GL atlas
 fontdb = "0.23"                      # pure-Rust system font discovery (family picker; no X11)
 log = "0.4"                          # diagnostics
 env_logger = "0.11"                  # RUST_LOG-driven logging for the binary
-# X11 AND macOS clipboard; no longer optional. default-features off, as before
-# (arboard's default pulls in `image-data`, which drags the `image` crate and
-# its codec tree into every build for a capability rt never uses -- text only).
-arboard = { version = "3.6", default-features = false }
 # For the patch-bay pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).
 libc = "0.2"
 
@@ -86,6 +84,11 @@ libc = "0.2"
 # winit needs no gating here -- it already target-gates winit-x11/winit-wayland
 # to all(unix, not(target_vendor = "apple")) and selects winit-appkit itself.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
+# The X11 clipboard, and ONLY that -- Wayland uses smithay-clipboard. Optional and
+# pulled in by the `x11` feature, because arboard depends on x11rb: making it
+# unconditional silently put four X11 crates into the --no-default-features build
+# that README advertises as "lean, Wayland-only (zero X11 crates)".
+arboard = { version = "3.6", default-features = false, optional = true }
 # glutin is joined to winit directly, by raw handle: `glutin-winit` is still
 # pinned to winit 0.30 and cannot bridge 0.31. Both speak raw-window-handle 0.6,
 # which is the only interface the join actually needs.
@@ -116,6 +119,11 @@ smithay-clipboard = "0.7"
 x11rb = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Clipboard via NSPasteboard. Unconditional here: macOS has no `x11` feature to
+# hang it on, and there is no second clipboard backend to fall back to.
+# default-features off -- arboard's default pulls `image-data`, which drags the
+# `image` crate and its codec tree in for a capability rt never uses (text only).
+arboard = { version = "3.6", default-features = false }
 wgpu = "27"
 objc2 = "0.6"
 # `NSGraphics` is what carries `NSWindowOrderingMode`, and objc2 gates
