@@ -1489,6 +1489,51 @@ mod vtpane_tests {
         assert!(saw_exit, "shell exit not detected while a backgrounded child held the PTY open");
     }
 
+    /// An unanswered `CSI ? u` is a dead feature: the application concludes rt has no
+    /// keyboard protocol and never enables it. So prove the whole loop with a real
+    /// child on a real PTY — the query goes down, `Term::reply` queues it, the reader
+    /// loop drains `take_output()`, and the bytes come back up to the child.
+    #[test]
+    fn a_real_child_gets_its_keyboard_query_answered() {
+        let pane = vtpane::VtPane::spawn_env(
+            Some((
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    // Raw mode: the reply has no newline, so a cooked line discipline
+                    // would never hand it to `head`, and echo would print it back at us.
+                    // Then: enable the protocol, ask what is active, read the 5-byte
+                    // reply, and print it as hex where the test can read it off the grid.
+                    "stty raw -echo; printf '\\033[>1u\\033[?u'; \
+                     head -c 5 | od -An -tx1 | tr -d ' \\n'; printf '_DONE\\r\\n'"
+                        .into(),
+                ],
+            )),
+            None,
+            40,
+            10,
+            &[],
+            1000,
+            &Arc::new(budget::Budget::default()),
+        )
+        .expect("spawn vt-term pane");
+
+        let mut screen = String::new();
+        for _ in 0..300 {
+            screen = pane.snapshot().to_text();
+            if screen.contains("_DONE") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // `1b 5b 3f 31 75` is `ESC [ ? 1 u` — the flags the child just pushed, read
+        // back by the child itself off the PTY.
+        assert!(
+            screen.contains("1b5b3f3175"),
+            "child never received `\\x1b[?1u`; screen was:\n{screen}"
+        );
+    }
+
     /// The in-house backend drives a real PTY: spawn a shell that prints many lines (so
     /// scrollback builds), poll until the marker appears, confirm the child-exit event,
     /// then exercise scroll / search / selection / title / resize.
