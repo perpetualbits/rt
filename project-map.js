@@ -64,12 +64,14 @@ window.PROJECT_MAP = {
     {
       id: "render-gl", label: "GL renderer", layer: "frontend", status: "done",
       tags: ["OpenGL", "glyphs"],
-      desc: "The custom OpenGL glyph-atlas renderer used on Wayland and local X11. Rasterises glyphs on the CPU (anti-aliased coverage masks) through a multi-font fallback chain, then blits cells on the GPU. Handles bold/italic/underline, truecolour, and compositor blur.",
+      desc: "The custom OpenGL glyph-atlas renderer used on Wayland and local X11. Rasterises glyphs on the CPU (anti-aliased coverage masks) through a multi-font fallback chain, then blits cells on the GPU. Handles bold/italic/underline, truecolour, and compositor blur. Speaks two GLSL dialects from one shader body, picked at runtime from the live context: desktop GL 3.3 core, or GLES 3.0 for boards whose driver is OpenGL-ES-only (PowerVR/Mali/Adreno).",
       files: ["crates/rt/src/render.rs", "crates/rt/src/gl_backend.rs", "crates/rt/src/raster.rs", "crates/rt/src/blur.rs"],
       specs: [],
       parts: [
         { label: "Font-fallback chain", status: "done", desc: "Primary + fallbacks (DejaVu, Agave …) so braille/box glyphs aren't tofu." },
-        { label: "Background blur", status: "done", desc: "Wayland ext-background-effect-v1 / KDE; X11 _KDE_NET_WM_BLUR." }
+        { label: "Background blur", status: "done", desc: "Wayland ext-background-effect-v1 / KDE; X11 _KDE_NET_WM_BLUR." },
+        { label: "GLES 3.0 shader path", status: "done", desc: "#version 300 es with highp precision, selected from glow's parsed GL_VERSION; one shared shader body keeps the desktop 3.30 source byte-identical." },
+        { label: "XRender fallback on GL failure", status: "done", desc: "A renderer that will not initialise is no longer fatal: rt drops to XRender on X11 (warn! saying why) and only exits when neither path can draw." }
       ],
       deps: []
     },

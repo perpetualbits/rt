@@ -130,6 +130,173 @@ pub fn scissor_box(r: crate::damage::PxRect, screen_h: i32) -> (i32, i32, i32, i
     (r.x, gl_y, r.w, r.h)
 }
 
+// ---------------------------------------------------------------------------
+// Shaders: one body, two dialects.
+// ---------------------------------------------------------------------------
+
+/// Vertex shader body — map pixel coordinates to clip space using the viewport
+/// size uniform (origin top-left, y down — the usual GUI convention).
+///
+/// Everything here is valid in BOTH desktop GLSL 3.30 core and GLSL ES 3.00:
+/// `layout (location = N) in` on vertex inputs, `out` varyings and `gl_Position`
+/// all exist unchanged in ES 3.00 (they are the ES 2.0 `attribute`/`varying`
+/// keywords that do *not*). Only the header above it differs — see
+/// [`ShaderDialect::vs_header`]. Starts with the newline that follows the
+/// `#version` line, so `header + body` reproduces the original single string.
+const VS_BODY: &str = r#"
+            layout (location = 0) in vec2 a_pos;      // pixel position
+            layout (location = 1) in vec2 a_uv;       // atlas uv
+            layout (location = 2) in vec4 a_color;    // rgba
+            uniform vec2 u_screen;                    // viewport in pixels
+            out vec2 v_uv;                            // -> fragment
+            out vec4 v_color;
+            void main() {
+                // Convert pixels to normalised device coords, flipping y.
+                float x = (a_pos.x / u_screen.x) * 2.0 - 1.0;
+                float y = 1.0 - (a_pos.y / u_screen.y) * 2.0;
+                gl_Position = vec4(x, y, 0.0, 1.0);
+                v_uv = a_uv;
+                v_color = a_color;
+            }"#;
+
+/// Fragment shader body: coverage (red channel) becomes alpha.
+///
+/// Also dialect-neutral. `texture(sampler2D, vec2)` is the ES 3.00 spelling too
+/// (ES 2.0's `texture2D` is what would have been needed at `#version 100`), and a
+/// single user-declared `out` defaults to colour attachment 0 in both dialects,
+/// so no `layout (location = 0)` is needed on `frag`. The one thing ES demands
+/// that desktop GL does not is a default float precision in the fragment stage;
+/// that lives in [`ShaderDialect::fs_header`].
+const FS_BODY: &str = r#"
+            in vec2 v_uv;
+            in vec4 v_color;
+            uniform sampler2D u_atlas;                // the coverage atlas
+            out vec4 frag;
+            void main() {
+                float cov = texture(u_atlas, v_uv).r; // glyph coverage / 1.0 for solids
+                float a = v_color.a * cov;             // effective alpha of this fragment
+                frag = vec4(v_color.rgb * a, a);       // PREMULTIPLIED output (rgb scaled by alpha)
+            }"#;
+
+/// Which GLSL dialect the *live* context speaks. Chosen at runtime from
+/// `glGetString(GL_VERSION)` (via glow's parsed [`glow::Version`]), never guessed
+/// from the platform: the same rt binary meets desktop Mesa on a PC and an
+/// OpenGL-ES-only vendor driver (PowerVR on a StarFive JH7110, Mali, Adreno…) on
+/// a small board, and only the context can say which it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShaderDialect {
+    /// Desktop OpenGL 3.3 core profile — what rt has always emitted.
+    Core330,
+    /// OpenGL ES 3.0 — `#version 300 es` plus mandatory precision declarations.
+    /// ES 3.0 (not 2.0) is the floor because `render.rs` uses vertex array
+    /// objects, `in`/`out` varyings, `texture()`, sized `R8` internal formats and
+    /// a user-declared fragment output — every one of which is ES 3.0, not ES 2.0.
+    Es300,
+}
+
+impl ShaderDialect {
+    /// The dialect a context of this version can compile, or `None` if it is too
+    /// old for either variant. Pure and platform-free so it is unit-testable
+    /// without a GL context (there is none in CI's headless sandbox).
+    ///
+    /// `is_embedded` is glow's flag for an OpenGL **ES** context (it parses the
+    /// `OpenGL ES N.M …` form of `GL_VERSION`).
+    pub fn pick(major: u32, minor: u32, is_embedded: bool) -> Option<ShaderDialect> {
+        if is_embedded {
+            // GLES 3.0+ → `#version 300 es`. ES 2.x/1.x cannot run this renderer.
+            ((major, minor) >= (3, 0)).then_some(ShaderDialect::Es300)
+        } else {
+            // Desktop GL 3.3+ → `#version 330 core`. 4.x accepts 330 as well,
+            // core or compatibility profile alike.
+            ((major, minor) >= (3, 3)).then_some(ShaderDialect::Core330)
+        }
+    }
+
+    /// The complete vertex shader source for this dialect: the dialect's header
+    /// lines followed by the one shared [`VS_BODY`].
+    ///
+    /// Public so `tests/gles_shader_path.rs` can hand each dialect's exact source
+    /// to a real driver and see it compile — the only way to check the GLES
+    /// variant on a machine that has no GLES-only GPU.
+    pub fn vertex_source(self) -> String {
+        format!("{}{VS_BODY}", self.vs_header())
+    }
+
+    /// The complete fragment shader source for this dialect. See
+    /// [`vertex_source`](Self::vertex_source).
+    pub fn fragment_source(self) -> String {
+        format!("{}{FS_BODY}", self.fs_header())
+    }
+
+    /// The `#version` line this dialect emits, for logs and error messages.
+    pub fn version_line(self) -> &'static str {
+        match self {
+            ShaderDialect::Core330 => "#version 330 core",
+            ShaderDialect::Es300 => "#version 300 es",
+        }
+    }
+
+    /// Ask the live context which dialect to compile for. Returns a message
+    /// naming *what was found* and *what is required* when neither fits, so the
+    /// caller (and `main`'s XRender fallback) can report something actionable
+    /// instead of a raw driver string like "version 330 not supported".
+    fn of_context(gl: &glow::Context) -> Result<ShaderDialect, String> {
+        let v = gl.version();
+        let api = if v.is_embedded { "OpenGL ES" } else { "OpenGL" };
+        match ShaderDialect::pick(v.major, v.minor, v.is_embedded) {
+            Some(d) => {
+                log::info!(
+                    "GL context: {api} {}.{} ({}); compiling shaders as `{}`",
+                    v.major,
+                    v.minor,
+                    v.vendor_info,
+                    d.version_line()
+                );
+                Ok(d)
+            }
+            None => Err(format!(
+                "unsupported GL version: this context is {api} {}.{} ({}), \
+                 but rt's GL renderer needs desktop OpenGL 3.3+ or OpenGL ES 3.0+",
+                v.major, v.minor, v.vendor_info
+            )),
+        }
+    }
+
+    /// Lines prepended to [`VS_BODY`]. Desktop is exactly the string rt has
+    /// always compiled; ES adds the float precision the vertex stage already
+    /// defaults to, stated explicitly so it provably matches the fragment
+    /// stage's declaration for the `v_uv`/`v_color` interface.
+    fn vs_header(self) -> &'static str {
+        match self {
+            ShaderDialect::Core330 => "#version 330 core",
+            ShaderDialect::Es300 => "#version 300 es\nprecision highp float;",
+        }
+    }
+
+    /// Lines prepended to [`FS_BODY`].
+    ///
+    /// GLSL ES has **no** default `float` precision in the fragment stage, so one
+    /// must be declared or the shader will not compile. `highp` — not the more
+    /// common `mediump` — is deliberate, on both declarations:
+    ///
+    /// * `v_uv` indexes a 1024² atlas. `mediump` is only guaranteed fp16-ish
+    ///   (10-bit mantissa, ~1e-3 relative), which at a UV near 1.0 is a quarter
+    ///   of a texel of error — and the atlas samples with `NEAREST`, so a quarter
+    ///   texel is the difference between a glyph's edge pixel and its neighbour's.
+    /// * `u_atlas` returns 8-bit coverage; the ES default sampler precision is
+    ///   `lowp`, which is not required to preserve all 256 levels and would band
+    ///   anti-aliased glyph edges.
+    ///
+    /// `highp` in the fragment stage is mandatory in ES 3.0 (unlike ES 2.0, where
+    /// it was optional), so this costs nothing in portability on our 3.0 floor.
+    fn fs_header(self) -> &'static str {
+        match self {
+            ShaderDialect::Core330 => "#version 330 core",
+            ShaderDialect::Es300 => "#version 300 es\nprecision highp float;\nprecision highp sampler2D;",
+        }
+    }
+}
+
 /// The renderer owns the GL objects, the font, the atlas, and the per-frame
 /// vertex scratch buffer.
 pub struct Renderer {
@@ -343,35 +510,17 @@ impl Renderer {
 
     /// Compile and link the vertex+fragment shaders into a program, returning a
     /// descriptive error on failure. Kept private; called once from `new`.
+    ///
+    /// The GLSL *body* of each stage is one source of truth ([`VS_BODY`] /
+    /// [`FS_BODY`]); only the few lines above it — the `#version` line and, on
+    /// GLES, the mandatory precision declarations — differ per dialect. That
+    /// keeps the desktop string byte-for-byte what it always was while a second
+    /// hardware class becomes reachable, and makes it impossible for the two
+    /// variants to drift apart in the part that actually computes pixels.
     unsafe fn build_program(gl: &glow::Context) -> Result<glow::Program, String> {
-        // Vertex shader: map pixel coordinates to clip space using the viewport
-        // size uniform (origin top-left, y down — the usual GUI convention).
-        let vs_src = r#"#version 330 core
-            layout (location = 0) in vec2 a_pos;      // pixel position
-            layout (location = 1) in vec2 a_uv;       // atlas uv
-            layout (location = 2) in vec4 a_color;    // rgba
-            uniform vec2 u_screen;                    // viewport in pixels
-            out vec2 v_uv;                            // -> fragment
-            out vec4 v_color;
-            void main() {
-                // Convert pixels to normalised device coords, flipping y.
-                float x = (a_pos.x / u_screen.x) * 2.0 - 1.0;
-                float y = 1.0 - (a_pos.y / u_screen.y) * 2.0;
-                gl_Position = vec4(x, y, 0.0, 1.0);
-                v_uv = a_uv;
-                v_color = a_color;
-            }"#;
-        // Fragment shader: coverage (red channel) becomes alpha.
-        let fs_src = r#"#version 330 core
-            in vec2 v_uv;
-            in vec4 v_color;
-            uniform sampler2D u_atlas;                // the coverage atlas
-            out vec4 frag;
-            void main() {
-                float cov = texture(u_atlas, v_uv).r; // glyph coverage / 1.0 for solids
-                float a = v_color.a * cov;             // effective alpha of this fragment
-                frag = vec4(v_color.rgb * a, a);       // PREMULTIPLIED output (rgb scaled by alpha)
-            }"#;
+        let dialect = ShaderDialect::of_context(gl)?; // desktop GL 3.3 vs GLES 3.0
+        let (vs_src, fs_src) = (dialect.vertex_source(), dialect.fragment_source());
+        let (vs_src, fs_src) = (vs_src.as_str(), fs_src.as_str());
 
         // Helper closure to compile one shader stage and check for errors.
         let compile = |kind: u32, src: &str| -> Result<glow::Shader, String> {
@@ -843,5 +992,93 @@ mod scissor_tests {
         // A rect flush against the bottom (y = 584, h = 16) maps to gl_y = 0.
         let (_, y, _, _) = scissor_box(PxRect { x: 0, y: 584, w: 8, h: 16 }, 600);
         assert_eq!(y, 0);
+    }
+}
+
+#[cfg(test)]
+mod shader_dialect_tests {
+    use super::{ShaderDialect, FS_BODY, VS_BODY};
+
+    /// The exact strings rt compiled before the GLES path existed. If a refactor
+    /// of the shader body ever changes what a desktop GL box compiles, this
+    /// fails — the desktop path is the one that must not move (dop561/apollo run
+    /// it daily, and `tests/damage_pixel_identity.rs` gates its pixels).
+    const LEGACY_VS: &str = r#"#version 330 core
+            layout (location = 0) in vec2 a_pos;      // pixel position
+            layout (location = 1) in vec2 a_uv;       // atlas uv
+            layout (location = 2) in vec4 a_color;    // rgba
+            uniform vec2 u_screen;                    // viewport in pixels
+            out vec2 v_uv;                            // -> fragment
+            out vec4 v_color;
+            void main() {
+                // Convert pixels to normalised device coords, flipping y.
+                float x = (a_pos.x / u_screen.x) * 2.0 - 1.0;
+                float y = 1.0 - (a_pos.y / u_screen.y) * 2.0;
+                gl_Position = vec4(x, y, 0.0, 1.0);
+                v_uv = a_uv;
+                v_color = a_color;
+            }"#;
+    const LEGACY_FS: &str = r#"#version 330 core
+            in vec2 v_uv;
+            in vec4 v_color;
+            uniform sampler2D u_atlas;                // the coverage atlas
+            out vec4 frag;
+            void main() {
+                float cov = texture(u_atlas, v_uv).r; // glyph coverage / 1.0 for solids
+                float a = v_color.a * cov;             // effective alpha of this fragment
+                frag = vec4(v_color.rgb * a, a);       // PREMULTIPLIED output (rgb scaled by alpha)
+            }"#;
+
+    #[test]
+    fn desktop_source_is_byte_identical_to_the_pre_gles_shader() {
+        assert_eq!(ShaderDialect::Core330.vertex_source(), LEGACY_VS);
+        assert_eq!(ShaderDialect::Core330.fragment_source(), LEGACY_FS);
+    }
+
+    /// The ES variant must differ from the desktop one ONLY in the header: same
+    /// body, `#version 300 es`, and the precision declarations GLSL ES needs.
+    #[test]
+    fn es_source_is_the_same_body_under_an_es_header() {
+        let vs = ShaderDialect::Es300.vertex_source();
+        let fs = ShaderDialect::Es300.fragment_source();
+        assert!(vs.starts_with("#version 300 es\n"), "vs: {vs}");
+        assert!(fs.starts_with("#version 300 es\n"), "fs: {fs}");
+        // Fragment stage: GLSL ES has no default float precision there at all,
+        // and the default sampler precision is lowp — both must be raised.
+        assert!(fs.contains("precision highp float;"));
+        assert!(fs.contains("precision highp sampler2D;"));
+        // Vertex stage declares the float precision explicitly so the
+        // v_uv/v_color interface provably matches the fragment stage.
+        assert!(vs.contains("precision highp float;"));
+        // The pixel-computing half is shared, not copied.
+        assert!(vs.ends_with(VS_BODY) && fs.ends_with(FS_BODY));
+        // No ES-2-era spellings crept in.
+        assert!(!fs.contains("texture2D") && !vs.contains("attribute ") && !vs.contains("varying "));
+    }
+
+    #[test]
+    fn desktop_gl_needs_3_3() {
+        assert_eq!(ShaderDialect::pick(3, 3, false), Some(ShaderDialect::Core330));
+        assert_eq!(ShaderDialect::pick(4, 6, false), Some(ShaderDialect::Core330));
+        assert_eq!(ShaderDialect::pick(3, 2, false), None); // one minor short
+        assert_eq!(ShaderDialect::pick(2, 1, false), None);
+    }
+
+    #[test]
+    fn embedded_gl_needs_3_0() {
+        // The failing board: PowerVR/pvrsrvkm advertises OpenGL ES only.
+        assert_eq!(ShaderDialect::pick(3, 0, true), Some(ShaderDialect::Es300));
+        assert_eq!(ShaderDialect::pick(3, 2, true), Some(ShaderDialect::Es300));
+        // ES 2.0 has no VAOs, no `in`/`out`, no sized R8 — not a target.
+        assert_eq!(ShaderDialect::pick(2, 0, true), None);
+    }
+
+    /// An ES 3.0 context must NOT be mistaken for desktop 3.3-capable, and a
+    /// desktop 3.0 context must not be mistaken for ES-capable: the two ladders
+    /// are independent, which is exactly what the `is_embedded` flag decides.
+    #[test]
+    fn the_two_version_ladders_do_not_cross() {
+        assert_eq!(ShaderDialect::pick(3, 0, false), None); // desktop 3.0 < 3.3
+        assert_eq!(ShaderDialect::pick(3, 0, true), Some(ShaderDialect::Es300));
     }
 }
