@@ -24,17 +24,36 @@ normalize_paths() {
 }
 
 echo "########## macOS graph: must be free of Wayland/X11 ##########"
-mac=$(cargo tree --target aarch64-apple-darwin -p rt --edges normal 2>/dev/null \
+# Resolve the graph FIRST and check cargo actually succeeded. Piping cargo's
+# stderr to /dev/null and grepping the result means a cargo failure yields an
+# empty string, no match, and a confident "OK" over no data at all -- the same
+# silent-green shape that hid the missing riscv64 coverage on milkv.
+if ! mac_tree=$(cargo tree --target aarch64-apple-darwin -p rt --edges normal 2>&1); then
+  echo "FAIL: cargo tree could not resolve the macOS graph -- this gate checked NOTHING:"
+  printf '%s\n' "$mac_tree" | tail -5 | sed 's/^/  /'
+  FAIL=1
+  mac_tree=""
+  mac_resolved=0
+else
+  mac_resolved=1
+fi
+mac=$(printf '%s\n' "$mac_tree" \
       | grep -oE '(wayland|smithay|x11rb|glutin|khronos-egl)[a-z0-9_-]*' | sort -u)
 if [ -n "$mac" ]; then
   echo "FAIL: these must not be in the macOS graph:"; echo "$mac" | sed 's/^/  /'
   FAIL=1
-else
+elif [ "$mac_resolved" = 1 ]; then
   echo "OK: no Wayland/X11/glutin crates on macOS"
 fi
 
 echo "########## Linux graph: must match the baseline ##########"
-lin=$(cargo tree --target x86_64-unknown-linux-gnu -p rt --edges normal 2>/dev/null | sort -u)
+if ! lin_tree=$(cargo tree --target x86_64-unknown-linux-gnu -p rt --edges normal 2>&1); then
+  echo "FAIL: cargo tree could not resolve the Linux graph -- this gate checked NOTHING:"
+  printf '%s\n' "$lin_tree" | tail -5 | sed 's/^/  /'
+  echo "Refusing to compare (or to write a baseline) from an empty graph."
+  exit 1
+fi
+lin=$(printf '%s\n' "$lin_tree" | sort -u)
 lin_normalized=$(printf '%s\n' "$lin" | normalize_paths)
 if [ ! -f "$BASE" ]; then
   printf '%s\n' "$lin_normalized" > "$BASE"
