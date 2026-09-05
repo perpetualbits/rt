@@ -93,3 +93,113 @@ fn sequence_keys_are_classified() {
     // so never reaches this classifier at all).
     assert!(!is_sequence_key(&NamedKey::BrowserBack));
 }
+
+// ── The legacy encoding is frozen ──────────────────────────────────────────────
+//
+// The kitty keyboard protocol only changes what rt sends *after* an application
+// has negotiated for it. An application that never asks — bash, vim, less, and
+// every program written before 2021 — must keep receiving exactly the bytes it
+// received before the protocol existed. The test below is that guarantee, and it
+// is deliberately exhaustive rather than representative: it pins every key
+// `encode_key` handles, under every modifier combination, in both cursor modes.
+// If a future change to the kitty path leaks into the un-negotiated path, this is
+// what fails.
+
+/// Every modifier combination rt distinguishes, as a `(name, ModifiersState)`
+/// pair so a failure names the combination rather than a bitmask.
+fn all_mod_combos() -> Vec<(&'static str, ModifiersState)> {
+    let (s, c, a, m) = (
+        ModifiersState::SHIFT,
+        ModifiersState::CONTROL,
+        ModifiersState::ALT,
+        ModifiersState::META,
+    );
+    vec![
+        ("none", ModifiersState::empty()),
+        ("shift", s),
+        ("ctrl", c),
+        ("alt", a),
+        ("super", m),
+        ("ctrl+shift", c | s),
+        ("alt+shift", a | s),
+        ("ctrl+alt", c | a),
+        ("ctrl+alt+shift", c | a | s),
+        ("super+shift", m | s),
+    ]
+}
+
+#[test]
+fn legacy_named_keys_are_byte_identical_under_every_modifier() {
+    // (key, bytes in normal cursor mode, bytes in application cursor mode).
+    // Modifiers do NOT appear: without a negotiated protocol every one of these
+    // keys ignores them, which is precisely the behaviour being frozen.
+    let expect: &[(NamedKey, &[u8], &[u8])] = &[
+        (NamedKey::Enter, b"\r", b"\r"),
+        (NamedKey::Backspace, &[0x7f], &[0x7f]),
+        (NamedKey::Tab, b"\t", b"\t"),
+        (NamedKey::Escape, &[0x1b], &[0x1b]),
+        // Cursor keys and Home/End switch CSI -> SS3 on DECCKM, and nothing else.
+        (NamedKey::ArrowUp, b"\x1b[A", b"\x1bOA"),
+        (NamedKey::ArrowDown, b"\x1b[B", b"\x1bOB"),
+        (NamedKey::ArrowRight, b"\x1b[C", b"\x1bOC"),
+        (NamedKey::ArrowLeft, b"\x1b[D", b"\x1bOD"),
+        (NamedKey::Home, b"\x1b[H", b"\x1bOH"),
+        (NamedKey::End, b"\x1b[F", b"\x1bOF"),
+        (NamedKey::Insert, b"\x1b[2~", b"\x1b[2~"),
+        (NamedKey::Delete, b"\x1b[3~", b"\x1b[3~"),
+        (NamedKey::PageUp, b"\x1b[5~", b"\x1b[5~"),
+        (NamedKey::PageDown, b"\x1b[6~", b"\x1b[6~"),
+        (NamedKey::F1, b"\x1bOP", b"\x1bOP"),
+        (NamedKey::F2, b"\x1bOQ", b"\x1bOQ"),
+        (NamedKey::F3, b"\x1bOR", b"\x1bOR"),
+        (NamedKey::F4, b"\x1bOS", b"\x1bOS"),
+        (NamedKey::F5, b"\x1b[15~", b"\x1b[15~"),
+        (NamedKey::F6, b"\x1b[17~", b"\x1b[17~"),
+        (NamedKey::F7, b"\x1b[18~", b"\x1b[18~"),
+        (NamedKey::F8, b"\x1b[19~", b"\x1b[19~"),
+        (NamedKey::F9, b"\x1b[20~", b"\x1b[20~"),
+        (NamedKey::F10, b"\x1b[21~", b"\x1b[21~"),
+        (NamedKey::F11, b"\x1b[23~", b"\x1b[23~"),
+        (NamedKey::F12, b"\x1b[24~", b"\x1b[24~"),
+    ];
+    for (named, normal, app) in expect {
+        let key = Key::Named(*named);
+        for (name, mods) in all_mod_combos() {
+            assert_eq!(
+                encode_key(&key, mods, false).as_deref(),
+                Some(*normal),
+                "{named:?} + {name} (normal cursor mode) must not change"
+            );
+            assert_eq!(
+                encode_key(&key, mods, true).as_deref(),
+                Some(*app),
+                "{named:?} + {name} (application cursor mode) must not change"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_character_keys_are_byte_identical() {
+    // Plain typing, Shift-typing (winit hands us the shifted logical key) and
+    // Ctrl-letters, all unaffected by the protocol until it is negotiated.
+    for (name, mods) in all_mod_combos() {
+        let ctrl = mods.control_key();
+        // A lower-case letter: C0 control code under Ctrl, the letter otherwise.
+        let want: Vec<u8> = if ctrl { vec![0x03] } else { b"c".to_vec() };
+        assert_eq!(encode_key(&ch("c"), mods, false).as_deref(), Some(&want[..]), "'c' + {name}");
+        // The shifted logical key is an upper-case letter; Ctrl still folds case.
+        let want: Vec<u8> = if ctrl { vec![0x03] } else { b"C".to_vec() };
+        assert_eq!(encode_key(&ch("C"), mods, false).as_deref(), Some(&want[..]), "'C' + {name}");
+        // A digit has no control code, so it is sent literally even under Ctrl.
+        assert_eq!(encode_key(&ch("1"), mods, false).as_deref(), Some(&b"1"[..]), "'1' + {name}");
+        // Non-ASCII typing goes out as UTF-8.
+        assert_eq!(
+            encode_key(&ch("ä"), mods, false).as_deref(),
+            Some("ä".as_bytes()),
+            "'ä' + {name}"
+        );
+    }
+    // A named key rt does not encode still produces nothing at all.
+    assert_eq!(encode_key(&Key::Named(NamedKey::BrowserBack), ModifiersState::empty(), false), None);
+}
