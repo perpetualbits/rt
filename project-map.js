@@ -276,7 +276,7 @@ window.PROJECT_MAP = {
     {
       id: "rt-config", label: "rt-config", layer: "control", status: "done",
       tags: ["settings"],
-      desc: "Settings and keybindings with a Terminator-compatible syntax, persisted to ~/.config/rt via serde. Holds opacity/scrim, focus mode, scrollback budget, font, the colour palette, and the arrow-accel preferences, all normalised and clamped on load.",
+      desc: "Settings and keybindings with a Terminator-compatible syntax, persisted to ~/.config/rt via serde. Holds opacity/scrim, focus mode, scrollback budget, font, the colour palette, and the arrow-accel preferences, all normalised and clamped on load. macOS builds layer a Command-key set (⌘C/⌘V, ⌘T/⌘W, ⌘D splits, ⌘, ⌘F, ⌘= / ⌘-) on top of the Terminator table without disturbing it — the Linux table is frozen by test, and an unbound ⌘ chord types nothing.",
       files: ["crates/rt-config"],
       specs: [],
       parts: [],

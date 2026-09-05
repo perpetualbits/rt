@@ -308,3 +308,62 @@ fn flag_one_encodes_exactly_the_ambiguous_keys() {
         Some(&b"\x1bOA"[..])
     );
 }
+
+// ── macOS Command key ────────────────────────────────────────────────────────
+//
+// winit maps `meta_key()` — the physical ⌘ on macOS — to `Mods::SUPER`, so the
+// chord side of this is platform-independent and testable here on Linux. What
+// the KEYMAP then does with it is not: the Command defaults are compiled in
+// only on macOS, which is why the resolution assertions below branch on
+// `cfg!`.
+
+#[test]
+fn meta_key_becomes_super_in_the_chord() {
+    // The plumbing claim the macOS bindings rest on: ⌘C arrives as Super+C.
+    // True on every target — winit reports ⌘ as `meta` and rt folds meta into
+    // SUPER — which is what makes the macOS table a defaults change and not a
+    // plumbing change.
+    let chord = chord_from_winit(&ch("c"), ModifiersState::META).expect("maps to a chord");
+    assert_eq!(chord, Chord::parse("<Super>c").unwrap());
+    assert!(chord.mods.contains(Mods::SUPER));
+}
+
+#[test]
+fn command_bindings_exist_on_macos_only() {
+    // Same chord, two platforms: bound on macOS, unbound everywhere else. This
+    // is the Linux guarantee stated from the GUI side of the seam.
+    let km = Keymap::defaults();
+    let copy = chord_from_winit(&ch("c"), ModifiersState::META).unwrap();
+    let paste = chord_from_winit(&ch("v"), ModifiersState::META).unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(km.action_for(&copy), Some(Action::Copy));
+        assert_eq!(km.action_for(&paste), Some(Action::Paste));
+    } else {
+        assert_eq!(km.action_for(&copy), None, "⌘C must not be bound off macOS");
+        assert_eq!(km.action_for(&paste), None, "⌘V must not be bound off macOS");
+    }
+    // Either way the Terminator chords keep working, untouched.
+    let ctrl_shift_c = chord_from_winit(&ch("c"), ModifiersState::CONTROL | ModifiersState::SHIFT).unwrap();
+    assert_eq!(km.action_for(&ctrl_shift_c), Some(Action::Copy));
+}
+
+#[test]
+fn unbound_command_chord_types_nothing_on_macos() {
+    // ⌘K is bound to nothing in rt. On macOS it must be SWALLOWED, not typed:
+    // AppKit hands winit the logical key `k` (and `text: Some("k")`), so the
+    // ordinary typing path would otherwise put a literal `k` on the command
+    // line. Off macOS the guard is a compile-time `false` and Super chords keep
+    // whatever behaviour they had.
+    let meta = ModifiersState::META;
+    assert!(Keymap::defaults().action_for(&chord_from_winit(&ch("k"), meta).unwrap()).is_none());
+    assert_eq!(rt_app::input::swallows_unbound(meta), cfg!(target_os = "macos"));
+
+    // …and the guard must never reach a chord the terminal needs. Ctrl+C is the
+    // one that matters: it still encodes to 0x03, i.e. the shell still gets its
+    // SIGINT, on every platform.
+    assert!(!rt_app::input::swallows_unbound(ModifiersState::CONTROL));
+    assert!(!rt_app::input::swallows_unbound(ModifiersState::CONTROL | ModifiersState::SHIFT));
+    assert!(!rt_app::input::swallows_unbound(ModifiersState::ALT));
+    assert!(!rt_app::input::swallows_unbound(ModifiersState::empty()));
+    assert_eq!(encode_key(&ch("c"), ModifiersState::CONTROL, false), Some(vec![0x03]));
+}

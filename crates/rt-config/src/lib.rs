@@ -445,6 +445,74 @@ impl Default for Keymap {
     }
 }
 
+/// macOS's Command-key defaults, layered **on top of** the Terminator table.
+///
+/// Why additive and not a replacement: only twenty of rt's forty-odd actions
+/// have a Mac reflex worth naming. Replacing the Terminator table would strip
+/// the keyboard route to the other two dozen (rotate, group cycle, the whole
+/// patch-bay, detach/pick-up, resize, broadcast) — and `Ctrl+Shift+<letter>`
+/// collides with nothing macOS reserves, so keeping it costs nothing. A Mac
+/// user reaches for ⌘ and finds it; anyone who knows rt already keeps every
+/// key they know.
+///
+/// **Spelling matters.** AppKit's `charactersIgnoringModifiers` — which is what
+/// winit reports as the logical key once Command is held — ignores Command and
+/// Option but *honours Shift*. So ⌘⇧[ arrives as `{`, ⌘⇧= as `+`, and ⌘⇧/ as
+/// `?`. Binding the unshifted symbol would compile, parse, and never once fire.
+///
+/// **What is deliberately absent:**
+/// - **⌘Q (Quit)** — winit's AppKit backend installs the standard application
+///   menu, whose Quit item owns ⌘Q and calls `terminate:`. AppKit consumes that
+///   key equivalent before the event reaches rt's window, so a binding here
+///   could never run. It is also the right outcome: ⌘Q means "quit rt", which
+///   is what `terminate:` does. rt's own escalation ladder is ⌘W (this pane,
+///   and the window with it once it is the last pane) → ⇧⌘W (this window) → ⌘Q
+///   (everything).
+/// - **⌘H / ⌥⌘H** — same menu, Hide and Hide Others.
+/// - **⌘1..⌘9** — rt has no "select tab N" action at all; only next/prev exist.
+///   Inventing one is a session-layer feature, not a keymap default.
+#[cfg(target_os = "macos")]
+const MACOS_DEFAULTS: &[(&str, Action)] = &[
+    // Clipboard — the whole reason this table exists.
+    ("<Super>c", Action::Copy),
+    ("<Super>v", Action::Paste),
+    // Tabs, panes and windows. ⌘W closes the focused PANE (iTerm2's semantics);
+    // when it is the last pane the session closes the window anyway, so the key
+    // still reads as "close this thing" at every depth. ⇧⌘W takes the window.
+    ("<Super>t", Action::NewTab),
+    ("<Super>w", Action::CloseTerm),
+    ("<Shift><Super>w", Action::CloseWindow),
+    ("<Super>n", Action::NewWindow),
+    // Splits, matching iTerm2: ⌘D gives two panes side by side (rt's "vertical
+    // divider"), ⇧⌘D stacks them.
+    ("<Super>d", Action::SplitVert),
+    ("<Shift><Super>d", Action::SplitHoriz),
+    // Tab cycling, twice over on purpose. ⇧⌘[ / ⇧⌘] is the reflex (Safari,
+    // Chrome, Terminal.app) but is layout-dependent — it only produces `{`/`}`
+    // on a US-ish layout. ⌥⌘← / ⌥⌘→ is Terminal.app's and iTerm2's other
+    // spelling, comes off named keys that no layout remaps, and is the only one
+    // reachable on a Mac laptop without Fn (rt's Ctrl+PageUp/Dn needs Fn there).
+    ("<Shift><Super>{", Action::PrevTab),
+    ("<Shift><Super>}", Action::NextTab),
+    ("<Alt><Super>Left", Action::PrevTab),
+    ("<Alt><Super>Right", Action::NextTab),
+    // ⌘, is the strongest convention macOS has; rt had no Preferences key at
+    // all before (menu only), so this adds one rather than moving one.
+    ("<Super>comma", Action::Preferences),
+    ("<Super>f", Action::Search), // ⌘F = Find, here the scrollback search bar
+    // Font zoom. ⌘= and ⌘⇧+ both zoom in (the second is what ⌘+ really sends).
+    ("<Super>equal", Action::ZoomIn),
+    ("<Shift><Super>plus", Action::ZoomIn),
+    ("<Super>minus", Action::ZoomOut),
+    ("<Super>0", Action::ZoomReset),
+    // ⌃⌘F is macOS's own fullscreen key. rt's F11 still works, but F11 on a Mac
+    // keyboard is a system media key that needs Fn.
+    ("<Control><Super>f", Action::Fullscreen),
+    // ⌘⇧? is macOS's Help key. Same reasoning as fullscreen: F1 needs Fn, and
+    // the manual is how a new user finds everything else.
+    ("<Shift><Super>?", Action::Manual),
+];
+
 impl Keymap {
     /// Build the keymap pre-populated with Terminator's default bindings.
     ///
@@ -509,6 +577,16 @@ impl Keymap {
             ("<Shift><Control>Page_Down", Action::MoveTabRight), // move_tab (Terminator)
         ];
         let mut map = Keymap { bindings: Vec::new() }; // empty binding list
+        // macOS: the Command-key set goes in FIRST, so it wins `shortcut_for`
+        // (menus and the manual then offer a Mac user ⌘C, not Ctrl+Shift+C).
+        // It cannot shadow anything in `action_for` — every chord below carries
+        // Super, which no Terminator default does.
+        #[cfg(target_os = "macos")]
+        for (accel, action) in MACOS_DEFAULTS {
+            if let Some(chord) = Chord::parse(accel) {
+                map.bindings.push((chord, *action));
+            }
+        }
         for (accel, action) in defaults {
             // Parse each default; a malformed default is a programming error, so
             // we skip it rather than panic (keeps `defaults()` infallible).
@@ -607,6 +685,204 @@ mod config_tests {
         ] {
             let chord = keys::Chord::parse(accel).expect("valid chord");
             assert_eq!(km.action_for(&chord), Some(action), "{accel}");
+        }
+    }
+
+    /// The Terminator-transcribed default table, frozen.
+    ///
+    /// This is the list rt's Linux keymap IS — every entry, in order, with the
+    /// accelerator spelled exactly as `Keymap::defaults()` spells it. It exists
+    /// so that a change to Linux's defaults cannot happen quietly: adding,
+    /// removing, reordering or respelling any line below is a deliberate act
+    /// that fails this test until the frozen copy is updated too.
+    ///
+    /// Deliberately NOT `Mods::SUPER`-bearing: the platform additions (macOS's
+    /// Command-key set) are the *only* bindings allowed to carry Super, which is
+    /// what lets `frozen_table_survives_platform_additions` filter them out and
+    /// compare the rest on every target, macOS included.
+    const FROZEN_LINUX_DEFAULTS: &[(&str, Action)] = &[
+        ("<Shift><Control>o", Action::SplitHoriz),
+        ("<Shift><Control>e", Action::SplitVert),
+        ("<Shift><Control>w", Action::CloseTerm),
+        ("<Shift><Control>t", Action::NewTab),
+        ("<Control>Page_Down", Action::NextTab),
+        ("<Control>Page_Up", Action::PrevTab),
+        ("<Alt>Up", Action::GoUp),
+        ("<Alt>Down", Action::GoDown),
+        ("<Alt>Left", Action::GoLeft),
+        ("<Alt>Right", Action::GoRight),
+        ("<Shift><Control>c", Action::Copy),
+        ("<Shift><Control>v", Action::Paste),
+        ("<Shift><Control>h", Action::ClipHistory),
+        ("<Shift><Control>q", Action::CloseWindow),
+        ("<Control>period", Action::ColumnsMore),
+        ("<Control>comma", Action::ColumnsFewer),
+        ("<Control><Alt>Up", Action::OpacityUp),
+        ("<Control><Alt>Down", Action::OpacityDown),
+        ("<Control>equal", Action::ZoomIn),
+        ("<Shift><Control>plus", Action::ZoomIn),
+        ("<Control>minus", Action::ZoomOut),
+        ("<Control>0", Action::ZoomReset),
+        ("F11", Action::Fullscreen),
+        ("<Shift><Control>x", Action::ToggleZoom),
+        ("<Shift><Control>f", Action::Search),
+        ("<Shift><Control>Left", Action::ResizeLeft),
+        ("<Shift><Control>Right", Action::ResizeRight),
+        ("<Shift><Control>Up", Action::ResizeUp),
+        ("<Shift><Control>Down", Action::ResizeDown),
+        ("<Shift><Control>r", Action::Rotate),
+        ("<Shift><Control>a", Action::SplitAuto),
+        ("<Shift><Control>g", Action::GroupCycle),
+        ("<Shift><Control>y", Action::WireStdout),
+        ("<Shift><Control>u", Action::WireStderr),
+        ("<Shift><Control>k", Action::Unwire),
+        ("<Shift><Control>p", Action::PipeInto),
+        ("F1", Action::Manual),
+        ("<Shift><Control>i", Action::NewWindow),
+        ("<Shift><Control>d", Action::DetachPane),
+        ("<Shift><Control>j", Action::DetachTab),
+        ("<Shift><Control>m", Action::PickUpPane),
+        ("<Shift><Control>n", Action::PickUpTab),
+        ("<Shift><Control>Page_Up", Action::MoveTabLeft),
+        ("<Shift><Control>Page_Down", Action::MoveTabRight),
+    ];
+
+    /// The Linux table is exactly [`FROZEN_LINUX_DEFAULTS`], in that order,
+    /// once any platform (Super-bearing) additions are filtered out.
+    ///
+    /// Runs on EVERY target on purpose. On Linux it pins the table outright; on
+    /// macOS it proves the Command-key additions were layered on top without
+    /// disturbing, reordering or shadowing a single Terminator binding.
+    #[test]
+    fn frozen_table_survives_platform_additions() {
+        let km = Keymap::defaults();
+        let expected: Vec<(Chord, Action)> = FROZEN_LINUX_DEFAULTS
+            .iter()
+            .map(|(accel, action)| (Chord::parse(accel).expect("frozen accel parses"), *action))
+            .collect();
+        // Every binding that does NOT carry Super is, by definition, part of the
+        // portable table — collect them in priority order and compare.
+        let actual: Vec<(Chord, Action)> = km
+            .bindings()
+            .filter(|(c, _)| !c.mods.contains(Mods::SUPER))
+            .map(|(c, a)| (*c, *a))
+            .collect();
+        assert_eq!(actual, expected, "the Terminator-transcribed default table changed");
+    }
+
+    /// Terminator accelerator strings still parse and still resolve to the same
+    /// action after the platform additions — the compatibility promise spelled
+    /// out one chord at a time, in Terminator's own syntax.
+    #[test]
+    fn terminator_accelerators_still_resolve() {
+        let km = Keymap::defaults();
+        for (accel, action) in FROZEN_LINUX_DEFAULTS {
+            let chord = Chord::parse(accel).unwrap_or_else(|| panic!("{accel} must parse"));
+            assert_eq!(km.action_for(&chord), Some(*action), "{accel}");
+        }
+        // And the aliases Terminator/GTK also writes resolve identically.
+        assert_eq!(Chord::parse("<Ctrl><Shift>o"), Chord::parse("<Shift><Control>o"));
+        assert_eq!(Chord::parse("<Primary><Shift>o"), Chord::parse("<Shift><Control>o"));
+    }
+
+    /// Off macOS, nothing is bound to Super at all: the platform additions must
+    /// not leak onto Linux. Paired with the frozen table above, this says the
+    /// Linux keymap is byte-for-byte what it was.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn no_super_bindings_off_macos() {
+        let km = Keymap::defaults();
+        let supers: Vec<String> = km
+            .bindings()
+            .filter(|(c, _)| c.mods.contains(Mods::SUPER))
+            .map(|(c, a)| format!("{c} ({a:?})"))
+            .collect();
+        assert!(supers.is_empty(), "Super bindings leaked onto a non-macOS target: {supers:?}");
+        assert_eq!(
+            km.bindings().count(),
+            FROZEN_LINUX_DEFAULTS.len(),
+            "the default keymap grew (or shrank) off macOS"
+        );
+    }
+
+    /// On macOS the Command key resolves to the action a Mac user expects.
+    ///
+    /// The accelerators are spelled the way the key event actually ARRIVES:
+    /// AppKit's `charactersIgnoringModifiers` honours Shift, so ⌘⇧[ reaches rt
+    /// as `{`, ⌘⇧= as `+`, and ⌘⇧/ as `?` — binding `[`/`=`/`/` would silently
+    /// never fire.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_command_bindings_resolve() {
+        let km = Keymap::defaults();
+        for (accel, action) in [
+            ("<Super>c", Action::Copy),
+            ("<Super>v", Action::Paste),
+            ("<Super>t", Action::NewTab),
+            ("<Super>w", Action::CloseTerm),
+            ("<Shift><Super>w", Action::CloseWindow),
+            ("<Super>n", Action::NewWindow),
+            ("<Super>d", Action::SplitVert),
+            ("<Shift><Super>d", Action::SplitHoriz),
+            ("<Shift><Super>{", Action::PrevTab),
+            ("<Shift><Super>}", Action::NextTab),
+            ("<Alt><Super>Left", Action::PrevTab),
+            ("<Alt><Super>Right", Action::NextTab),
+            ("<Super>comma", Action::Preferences),
+            ("<Super>f", Action::Search),
+            ("<Super>equal", Action::ZoomIn),
+            ("<Shift><Super>plus", Action::ZoomIn),
+            ("<Super>minus", Action::ZoomOut),
+            ("<Super>0", Action::ZoomReset),
+            ("<Control><Super>f", Action::Fullscreen),
+            ("<Shift><Super>?", Action::Manual),
+        ] {
+            let chord = Chord::parse(accel).unwrap_or_else(|| panic!("{accel} must parse"));
+            assert_eq!(km.action_for(&chord), Some(action), "{accel}");
+        }
+    }
+
+    /// On macOS the Command bindings take PRIORITY for display: the right-click
+    /// menu and the manual must offer a Mac user ⌘C, not Ctrl+Shift+C, even
+    /// though both fire. (Both remain bound — see the frozen table.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_command_bindings_are_what_menus_show() {
+        let km = Keymap::defaults();
+        assert_eq!(km.shortcut_for(Action::Copy).as_deref(), Some("Cmd+C"));
+        assert_eq!(km.shortcut_for(Action::Paste).as_deref(), Some("Cmd+V"));
+        assert_eq!(km.shortcut_for(Action::NewTab).as_deref(), Some("Cmd+T"));
+        // …while the Terminator chord still works.
+        let ctrl_shift_c = Chord::parse("<Shift><Control>c").expect("valid chord");
+        assert_eq!(km.action_for(&ctrl_shift_c), Some(Action::Copy));
+    }
+
+    /// ⌘Q is deliberately UNBOUND. winit's AppKit backend installs the standard
+    /// application menu, whose Quit item owns ⌘Q and calls `terminate:` — the
+    /// key equivalent is consumed by AppKit before the event ever reaches rt's
+    /// window, so a binding here would be dead code that also lied to the user
+    /// about what the key does. Same story for ⌘H (Hide) and ⌥⌘H (Hide Others).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_leaves_appkit_menu_equivalents_alone() {
+        let km = Keymap::defaults();
+        for accel in ["<Super>q", "<Super>h", "<Alt><Super>h"] {
+            let chord = Chord::parse(accel).expect("valid chord");
+            assert_eq!(km.action_for(&chord), None, "{accel} belongs to AppKit's menu");
+        }
+    }
+
+    /// The Super modifier displays as macOS's own name for the key on macOS,
+    /// and stays "Super" everywhere else. This is display only — it changes no
+    /// binding, and no Linux default carries Super in the first place.
+    #[test]
+    fn super_displays_per_platform() {
+        let chord = Chord::parse("<Super>c").expect("valid chord");
+        let shown = chord.to_string();
+        if cfg!(target_os = "macos") {
+            assert_eq!(shown, "Cmd+C");
+        } else {
+            assert_eq!(shown, "Super+C");
         }
     }
 }

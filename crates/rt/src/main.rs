@@ -5689,6 +5689,16 @@ impl App {
                 None => log::debug!("keymap: chord={chord:?} -> no binding"),
             }
         }
+        // macOS only: an UNBOUND Command chord types nothing. AppKit gives ⌘K the
+        // logical key `k` and the text "k", so without this the ordinary typing
+        // path below would push a stray letter into the shell for every ⌘-chord rt
+        // does not bind (⌘K, ⌘A, ⌘S, ⌘Z …). Every Mac terminal swallows those.
+        // Ctrl and Alt are untouched — Ctrl+C is still 0x03, still SIGINT — and off
+        // macOS this is a compile-time `false`. See `input::swallows_unbound`.
+        if input::swallows_unbound(mods) {
+            log::debug!("swallowing unbound Command chord: {:?}", key_event.logical_key);
+            return;
+        }
         // Not a binding: ordinary typing. Navigation/editing/function keys become
         // ANSI escape sequences; everything else sends the key's *produced text*
         // (`key_event.text`), which already contains dead-key / compose results

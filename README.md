@@ -65,6 +65,31 @@ edges still being driven to zero.
 
 Press **F1** in rt for the full built-in manual.
 
+### On macOS: the Command keys
+
+The Linux bindings above are all `Ctrl+Shift+…`, which no Mac user would guess. macOS
+builds therefore add a **Command (⌘) set on top** — nothing is taken away, so every
+`Ctrl+Shift` key you already know keeps working:
+
+| Key | Does |
+| --- | --- |
+| `⌘C` / `⌘V` | copy the selection / paste the clipboard |
+| `⌘T` | new tab |
+| `⌘W` | close the focused **pane** (and the window with it, once that was the last pane) |
+| `⇧⌘W` | close the window |
+| `⌘Q` | quit rt — **owned by the macOS menu bar**, not by rt |
+| `⌘N` | new window |
+| `⌘D` / `⇧⌘D` | split side by side / stacked |
+| `⇧⌘[` / `⇧⌘]`, or `⌥⌘←` / `⌥⌘→` | previous / next tab |
+| `⌘,` | Preferences |
+| `⌘F` | search this pane's scrollback |
+| `⌘=` / `⌘-` / `⌘0` | bigger / smaller / default font |
+| `⌃⌘F` | fullscreen (`F11` also works, with `Fn`) |
+| `⇧⌘?` | the built-in manual (`F1` also works, with `Fn`) |
+
+A `⌘` chord rt does **not** bind types nothing at all, exactly as in Terminal.app — it
+never leaks a stray letter into the shell. `Ctrl` is untouched: `Ctrl+C` still interrupts.
+
 ### Newspaper columns — use that wide screen
 
 Modern displays are wide, but a terminal only fills them with *columns*, not

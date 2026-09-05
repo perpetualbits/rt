@@ -12,6 +12,31 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
 - ☑ **Insert key (insert/overwrite toggle) does nothing.** rt didn't encode
   `Insert`. Fixed: sends `ESC [ 2 ~`. Also added Delete/Insert/keypad and F1–F12
   input sequences.
+- ☑ **macOS: the Command key did nothing.** Every binding was `Ctrl+Shift+…`,
+  which no Mac user would guess, and ⌘ reached the keymap (winit's `meta_key()`
+  already folds into `Mods::SUPER`) only to find nothing bound. Fixed: a
+  `#[cfg(target_os = "macos")]` Command table in `rt_config` — ⌘C/⌘V, ⌘T, ⌘W,
+  ⇧⌘W, ⌘N, ⌘D/⇧⌘D, ⇧⌘[ /] and ⌥⌘←/→, ⌘,, ⌘F, ⌘=/⌘-/⌘0, ⌃⌘F, ⇧⌘? — layered on
+  top of the Terminator table, which is unchanged and frozen by test. ⌘Q, ⌘H and
+  ⌥⌘H are deliberately unbound: winit's AppKit backend installs the standard
+  application menu, which owns those key equivalents and consumes them before
+  the event reaches rt.
+- ☑ **macOS: an unbound ⌘ chord typed a stray letter.** AppKit reports ⌘K's
+  logical key as `k` *with* `text: Some("k")`, so the ordinary typing path put a
+  literal `k` on the command line — for ⌘K, ⌘A, ⌘S, ⌘Z and every other ⌘ chord
+  rt does not bind. Fixed by `input::swallows_unbound`: on macOS an unbound
+  Command chord is swallowed, as in Terminal.app. Ctrl and Alt are untouched
+  (`Ctrl+C` is still `0x03`), and off macOS the guard is a folded constant
+  `false`.
+- ☐ **macOS: ⌘Q skips rt's patch-bay cleanup.** ⌘Q is AppKit's menu item and
+  calls `terminate:`, which exits the process without running `exit_clean()`, so
+  the session's `rt-<pid>` jack directory is left behind. The startup sweep that
+  would collect it (`sweep_stale_jacks`) tests liveness with
+  `Path::new("/proc/<pid>").exists()`, which is always false on macOS — so it
+  both fails to protect a *live* sibling session's directory and never learns
+  that a dead one is dead. Pre-existing, and independent of the keybindings; the
+  fix is a portable liveness check (`kill(pid, 0)`) plus an
+  `applicationShouldTerminate` hook or an `atexit` handler.
 
 ## Rendering / fonts
 - ☑ **Braille (U+2800–U+28FF) rendered as tofu** (visible in `spiral_stress`).

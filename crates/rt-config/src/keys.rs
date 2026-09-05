@@ -167,13 +167,23 @@ impl std::fmt::Display for Key {
 impl std::fmt::Display for Chord {
     /// The chord as a conventional accelerator string, e.g. `Ctrl+Shift+O`,
     /// `Ctrl+.`, `F1`. Modifiers are shown in the usual Ctrl, Shift, Alt, Super
-    /// order (independent of how they were written in the config).
+    /// order (independent of how they were written in the config) — which is
+    /// also Apple's own order for ⌃⌥⇧⌘, so a macOS chord reads `Shift+Cmd+{`
+    /// exactly as the Mac menu bar would order it.
+    ///
+    /// The one platform difference is the NAME of the Super modifier: nobody on
+    /// a Mac calls it "Super", so it displays as `Cmd` there. Display only — it
+    /// changes no binding, no parsing, and no Linux default carries Super
+    /// anyway.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `cfg!` (not `#[cfg]`) so both arms always compile and the constant
+        // folds away; there is no per-target code path to get wrong.
+        let super_name = if cfg!(target_os = "macos") { "Cmd" } else { "Super" };
         for (bit, name) in [
             (Mods::CONTROL, "Ctrl"),
             (Mods::SHIFT, "Shift"),
             (Mods::ALT, "Alt"),
-            (Mods::SUPER, "Super"),
+            (Mods::SUPER, super_name),
         ] {
             if self.mods.contains(bit) {
                 write!(f, "{name}+")?; // prefix each present modifier

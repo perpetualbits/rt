@@ -329,9 +329,59 @@ STARTING rt   (command line & environment)
   XWayland) and falls back to X11 otherwise; one binary serves both.
 "#;
 
+/// The macOS appendix — the Command-key defaults from `rt_config`'s
+/// `MACOS_DEFAULTS`, shown only on macOS builds so a Linux reader never scrolls
+/// past twenty lines about a platform they are not on.
+///
+/// Compiled as `""` off macOS, so [`manual_lines`] yields nothing extra there.
+/// Chords are spelled exactly as `Chord`'s `Display` renders them on macOS
+/// (`Cmd`, not `Super`) — `every_default_keybinding_is_documented` compares the
+/// two strings literally.
+#[cfg(target_os = "macos")]
+pub const MANUAL_MACOS: &str = r#"
+
+macOS — THE COMMAND (Cmd / ⌘) KEYS
+  Every Ctrl+Shift key above still works on macOS. These are the extra ones
+  a Mac user reaches for by reflex; both spellings do the same thing.
+  Cmd+C  /  Cmd+V     copy the selection  /  paste the clipboard
+  Cmd+T               new tab
+  Cmd+W               close the focused pane (and the window with it, once
+                      that pane was the last one)
+  Shift+Cmd+W         close the whole window
+  Cmd+Q               quit rt — every window. Owned by the macOS menu bar,
+                      not by rt, so it is the one key rt cannot rebind.
+  Cmd+N               new window
+  Cmd+D               split side by side;  Shift+Cmd+D splits stacked
+  Shift+Cmd+{ and Shift+Cmd+}   previous / next tab — the keys you press
+                      are Shift+Cmd+[ and Shift+Cmd+], which on a Mac send
+                      the braces
+  Alt+Cmd+Left and Alt+Cmd+Right   previous / next tab again, the spelling
+                      that works on any layout and needs no Fn key
+  Cmd+,               Preferences
+  Cmd+F               search this pane's scrollback
+  Cmd+=  /  Cmd+-     bigger / smaller font;  Cmd+0 resets it
+                      (Shift+Cmd++ is the same as Cmd+=)
+  Ctrl+Cmd+F          fullscreen (F11 also works, with Fn)
+  Shift+Cmd+?         this manual (F1 also works, with Fn)
+  A Cmd chord rt does NOT bind types nothing at all, exactly as in
+  Terminal.app — it will never leak a stray letter into your shell.
+  Ctrl is untouched: Ctrl+C still interrupts.
+"#;
+
+/// Empty off macOS: there is no appendix to show.
+#[cfg(not(target_os = "macos"))]
+pub const MANUAL_MACOS: &str = "";
+
+/// The manual as the user sees it: [`MANUAL`] followed by the platform
+/// appendix. Everything that renders or checks the manual goes through this, so
+/// the appendix can never drift out of the overlay.
+pub fn manual_lines() -> impl Iterator<Item = &'static str> {
+    MANUAL.lines().chain(MANUAL_MACOS.lines())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::MANUAL;
+    use super::{MANUAL, MANUAL_MACOS};
 
     /// Every default keybinding must be mentioned in the manual — the manual is
     /// the only place a user learns the keys, and features have shipped without a
@@ -342,8 +392,10 @@ mod tests {
     #[test]
     fn every_default_keybinding_is_documented() {
         let km = rt_config::Keymap::defaults();
+        // The macOS appendix counts as documentation too (and is empty
+        // elsewhere), so a Cmd binding must have a line there.
         let documented = |chord: &str| -> bool {
-            if MANUAL.contains(chord) {
+            if MANUAL.contains(chord) || MANUAL_MACOS.contains(chord) {
                 return true;
             }
             // "<mods>+Up" etc. may be documented as "<mods>+Arrows".

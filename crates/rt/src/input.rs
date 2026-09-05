@@ -95,6 +95,28 @@ pub fn chord_from_winit(key: &Key, mods: ModifiersState) -> Option<Chord> {
     Some(chord)
 }
 
+/// Whether a key press that matched **no** binding should be swallowed instead
+/// of typed into the PTY.
+///
+/// This exists for exactly one case: the macOS Command key. AppKit reports the
+/// logical key of a ⌘-chord via `charactersIgnoringModifiers`, so winit hands rt
+/// `Key::Character("k")` with `text: Some("k")` for ⌘K — and the ordinary typing
+/// path would then push a literal `k` into the shell. Every Mac terminal treats
+/// ⌘ as a menu accelerator and *nothing else*: an unbound ⌘-chord does nothing.
+/// Without this guard, ⌘K / ⌘A / ⌘S / ⌘Z — all things a Mac user presses by
+/// reflex and rt does not bind — would silently corrupt the command line.
+///
+/// Note what this does NOT touch. Ctrl is untouched, so `Ctrl+C` still becomes
+/// `0x03` and still sends `SIGINT`; Alt/Option still take the ESC prefix. Only
+/// Super/Command is affected, and only when the chord found no binding — a
+/// bound ⌘-chord has already returned before this is consulted.
+///
+/// `cfg!` rather than `#[cfg]` so both arms always compile: off macOS this is
+/// the constant `false` and folds away, leaving Linux behaviour bit-identical.
+pub fn swallows_unbound(mods: ModifiersState) -> bool {
+    cfg!(target_os = "macos") && mods.meta_key()
+}
+
 /// Whether a named key must be sent as an ANSI escape sequence (via
 /// [`encode_key`]) rather than as its produced text. These are the navigation/
 /// editing/function keys; *everything else* (printable characters, and crucially

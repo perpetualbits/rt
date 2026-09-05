@@ -366,3 +366,57 @@ open-on-right-click path is verified by construction + the shared, already-teste
 apply_action. On a real Wayland session winit delivers the MouseInput normally.
 
 36 tests green; default build Wayland-native.
+
+## 2026-09-05 — macOS: the Command (⌘) keys
+
+Copy was `Ctrl+Shift+C` on every target, which no Mac user would guess. The
+macOS keymap had never been considered — `Mods::SUPER` existed and
+`input::mods_from_winit` already folded winit's `meta_key()` (the physical ⌘)
+into it, so ⌘ *reached* the keymap and found nothing bound. A defaults change,
+not a plumbing change.
+
+**Additive, not replacing.** `rt_config::MACOS_DEFAULTS` — twenty bindings,
+`#[cfg(target_os = "macos")]` — is pushed into `Keymap::defaults()` *ahead of*
+the Terminator table. Ahead, so `shortcut_for` (the right-click menu, the
+manual) offers a Mac user ⌘C rather than Ctrl+Shift+C; it cannot shadow anything,
+since every macOS entry carries Super and no Terminator default does. Replacing
+the table was rejected: only about twenty of rt's forty-odd actions have a Mac
+reflex worth a key, so a replacement would strip the keyboard route to rotate,
+group cycle, the whole patch-bay, detach/pick-up, resize and broadcast — and
+`Ctrl+Shift+<letter>` collides with nothing macOS reserves, so keeping it is free.
+
+**Spelling is load-bearing.** AppKit reports a ⌘-chord's logical key via
+`charactersIgnoringModifiers`, which ignores Command and Option but *honours
+Shift* (`winit-appkit .../src/event.rs:116-129`). ⌘⇧[ therefore arrives as `{`,
+⌘⇧= as `+`, ⌘⇧/ as `?`. The table binds the shifted characters; binding `[`/`=`
+would have parsed, compiled, and never once fired.
+
+**⌘Q is deliberately unbound.** winit's AppKit backend installs the standard
+application menu (`winit-appkit .../src/menu.rs`), whose Quit item owns ⌘Q and
+calls `terminate:`; AppKit consumes that key equivalent before the event reaches
+rt's window, so any binding here would be dead code that also lied about what
+the key does. ⌘H and ⌥⌘H (Hide / Hide Others) are the same menu's. That leaves a
+clean ladder: ⌘W closes the pane (and the window with it once that was the last
+pane — iTerm2's semantics, and what `SessionEvent::CloseWindow` already does),
+⇧⌘W closes the window, ⌘Q quits. ⌘1..⌘9 was skipped because rt has no
+"select tab N" action at all; inventing one is a session-layer feature.
+
+**Unbound ⌘ chords no longer type.** AppKit hands winit `Key::Character("k")`
+with `text: Some("k")` for ⌘K, so the ordinary typing path would have pushed a
+stray letter into the shell for every ⌘ chord rt does not bind (⌘K, ⌘A, ⌘S, ⌘Z…).
+`input::swallows_unbound` — `cfg!(target_os = "macos") && mods.meta_key()`, so a
+folded constant `false` on Linux — makes `on_key_press` return instead. Ctrl and
+Alt are untouched; Ctrl+C is still `0x03`.
+
+**Linux is frozen, by test.** `config_tests::FROZEN_LINUX_DEFAULTS` is a literal
+copy of the Terminator table; `frozen_table_survives_platform_additions` runs on
+every target and compares it against the non-Super bindings in order, so the
+macOS additions are proved not to disturb, reorder or shadow a single entry, and
+`no_super_bindings_off_macos` proves none of them leak onto Linux. Verified by
+mutation (respelling one Linux accelerator fails both freeze tests) and by a
+local dry run with the target gates flipped to `linux`, which exercises the whole
+macOS path — including the manual's macOS appendix — on this machine.
+
+Display-only touch: `Chord`'s `Display` renders Super as `Cmd` on macOS. Apple's
+modifier order is ⌃⌥⇧⌘, which is already the order `Display` used, so a chord
+reads `Shift+Cmd+{` exactly as the Mac menu bar would order it.

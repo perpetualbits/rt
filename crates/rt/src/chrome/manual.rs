@@ -3,7 +3,7 @@
 //! text. Scroll position lives in `Active.manual_scroll`.
 use crate::backend::Backend;
 use crate::chrome::Recti;
-use crate::manual::MANUAL;
+use crate::manual::manual_lines;
 use crate::render::Color;
 
 /// Manual panel geometry plus the wrapped lines to draw (version header first).
@@ -43,7 +43,7 @@ pub fn wrapped(cols: usize) -> Vec<String> {
         }
         chars.into_iter().collect()
     };
-    for line in MANUAL.lines() {
+    for line in manual_lines() {
         if line.chars().count() <= cols {
             out.push(line.to_string());
             continue;
@@ -147,7 +147,7 @@ mod tests {
             assert!(l.chars().count() <= cols, "line wider than {cols}: {l:?}");
         }
         // And the manual genuinely has lines that needed wrapping.
-        assert!(MANUAL.lines().any(|l| l.chars().count() > cols));
+        assert!(manual_lines().any(|l| l.chars().count() > cols));
     }
 
     #[test]
