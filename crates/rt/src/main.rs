@@ -1197,10 +1197,26 @@ impl App {
         // Ask KWin to blur behind us (true background blur on KDE). No-op
         // elsewhere (COSMIC/GNOME/sway use the ext protocol below, or nothing).
         // Both blur mechanisms are Linux-only (see the `Active::bg_effect`/
-        // `x11_blur` field comment); Task 8 (vibrancy.rs) is the macOS
-        // equivalent, not part of this task.
+        // `x11_blur` field comment); `vibrancy.rs` is the macOS equivalent,
+        // installed just below.
         #[cfg(not(target_os = "macos"))]
         blur::try_enable_kwin_blur(window.as_ref());
+        // macOS frosted glass, as a fallback chain:
+        //   1. a public NSVisualEffectView under the content view (vibrancy,
+        //      material, light/dark adaptation — the look Apple ships);
+        //   2. winit's set_blur(), i.e. the PRIVATE CGSSetWindowBackgroundBlurRadius
+        //      at a hardcoded radius 80: a plain gaussian backdrop blur, no
+        //      vibrancy and no adaptation, but better than nothing;
+        //   3. plain transparency, which already works and needs no call.
+        // Only one of 1/2 is applied, so what the user sees identifies which
+        // path ran (the log line says so too). Unconditional, not gated on
+        // `want_blur`: the glass is simply invisible at opacity 1.0, and there
+        // is then nothing to re-apply when the opacity slider moves.
+        #[cfg(target_os = "macos")]
+        if !vibrancy::try_enable(window.as_ref()) {
+            log::info!("NSVisualEffectView unavailable; falling back to winit's window blur");
+            window.set_blur(true);
+        }
         // Cross-compositor blur via the ext-background-effect-v1 staging protocol
         // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
         // translucent — blur behind an opaque surface is wasted compositor work.
@@ -7408,7 +7424,9 @@ fn want_blur(settings: &rt_config::Settings) -> bool {
 /// this is always safe to call after an opacity/blur change.
 fn apply_blur(active: &mut Active) {
     // Both mechanisms are Linux-only (see the `Active::bg_effect`/`x11_blur`
-    // field comment); on macOS this is a no-op until Task 8 (vibrancy.rs).
+    // field comment). On macOS this is a no-op by design: `vibrancy.rs` installs
+    // the NSVisualEffectView once at startup and it needs no runtime toggle —
+    // the glass is simply invisible while the background is opaque.
     #[cfg(not(target_os = "macos"))]
     {
         let want = want_blur(&active.settings);

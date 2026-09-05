@@ -118,7 +118,10 @@ x11rb = { version = "0.13", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = "27"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor"] }
+# `NSGraphics` is what carries `NSWindowOrderingMode`, and objc2 gates
+# `addSubview:positioned:relativeTo:` on it -- vibrancy.rs needs that exact
+# method to slide the effect view UNDER the content view.
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics"] }
 objc2-foundation = "0.3"
 pollster = "0.4"   # block_on for wgpu's async adapter/device request
 bytemuck = { version = "1", features = ["derive"] }  # Pod/Zeroable for TextPipeline's Vertex
