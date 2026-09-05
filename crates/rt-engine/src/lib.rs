@@ -902,8 +902,10 @@ impl AlacPane {
     /// This engine already implements all five flags, but rt's key encoder honours only
     /// flag 1 ("disambiguate escape codes"), so only that bit is reported — a caller
     /// must never be told about a flag rt would not act on. The engine's own `CSI ? u`
-    /// reply is NOT filtered this way and can name flags rt does not encode; that is the
-    /// recorded divergence in `docs/engine-divergence.md`.
+    /// reply is masked to the same bit on its way out, by `mask_kitty_keyboard_reply` —
+    /// this accessor and that filter are the two halves of one guarantee, and neither is
+    /// safe alone. See `docs/engine-divergence.md` for what this leaves diverging from
+    /// the oracle's own state.
     pub fn kitty_keyboard_flags(&self) -> u8 {
         use alacritty_terminal::term::TermMode;
         let term = self.term.lock();
