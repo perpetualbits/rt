@@ -1510,48 +1510,6 @@ impl App {
     }
 }
 
-// --- [clickdbg] investigation instrumentation ------------------------------
-// TEMPORARY diagnostics for the "one click opens+dismisses the colour picker"
-// bug report (macOS). Every line is tagged `[clickdbg]` so the log can be
-// grepped in isolation; none of this changes behaviour. See
-// `.superpowers/sdd/2026-09-03-macos-port/task-13-report.md` for how to read
-// the output. Remove once the bug is pinned down.
-
-/// Monotonic sequence number for every `PointerButton` event this process
-/// sees, across all windows — makes it trivial to spot duplicates (two log
-/// lines with adjacent seq numbers but identical/near-identical timestamps
-/// and position) versus a single event reaching two code paths (same seq
-/// number logged twice).
-static CLICKDBG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Rate-limit state for the `PointerMoved` probe: last time we logged, and
-/// the position we logged then. `PointerMoved` fires on every pixel of
-/// motion, so logging every one would flood the log; we only care about
-/// motion here as context around the clicks.
-static CLICKDBG_LAST_MOVE_LOG: std::sync::Mutex<Option<(Instant, (f32, f32))>> = std::sync::Mutex::new(None);
-
-/// Log a `PointerMoved`-driven update to `active.mouse`, rate-limited to once
-/// per 200ms UNLESS the position moved more than 3px since the last log line
-/// (so a slow drag still gets samples, and a fast flick isn't lost entirely
-/// between two 200ms ticks).
-fn clickdbg_log_move(mouse: (f32, f32)) {
-    let now = Instant::now();
-    let mut guard = match CLICKDBG_LAST_MOVE_LOG.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(), // a prior logging call can't meaningfully poison this; recover
-    };
-    let should_log = match *guard {
-        None => true,
-        Some((t, (px, py))) => {
-            now.duration_since(t) >= Duration::from_millis(200) || (px - mouse.0).abs() > 3.0 || (py - mouse.1).abs() > 3.0
-        }
-    };
-    if should_log {
-        *guard = Some((now, mouse));
-        log::debug!("[clickdbg] pointer_moved active_mouse=({:.1},{:.1})", mouse.0, mouse.1);
-    }
-}
-
 impl ApplicationHandler for App {
     /// Called when it is possible to create surfaces. On the first call we build
     /// the first window (window, GL context, renderer, session) and apply the RT_*
@@ -1711,22 +1669,6 @@ impl ApplicationHandler for App {
             WindowEvent::PointerButton { button, .. } => button.clone().mouse_button(),
             _ => None,
         };
-        // [clickdbg] probe 1: EVERY PointerButton, before any branch below has
-        // decided anything. `seq` is process-global and monotonic — two lines
-        // with consecutive seq numbers and the same/adjacent timestamp are two
-        // genuinely separate events (duplicates really arrived); the SAME seq
-        // number appearing in a later probe's log line means one event was
-        // processed twice (two branches ran for it). `active_mouse` here is
-        // the value BEFORE this event's own position-sync (line below), i.e.
-        // wherever the previous event left it.
-        if let WindowEvent::PointerButton { device_id, state, position, primary, button: raw_button, .. } = &event {
-            let seq = CLICKDBG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let prior_mouse = self.windows.get(&id).map(|a| a.mouse);
-            log::debug!(
-                "[clickdbg] seq={seq} win={id:?} button_event state={state:?} resolved={ptr_button:?} raw={raw_button:?} primary={primary} device={device_id:?} raw_pos=({:.1},{:.1}) prior_active_mouse={prior_mouse:?}",
-                position.x, position.y
-            );
-        }
         // Two ways a mouse BUTTON event abandons a live pane/tab drag:
         //
         //  - it arrived in a window that is NOT where the gesture began, which
@@ -1850,22 +1792,12 @@ impl ApplicationHandler for App {
                 WindowEvent::PointerButton { state: ElementState::Pressed, .. }
                     if ptr_button == Some(MouseButton::Left) =>
                 {
-                    // [clickdbg] probe 4: the decisive hit-test. If `active.mouse`
-                    // and `g` (built from the same cell/surface sizes) disagree
-                    // about coordinate space, `inside_panel` and/or `hit` will be
-                    // wrong even though the numbers look "reasonable" on their own.
-                    let inside_panel = g.panel.contains(active.mouse);
-                    let hit = if inside_panel { Some(cp::hit(&g, active.mouse)) } else { None };
-                    log::debug!(
-                        "[clickdbg] picker_hit active_mouse=({:.1},{:.1}) panel=(x={:.1},y={:.1},w={:.1},h={:.1}) inside_panel={inside_panel} hit={hit:?}",
-                        active.mouse.0, active.mouse.1, g.panel.x, g.panel.y, g.panel.w, g.panel.h
-                    );
-                    if !inside_panel {
-                        Self::close_picker(active, "clicked outside panel"); // a click outside dismisses
+                    if !g.panel.contains(active.mouse) {
+                        Self::close_picker(active); // a click outside dismisses
                         return;
                     }
-                    match hit.unwrap() {
-                        cp::Hit::Close => Self::close_picker(active, "Hit::Close"),
+                    match cp::hit(&g, active.mouse) {
+                        cp::Hit::Close => Self::close_picker(active),
                         cp::Hit::Sv => {
                             let (s, v) = cp::sv_at(&g, active.mouse);
                             {
@@ -1874,7 +1806,7 @@ impl ApplicationHandler for App {
                                 pk.s = s;
                                 pk.v = v;
                             }
-                            Self::picker_write(active, "press:Sv");
+                            Self::picker_write(active);
                         }
                         cp::Hit::Hue => {
                             let h = cp::hue_at(&g, active.mouse);
@@ -1883,7 +1815,7 @@ impl ApplicationHandler for App {
                                 pk.drag = Some(cp::Drag::Hue);
                                 pk.h = h;
                             }
-                            Self::picker_write(active, "press:Hue");
+                            Self::picker_write(active);
                         }
                         cp::Hit::None => {} // press on panel chrome: swallow, do nothing
                     }
@@ -1892,7 +1824,6 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
-                    clickdbg_log_move(active.mouse); // [clickdbg] probe 2, rate-limited
                     if let Some(d) = active.picker.and_then(|p| p.drag) {
                         {
                             let pk = active.picker.as_mut().unwrap();
@@ -1905,7 +1836,7 @@ impl ApplicationHandler for App {
                                 cp::Drag::Hue => pk.h = cp::hue_at(&g, active.mouse),
                             }
                         }
-                        Self::picker_write(active, "drag");
+                        Self::picker_write(active);
                         active.window.request_redraw();
                     }
                     return;
@@ -1920,7 +1851,7 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
                     if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
-                        Self::close_picker(active, "Escape");
+                        Self::close_picker(active);
                     }
                     return; // swallow every key while the picker is up
                 }
@@ -2023,15 +1954,6 @@ impl ApplicationHandler for App {
                                 let rects = chrome::prefs::swatch_rects(g.rows[i], sw.len(), ch);
                                 if let Some(k) = rects.iter().position(|r| r.contains(active.mouse)) {
                                     let slot = chrome::colour_picker::Slot::from_swatch_index(k);
-                                    // [clickdbg] probe 3: picker lifecycle — open. `active_mouse`
-                                    // here is in the SAME coordinate space `chrome::prefs::hit`
-                                    // just used to land on this swatch; compare it against the
-                                    // `active_mouse` the very next `[clickdbg] picker_hit` line
-                                    // reports for the SAME seq+1 event, if one follows immediately.
-                                    log::debug!(
-                                        "[clickdbg] picker_open slot={slot:?} seed_rgb={:?} swatch_index={k} active_mouse=({:.1},{:.1})",
-                                        sw[k], active.mouse.0, active.mouse.1
-                                    );
                                     active.picker =
                                         Some(chrome::colour_picker::PickerState::new(slot, sw[k]));
                                 }
@@ -2048,7 +1970,6 @@ impl ApplicationHandler for App {
                 // than a stale pre-open position.
                 WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
-                    clickdbg_log_move(active.mouse); // [clickdbg] probe 2, rate-limited
                     return;
                 }
                 // Swallow all other input so it cannot reach the PTY.
@@ -2144,7 +2065,6 @@ impl ApplicationHandler for App {
             match &event {
                 WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
-                    clickdbg_log_move(active.mouse); // [clickdbg] probe 2, rate-limited
                     active.menu_hover = chrome::menu::hit_row(&g, active.mouse);
                     active.window.request_redraw();
                     return;
@@ -2286,7 +2206,6 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
-                    clickdbg_log_move(active.mouse); // [clickdbg] probe 2, rate-limited
                     if let Some(i) = chrome::clip_history::hit_row(&g, active.mouse) {
                         active.clip_overlay = Some(i);
                         active.force_full = true;
@@ -2468,7 +2387,6 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::PointerMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
-                clickdbg_log_move(active.mouse); // [clickdbg] probe 2, rate-limited
                 // --- pane/tab drag-and-drop owns the pointer while it lasts ---
                 // An armed press becomes a drag once the pointer has moved far
                 // enough that it clearly isn't a click. (`self.armed_drag` /
@@ -6963,16 +6881,6 @@ impl App {
         let titlebar_changed = new.show_titlebar != active.settings.show_titlebar;
         // The blur decision depends on both the toggle and the opacity slider.
         let blur_changed = want_blur(&new) != want_blur(&active.settings);
-        if colours_changed {
-            // [clickdbg] probe 5: the colour actually applied + persisted (this
-            // is the point of no return — `Self::persist` below writes it to
-            // disk). fg/bg/palette are logged together since any of the three
-            // can be the one an arbitrary picker close mutated.
-            log::debug!(
-                "[clickdbg] commit_settings colours_changed fg={:?} bg={:?} palette={:?}",
-                new.foreground, new.background, new.palette
-            );
-        }
         active.settings = new; // commit
         Self::persist(&active.settings);
         // Scrollback: newly spawned panes read this live cell.
@@ -7038,16 +6946,9 @@ impl App {
     /// Write the picker's current colour into the pending settings' slot and arm
     /// the settle — so `commit_settings` applies + persists it once the drag
     /// pauses, exactly like a stepped prefs edit (no per-move recolour/persist).
-    /// `trigger` is a short [clickdbg] tag naming what caused this write (a
-    /// press on Sv/Hue, or a drag sample) — NOT a behaviour change, diagnostics
-    /// only.
-    fn picker_write(active: &mut Active, trigger: &str) {
+    fn picker_write(active: &mut Active) {
         let Some(pk) = active.picker else { return };
         let rgb = pk.rgb();
-        // [clickdbg] probe 5: the write that will land in prefs_pending and,
-        // once the picker closes (or PREFS_SETTLE elapses), get persisted by
-        // commit_settings. This is the arbitrary-colour-commit suspect.
-        log::debug!("[clickdbg] picker_write trigger={trigger} slot={:?} rgb={rgb:?}", pk.slot);
         let mut s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
         set_slot(&mut s, pk.slot, rgb);
         active.prefs_pending = Some(s);
@@ -7057,17 +6958,7 @@ impl App {
 
     /// Close the picker (prefs stays open) and commit any pending colour now,
     /// rather than stranding it behind PREFS_SETTLE — mirrors the prefs Esc path.
-    /// `reason` is a short [clickdbg] tag naming which path dismissed it
-    /// (clicked outside the panel, Hit::Close, Escape) — diagnostics only.
-    fn close_picker(active: &mut Active, reason: &str) {
-        // [clickdbg] probe 3: picker lifecycle — close. If `active.prefs_pending`
-        // is Some here, whatever picker_write last wrote is about to be applied
-        // and persisted by commit_settings below.
-        log::debug!(
-            "[clickdbg] close_picker reason={reason} slot={:?} pending_colour={:?}",
-            active.picker.map(|p| p.slot),
-            active.prefs_pending.is_some()
-        );
+    fn close_picker(active: &mut Active) {
         active.picker = None;
         if let Some(new) = active.prefs_pending.take() {
             active.prefs_edits = 0;
