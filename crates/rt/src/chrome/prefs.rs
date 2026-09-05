@@ -73,7 +73,16 @@ pub enum Hit {
 
 const PAD_X: f32 = 10.0; // inner horizontal padding
 const ARROW_W: f32 = 2.0; // "◄ " / " ►" width, in cells
-const VALUE_COLS: usize = 22; // room for the widest value ("DejaVu Sans Mono")
+// Room for the widest value. The right "►" arrow is drawn in the LAST `ARROW_W`
+// cells of this field, so the usable text width is `VALUE_COLS - ARROW_W`.
+#[cfg(not(target_os = "macos"))]
+const VALUE_COLS: usize = 22; // 20 usable: "DejaVu Sans Mono" (16) is the widest
+// macOS carries one more row, "Glass material", whose widest value is
+// "under-window-background" — 23 characters, three past what the Linux panel
+// leaves for text. Widened HERE rather than everywhere, so the Linux dialog keeps
+// the exact width it has always had.
+#[cfg(target_os = "macos")]
+const VALUE_COLS: usize = 26; // 24 usable: "under-window-background" (23) + slack
 const LABEL_COLS: usize = 26; // room for the widest label
 
 fn sec(label: &str) -> Row {
@@ -120,6 +129,20 @@ pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row> {
     v.push(sec("Appearance"));
     v.push(stepper("Background opacity", format!("{:.2}", s.background_opacity), PrefRow::Opacity));
     v.push(toggle("Background blur", s.background_blur, PrefRow::Blur, true));
+    // macOS only, and BUILT only there: on Linux the compositor owns the blur and
+    // the protocols offer nothing but on/off, so a material row would be a control
+    // that visibly does nothing. The setting itself is cross-platform (it is
+    // parsed and preserved everywhere, so one config.toml stays portable) — it is
+    // only the UI for it that is target-gated. Dimmed unless there is actually
+    // glass on screen; see `prefs_model::enabled`.
+    #[cfg(target_os = "macos")]
+    v.push(Row {
+        kind: RowKind::Step,
+        label: "Glass material".into(),
+        value: s.macos_glass_material.name().to_string(),
+        pref: Some(PrefRow::GlassMaterial),
+        enabled: enabled(s, PrefRow::GlassMaterial),
+    });
 
     v.push(sec("Colours"));
     v.push(stepper("Preset", preset_name(s).to_string(), PrefRow::Preset));
@@ -423,6 +446,10 @@ mod tests {
         let rows = rs(&Settings::default());
         let want = [
             PrefRow::FontSize, PrefRow::FontFamily, PrefRow::Opacity, PrefRow::Blur,
+            // The glass material row exists only on macOS (see `rows`), so the
+            // frozen order differs by target rather than pretending it doesn't.
+            #[cfg(target_os = "macos")]
+            PrefRow::GlassMaterial,
             PrefRow::Preset, PrefRow::Ffm, PrefRow::Titlebar, PrefRow::Scrollback,
             PrefRow::ArrowAccel, PrefRow::ArrowAccelMax, PrefRow::Term,
             PrefRow::InstOutput, PrefRow::InstHeat, PrefRow::InstLatency, PrefRow::Jacks,
@@ -459,6 +486,47 @@ mod tests {
             "the advisory must name the check to run: {:?}",
             rows[i + 1].value
         );
+    }
+
+    /// The value column is sized to the widest value a row can hold, and the
+    /// step arrows are drawn in its last `ARROW_W` cells — so a value longer than
+    /// `VALUE_COLS - ARROW_W` silently draws over the "►" and out of the panel.
+    /// Adding a setting whose value is a NAME (a font family, a colour preset, a
+    /// glass material) is exactly how that happens, so pin it.
+    #[test]
+    fn every_value_a_row_can_show_fits_the_value_column() {
+        let budget = VALUE_COLS - ARROW_W as usize;
+        let mut states = vec![Settings::default()];
+        // The widest value of each name-valued row, not just the default one.
+        for name in rt_config::SCHEMES.iter() {
+            let mut s = Settings::default();
+            s.foreground = name.foreground;
+            s.background = name.background;
+            s.palette = name.palette;
+            states.push(s);
+        }
+        for m in rt_config::GlassMaterial::ALL {
+            let mut s = Settings::default();
+            s.background_blur = true;
+            s.background_opacity = 0.5;
+            s.macos_glass_material = *m;
+            states.push(s);
+        }
+        // Font family is user-supplied and unbounded, so it is deliberately not
+        // covered here — the panel clamps to the window width and a long family
+        // name has always been allowed to run wide.
+        for s in &states {
+            for row in rs(s) {
+                if matches!(row.kind, RowKind::Display | RowKind::Section | RowKind::Swatches) {
+                    continue; // drawn from the label column, not the value column
+                }
+                if row.pref == Some(PrefRow::FontFamily) {
+                    continue;
+                }
+                let n = row.value.chars().count();
+                assert!(n <= budget, "{:?} value {:?} is {n} cells, budget {budget}", row.pref, row.value);
+            }
+        }
     }
 
     #[test]

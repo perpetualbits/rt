@@ -85,3 +85,67 @@ so our setup roundtrip buffers rather than steals winit's events.
 - **Not yet verified on live KWin** (no KDE session available here). The protocol
   calls are correct by construction; confirm on a KDE box that the window gains
   a real blur behind it.
+
+## macOS: the frosted glass and its material
+
+macOS is the one platform where rt gets real blur-behind for free: the window
+server blurs behind a transparent window through `NSVisualEffectView`
+(`crates/rt/src/vibrancy.rs`), which is the AppKit sibling of `blur.rs` and
+`bg_effect.rs`. Two things about it were wrong in the first cut and are worth
+recording, because both were reported from a real screen rather than reasoned
+about.
+
+**It is gated, like every other blur path.** The effect view used to be installed
+unconditionally, on the theory that glass behind an opaque background is
+invisible so there was nothing to toggle. At `background_opacity = 0.05` it is
+the dominant thing on screen, and `background_blur = false` did nothing at all.
+Install and removal now hang off `Settings::wants_background_blur()` — the same
+`background_blur && background_opacity < 1.0` the Wayland and X11 paths use — and
+`apply_blur` re-runs the decision on every opacity step and settings commit, so
+the preference and the slider both take effect live. `vibrancy::set_enabled` is
+idempotent: it finds its own view by an `identifier` tag rather than remembering
+a handle, so the hierarchy is the only source of truth and a repeated call can
+never stack a second pane of glass. The decision itself is
+`vibrancy_policy::glass_action`, deliberately not `cfg`'d so Linux CI tests it.
+
+**The material is chosen, not defaulted.** AppKit's `material` property "Defaults
+to `NSVisualEffectMaterialAppearanceBased`" — deprecated since 10.14, and much
+denser than what Terminal.app shows. Leaving it unset is what made rt's glass
+read as an almost-opaque grey-blue haze with the user's own background colour
+faintly on top of it.
+
+`macos_glass_material` in `config.toml` names it. The default is
+`under-window-background`: AppKit documents `.underWindowBackground` as "the
+material used under window backgrounds", which is literally where rt puts the
+effect view (below the content view, as a sibling one level up), and it is the
+lightest of the behind-window materials — the one that leaves the desktop behind
+the window legible rather than merely present.
+
+The full list, in Preferences cycle order (roughly lightest to heaviest):
+
+`under-window-background`, `under-page-background`, `content-background`,
+`window-background`, `sidebar`, `header-view`, `titlebar`, `menu`, `popover`,
+`sheet`, `full-screen-ui`, `hud-window`, `system-default`.
+
+`system-default` means "never call `setMaterial:`" — the deprecated AppKit
+default, kept only as the control case to compare against.
+
+Three ways to set it, no rebuild needed for any of them:
+
+- **Preferences → Appearance → "Glass material"** (macOS builds only; the row is
+  dimmed while there is no glass on screen). Left/Right steps through the list
+  and the window changes **live**.
+- `macos_glass_material = "hud-window"` in `~/.config/rt/config.toml` — read at
+  startup, so this one needs a restart.
+- `RT_GLASS_MATERIAL=hud-window rt` — one run, overrides the config file.
+
+The one change that does *not* apply live is switching **to** `system-default`: a
+view that already carries a material cannot be talked back into AppKit's implicit
+default, so that takes a restart. Every other material applies immediately.
+
+The setting is macOS-only in **effect** but cross-platform in **type**: a Linux rt
+parses it, keeps it, and writes it back unchanged, so one `config.toml` stays
+portable between machines. An unknown name is reported on stderr and falls back to
+the default rather than failing the parse — `Config::load` discards the whole file
+on any parse error, so one mistyped material would otherwise reset every
+preference the user has.

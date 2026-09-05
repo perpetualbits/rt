@@ -13,6 +13,15 @@ pub enum PrefRow {
     FontFamily,
     Opacity,
     Blur,
+    /// The macOS `NSVisualEffectMaterial` the frosted glass is made of. The row
+    /// is only BUILT on macOS (see `chrome::prefs::rows`), but the rule lives
+    /// here unguarded so Linux CI still tests it — the same reason
+    /// `vibrancy_policy` is not `cfg`'d.
+    // Off macOS nothing constructs it outside this file's tests, which is the
+    // point of keeping the rule cross-platform; the resulting dead-code warning
+    // is noise, not a finding.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    GlassMaterial,
     Preset,
     Ffm,
     Titlebar,
@@ -41,15 +50,21 @@ const OPACITY_STEP: f32 = 0.05;
 
 /// Is this row live? A disabled row draws dimmed and refuses steps.
 ///
-/// Only one row is ever disabled, and for a reason worth encoding: the 6fps
-/// instrument tick is gated on BOTH flags (`instruments_animating = anim &&
-/// inst_remote && inst_animate`), so `inst_animate` alone does nothing while
-/// `inst_remote` is off. Setting `inst_remote = true` and seeing no animation —
-/// because `inst_animate` defaulted false — is exactly the trap this avoids.
+/// Rows are disabled only where a setting is genuinely inert given another one,
+/// and each case is worth encoding. The 6fps instrument tick is gated on BOTH
+/// flags (`instruments_animating = anim && inst_remote && inst_animate`), so
+/// `inst_animate` alone does nothing while `inst_remote` is off — setting
+/// `inst_remote = true` and seeing no animation, because `inst_animate` defaulted
+/// false, is exactly the trap that avoids. The glass material is the same shape
+/// of trap: it names the LOOK of a frosted glass that `background_blur` (and a
+/// translucent background) decide the existence of, so with no glass on screen
+/// stepping it would change nothing visible.
 pub fn enabled(s: &Settings, row: PrefRow) -> bool {
     match row {
         PrefRow::InstAnimate => s.inst_remote,
         PrefRow::ArrowAccelMax => s.arrow_accel, // the cap is moot when acceleration is off
+        // The one predicate every blur/glass backend shares; never a second copy.
+        PrefRow::GlassMaterial => s.wants_background_blur(),
         _ => true,
     }
 }
@@ -137,6 +152,9 @@ pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String], terms
             s.background = c.background;
             s.palette = c.palette;
         }
+        // Cycles rather than toggles: 13 materials, wrapping at both ends, so a
+        // user can walk the whole list with one arrow key and watch each one land.
+        PrefRow::GlassMaterial => s.macos_glass_material = s.macos_glass_material.step(dir),
         PrefRow::Blur => s.background_blur = !s.background_blur,
         PrefRow::Ffm => s.focus_follows_mouse = !s.focus_follows_mouse,
         PrefRow::Titlebar => s.show_titlebar = !s.show_titlebar,
@@ -302,6 +320,44 @@ mod tests {
         s.font_family = "Not Installed".to_string();
         step(&mut s, PrefRow::FontFamily, -1, &fams(), &terms());
         assert_eq!(s.font_family, "Gamma Mono", "Left from unmatched -> last family");
+    }
+
+    #[test]
+    fn glass_material_cycles_and_wraps() {
+        let mut s = Settings::default();
+        s.background_blur = true;
+        s.background_opacity = 0.5; // the row is live only while there IS glass
+        let all = rt_config::GlassMaterial::ALL;
+        assert_eq!(s.macos_glass_material, all[0], "starts at the default");
+        step(&mut s, PrefRow::GlassMaterial, 1, &fams(), &terms());
+        assert_eq!(s.macos_glass_material, all[1]);
+        step(&mut s, PrefRow::GlassMaterial, -1, &fams(), &terms());
+        assert_eq!(s.macos_glass_material, all[0]);
+        step(&mut s, PrefRow::GlassMaterial, -1, &fams(), &terms());
+        assert_eq!(s.macos_glass_material, all[all.len() - 1], "wraps backward");
+        // A whole lap comes home: the user can walk every material with one key.
+        for _ in 0..all.len() {
+            step(&mut s, PrefRow::GlassMaterial, 1, &fams(), &terms());
+        }
+        assert_eq!(s.macos_glass_material, all[all.len() - 1]);
+    }
+
+    #[test]
+    fn glass_material_is_disabled_when_there_is_no_glass_to_shape() {
+        let mut s = Settings::default();
+        s.background_blur = false;
+        s.background_opacity = 0.5;
+        assert!(!enabled(&s, PrefRow::GlassMaterial), "no blur -> no glass to shape");
+        s.background_blur = true;
+        s.background_opacity = 1.0;
+        assert!(!enabled(&s, PrefRow::GlassMaterial), "opaque -> the glass is invisible");
+        s.background_opacity = 0.5;
+        assert!(enabled(&s, PrefRow::GlassMaterial));
+        // And a disabled row refuses to step, like every other disabled row.
+        s.background_blur = false;
+        let before = s.macos_glass_material;
+        step(&mut s, PrefRow::GlassMaterial, 1, &fams(), &terms());
+        assert_eq!(s.macos_glass_material, before);
     }
 
     #[test]
