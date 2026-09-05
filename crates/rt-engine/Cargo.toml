@@ -29,4 +29,9 @@ own = []
 alacritty_terminal = { path = "../../vendor/alacritty_terminal", optional = true }  # vendored throughput fork (see docs/vendored-engine.md)
 libc = "0.2"  # PTY read/write/ioctl for the in-house (vt-term) backend
 vt-term = { path = "../vt-term" }  # the in-house Term (RT_ENGINE=vtterm backend)
+# Only for the TERM name the engines export into a pane's shell: `rt_config::term_name`
+# owns the default and the RT_TERM precedence, so the two engine spawn paths cannot
+# drift apart from each other or from the config file. rt-config is pure serde/toml —
+# no GUI, no display — so rt-engine still builds and tests headlessly.
+rt-config = { path = "../rt-config" }
 rt-handoff = { path = "../rt-handoff" }  # the frozen cross-process wire model

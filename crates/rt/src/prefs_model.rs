@@ -25,6 +25,7 @@ pub enum PrefRow {
     InstAnimate,
     ArrowAccel,
     ArrowAccelMax,
+    Term,
     Close,
 }
 
@@ -70,7 +71,12 @@ pub fn preset_name(s: &Settings) -> &'static str {
 /// Every rule clamps or wraps; nothing here can leave `Settings` invalid. A
 /// toggle flips on either direction — Left/Right on a checkbox has no natural
 /// "increase", and users press both.
-pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String]) {
+///
+/// `families` is the installed monospace font list and `terms` the terminal types this
+/// machine actually has terminfo for (`rt_config::term_candidates`). Both are passed in
+/// rather than looked up here so this module stays pure and its tests stay independent of
+/// what happens to be installed on the machine running them.
+pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String], terms: &[String]) {
     if !enabled(s, row) {
         return; // greyed rows refuse input; see `enabled`
     }
@@ -91,6 +97,20 @@ pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String]) {
                 None => if dir > 0 { 0 } else { n - 1 },
             };
             s.font_family = families[next].clone();
+        }
+        // Same cycle as Family, over the terminal types this machine has terminfo for.
+        // `term_candidates` always includes the configured value, so `position` finds it
+        // and the "not in the list" arm only fires for an empty list.
+        PrefRow::Term => {
+            if terms.is_empty() {
+                return; // nothing to offer; leave the name alone rather than blank it
+            }
+            let n = terms.len();
+            let next = match terms.iter().position(|t| *t == s.term) {
+                Some(cur) => (cur as i32 + dir).rem_euclid(n as i32) as usize,
+                None => if dir > 0 { 0 } else { n - 1 },
+            };
+            s.term = terms[next].clone();
         }
         // Reuse the existing rule rather than write a second one: `Settings`
         // already clamps opacity to MIN_OPACITY..=1.0 for the OpacityUp/Down
@@ -144,21 +164,27 @@ mod tests {
         vec!["Alpha Mono".to_string(), "Beta Mono".to_string(), "Gamma Mono".to_string()]
     }
 
+    /// A fixed candidate list, NOT `rt_config::term_candidates()` — what terminfo the test
+    /// machine happens to have installed must not decide whether these tests pass.
+    fn terms() -> Vec<String> {
+        vec!["xterm-256color".to_string(), "xterm-kitty".to_string(), "rt".to_string()]
+    }
+
     #[test]
     fn font_size_steps_by_one_and_clamps_at_both_ends() {
         let mut s = Settings::default();
         s.font_size = 18.0;
-        step(&mut s, PrefRow::FontSize, 1, &fams());
+        step(&mut s, PrefRow::FontSize, 1, &fams(), &terms());
         assert_eq!(s.font_size, 19.0);
-        step(&mut s, PrefRow::FontSize, -1, &fams());
+        step(&mut s, PrefRow::FontSize, -1, &fams(), &terms());
         assert_eq!(s.font_size, 18.0);
         // Clamps at 48 (an unbounded slider could pick an unrenderable size).
         s.font_size = 48.0;
-        step(&mut s, PrefRow::FontSize, 1, &fams());
+        step(&mut s, PrefRow::FontSize, 1, &fams(), &terms());
         assert_eq!(s.font_size, 48.0);
         // Clamps at 8.
         s.font_size = 8.0;
-        step(&mut s, PrefRow::FontSize, -1, &fams());
+        step(&mut s, PrefRow::FontSize, -1, &fams(), &terms());
         assert_eq!(s.font_size, 8.0);
     }
 
@@ -166,11 +192,11 @@ mod tests {
     fn opacity_clamps_via_the_existing_settings_rule() {
         let mut s = Settings::default();
         s.background_opacity = 1.0;
-        step(&mut s, PrefRow::Opacity, 1, &fams());
+        step(&mut s, PrefRow::Opacity, 1, &fams(), &terms());
         assert_eq!(s.background_opacity, 1.0, "must not exceed 1.0");
         // Down to the floor: MIN_OPACITY, never 0 (the window would vanish).
         for _ in 0..100 {
-            step(&mut s, PrefRow::Opacity, -1, &fams());
+            step(&mut s, PrefRow::Opacity, -1, &fams(), &terms());
         }
         assert_eq!(s.background_opacity, Settings::MIN_OPACITY);
     }
@@ -179,17 +205,17 @@ mod tests {
     fn scrollback_doubles_and_halves_within_bounds() {
         let mut s = Settings::default();
         s.scrollback = 10_000;
-        step(&mut s, PrefRow::Scrollback, 1, &fams());
+        step(&mut s, PrefRow::Scrollback, 1, &fams(), &terms());
         assert_eq!(s.scrollback, 20_000, "logarithmic: x2 per step");
-        step(&mut s, PrefRow::Scrollback, -1, &fams());
+        step(&mut s, PrefRow::Scrollback, -1, &fams(), &terms());
         assert_eq!(s.scrollback, 10_000);
         // Clamps at the 1000 floor.
         s.scrollback = 1000;
-        step(&mut s, PrefRow::Scrollback, -1, &fams());
+        step(&mut s, PrefRow::Scrollback, -1, &fams(), &terms());
         assert_eq!(s.scrollback, 1000);
         // Clamps at MAX_SCROLLBACK (a full buffer no machine can hold).
         s.scrollback = Settings::MAX_SCROLLBACK;
-        step(&mut s, PrefRow::Scrollback, 1, &fams());
+        step(&mut s, PrefRow::Scrollback, 1, &fams(), &terms());
         assert_eq!(s.scrollback, Settings::MAX_SCROLLBACK);
     }
 
@@ -197,11 +223,11 @@ mod tests {
     fn family_cycles_and_wraps_both_ways() {
         let mut s = Settings::default();
         s.font_family = "Beta Mono".to_string();
-        step(&mut s, PrefRow::FontFamily, 1, &fams());
+        step(&mut s, PrefRow::FontFamily, 1, &fams(), &terms());
         assert_eq!(s.font_family, "Gamma Mono");
-        step(&mut s, PrefRow::FontFamily, 1, &fams());
+        step(&mut s, PrefRow::FontFamily, 1, &fams(), &terms());
         assert_eq!(s.font_family, "Alpha Mono", "wraps forward");
-        step(&mut s, PrefRow::FontFamily, -1, &fams());
+        step(&mut s, PrefRow::FontFamily, -1, &fams(), &terms());
         assert_eq!(s.font_family, "Gamma Mono", "wraps backward");
     }
 
@@ -209,7 +235,7 @@ mod tests {
     fn family_step_is_a_noop_when_no_families_are_installed() {
         let mut s = Settings::default();
         s.font_family = "Whatever".to_string();
-        step(&mut s, PrefRow::FontFamily, 1, &[]);
+        step(&mut s, PrefRow::FontFamily, 1, &[], &terms());
         assert_eq!(s.font_family, "Whatever", "must not panic or blank the family");
     }
 
@@ -217,16 +243,16 @@ mod tests {
     fn a_toggle_flips_on_either_direction() {
         let mut s = Settings::default();
         s.show_titlebar = true;
-        step(&mut s, PrefRow::Titlebar, 1, &fams());
+        step(&mut s, PrefRow::Titlebar, 1, &fams(), &terms());
         assert!(!s.show_titlebar);
-        step(&mut s, PrefRow::Titlebar, -1, &fams());
+        step(&mut s, PrefRow::Titlebar, -1, &fams(), &terms());
         assert!(s.show_titlebar, "Left and Right both toggle");
     }
 
     #[test]
     fn preset_applies_a_whole_scheme_and_reports_its_name() {
         let mut s = Settings::default();
-        step(&mut s, PrefRow::Preset, 1, &fams());
+        step(&mut s, PrefRow::Preset, 1, &fams(), &terms());
         let want = &rt_config::SCHEMES[1];
         assert_eq!(s.foreground, want.foreground);
         assert_eq!(s.background, want.background);
@@ -248,7 +274,7 @@ mod tests {
         let mut s = Settings::default();
         s.foreground = [248, 194, 0]; // the user's own; matches nothing
         s.background = [1, 2, 3];
-        step(&mut s, PrefRow::Preset, 1, &fams());
+        step(&mut s, PrefRow::Preset, 1, &fams(), &terms());
         let first = &rt_config::SCHEMES[0];
         assert_eq!(s.foreground, first.foreground, "Right from custom -> first scheme");
         assert_eq!(s.background, first.background);
@@ -257,7 +283,7 @@ mod tests {
         let mut s = Settings::default();
         s.foreground = [248, 194, 0];
         s.background = [1, 2, 3];
-        step(&mut s, PrefRow::Preset, -1, &fams());
+        step(&mut s, PrefRow::Preset, -1, &fams(), &terms());
         let last = &rt_config::SCHEMES[rt_config::SCHEMES.len() - 1];
         assert_eq!(s.foreground, last.foreground, "Left from custom -> last scheme");
         assert_eq!(s.background, last.background);
@@ -270,11 +296,11 @@ mod tests {
         // Left -> last (index n-1); neither skips index 0.
         let mut s = Settings::default();
         s.font_family = "Not Installed".to_string();
-        step(&mut s, PrefRow::FontFamily, 1, &fams());
+        step(&mut s, PrefRow::FontFamily, 1, &fams(), &terms());
         assert_eq!(s.font_family, "Alpha Mono", "Right from unmatched -> first family");
         let mut s = Settings::default();
         s.font_family = "Not Installed".to_string();
-        step(&mut s, PrefRow::FontFamily, -1, &fams());
+        step(&mut s, PrefRow::FontFamily, -1, &fams(), &terms());
         assert_eq!(s.font_family, "Gamma Mono", "Left from unmatched -> last family");
     }
 
@@ -294,7 +320,7 @@ mod tests {
         let mut s = Settings::default();
         s.inst_remote = false;
         s.inst_animate = false;
-        step(&mut s, PrefRow::InstAnimate, 1, &fams());
+        step(&mut s, PrefRow::InstAnimate, 1, &fams(), &terms());
         assert!(!s.inst_animate, "a greyed row must not be steppable");
     }
 }

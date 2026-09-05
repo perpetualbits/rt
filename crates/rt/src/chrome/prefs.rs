@@ -160,6 +160,29 @@ pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row> {
         enabled: true,
     });
 
+    // Terminal type. Cycles only names this machine has terminfo for (see
+    // `rt_config::term_candidates`), because a `TERM` with no entry breaks every ncurses
+    // application in every pane opened afterwards — `vim`, `less`, `htop`, `mc`.
+    v.push(sec("Terminal type"));
+    v.push(stepper("TERM", s.term.clone(), PrefRow::Term));
+    // What the next pane will ACTUALLY get, and why. `RT_TERM` in rt's own environment
+    // overrides the setting above, and a user who exported it for an experiment needs to
+    // see that the dialog is not in charge — otherwise the row reads as a lie.
+    let effective = rt_config::term_name(Some(&s.term));
+    v.push(Row {
+        kind: RowKind::Display,
+        label: String::new(),
+        value: if effective != s.term {
+            format!("next pane gets {effective} — $RT_TERM overrides this")
+        } else if s.term == rt_config::DEFAULT_TERM {
+            "rt's own sequences are a superset of this; safe everywhere".to_string()
+        } else {
+            format!("needs `infocmp {effective}` to work on EVERY host you ssh to")
+        },
+        pref: None,
+        enabled: true,
+    });
+
     v.push(sec("Border instruments"));
     v.push(toggle("Output activity", s.inst_output, PrefRow::InstOutput, true));
     v.push(toggle("CPU heat", s.inst_heat, PrefRow::InstHeat, true));
@@ -401,12 +424,41 @@ mod tests {
         let want = [
             PrefRow::FontSize, PrefRow::FontFamily, PrefRow::Opacity, PrefRow::Blur,
             PrefRow::Preset, PrefRow::Ffm, PrefRow::Titlebar, PrefRow::Scrollback,
-            PrefRow::ArrowAccel, PrefRow::ArrowAccelMax,
+            PrefRow::ArrowAccel, PrefRow::ArrowAccelMax, PrefRow::Term,
             PrefRow::InstOutput, PrefRow::InstHeat, PrefRow::InstLatency, PrefRow::Jacks,
             PrefRow::InstRemote, PrefRow::InstAnimate, PrefRow::Close,
         ];
         let got: Vec<PrefRow> = rows.iter().filter_map(|r| r.pref).collect();
         assert_eq!(got, want, "every PrefRow appears once, in order");
+    }
+
+    /// The TERM row shows the configured name, and the readout under it says what the
+    /// next pane will really get. A `TERM` that is not installed here is the one setting
+    /// in this dialog that can stop `vim` from starting, so the row must not read as a
+    /// bare cosmetic choice.
+    #[test]
+    fn the_terminal_type_row_shows_the_setting_and_warns_about_a_borrowed_one() {
+        let rows = rs(&Settings::default());
+        let i = rows.iter().position(|r| r.pref == Some(PrefRow::Term)).expect("a TERM row");
+        assert_eq!(rows[i].value, "xterm-256color", "the default is shown as-is");
+        assert_eq!(rows[i + 1].kind, RowKind::Display, "an advisory line follows it");
+        assert!(
+            rows[i + 1].value.contains("safe everywhere"),
+            "the default must read as safe: {:?}",
+            rows[i + 1].value
+        );
+
+        // A borrowed name turns the advisory into the check the user has to make on every
+        // machine — rt cannot make it for them.
+        let borrowed = Settings { term: "xterm-kitty".to_string(), ..Settings::default() };
+        let rows = rs(&borrowed);
+        let i = rows.iter().position(|r| r.pref == Some(PrefRow::Term)).expect("a TERM row");
+        assert_eq!(rows[i].value, "xterm-kitty");
+        assert!(
+            rows[i + 1].value.contains("infocmp xterm-kitty"),
+            "the advisory must name the check to run: {:?}",
+            rows[i + 1].value
+        );
     }
 
     #[test]

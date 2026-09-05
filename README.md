@@ -163,6 +163,65 @@ which is what lets the compositor match the window to that icon.
 Settings live in `$XDG_CONFIG_HOME/rt/config.toml` (or `~/.config/rt/config.toml`).
 Right-click → **Preferences** edits them live.
 
+### Terminal type (`$TERM`)
+
+rt exports `TERM=xterm-256color` (and `COLORTERM=truecolor`) into every pane. That
+is a *borrowed* identity — rt is not xterm — but a safe one: the entry exists
+wherever ncurses does, and rt implements a superset of what it claims.
+
+You can change it, per install or per run:
+
+```toml
+# ~/.config/rt/config.toml
+[settings]
+term = "xterm-kitty"
+```
+
+```sh
+RT_TERM=xterm-kitty rt      # one-off; the env var beats the config setting
+```
+
+Precedence is **`RT_TERM` → `term` in `config.toml` → `xterm-256color`**. Preferences
+→ *Terminal type* cycles only the names your machine actually has terminfo for.
+Changing it affects panes opened afterwards; a running shell keeps the `TERM` it was
+forked with.
+
+**Two ways this bites, both worth understanding before you touch it.**
+
+1. **A `TERM` with no terminfo entry on the machine breaks ncurses applications
+   outright** — `vim`, `less`, `top`, `htop`, `mc` exit with "unknown terminal type"
+   rather than degrading. `TERM` also travels into every `ssh`, `sudo`, container and
+   `tmux` you start from a pane, so a name your desktop has and a server does not
+   breaks that server. Check with `infocmp <name>` on every host you use.
+2. **Borrowing a name claims everything that terminal does.** `xterm-kitty` is the
+   tempting one: applications that decide whether to use the kitty keyboard protocol
+   from the `TERM` *name* — rather than by querying `CSI ? u`, which rt answers
+   correctly — will negotiate it, and rt does implement it. But that same entry also
+   advertises the kitty *graphics* protocol, which rt does **not** implement, so image
+   viewers and plotting backends will emit graphics escapes rt silently swallows.
+   `xterm-ghostty` has the same shape.
+
+### rt's own terminfo entry
+
+[`extra/rt.terminfo`](extra/rt.terminfo) describes what rt actually implements: it is
+`xterm-256color` with everything rt does not do removed (no bell, no blink, no `rep`,
+no settable tab stops, no OSC 4/52, no styled underlines, no modified-key sequences),
+each removal annotated with the reason in the file. Install it with:
+
+```sh
+tic -x -o ~/.terminfo extra/rt.terminfo               # this user only
+sudo tic -x -o /usr/share/terminfo extra/rt.terminfo  # machine-wide
+infocmp rt                                            # verify
+```
+
+`-x` is required — several capabilities are user-defined extensions and `tic` drops
+them without it.
+
+**It is not the default, and rt will not install it for you.** Until it is compiled on
+a machine, `TERM=rt` breaks every ncurses application there — which is exactly the
+first trap above, and the reason this stays an explicit, per-machine step you take
+before setting `term = "rt"`.
+
 ## Credits
 
 - **Terminal engine: in-house** — `vt-parser` + `vt-term` (this repo, GPL-3.0-or-later),

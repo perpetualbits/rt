@@ -124,7 +124,13 @@ impl VtPane {
             pty_opts.shell = Some(Shell::new(program, args));
         }
         pty_opts.working_directory = working_directory;
-        pty_opts.env.insert("TERM".to_string(), "xterm-256color".to_string());
+        // TERM: the default (`xterm-256color`) plus an `RT_TERM` override, resolved in one
+        // place for both engines — see `rt_config::term_name` and the `Settings::term`
+        // comment for why changing it is a machine-wide decision, not a preference. A host
+        // with a config file (rt) resolves the setting itself and passes the answer in
+        // `env` below, which lands after this insert and so wins; a host without one
+        // (rt-mux, tests) still gets the env override from here.
+        pty_opts.env.insert("TERM".to_string(), rt_config::term_name(None));
         pty_opts.env.insert("COLORTERM".to_string(), "truecolor".to_string());
         for (k, v) in env {
             pty_opts.env.insert(k.clone(), v.clone());

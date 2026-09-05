@@ -509,7 +509,11 @@ impl AlacPane {
         // We emit standard xterm-compatible sequences, and we resolve 24-bit
         // colour, so xterm-256color + truecolor is accurate. Without this, apps
         // like `mc` inherit whatever TERM launched rt and mis-decode our keys.
-        pty_opts.env.insert("TERM".to_string(), "xterm-256color".to_string());
+        // The name is `rt_config::term_name`'s to choose (default `xterm-256color`,
+        // `RT_TERM` overriding) so this engine and `vtpane` cannot drift apart; a host
+        // with a config file passes its resolved answer in `env` below, which is applied
+        // after this insert and therefore wins.
+        pty_opts.env.insert("TERM".to_string(), rt_config::term_name(None));
         pty_opts.env.insert("COLORTERM".to_string(), "truecolor".to_string());
         // Caller-supplied extras (e.g. rt-mux's $RT_OUT / $RT_IN pipe jacks).
         for (k, v) in env {

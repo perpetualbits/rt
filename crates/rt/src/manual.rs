@@ -303,6 +303,12 @@ APPEARANCE  &  PREFERENCES   (right-click menu -> Preferences...)
                      and the 16 ANSI palette entries with the colour picker
   Behaviour          focus-follows-mouse, per-pane titlebars, scrollback
                      size, hold-arrow acceleration and its max speed
+  Terminal type      the $TERM exported to new panes (default xterm-256color).
+                     Only names this machine has terminfo for are offered: a
+                     TERM with no entry makes vim/less/htop refuse to start,
+                     here AND on every host you ssh to. Borrowing another
+                     terminal's name also claims what IT can do (xterm-kitty
+                     advertises kitty GRAPHICS, which rt does not implement).
   Border instruments output / heat / latency toggles, patch-bay jacks,
                      and the ssh -X show / animate switches
   Ctrl+=  (or Ctrl+Shift++)  Ctrl+-  Ctrl+0   font zoom in / out / reset
@@ -323,6 +329,8 @@ STARTING rt   (command line & environment)
   RT_ENGINE=vtterm|alacritty  in-house VT engine (default) or the vendored
                             alacritty engine; rt announces its engine on start
   RT_BACKEND=gl|xrender     same as --backend
+  RT_TERM=xterm-kitty       $TERM for this run's panes; beats the config
+                            setting. Read the Terminal type note above first
   RT_OPACITY=0.8            start with this background opacity (demo knob)
   RT_FOCUS=sloppy           start with focus-follows-mouse on (demo knob)
   rt prefers native Wayland when a Wayland session is present (never

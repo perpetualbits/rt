@@ -153,7 +153,7 @@ window.PROJECT_MAP = {
     {
       id: "chrome-prefs", label: "Preferences", layer: "chrome", status: "done",
       tags: ["native chrome"],
-      desc: "A native (not egui) preferences dialog drawn with the same glyph pipeline as the terminal: toggles, steppers, and section headers over font, appearance, behaviour, scrollback, instruments, and the arrow-key acceleration controls. Persists through the rt-config store.",
+      desc: "A native (not egui) preferences dialog drawn with the same glyph pipeline as the terminal: toggles, steppers, and section headers over font, appearance, behaviour, scrollback, instruments, the arrow-key acceleration controls and the terminal type (which offers only names this machine has terminfo for). Persists through the rt-config store.",
       files: ["crates/rt/src/chrome/prefs.rs", "crates/rt/src/prefs_model.rs"],
       specs: [
         { label: "Native preferences design", href: "docs/superpowers/specs/2026-07-15-native-preferences-design.md" },
@@ -278,8 +278,8 @@ window.PROJECT_MAP = {
     {
       id: "rt-config", label: "rt-config", layer: "control", status: "done",
       tags: ["settings"],
-      desc: "Settings and keybindings with a Terminator-compatible syntax, persisted to ~/.config/rt via serde. Holds opacity/scrim, focus mode, scrollback budget, font, the colour palette, and the arrow-accel preferences, all normalised and clamped on load. macOS builds layer a Command-key set (⌘C/⌘V, ⌘T/⌘W, ⌘D splits, ⌘, ⌘F, ⌘= / ⌘-) on top of the Terminator table without disturbing it — the Linux table is frozen by test, and an unbound ⌘ chord types nothing.",
-      files: ["crates/rt-config"],
+      desc: "Settings and keybindings with a Terminator-compatible syntax, persisted to ~/.config/rt via serde. Holds opacity/scrim, focus mode, scrollback budget, font, the colour palette, the arrow-accel preferences and the pane $TERM, all normalised and clamped on load. The terminal type resolves RT_TERM → the `term` setting → xterm-256color (frozen by test) for both engines; rt also ships its own honest terminfo source, extra/rt.terminfo, which is groundwork only — nothing sets TERM=rt. macOS builds layer a Command-key set (⌘C/⌘V, ⌘T/⌘W, ⌘D splits, ⌘, ⌘F, ⌘= / ⌘-) on top of the Terminator table without disturbing it — the Linux table is frozen by test, and an unbound ⌘ chord types nothing.",
+      files: ["crates/rt-config", "extra/rt.terminfo"],
       specs: [],
       parts: [],
       deps: []

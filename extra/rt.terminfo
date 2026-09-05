@@ -1,0 +1,233 @@
+#### rt — a terminfo entry describing what rt ACTUALLY implements
+#
+# rt exports TERM=xterm-256color by default, which is a borrowed identity: rt is
+# not xterm, and every capability xterm's entry claims is a promise rt has to
+# keep. This file is the honest version. It is derived from xterm-256color by
+# SUBTRACTION — every capability below was checked against the dispatch tables in
+# crates/vt-term/src/lib.rs and the key encoder in crates/rt/src/input.rs, and
+# anything rt does not implement was removed rather than inherited. The removals
+# are listed, with their reasons, at the bottom of this file: they are the point
+# of the entry, not an afterthought.
+#
+# INSTALLING IT — rt cannot do this for you:
+#
+#     tic -x -o ~/.terminfo extra/rt.terminfo      # this user only
+#     sudo tic -x -o /usr/share/terminfo extra/rt.terminfo   # machine-wide
+#
+# The -x is required: several capabilities here are user-defined extensions
+# (Tc, BE/BD, Ss/Se, XM/xm, setrgbf/setrgbb) and tic silently drops them without it.
+#
+# THEN READ THIS BEFORE SETTING term = "rt" IN ~/.config/rt/config.toml:
+#
+# terminfo is per-machine. `TERM` travels into every ssh session, every sudo,
+# every container and every tmux you start from an rt pane, and on any host where
+# this entry has NOT been installed, ncurses applications do not degrade — they
+# refuse to run ("unknown terminal type", "terminal database is inadequate").
+# vim, less, top, htop, mc: all of them. That is why rt does not ship this as its
+# default and will not install it behind your back. Install it everywhere you
+# work first, verify with `infocmp rt`, and only then change the setting.
+#
+# The entry is deliberately conservative. Where rt's behaviour was not provable
+# from the source, the capability was left out: an application that is told a
+# feature is missing degrades gracefully, while one that is told a feature exists
+# and then finds it does not is simply broken.
+#
+rt|rt-256color|rt terminal multiplexer,
+#
+# ── Booleans ──────────────────────────────────────────────────────────────────
+# am    DECAWM is on by default and honoured (vt-term set_mode ?7).
+# xenl  the right-margin wrap is DEFERRED, xterm-style: printing in the last
+#       column arms `pending_wrap` rather than moving the cursor immediately.
+# bce   erased cells keep the CURRENT background — vt-term's `blank()` copies the
+#       pen's bg into every cell that ED/EL/ECH/ICH/scroll clears.
+# mir   IRM (CSI 4 h) is implemented and cursor motion does not disturb it.
+# msgr  attributes are SGR state, unaffected by cursor movement.
+# npc   there is no padding character; rt never needs pad delays.
+# hs    rt's "status line" is the window/pane title, set with OSC 0/2 — the only
+#       OSC rt applies. tsl/fsl/dsl below drive it.
+# AX    SGR 39 and 49 reset fg/bg to the defaults (vt-term sgr arms 39 and 49).
+	am, xenl, bce, mir, msgr, npc, hs, AX,
+#
+# ── Numbers ───────────────────────────────────────────────────────────────────
+# it#8  tab stops are FIXED every 8 columns. rt tracks no tab-stop table at all,
+#       which is also why hts/tbc are absent: this number is not a default, it is
+#       the whole truth about tabs in rt.
+	colors#0x100, pairs#0x10000, cols#80, lines#24, it#8,
+#
+# ── Colour ────────────────────────────────────────────────────────────────────
+# 16 ANSI + 8 bright + the 256-colour cube, all resolved by rt's palette.
+# 24-bit colour is real: SGR 38;2;r;g;b and 38:2:r:g:b both parse (including the
+# 6-parameter colon form with an ISO colour-space id), and rt resolves to RGB.
+# `Tc` is tmux's flag for that; `RGB` is deliberately NOT set, because ncurses
+# reads RGB together with colors# and would conclude rt has 86 bits per channel.
+	Tc,
+	setaf=\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m,
+	setab=\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m,
+	setrgbf=\E[38:2:%p1%d:%p2%d:%p3%dm,
+	setrgbb=\E[48:2:%p1%d:%p2%d:%p3%dm,
+	op=\E[39;49m,
+#
+# ── Attributes ────────────────────────────────────────────────────────────────
+# rt has exactly seven attribute bits: bold, dim, italic, underline, reverse,
+# invisible, strikethrough. `smso` is reverse video because rt has no separate
+# standout. `sgr` is xterm's, minus the blink parameter (%p4) and protect (%p8),
+# which rt does not implement — see the removals at the end.
+	bold=\E[1m, dim=\E[2m, sitm=\E[3m, ritm=\E[23m,
+	smul=\E[4m, rmul=\E[24m, smxx=\E[9m, rmxx=\E[29m,
+	invis=\E[8m, rev=\E[7m, smso=\E[7m, rmso=\E[27m,
+	sgr=%?%p9%t\E(0%e\E(B%;\E[0%?%p6%t;1%;%?%p5%t;2%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p7%t;8%;m,
+	sgr0=\E(B\E[m,
+#
+# ── Alternate character set ───────────────────────────────────────────────────
+# ESC ( 0 selects DEC Special Graphics; the mapping table is character-for-
+# character alacritty's. This is xterm's acsc, NOT kitty's: kitty additionally
+# claims +,-.0 (arrows and a solid block), which rt's table leaves unmapped.
+	smacs=\E(0, rmacs=\E(B,
+	acsc=``aaffggiijjkkllmmnnooppqqrrssttuuvvwwxxyyzz{{||}}~~,
+#
+# ── Cursor motion ─────────────────────────────────────────────────────────────
+	cr=\r, cub1=^H, cuf1=\E[C, cuu1=\E[A, cud1=\n, ht=^I,
+	home=\E[H, cup=\E[%i%p1%d;%p2%dH,
+	cuu=\E[%p1%dA, cud=\E[%p1%dB, cuf=\E[%p1%dC, cub=\E[%p1%dD,
+	hpa=\E[%i%p1%dG, vpa=\E[%i%p1%dd,
+	ind=\n, nel=\EE, ri=\EM, indn=\E[%p1%dS, rin=\E[%p1%dT,
+	cbt=\E[Z,
+# DECSC/DECRC. CSI s / CSI u (SCOSC/SCORC) are NOT implemented, so these must be
+# the ESC 7 / ESC 8 forms.
+	sc=\E7, rc=\E8,
+	csr=\E[%i%p1%d;%p2%dr,
+#
+# ── Erase, insert, delete ─────────────────────────────────────────────────────
+	clear=\E[H\E[2J, ed=\E[J, el=\E[K, el1=\E[1K,
+# E3 clears the scrollback: ED 3 is implemented, and `clear` uses this.
+	E3=\E[3J,
+	ech=\E[%p1%dX,
+	ich=\E[%p1%d@, dch1=\E[P, dch=\E[%p1%dP,
+	il1=\E[L, il=\E[%p1%dL, dl1=\E[M, dl=\E[%p1%dM,
+	smir=\E[4h, rmir=\E[4l,
+#
+# ── Modes ─────────────────────────────────────────────────────────────────────
+# The alternate screen. rt aliases ?47 and ?1047 onto ?1049 (all three save and
+# restore the screen AND the cursor), so ?1049 is the accurate spelling. Note
+# there is no `\E[22;0;0t` / `\E[23;0;0t` title-stack push here as in xterm's
+# entry: rt implements no XTWINOPS at all.
+	smcup=\E[?1049h, rmcup=\E[?1049l,
+	smam=\E[?7h, rmam=\E[?7l,
+# Application cursor keys (DECCKM) only. xterm's smkx also sends \E= (DECKPAM);
+# rt does not implement keypad application mode, so claiming it would leave an
+# application waiting for keypad sequences that never come.
+	smkx=\E[?1h, rmkx=\E[?1l,
+	civis=\E[?25l, cnorm=\E[?25h,
+#
+# ── Cursor shape (DECSCUSR) ───────────────────────────────────────────────────
+# CSI Ps SP q: 0/1/2 block, 3/4 underline, 5/6 bar; odd values blink.
+	Ss=\E[%p1%d q, Se=\E[2 q,
+#
+# ── Title (rt's "status line") ────────────────────────────────────────────────
+# OSC 0 (icon + title) and OSC 2 (title) are the ONLY OSCs rt acts on. Both BEL
+# and ST terminate an OSC in rt's parser.
+	tsl=\E]2;, fsl=^G, dsl=\E]2;\E\\,
+#
+# ── Bracketed paste ───────────────────────────────────────────────────────────
+# DECSET 2004 is honoured, and rt's session layer really does wrap pasted text in
+# \E[200~ … \E[201~.
+	BE=\E[?2004h, BD=\E[?2004l, PS=\E[200~, PE=\E[201~,
+#
+# ── Mouse ─────────────────────────────────────────────────────────────────────
+# rt implements 1000 (click), 1002 (drag), 1003 (any motion) and the 1006 SGR
+# encoding. 1005 (UTF-8) is tracked but never emitted, and 1015 (urxvt) does not
+# exist, so SGR is the only encoding worth advertising.
+	kmous=\E[<,
+	XM=\E[?1006;1000%?%p1%{1}%=%th%el%;,
+	xm=\E[<%i%p3%d;%p1%d;%p2%d;%?%p4%tM%em%;,
+#
+# ── Reset / init ──────────────────────────────────────────────────────────────
+# Built only from sequences rt implements. In particular there is no \E[!p
+# (DECSTR soft reset, not implemented), no \E[?3l (DECCOLM, not implemented) and
+# no \E> (DECKPNM, not implemented) — xterm's is2/rs2 use all three.
+# rs1 is RIS (ESC c), which rt does implement and which resets everything except
+# the host-configured scrollback limits.
+	is2=\E[?7h\E[?1l\E[?6l\E[4l\E[r\E(B\E[m,
+	rs1=\Ec,
+	rs2=\E[?7h\E[?1l\E[?6l\E[4l\E[r\E(B\E[m,
+#
+# ── Queries ncurses makes ─────────────────────────────────────────────────────
+# u7/u6: DSR 6 (cursor position report) and the CSI r;c R reply — implemented.
+# u9/u8: DA1 (CSI c); rt answers \E[?6c, which the u8 pattern matches.
+	u6=\E[%i%d;%dR, u7=\E[6n, u8=\E[?%[;0123456789]c, u9=\E[c,
+#
+# ── Keys ──────────────────────────────────────────────────────────────────────
+# Cursor and Home/End keys are listed in their SS3 (application) form because
+# ncurses sends smkx first and rt honours DECCKM. Everything below was read out
+# of rt's key encoder; nothing is assumed from xterm.
+	kbs=^?,
+	kcuu1=\EOA, kcud1=\EOB, kcuf1=\EOC, kcub1=\EOD,
+	khome=\EOH, kend=\EOF,
+	kich1=\E[2~, kdch1=\E[3~, kpp=\E[5~, knp=\E[6~,
+	kf1=\EOP, kf2=\EOQ, kf3=\EOR, kf4=\EOS,
+	kf5=\E[15~, kf6=\E[17~, kf7=\E[18~, kf8=\E[19~,
+	kf9=\E[20~, kf10=\E[21~, kf11=\E[23~, kf12=\E[24~,
+#
+#
+################################################################################
+# WHAT IS DELIBERATELY ABSENT, AND WHY
+#
+# Every line here is a capability xterm-256color, xterm-kitty or foot carries and
+# rt does not implement. Each was verified in the source; none is an oversight.
+#
+#   bel, flash        rt ignores BEL entirely (no audible or visual bell) and
+#                     does not implement DECSCNM (?5), so there is nothing to
+#                     flash with. An entry claiming either would produce a
+#                     terminal that appears to swallow every alert.
+#   blink, sgr's %p4  SGR 5/6/25 are not implemented; there is no blink bit.
+#   rep               REP (CSI b) is not implemented. ncurses uses `rep` to
+#                     compress long runs, so claiming it would corrupt output.
+#   hts, tbc          rt tracks no tab stops; they are hard-coded every 8
+#                     columns (see it#8). Setting or clearing one does nothing.
+#   ccc, initc, oc    OSC 4 / OSC 104 are not implemented; rt's 256-colour table
+#                     is fixed at compile time and cannot be redefined.
+#   km, smm, rmm      rt sends Alt as an ESC prefix and implements no meta-mode
+#                     toggle (?1034).
+#   cvvis             DECSET 12 (cursor blink) is tracked for DECRQM only.
+#   Ms                OSC 52 (clipboard) is parsed and ignored. An application
+#                     that believed this would think it had copied something.
+#   Cr, Cs            OSC 12 / OSC 112 (cursor colour) are not implemented.
+#   Smulx, Setulc     SGR 4:3 (curly/styled underline) and 58/59 (underline
+#                     colour) are not implemented. Worse than absent: SGR 4:3
+#                     does not even fall back to a plain underline in rt.
+#   Sync, Su          rt DOES implement synchronized output — but as DECSET
+#                     ?2026, whereas kitty's `Sync` capability is the DCS form
+#                     (\EP=1s\E\\), and rt handles no DCS at all. rt's DECRQM
+#                     also reports ?2026 as unset, so an application probing for
+#                     it will not use it either way. Left out rather than
+#                     half-claimed.
+#   XF, fd, fe        focus reporting: DECSET ?1004 is tracked, but rt never
+#                     emits \E[I / \E[O, so nothing would ever arrive.
+#   fullkbd           kitty's boolean for the kitty keyboard protocol. rt
+#                     implements the NEGOTIATION completely (CSI ? u query, CSI >
+#                     u push, CSI < u pop, CSI = u set, with a per-screen stack)
+#                     but honours exactly one flag: 1, DISAMBIGUATE_ESC_CODES.
+#                     It answers a query with `CSI ? 1 u`, which is the truth.
+#                     `fullkbd` says "full", and an application that believed it
+#                     would enable flag 8 (report all keys as escape codes) and
+#                     then wait forever for sequences rt sends as plain text.
+#                     Discovery is by query, and rt's answer is honest; a
+#                     boolean that overstates it is not.
+#   XT                implies xterm's OSC 52 and DECSLRM extensions; rt has
+#                     neither.
+#   mc0, mc4, mc5     no printer support (MC / media copy is not implemented).
+#   kcbt              CSI Z is implemented as OUTPUT (cbt, above), but Shift+Tab
+#                     produces a plain \t: rt's legacy key encoder discards
+#                     modifiers on named keys.
+#   kLFT kRIT kUP     ...and every other modified-key capability, for the same
+#   kDN kHOM kEND     reason. Ctrl+Left, Shift+Home and friends send the
+#   kIC kDC kPRV      UNMODIFIED sequence unless an application has negotiated
+#   kNXT + variants   the kitty keyboard protocol, in which case it gets the
+#                     protocol's own encoding, not these. Listing them would
+#                     make an application wait for bytes that never come.
+#   kf13 … kf63       modified function keys, same reason. rt encodes F1–F12.
+#   RGB               ncurses reads RGB together with colors#, and with
+#                     colors#256 it would compute a nonsensical bit depth. `Tc`
+#                     is the correct flag for what rt does.
+#   OTbs, meml, memu  xterm-specific legacy/memory-lock capabilities.
+################################################################################

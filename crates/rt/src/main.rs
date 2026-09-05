@@ -444,6 +444,7 @@ struct Active {
     low_power: bool,                      // software GL → cap animated-chrome repaints so bling can't peg a weak CPU
     poll_ms: u64,                         // the wake interval set last tick, so latency is judged against it
     scrollback: Rc<std::cell::Cell<usize>>, // live scrollback size for newly spawned panes
+    term: Rc<std::cell::RefCell<String>>, // live $TERM for newly spawned panes (see rt_config::term_name)
     jacks: SharedJacks,                   // per-pane patch-bay pipe jacks (shared with the spawn closure)
     wires: Vec<Wire>,                     // active patch-bay connections
     wiring_from: Option<(rt_core::PaneId, Stream)>, // the armed wire source, mid-gesture
@@ -1342,6 +1343,12 @@ impl App {
         // Preferences takes effect for the next terminal without a restart.
         let scrollback = Rc::new(std::cell::Cell::new(settings.scrollback));
         let scrollback_spawn = scrollback.clone();
+        // Same idea for $TERM: resolved ONCE here (RT_TERM beats the config setting — see
+        // `rt_config::term_name`) and shared with the spawn factory, so changing it in
+        // Preferences reaches the next pane without a restart. Existing panes keep the
+        // TERM they were forked with; nothing can change a running child's environment.
+        let term = Rc::new(std::cell::RefCell::new(rt_config::term_name(Some(&settings.term))));
+        let term_spawn = term.clone();
         // This window's spawn closure shares the app-wide budget (cloning the Arc,
         // not the coordinator) so every pane in every window reports into the same
         // process-wide total.
@@ -1359,7 +1366,7 @@ impl App {
             });
             // Create this pane's patch-bay jacks and advertise them to the shell
             // (only when the session dir was created securely above).
-            let env = match patchbay_ok.then(|| Jacks::new(&jacks_dir, id)) {
+            let mut env = match patchbay_ok.then(|| Jacks::new(&jacks_dir, id)) {
                 Some(Ok(j)) => {
                     let e = j.env();
                     jacks_spawn.borrow_mut().insert(id, j);
@@ -1367,6 +1374,9 @@ impl App {
                 }
                 _ => Vec::new(), // no jacks: the pane still runs, just unwireable
             };
+            // The configured (or RT_TERM-overridden) terminal type. `spawn_env` applies
+            // `env` AFTER its own TERM default, so this is what the child actually sees.
+            env.push(("TERM".to_string(), term_spawn.borrow().clone()));
             let mut pane = match TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get(), &budget_spawn) {
                 Ok(pane) => pane,
                 Err(e) => {
@@ -1560,6 +1570,7 @@ impl App {
             low_power,
             poll_ms: 16,
             scrollback,
+            term,
             jacks,
             wires: Vec::new(),
             wiring_from: None,
@@ -7048,6 +7059,9 @@ impl App {
         Self::persist(&active.settings);
         // Scrollback: newly spawned panes read this live cell.
         active.scrollback.set(active.settings.scrollback);
+        // $TERM: same deal, re-resolved so RT_TERM keeps its precedence over whatever the
+        // dialog just wrote. Panes already running keep the TERM they were forked with.
+        *active.term.borrow_mut() = rt_config::term_name(Some(&active.settings.term));
         // Background blur: toggle live if the config or opacity moved it.
         if blur_changed {
             apply_blur(active);
@@ -7139,7 +7153,11 @@ impl App {
             return;
         }
         let mut s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
-        prefs_model::step(&mut s, pref, dir, &active.mono_families);
+        // The terminal-type list is re-derived per step rather than cached at startup: it
+        // depends on what terminfo is installed, and `tic`-ing rt's own entry while rt is
+        // running should make `rt` appear in the picker without a restart.
+        let terms = rt_config::term_candidates(&s.term);
+        prefs_model::step(&mut s, pref, dir, &active.mono_families, &terms);
         active.prefs_pending = Some(s);
         active.prefs_edits += 1;
         active.last_prefs_edit = Instant::now();

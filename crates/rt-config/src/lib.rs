@@ -202,6 +202,166 @@ pub struct Settings {
     /// top speed ≈ this × the OS keyboard repeat rate. Clamped to `1..=MAX_ARROW_ACCEL`; `1`
     /// disables acceleration even with `arrow_accel` on.
     pub arrow_accel_max: u32,
+    /// The `TERM` value exported into every pane's shell. Default [`DEFAULT_TERM`]
+    /// (`xterm-256color`), and you almost certainly want to leave it there.
+    ///
+    /// **Read this before changing it.** `TERM` is not a preference, it is a promise:
+    /// it names a terminfo entry, and every ncurses application on the machine
+    /// believes that entry describes rt exactly.
+    ///
+    /// 1. **If the name has no terminfo entry installed on THIS machine, ncurses
+    ///    applications refuse to start** — `vim`, `less`, `top`, `htop`, `mc`, and
+    ///    anything else linked against ncurses die with "unknown terminal type" or
+    ///    "terminal database is inadequate". Not degraded: broken. Terminfo is
+    ///    per-machine, so a value that works on your desktop can break every pane
+    ///    over `ssh` to a host that lacks it, and rt cannot install it for you.
+    ///    Check with `infocmp <name> >/dev/null` before setting this.
+    /// 2. **Borrowing another terminal's name claims everything that terminal can
+    ///    do.** `xterm-kitty` is the tempting one: it makes applications that gate
+    ///    on the `TERM` *name* (rather than querying `CSI ? u`) negotiate the kitty
+    ///    keyboard protocol, which rt genuinely implements. But the same entry also
+    ///    advertises the kitty **graphics** protocol, which rt does **not**
+    ///    implement — so an image viewer, a `matplotlib` backend or an `icat` will
+    ///    emit graphics escapes rt silently discards, and you have traded a missing
+    ///    feature for a wrong answer. `xterm-ghostty` has the same shape.
+    ///
+    /// So this setting exists for a user who has measured a specific problem, knows
+    /// which entry is installed where, and accepts the trade. `RT_TERM` in the
+    /// environment overrides it for one-off experiments (see [`term_name`]); rt's own
+    /// entry, `terminfo/rt.terminfo`, describes rt honestly but must be `tic`-installed
+    /// on every machine you use before `term = "rt"` is safe (see the README).
+    ///
+    /// Values that are empty or contain anything outside `[A-Za-z0-9._+-]` are
+    /// rejected by [`Settings::normalize`] and fall back to [`DEFAULT_TERM`].
+    pub term: String,
+}
+
+/// The `TERM` rt exports into a pane's shell unless told otherwise.
+///
+/// A borrowed identity — rt is not xterm — but a deliberately conservative one: this
+/// entry exists on every machine that has ncurses at all, and rt implements a superset
+/// of what it claims (see `terminfo/rt.terminfo` for what rt actually does). Changing
+/// this default is a decision with machine-wide blast radius; see [`Settings::term`].
+pub const DEFAULT_TERM: &str = "xterm-256color";
+
+/// The environment variable that overrides the configured `TERM` for one run.
+pub const TERM_ENV: &str = "RT_TERM";
+
+/// Resolve the `TERM` to export into a pane, applying rt's precedence:
+/// **`RT_TERM` in the environment > the `term` config setting > [`DEFAULT_TERM`]**.
+///
+/// The env var wins because it is the one-off: you export `RT_TERM=xterm-kitty` in one
+/// shell to test a claim, and nothing you did to `config.toml` quietly changes what you
+/// measured. `configured` is `None` for hosts that have no config file to consult
+/// (rt-mux, tests, the engine's own default), which is exactly "fall through to the env
+/// var, then the default".
+///
+/// Blank or syntactically impossible names are ignored at every level rather than
+/// exported — a `TERM` containing a NUL or a space cannot name a terminfo entry, and
+/// exporting one only moves the failure into the child process.
+pub fn term_name(configured: Option<&str>) -> String {
+    term_name_from(std::env::var(TERM_ENV).ok().as_deref(), configured)
+}
+
+/// The pure half of [`term_name`] — same precedence, with the environment passed in.
+/// Split out so the precedence can be tested without `set_var`, which is process-global
+/// and races every other test in the binary.
+pub fn term_name_from(env: Option<&str>, configured: Option<&str>) -> String {
+    for name in [env, configured].into_iter().flatten() {
+        let name = name.trim();
+        if valid_term_name(name) {
+            return name.to_string();
+        }
+    }
+    DEFAULT_TERM.to_string()
+}
+
+/// Is `name` shaped like a terminfo entry name? This checks SYNTAX only — whether the
+/// entry actually exists on this machine is a question only the machine can answer, and
+/// the answer differs per host (see [`Settings::term`]).
+///
+/// The character set is terminfo's own: entry names are used as path components under
+/// `/usr/share/terminfo/<initial>/<name>`, so anything with a `/`, a space or a NUL is
+/// not a name at all, it is a way to confuse the child's environment.
+pub fn valid_term_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// Terminal types the Preferences picker offers, besides [`DEFAULT_TERM`] — the ones a
+/// user might plausibly want and that mean something specific:
+///
+/// * `xterm-kitty` / `xterm-ghostty` — the two names that make applications which gate the
+///   kitty keyboard protocol on the `TERM` *name* (rather than querying `CSI ? u`)
+///   negotiate it. They also claim the kitty **graphics** protocol, which rt does not
+///   implement: see [`Settings::term`] for the trade.
+/// * `rt` — rt's own entry (`terminfo/rt.terminfo`), which claims only what rt does. It is
+///   NOT installed by rt; `tic` it yourself first (see the README) or it will not appear.
+const TERM_ALTERNATES: &[&str] = &["xterm-kitty", "xterm-ghostty", "rt"];
+
+/// The terminal types Preferences will let you cycle through on THIS machine.
+///
+/// Deliberately filtered by [`terminfo_installed`]: offering a name whose terminfo is
+/// missing would let one arrow-key press break `vim`, `less` and `htop` in every pane
+/// opened afterwards, which is not a preference, it is a trap. `configured` is always
+/// included even when its entry is missing — a value hand-written into `config.toml`
+/// must stay visible in the list, or the user cannot see what is in effect or step off it.
+///
+/// The list is a local-machine answer. It says nothing about hosts you `ssh` into, which
+/// have their own terminfo databases and will see whatever `TERM` you export.
+pub fn term_candidates(configured: &str) -> Vec<String> {
+    let mut out = vec![DEFAULT_TERM.to_string()];
+    for name in TERM_ALTERNATES {
+        if terminfo_installed(name) {
+            out.push((*name).to_string());
+        }
+    }
+    let configured = configured.trim();
+    if valid_term_name(configured) && !out.iter().any(|n| n == configured) {
+        out.push(configured.to_string());
+    }
+    out
+}
+
+/// Does a terminfo entry named `name` exist on this machine?
+///
+/// This walks the same directories ncurses does, in its order: `$TERMINFO`, then
+/// `$TERMINFO_DIRS` (colon-separated; an empty element means the compiled-in default),
+/// then `~/.terminfo`, then the usual system trees. Within a tree an entry lives at
+/// `<dir>/<first character>/<name>`, or `<dir>/<two hex digits of the first byte>/<name>`
+/// on the hashed layout some distributions use — both are checked.
+///
+/// It answers "is the file there", which is what "will ncurses find it" reduces to for
+/// the directory-tree databases every Linux and macOS install uses. A `false` from a
+/// system using a single-file hashed database (BSD `terminfo.db`) would be a false
+/// negative, which costs a name in a picker list — never a wrong `TERM` export.
+pub fn terminfo_installed(name: &str) -> bool {
+    if !valid_term_name(name) {
+        return false; // not a name at all; never touch the filesystem with it
+    }
+    let first = &name[..1]; // ASCII by `valid_term_name`, so a byte is a char
+    let hashed = format!("{:02x}", name.as_bytes()[0]);
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = std::env::var_os("TERMINFO") {
+        dirs.push(d.into());
+    }
+    if let Some(list) = std::env::var_os("TERMINFO_DIRS") {
+        for part in std::env::split_paths(&list) {
+            // An empty element in TERMINFO_DIRS means "the compiled-in default location",
+            // which the system trees below already cover.
+            if !part.as_os_str().is_empty() {
+                dirs.push(part);
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join(".terminfo"));
+    }
+    for sys in ["/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo", "/usr/lib/terminfo"] {
+        dirs.push(std::path::PathBuf::from(sys));
+    }
+    dirs.iter().any(|d| d.join(first).join(name).exists() || d.join(&hashed).join(name).exists())
 }
 
 /// The default 16-colour ANSI palette (classic xterm values).
@@ -248,6 +408,7 @@ impl Default for Settings {
             scrollback: 10_000,            // matches rt_engine::DEFAULT_SCROLLBACK
             arrow_accel: true,             // hold-to-accelerate arrows on by default
             arrow_accel_max: 10,           // up to 10 cursor moves per held repeat
+            term: DEFAULT_TERM.to_string(), // the borrowed-but-universally-installed identity
         }
     }
 }
@@ -308,6 +469,20 @@ impl Settings {
                 self.arrow_accel_max, Self::MAX_ARROW_ACCEL
             );
             self.arrow_accel_max = c;
+        }
+        // A `term` that isn't shaped like a terminfo entry name can only break the child
+        // (see `valid_term_name`), so refuse it here rather than export it. Note this
+        // cannot check that the entry EXISTS — that is per-machine and rt has no business
+        // guessing; see the field's own comment for what a wrong-but-valid name costs.
+        let trimmed = self.term.trim();
+        if !valid_term_name(trimmed) {
+            eprintln!(
+                "rt: config term {:?} is not a usable terminfo entry name; using {DEFAULT_TERM}",
+                self.term
+            );
+            self.term = DEFAULT_TERM.to_string();
+        } else if trimmed.len() != self.term.len() {
+            self.term = trimmed.to_string(); // stray whitespace, otherwise fine
         }
     }
 }
