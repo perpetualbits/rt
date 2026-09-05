@@ -44,7 +44,11 @@
 //! Xvfb entirely, so the test would measure the wrong display (or pop a window
 //! on the user's actual screen).
 
-#![cfg(feature = "x11")]
+// The `x11` feature is in `default`, and default features apply on EVERY
+// target -- so a bare `cfg(feature = "x11")` is ALSO active on macOS.
+// It exercises the X11 native-prefs path, a Linux-only module.
+// The target must be part of the gate.
+#![cfg(all(feature = "x11", not(target_os = "macos")))]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

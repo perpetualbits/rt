@@ -14,7 +14,11 @@
 //! by that exact handle (`child.kill()`) — never by name/pattern — and the traced rt
 //! is bounded by `timeout(1)` so it exits on its own.
 
-#![cfg(feature = "x11")]
+// The `x11` feature is in `default`, and default features apply on EVERY
+// target -- so a bare `cfg(feature = "x11")` is ALSO active on macOS.
+// It exercises the XRender backend, a Linux-only module.
+// The target must be part of the gate.
+#![cfg(all(feature = "x11", not(target_os = "macos")))]
 
 use std::io::Write;
 use std::path::PathBuf;

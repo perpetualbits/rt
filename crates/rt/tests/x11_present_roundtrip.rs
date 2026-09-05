@@ -3,7 +3,11 @@
 //! Needs an X server; run under Xvfb:
 //!   Xvfb :99 & DISPLAY=:99 cargo test -p rt --test x11_present_roundtrip -- --ignored
 
-#![cfg(feature = "x11")]
+// The `x11` feature is in `default`, and default features apply on EVERY
+// target -- so a bare `cfg(feature = "x11")` is ALSO active on macOS.
+// It imports `x11rb` directly, which does not exist on macOS.
+// The target must be part of the gate.
+#![cfg(all(feature = "x11", not(target_os = "macos")))]
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, CreateGCAux, ImageFormat};
