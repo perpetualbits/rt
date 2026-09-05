@@ -84,6 +84,16 @@ pub struct VtPane {
     /// reports as damaged into it, then shares it into the returned snapshot via the `Arc`
     /// refcount. Kept across frames so an unchanged pane costs O(damaged cells), not O(grid).
     last_render: Mutex<Arc<Vec<Vec<SnapCell>>>>,
+    /// Set by `set_palette` and consumed by the next `render_snapshot`. A palette change
+    /// damages no cells in vt-term's own tracking (no bytes were parsed), so the incremental
+    /// path in `apply_damage` would otherwise leave every cached cell resolved against the
+    /// OLD palette until something else (a resize) forced a full rebuild — the stale-interior-
+    /// colour bug. `&mut self` on `set_palette` can't reach into `last_render` at that point
+    /// (rebuilding needs `&self.term`'s lock plus `&self.palette`, done together in
+    /// `render_snapshot`), so this just flags "the next snapshot must do a full re-resolve",
+    /// mirroring the existing `dirty` flag's interior-mutability pattern. One-shot: cleared
+    /// the moment it's consumed, so steady-state frames stay on the damaged-cells-only path.
+    palette_dirty: AtomicBool,
     /// Reader thread; detached — it ends on its own when the child closes the PTY.
     _reader: std::thread::JoinHandle<()>,
     cols: usize,
@@ -293,6 +303,7 @@ impl VtPane {
             _writer: writer,
             dirty,
             last_render: Mutex::new(Arc::new(Vec::new())),
+            palette_dirty: AtomicBool::new(false),
             _reader: reader,
             cols,
             rows,
@@ -406,16 +417,31 @@ impl VtPane {
         self.dirty.store(false, Ordering::Release);
         let mut t = self.lock_term();
         let cols = t.cols();
-        let dmg = t.take_damage();
+        let dmg = t.take_damage(); // must still drain vt-term's damage even when we override below
         let cursor = capture_cursor(&t);
         let mut last = self.last_render.lock().unwrap_or_else(|e| e.into_inner());
         let grid = Arc::make_mut(&mut last);
-        let damage = apply_damage(&t, &self.palette, dmg, grid);
+        // A pending palette change trumps vt-term's own damage: no cells were touched, so
+        // `apply_damage`'s incremental path would leave the cache resolved against the OLD
+        // palette. Do the one-shot full re-resolve `set_palette` couldn't do itself, and
+        // report `Full` so partial/scissored consumers repaint too, not just a full redraw.
+        let damage = if self.palette_dirty.swap(false, Ordering::AcqRel) {
+            *grid = resolve_full(&t, &self.palette);
+            Damage::Full
+        } else {
+            apply_damage(&t, &self.palette, dmg, grid)
+        };
         Snapshot { cols, rows: Arc::clone(&last), cursor, damage }
     }
 
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
+        // Force the next render_snapshot to fully re-resolve the cached grid (see
+        // `palette_dirty`'s doc comment) and make sure a repaint actually gets scheduled —
+        // a palette-only change touches no cells, so without this `dirty` could stay false
+        // and nothing would call render_snapshot again until unrelated activity did.
+        self.palette_dirty.store(true, Ordering::Release);
+        self.dirty.store(true, Ordering::Release);
     }
 
     // ── Scrollback viewport ────────────────────────────────────────────────────

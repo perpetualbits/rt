@@ -206,21 +206,37 @@ fn mkfifo(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Set once this process has successfully established its own patch-bay dir
+/// (see [`ensure_jacks_dir`]) — never before that success. `build_active` runs
+/// once per window, all in this one process, and only the very first call for
+/// our `rt-<pid>` dir can legitimately be a crashed prior run's leftover; every
+/// later call in the same run is our own live directory, already handed out to
+/// running panes' shells. Left unset on failure (patch-bay disabled) on
+/// purpose: nothing was created or wiped, so a later window's call is free to
+/// retry the full first-call handshake rather than wrongly skip it.
+static JACKS_DIR_ENSURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Securely (re)create this session's patch-bay directory with mode 0700. The
 /// fallback base (`$TMPDIR`) is world-writable, and our pid is guessable, so we
 /// must not blindly `create_dir_all` and trust whatever is there: an attacker
 /// could plant `rt-<pid>` (or make it a symlink, or pre-create the fifos inside)
 /// to hijack a pane's stdio. We `mkdir(0700)` fresh; if the path already exists
 /// we accept it only when an `lstat` proves it is a real directory we own with
-/// no group/other access, then wipe it clean so no planted node survives. Any
-/// doubt fails closed — the caller then runs with the patch-bay disabled.
+/// no group/other access. The wipe-and-recreate below only ever runs on this
+/// process's FIRST call (see [`JACKS_DIR_ENSURED`]) — that's the only call
+/// where "already exists" can mean a crashed prior run's leftover rather than
+/// our own live dir; every later call just re-validates and returns. Any doubt
+/// fails closed — the caller then runs with the patch-bay disabled.
 fn ensure_jacks_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::Ordering;
+    let first_call = !JACKS_DIR_ENSURED.load(Ordering::SeqCst);
     let c = CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "jacks dir path has a NUL"))?;
     // SAFETY: `c` is a valid NUL-terminated C string for the call's duration.
     let mkdir = || unsafe { libc::mkdir(c.as_ptr(), 0o700) };
     if mkdir() == 0 {
+        JACKS_DIR_ENSURED.store(true, Ordering::SeqCst);
         return Ok(()); // created fresh and private — the common case
     }
     let err = std::io::Error::last_os_error();
@@ -228,7 +244,9 @@ fn ensure_jacks_dir(dir: &Path) -> std::io::Result<()> {
         return Err(err); // e.g. base dir missing or unwritable
     }
     // The path exists. `lstat` (does not follow a symlink) must show a plain
-    // directory, owned by us, with no access for group or other.
+    // directory, owned by us, with no access for group or other. This
+    // validation runs on EVERY call, first or not — the directory could in
+    // principle be tampered with mid-run.
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.is_dir() {
         return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists,
@@ -242,14 +260,23 @@ fn ensure_jacks_dir(dir: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
             "patch-bay directory is accessible by group or other"));
     }
-    // It is our own stale dir (a crashed prior run that reused this pid). Wipe
-    // it so no leftover fifo is silently reused, then recreate it private. If an
-    // attacker races to plant the path in the gap, the second mkdir fails
-    // EEXIST and we bail — fail closed.
+    if !first_call {
+        // Our own live directory from earlier this run (e.g. a second window
+        // via tear-off). Validated above; do NOT wipe — it holds fifos already
+        // handed to running panes' shells, and those paths can never be
+        // repaired once a pane has started.
+        return Ok(());
+    }
+    // First call, and the path already existed: it is our own stale dir (a
+    // crashed prior run that reused this pid). Wipe it so no leftover fifo is
+    // silently reused, then recreate it private. If an attacker races to plant
+    // the path in the gap, the second mkdir fails EEXIST and we bail — fail
+    // closed.
     std::fs::remove_dir_all(dir)?;
     if mkdir() != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    JACKS_DIR_ENSURED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -904,9 +931,12 @@ impl App {
     /// every extra window (`WindowCmd::NewWindow`). Returns `None` on failure —
     /// fatal (the event loop is stopped) only while no window exists yet, see
     /// [`App::fail_build`]. CLI `--cols/--rows` pre-sizing applies only to the
-    /// FIRST window. The patch-bay dir is process-scoped (`rt-<pid>`) and
-    /// `ensure_jacks_dir` is idempotent, so every window shares the same dir
-    /// while keeping its own `SharedJacks` map + spawn closure.
+    /// FIRST window. The patch-bay dir is process-scoped (`rt-<pid>`) and every
+    /// window shares the same dir while keeping its own `SharedJacks` map +
+    /// spawn closure. `ensure_jacks_dir` only wipes the dir on this process's
+    /// first call for it (see [`JACKS_DIR_ENSURED`]) — a second, third, ...
+    /// window's call just re-validates and reuses it, so already-spawned
+    /// panes' fifos survive opening more windows.
     fn build_active(&mut self, event_loop: &dyn ActiveEventLoop) -> Option<Active> {
         // Load persisted settings (before the renderer, so fonts/colours come
         // from the config). Env vars override for demos/screenshots. Loaded here
@@ -7640,8 +7670,11 @@ fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -
 /// The running build's identity — crate version plus the git commit stamped in
 /// by build.rs (e.g. `rt 0.2.8 (42c5ba7)`), so a from-source build is never
 /// mistaken for the release it sits ahead of. Shown by `--version` and in the
-/// menu, manual and preferences. `option_env!` keeps it compiling if build.rs
-/// didn't run (then it's just `rt <version>`).
+/// menu, manual and preferences. build.rs always sets `RT_GIT_DESC` — to a
+/// real commit, an `RT_GIT_DESC` override from the build environment, or
+/// `unknown` when git isn't usable (a packaged tarball, an rsynced worktree)
+/// — so the stamp is never silently empty; `option_env!` only falls back to a
+/// bare `rt <version>` in the never-expected case that build.rs didn't run.
 pub fn version_string() -> String {
     let v = env!("CARGO_PKG_VERSION");
     match option_env!("RT_GIT_DESC") {
@@ -8132,5 +8165,50 @@ mod broadcast_tests {
         let a = WindowId::from_raw(1);
         let targets = App::group_broadcast_targets(a, [a].into_iter());
         assert!(targets.is_empty(), "a lone window has no cross-window targets: {targets:?}");
+    }
+}
+
+#[cfg(test)]
+mod jacks_dir_tests {
+    use super::*;
+
+    /// Regression test for the tear-off bug: `build_active` runs once per
+    /// window, and `ensure_jacks_dir`'s EEXIST branch is only safe to wipe on
+    /// this process's genuinely first call for its patch-bay dir — a crashed
+    /// prior run that reused our pid. A second call in the same run (e.g. a
+    /// second window opened via `DetachPane`/tear-off) must leave whatever is
+    /// already inside alone, since by then it is our own live directory,
+    /// holding fifos already handed out to running panes' shells. Before the
+    /// fix, `ensure_jacks_dir` had no memory of prior calls, so it wiped the
+    /// dir — and every live fifo in it — on every call, every time.
+    #[test]
+    fn second_call_in_same_process_does_not_wipe_live_fifos() {
+        // A unique path under the system temp dir so concurrent test runs
+        // (or a leftover from a prior aborted run) cannot collide with us.
+        let dir = std::env::temp_dir().join(format!(
+            "rt-jacks-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // clean slate, ignore "didn't exist"
+
+        // First call: this exact directory has never existed in this process
+        // before, so this always takes the fresh-mkdir path — regardless of
+        // whether some earlier test already flipped the process-wide
+        // "ensured" flag for a *different* directory. That keeps this test
+        // meaningful rather than vacuous: the second call below is the one
+        // actually being exercised.
+        ensure_jacks_dir(&dir).expect("first call creates the dir");
+
+        // Stand in for a pane's live jack, the way `Jacks::new` would create it.
+        let fifo_path = dir.join("0.in");
+        mkfifo(&fifo_path).expect("create a live fifo inside the freshly-made dir");
+
+        // Second call, same process, same dir — the tear-off / second-window case.
+        ensure_jacks_dir(&dir).expect("second call in the same process must still succeed");
+
+        assert!(fifo_path.exists(), "second ensure_jacks_dir call wiped a live fifo");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
