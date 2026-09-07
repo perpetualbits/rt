@@ -282,9 +282,13 @@ same on both.
 
 Two consequences:
 
-- **`--backend` and `RT_BACKEND` do nothing on macOS.** A macOS build contains
-  exactly one backend, so the choice is made before the override is read.
-  `rt --help` still lists `--backend gl|xrender`; on a Mac it is inert.
+- **`--backend` and `RT_BACKEND` are refused on macOS**, rather than accepted
+  and ignored. A macOS build contains exactly one backend, so `rt --help` there
+  lists no `--backend` option at all; passing one anyway exits with
+  `rt: --backend is not available in this build: a macOS rt contains exactly one
+  rendering backend (Metal, via wgpu), so 'gl' cannot be honoured`. An
+  `RT_BACKEND` left over in a shell profile is not fatal — rt logs one warning
+  and starts normally. On Linux both are unchanged.
 - **Every frame is a full redraw.** rt's damage tracking — the machinery that
   repaints only the cells that changed — is not wired into the wgpu backend, so
   it is switched off on macOS. You are unlikely to notice on a modern Mac; it is
@@ -347,9 +351,11 @@ and the screen agree.
 
 ### Opening URLs
 
-`Ctrl`+click on a URL opens it in your browser on Linux. On macOS **it does
-nothing**: rt shells out to `xdg-open`, which macOS does not have. (macOS's
-equivalent is `open`; rt does not call it.) Copy the URL and open it yourself.
+`Ctrl`+click on a URL opens it in your default browser, on macOS as on Linux.
+rt runs `open` on a Mac and `xdg-open` elsewhere, handing it the URL as a single
+argument and never through a shell; only the scheme and host are ever written to
+a log. If the handler is missing rt says so and carries on — it will not take the
+window down over a link.
 
 ### Border instruments
 
@@ -357,9 +363,12 @@ Each pane's border can show three live gauges. On macOS:
 
 - **output flow** — works.
 - **render latency** — works.
-- **CPU heat** — **stays cold, always.** It is measured by reading `/proc`,
-  which macOS does not have, so every pane reads as zero load. The instrument
-  can be switched off in Preferences.
+- **CPU heat** — works. It sums the CPU time of the pane's shell *and
+  everything the shell started*, so a build or a runaway process warms the
+  border of the pane that owns it. On macOS the numbers come from
+  `proc_pid_rusage` and `proc_listchildpids` rather than `/proc`; they were
+  checked against `ps` on an Apple Silicon Mac and agree to within a percent.
+  The instrument can be switched off in Preferences.
 
 ### Smaller things
 
@@ -487,20 +496,24 @@ other open issues, is in [`docs/KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
   the display's factor; the 8px window margin and the pane/titlebar padding are
   flat pixel constants. At 2x they look proportionally hairline. Cosmetic.
 
-- ☐ **`Ctrl`+click on a URL does nothing** — rt runs `xdg-open`, which macOS
-  does not have.
+- ☑ **`Ctrl`+click on a URL did nothing** — rt ran `xdg-open`, which macOS does
+  not have. Fixed: it runs `open` on a Mac.
 
 - ☐ **Selecting text does not put it on the clipboard, and middle-click paste
   does nothing** — both rely on the X11 PRIMARY selection. Use `⌘C` / `⌘V`.
 
-- ☐ **The CPU-heat instrument never lights up** — it reads `/proc`.
+- ☑ **The CPU-heat instrument never lit up** — it read `/proc`, which macOS
+  does not have. Fixed: it uses `proc_pid_rusage` and `proc_listchildpids`
+  there, and agrees with `ps` to within a percent.
 
 - ☐ **A `.ttc` font family gives you one face for everything.** rt reads only
   the first face out of a font collection, so Menlo's bold and italic render as
   regular, and PT Mono renders entirely in its Bold face.
 
-- ☐ **`--backend` / `RT_BACKEND` are accepted and ignored**, and `rt --help`
-  still lists `--backend gl|xrender`. macOS builds contain one backend.
+- ☑ **`--backend` / `RT_BACKEND` were accepted and ignored**, and `rt --help`
+  listed `--backend gl|xrender`. Fixed: macOS `--help` advertises no backend
+  choice, `--backend` is refused with a reason, and `RT_BACKEND` warns instead of
+  vanishing.
 
 - ☐ **rt's damage tracking is inert on macOS** — every frame is a full redraw.
 
