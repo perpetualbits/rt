@@ -47,6 +47,11 @@ mod crashlog; // panic hook + stderr sink, so a crash leaves evidence behind
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
+#[cfg(target_os = "macos")]
+mod menubar; // the native macOS menu bar (NSMenu), built from menubar_model
+// NOT cfg'd to macOS on purpose: the shape of the menu bar is plain data, and
+// this is the only coverage Linux CI can give it. See the module's own doc.
+mod menubar_model; // which row goes in which menu-bar menu, and what it advertises
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
 mod proc_liveness; // portable "is this pid still alive?" for the patch-bay sweep
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
@@ -754,6 +759,26 @@ struct App {
     /// it to roughly once a second here so `about_to_wait`'s own per-wake cost stays a
     /// single `Instant::elapsed()` comparison the rest of the time.
     budget_last_rebalance: Instant,
+    /// The native macOS menu bar, once the first window has brought AppKit far
+    /// enough along to have one. `None` on every failure path (see
+    /// `menubar::install`) — rt runs perfectly well without it.
+    #[cfg(target_os = "macos")]
+    menubar: Option<menubar::MenuBar>,
+    /// `(has_selection, suspended)` the menu bar's enable snapshot was last
+    /// built from. Rebuilding the model allocates a few dozen strings, and
+    /// `about_to_wait` runs on every wake (as often as every ~16 ms while
+    /// animating, and back-to-back under `ControlFlow::Poll`), so the snapshot
+    /// is only recomputed when one of those two booleans actually moves.
+    #[cfg(target_os = "macos")]
+    menubar_state: Option<(bool, bool)>,
+    /// The window that last took keyboard focus — the one a menu-bar click acts
+    /// on. A macOS menu belongs to the APPLICATION, not to a window, so unlike
+    /// the right-click menu (which arrives with the window id that was clicked)
+    /// a menu-bar click has to be routed. Clicking the menu bar does not take
+    /// focus off the key window, so this is still the window the user was
+    /// looking at.
+    #[cfg(target_os = "macos")]
+    focused: Option<WindowId>,
     /// The wgpu `Instance`/`Adapter`/`Device`/`Queue` every window's backend draws with.
     /// App-level for the same reason `budget` is: the GPU is a process-wide resource, not
     /// a per-window one, and only the App sees every window. `None` until the first
@@ -1914,12 +1939,30 @@ impl ApplicationHandler for App {
         // Poll so we keep re-checking PTYs for async output even without input.
         event_loop.set_control_flow(ControlFlow::Poll);
         active.window.request_redraw(); // first paint
-        self.windows.insert(active.window.id(), active);
+        let id = active.window.id();
+        self.windows.insert(id, active);
+        // macOS only: put rt's menus in the system menu bar. Done here, after
+        // the first window, because that is the earliest point at which winit's
+        // AppKit backend has finished installing the application menu this one
+        // is appended to — and because a menu bar with nothing to act on is not
+        // worth having.
+        #[cfg(target_os = "macos")]
+        {
+            self.focused = Some(id);
+            self.install_menu_bar(event_loop);
+        }
     }
 
     /// Handle a window event: close, resize, key input, redraw. Routed to the
     /// window it belongs to via `id`.
     fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // macOS only: remember which window a menu-bar click should act on. The
+        // event is only observed here, never consumed — everything below still
+        // sees it.
+        #[cfg(target_os = "macos")]
+        if matches!(event, WindowEvent::Focused(true)) {
+            self.focused = Some(id);
+        }
         // winit 0.31 delivers mouse, finger and stylus through the SAME pointer
         // events, told apart only by their source. rt wants a tap and a stylus
         // tip-down to mean what a left click means, so the source is collapsed
@@ -3404,6 +3447,25 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// A wake-up asked for through the [`winit::event_loop::EventLoopProxy`].
+    ///
+    /// rt has exactly one source of these: the macOS menu bar. An `NSMenuItem`
+    /// click lands on AppKit's terms in the middle of its run loop, with no
+    /// `&mut App` in reach, so `menubar.rs` queues the [`rt_config::Action`] and
+    /// wakes the loop; this is where it is collected and run — through the SAME
+    /// `apply_action` a keybinding and the right-click menu go through, never a
+    /// second path.
+    ///
+    /// Wake-ups coalesce, so this drains the whole queue rather than assuming
+    /// one call per click.
+    #[cfg(target_os = "macos")]
+    fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(menubar) = &self.menubar else { return };
+        for action in menubar.take_pending() {
+            self.run_menu_bar_action(event_loop, action);
+        }
+    }
+
     /// Called whenever the loop is about to block. We use it to poll every
     /// window's panes for asynchronous PTY output and request redraws when
     /// anything changed, so terminal output appears without the user touching
@@ -3411,6 +3473,12 @@ impl ApplicationHandler for App {
     /// iteration (`close_window` mutates the map — and exits the process when
     /// it was the last window); the next wake is the fastest any window wants.
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        // macOS only: keep the menu bar's greying current. AppKit reads the
+        // snapshot on its own schedule (a menu about to drop down, a key
+        // equivalent about to fire) and gives rt no hook at that moment, so it
+        // has to already be right — which means once per turn of the loop, here.
+        #[cfg(target_os = "macos")]
+        self.refresh_menu_bar();
         let mut to_close: Vec<WindowId> = Vec::new();
         let mut min_interval: Option<Duration> = None;
         // A pane inside the payload of a live drag can exit under the gesture
@@ -3873,6 +3941,128 @@ fn opens_modal_overlay(action: rt_config::Action) -> bool {
 fn removes_pane_mid_drag(action: rt_config::Action) -> bool {
     use rt_config::Action;
     matches!(action, Action::CloseTerm | Action::DetachPane | Action::DetachTab | Action::CloseWindow)
+}
+
+/// The macOS menu bar's side of the run loop.
+///
+/// The menus themselves are built by `menubar.rs` from `menubar_model.rs`; this
+/// is the three things only `App` can do: install the bar once there is a window
+/// to act on, keep its greying current, and run a clicked action.
+///
+/// Linux is untouched — the whole block is `cfg(target_os = "macos")`, gated on
+/// the TARGET and not on the `x11` feature (which is default-on everywhere,
+/// macOS included, and would therefore have been no gate at all).
+#[cfg(target_os = "macos")]
+impl App {
+    /// Which window a menu-bar click acts on.
+    ///
+    /// A macOS menu belongs to the application, so unlike the right-click menu
+    /// (which arrives already carrying the window id that was clicked) this has
+    /// to be resolved. The key window is the answer; the single-window fallback
+    /// covers the sliver between a window opening and its `Focused(true)`
+    /// arriving, where there is nothing to be ambiguous about anyway.
+    fn menu_target_id(&self) -> Option<WindowId> {
+        if let Some(id) = self.focused.filter(|id| self.windows.contains_key(id)) {
+            return Some(id);
+        }
+        (self.windows.len() == 1).then(|| *self.windows.keys().next().expect("len == 1"))
+    }
+
+    /// `(has_selection, suspended)` — the two booleans the enable snapshot is
+    /// built from. See `menubar_model::model`.
+    fn menu_bar_state(&self) -> (bool, bool) {
+        // No window: nothing is clickable and nothing the bar owns may fire.
+        let Some(active) = self.menu_target_id().and_then(|id| self.windows.get(&id)) else {
+            return (false, true);
+        };
+        // `selection.is_some()` rather than `selected_text(..).is_some()`: this
+        // runs on every turn of the loop, and the latter reads the pane's grid
+        // and builds a `String` to answer a question the `Option` already
+        // answers. The one case they differ in is a selection whose pane has
+        // since died, where Copy would be offered and quietly do nothing.
+        let has_selection = active.selection.is_some();
+        // Every state in which `on_key_press` swallows the keystroke instead of
+        // running the binding. Greying is what makes a disabled item's key
+        // equivalent inert, so this is what keeps ⌘V typing into the search bar.
+        let suspended = active.prefs_open
+            || active.manual_open
+            || active.search_open
+            || active.clip_overlay.is_some()
+            || active.composing
+            || active.menu.is_some()
+            || active.ime_preedit;
+        (has_selection, suspended)
+    }
+
+    /// Build the menus and hand them to AppKit. Idempotent; a no-op after the
+    /// first success, and after a failure it simply leaves rt without a menu bar
+    /// (every keybinding and the right-click menu are unaffected).
+    fn install_menu_bar(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.menubar.is_some() {
+            return;
+        }
+        let Some(active) = self.menu_target_id().and_then(|id| self.windows.get(&id)) else { return };
+        let model = menubar_model::model(&active.keymap, false, false);
+        self.menubar = menubar::install(&model, event_loop.create_proxy());
+        self.menubar_state = None; // nothing pushed yet; force the first snapshot
+    }
+
+    /// Push a fresh enable snapshot, if anything it depends on has moved.
+    fn refresh_menu_bar(&mut self) {
+        if self.menubar.is_none() {
+            return;
+        }
+        let state = self.menu_bar_state();
+        if self.menubar_state == Some(state) {
+            return; // nothing changed; don't rebuild the model
+        }
+        let fallback;
+        let keymap = match self.menu_target_id().and_then(|id| self.windows.get(&id)) {
+            Some(a) => &a.keymap,
+            // No window left to read a keymap off. The bar's SHAPE does not
+            // depend on the keymap's contents, so any keymap gives a snapshot of
+            // the right length — and every flag in it is false anyway.
+            None => {
+                fallback = Keymap::default();
+                &fallback
+            }
+        };
+        let flags: Vec<bool> =
+            menubar_model::model(keymap, state.0, state.1).items().map(|i| i.enabled).collect();
+        if let Some(mb) = &self.menubar {
+            mb.refresh(flags);
+        }
+        self.menubar_state = Some(state);
+    }
+
+    /// Run an action a menu-bar item was clicked for.
+    ///
+    /// Deliberately the same three lines `on_key_press` runs for a bound chord —
+    /// `apply_action`, then `run_window_cmd`, then the group echo — preceded by
+    /// the same two drag/carry guards. A menu click and its keybinding are one
+    /// code path; the only difference is how the action got here.
+    fn run_menu_bar_action(&mut self, event_loop: &dyn ActiveEventLoop, action: rt_config::Action) {
+        let Some(id) = self.menu_target_id() else {
+            log::debug!("menu bar: {action:?} with no window to act on");
+            return;
+        };
+        // A live drag/carry holds pane ids and window cues across its gesture; an
+        // action that opens a modal overlay or removes a pane would strand them.
+        // Same guard, same reasoning as `on_key_press` — a menu bar is reachable
+        // mid-gesture in a way the right-click menu is not.
+        if (self.drag.is_some() || self.armed_drag.is_some() || self.carry.is_some())
+            && (opens_modal_overlay(action) || removes_pane_mid_drag(action))
+        {
+            self.cancel_drag();
+            self.cancel_carry();
+        }
+        let Some(active) = self.windows.get_mut(&id) else { return };
+        let (cmd, group_echo) = Self::apply_action(active, action); // shared with the keymap
+        self.run_window_cmd(event_loop, id, cmd);
+        if let Some((grp, bytes)) = group_echo {
+            self.broadcast_group_paste(id, grp, &bytes);
+        }
+    }
 }
 
 impl App {
@@ -8211,6 +8401,12 @@ fn main() {
         budget_last_rebalance: Instant::now(),
         #[cfg(target_os = "macos")]
         wgpu_shared: None, // built by the first window, shared by the rest
+        #[cfg(target_os = "macos")]
+        menubar: None, // installed once the first window exists
+        #[cfg(target_os = "macos")]
+        menubar_state: None,
+        #[cfg(target_os = "macos")]
+        focused: None,
     };
     if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
