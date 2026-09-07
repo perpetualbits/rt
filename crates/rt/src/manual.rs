@@ -98,6 +98,21 @@ WINDOWS  &  DRAG-AND-DROP
                   to a plain grab cursor if the compositor refuses
                   custom cursor images. Works with titlebars off —
                   pick-up needs no titlebar to grab.
+  Dropped text    select text in another app (a browser, an editor),
+                  drag it onto a pane and let go: it is inserted there,
+                  exactly as a paste would be. The pane UNDER THE
+                  POINTER takes it, not the focused one, and it becomes
+                  the focus so your Return goes where the text went.
+                  The receiving pane lights up while you hover, with a
+                  chip naming the payload; over the tab strip or an
+                  open dialog nothing lights up and the drop does
+                  nothing. Multi-line text is bracketed-pasted, so a
+                  shell shows it as one editable block and runs nothing
+                  until you press Return; in a program that has NOT
+                  asked for bracketed paste the line breaks become
+                  spaces, so a dropped paragraph can never run as a
+                  series of commands. A trailing newline is never sent.
+                  macOS today; Wayland and X11 are still to come.
 
 
 SELECTING TEXT

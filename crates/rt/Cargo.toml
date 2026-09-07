@@ -138,7 +138,13 @@ objc2 = "0.6"
 # item can name a key but not the ⌘/⇧/⌃/⌥ it needs. All four are already in the
 # graph via winit-appkit, which builds its own default menu; naming them here
 # just says rt uses them too.
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics", "NSUserInterfaceItemIdentification", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent"] }
+# `NSDragging` + `NSPasteboard` are the text-drop receiver (text_drop_mac.rs):
+# `NSDraggingDestination`/`NSDraggingInfo`/`NSDragOperation` live behind the
+# first, and `NSPasteboardTypeString` + `stringForType:` behind the second.
+# Both are already in the graph via winit-appkit, whose window delegate is a
+# dragging destination for FILE drops -- naming them here says rt is one too,
+# for text.
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics", "NSUserInterfaceItemIdentification", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSDragging", "NSPasteboard"] }
 objc2-foundation = "0.3"
 pollster = "0.4"   # block_on for wgpu's async adapter/device request
 bytemuck = { version = "1", features = ["derive"] }  # Pod/Zeroable for TextPipeline's Vertex

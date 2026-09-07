@@ -136,6 +136,22 @@ window.PROJECT_MAP = {
       deps: ["rt-session"]
     },
 
+    {
+      id: "text-drop", label: "Dropped-in text", layer: "frontend", status: "active",
+      tags: ["macOS", "Wayland/X11 pending"],
+      desc: "Text dragged in from ANOTHER application (select in Chrome/Firefox, drag onto a pane, drop) is inserted like a paste \u2014 the feature terminator and gnome-terminal have and Alacritty does not. winit surfaces FILE drops only (WindowEvent::DragEntered carries Vec<PathBuf>; its macOS delegate registers NSFilenamesPboardType alone and refuses everything else), so each platform needs a receiver below winit. macOS is done: an NSDraggingDestination NSView registered for NSPasteboardTypeString, added as a click-through \"glass\" subview of winit's content view (hitTest: returns nil, so mouse/IME/cursor still land on winit's view) writing into an Rc<RefCell<DropInbox>> the run-loop reads in about_to_wait. The pane under the POINTER takes the drop (not the focus) and then becomes the focus; delivery is Session::paste_to_pane, the same per-pane bracketed-paste wrap + end-marker strip feed_paste uses, so it reaches exactly one pane and cannot break out of its own bracket. Both decisions \u2014 which pane, and what bytes \u2014 live in the un-cfg'd textdrop module so Linux CI tests them. Wayland (a second wl_data_device on winit's connection) and X11 (an XdndAware InputOnly child window) are designed but not built: both are reachable without forking winit, with a compositor-dependent risk documented in the report.",
+      files: ["crates/rt/src/textdrop.rs", "crates/rt/src/text_drop_mac.rs", "crates/rt/src/main.rs", "crates/rt/src/chrome/dragdrop.rs", "crates/rt-session/src/lib.rs"],
+      parts: [
+        { label: "Drop policy (pure, tested)", status: "done", desc: "textdrop::resolve picks the pane under the cursor and refuses tab strips, gutters and open overlays; textdrop::payload normalises CRLF, never delivers a trailing newline, and flattens line breaks when the target has no bracketed paste. 18 unit tests, run on Linux." },
+        { label: "Paste path (one path, not two)", status: "done", desc: "Session::paste_to_pane + pane_bracketed_paste: feed_paste's wrap-and-strip narrowed to the pane the pointer named, never the broadcast set." },
+        { label: "macOS receiver", status: "done", desc: "NSDraggingDestination glass subview for NSPasteboardTypeString; file drops still reach winit untouched." },
+        { label: "Drop cue", status: "done", desc: "The receiving pane lights up with the same zone fill/border and ghost chip chrome::dragdrop draws for an internal pane drag." },
+        { label: "Wayland receiver", status: "planned", desc: "wl_data_device_manager bound on rt's own EventQueue over winit's wl_display (the bg_effect.rs pattern), MIME text/plain;charset=utf-8. Open risk: whether a compositor delivers DnD events to a client's SECOND data device for a seat." },
+        { label: "X11 receiver", status: "planned", desc: "An XdndAware InputOnly child window on rt's own x11rb connection, so XDND ClientMessages reach rt rather than winit's event loop." }
+      ],
+      deps: ["rt-app", "rt-session"]
+    },
+
     /* ---- Chrome & Interaction ---- */
     {
       id: "selection", label: "Text selection", layer: "chrome", status: "done",
