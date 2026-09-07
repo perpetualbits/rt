@@ -993,10 +993,22 @@ impl Keymap {
     /// The first accelerator bound to `action`, formatted for display (e.g. the
     /// right-click menu). `None` when the action has no binding.
     pub fn shortcut_for(&self, action: Action) -> Option<String> {
+        self.chord_for(action).map(|chord| chord.to_string()) // via the Chord Display impl
+    }
+
+    /// The first accelerator bound to `action`, UNRENDERED.
+    ///
+    /// [`shortcut_for`](Self::shortcut_for) is the same lookup with
+    /// [`Chord`]'s `Display` applied; a caller that needs the modifier set and
+    /// the key separately — the macOS menu bar, which hands AppKit a
+    /// `keyEquivalent` string plus a `keyEquivalentModifierMask` and lets it
+    /// draw the ⌃⌥⇧⌘ glyphs itself — takes this instead of re-parsing a string
+    /// rt just finished formatting.
+    pub fn chord_for(&self, action: Action) -> Option<Chord> {
         self.bindings
             .iter()
             .find(|(_, a)| *a == action) // first binding for this action
-            .map(|(chord, _)| chord.to_string()) // via the Chord Display impl
+            .map(|(chord, _)| *chord)
     }
 }
 

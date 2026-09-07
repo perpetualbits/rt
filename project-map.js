@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-09-05"
+    updated: "2026-09-07"
   },
 
   statuses: {
@@ -174,10 +174,12 @@ window.PROJECT_MAP = {
     {
       id: "chrome-menu", label: "Menu & manual", layer: "chrome", status: "done",
       tags: ["native chrome"],
-      desc: "The right-click context menu that drives rt actions, and the built-in F1 manual — both drawn natively. The menu shares its action table with the keymap so a binding and its menu item can never drift apart.",
-      files: ["crates/rt/src/chrome/menu.rs", "crates/rt/src/chrome/manual.rs"],
+      desc: "The right-click context menu that drives rt actions, and the built-in F1 manual — both drawn natively. The menu shares its action table with the keymap so a binding and its menu item can never drift apart. On macOS a third renderer of that same table puts rt's menus in the system menu bar, where a Mac user looks for them.",
+      files: ["crates/rt/src/chrome/menu.rs", "crates/rt/src/chrome/manual.rs", "crates/rt/src/menu.rs", "crates/rt/src/menubar.rs", "crates/rt/src/menubar_model.rs"],
       specs: [],
-      parts: [],
+      parts: [
+        { label: "macOS menu bar", status: "active", desc: "A real NSMenu in the system menu bar — Shell / Edit / View / Window / Help, plus Settings… in the application menu winit already installs (⌘Q and ⌘H untouched). Rows, labels and enabled-state come verbatim from menu::rows(), so a click dispatches the same Action a keybinding does via App::apply_action; the pointer-dependent rows (Open Link, Copy Address, Move Pane to …) stay context-menu-only. Chords are shown as real AppKit key equivalents taken from the keymap. Enable/disable is live via -validateMenuItem: against a snapshot the run loop refreshes each turn, which also greys the bar (and kills its key equivalents) while a modal overlay owns the keyboard. The click reaches the loop through winit 0.31's EventLoopProxy::wake_up + proxy_wake_up. The AppKit calls are macOS-only; the STRUCTURE is plain data in menubar_model.rs, unit-tested on Linux like vibrancy_policy.rs. Awaiting on-screen verification." }
+      ],
       deps: ["rt-session"]
     },
     {

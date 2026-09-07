@@ -76,6 +76,23 @@ pub enum RowAction {
 }
 
 impl RowAction {
+    /// The [`Action`] this row runs, for the renderers that can only express
+    /// actions — today the macOS menu bar (see [`crate::menubar_model`]).
+    ///
+    /// `None` for the three POINTER-DEPENDENT variants: `OpenUrl`/`CopyUrl` are
+    /// about whatever is under the cursor and `MoveToWindow` is an index into a
+    /// snapshot taken when the menu opened. A menu bar has no cursor and no such
+    /// snapshot, so those rows are context-menu-only by construction rather than
+    /// by an exclusion list someone has to remember to maintain.
+    pub fn action(&self) -> Option<Action> {
+        match self {
+            RowAction::Do(a) => Some(*a),
+            RowAction::Copy => Some(Action::Copy),
+            RowAction::Paste => Some(Action::Paste),
+            RowAction::OpenUrl(_) | RowAction::CopyUrl(_) | RowAction::MoveToWindow(_) => None,
+        }
+    }
+
     /// Turn a clicked row into the pick the caller applies.
     pub fn into_pick(self) -> MenuPick {
         match self {

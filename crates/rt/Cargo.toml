@@ -132,7 +132,13 @@ objc2 = "0.6"
 # `NSUserInterfaceItemIdentification` carries `setIdentifier:`/`identifier`, which
 # is how vibrancy.rs tags its own effect view and finds it again to retarget or
 # remove it -- without a tag it could not tell its glass from AppKit's own.
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics", "NSUserInterfaceItemIdentification"] }
+# `NSApplication` (for `sharedApplication`/`mainMenu`), `NSMenu` and `NSMenuItem`
+# are the menu bar (menubar.rs); `NSEvent` is what carries `NSEventModifierFlags`,
+# and objc2 gates `setKeyEquivalentModifierMask:` on it -- without that a menu
+# item can name a key but not the ⌘/⇧/⌃/⌥ it needs. All four are already in the
+# graph via winit-appkit, which builds its own default menu; naming them here
+# just says rt uses them too.
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics", "NSUserInterfaceItemIdentification", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent"] }
 objc2-foundation = "0.3"
 pollster = "0.4"   # block_on for wgpu's async adapter/device request
 bytemuck = { version = "1", features = ["derive"] }  # Pod/Zeroable for TextPipeline's Vertex
