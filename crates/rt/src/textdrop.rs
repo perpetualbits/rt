@@ -26,6 +26,28 @@
 
 use rt_core::{PaneId, Rect, TabBar};
 
+/// One turn's worth of news from a platform receiver, in the only two facts the
+/// app needs: where a foreign text drag is hovering (with the label for its
+/// chip), and a drop that has just completed (where, and the text).
+///
+/// Every receiver — the macOS `NSDraggingDestination`, and the X11/Wayland ones
+/// — reduces to this before `App::apply_text_drop` sees it, so the behaviour
+/// cannot fork per platform. Positions are in the space winit reports the
+/// pointer in: physical pixels from the top-left of the window's content area.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DropNews {
+    pub hover: Option<((f32, f32), String)>,
+    pub dropped: Option<((f32, f32), String)>,
+}
+
+impl DropNews {
+    /// Nothing to tell the app — the common case, and worth checking before it
+    /// re-derives the window's layout.
+    pub fn is_empty(&self) -> bool {
+        self.hover.is_none() && self.dropped.is_none()
+    }
+}
+
 /// A resolved text drop: which pane takes the text, and the rectangle to
 /// highlight while the pointer hovers.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,9 +189,10 @@ pub fn payload(text: &str, bracketed: bool) -> String {
 /// ends stay recognisable); anything with a line break shows the line count
 /// instead, because the count is the thing worth knowing before letting go.
 /// Counted in CHARS, not bytes — the chip's width is `chars * cell_width`.
-// Called by the platform receivers only (macOS today; the Wayland/X11 ones
-// land next), so a Linux build has no caller yet — the tests below are the
-// coverage, which is the whole point of keeping this module un-`cfg`d.
+// Called by the platform receivers that can see the payload before the drop —
+// AppKit can, XDND cannot (its selection may only be converted after XdndDrop),
+// so the X11 receiver uses a fixed label instead. The tests below are the
+// coverage on a Linux build, which is the point of keeping this module un-cfg'd.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn ghost_label(text: &str) -> String {
     let lines = text.lines().filter(|l| !l.is_empty()).count();

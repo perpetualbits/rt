@@ -104,7 +104,7 @@ WINDOWS  &  DRAG-AND-DROP
                   POINTER takes it, not the focused one, and it becomes
                   the focus so your Return goes where the text went.
                   The receiving pane lights up while you hover, with a
-                  chip naming the payload; over the tab strip or an
+                  chip riding the cursor; over the tab strip or an
                   open dialog nothing lights up and the drop does
                   nothing. Multi-line text is bracketed-pasted, so a
                   shell shows it as one editable block and runs nothing
@@ -112,7 +112,8 @@ WINDOWS  &  DRAG-AND-DROP
                   asked for bracketed paste the line breaks become
                   spaces, so a dropped paragraph can never run as a
                   series of commands. A trailing newline is never sent.
-                  macOS today; Wayland and X11 are still to come.
+                  X11 (including ssh -X) and macOS; on native Wayland
+                  the drop is not accepted yet.
 
 
 SELECTING TEXT

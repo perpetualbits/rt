@@ -105,19 +105,19 @@ pub struct DropInbox {
     pub changed: bool,
 }
 
-/// What one turn of the loop learns from the inbox: where the drag is (and what
-/// to label it), plus a completed drop if one just happened.
-pub type DropChange = (Option<((f32, f32), String)>, Option<((f32, f32), String)>);
-
 impl DropInbox {
-    /// Take whatever changed since the last look. `None` when nothing did.
-    pub fn take_change(&mut self) -> Option<DropChange> {
+    /// Take whatever changed since the last look. `None` when nothing did — the
+    /// state of affairs on essentially every turn of the loop, which is why the
+    /// caller can skip re-deriving the window's layout.
+    pub fn take_change(&mut self) -> Option<crate::textdrop::DropNews> {
         if !self.changed {
             return None;
         }
         self.changed = false;
-        let hover = self.hover.map(|at| (at, self.label.clone()));
-        Some((hover, self.dropped.take()))
+        Some(crate::textdrop::DropNews {
+            hover: self.hover.map(|at| (at, self.label.clone())),
+            dropped: self.dropped.take(),
+        })
     }
 }
 

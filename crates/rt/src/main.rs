@@ -84,6 +84,12 @@ mod textdrop; // pure policy for text dragged in from ANOTHER app (browser selec
 // below winit -- see the module doc.
 #[cfg(target_os = "macos")]
 mod text_drop_mac; // AppKit receiver for dragged-in text
+// And the X11 half: an XdndProxy window on rt's own x11rb connection. winit's
+// X11 backend does speak XDND, but hardcodes text/uri-list, and XDND client
+// messages reach only the client that created the window -- so the protocol's
+// own proxy mechanism is what lets rt receive them. See the module doc.
+#[cfg(not(target_os = "macos"))]
+mod text_drop_x11; // XDND receiver for dragged-in text (inert without the x11 feature)
 mod touch; // pure multi-touch gesture state: which fingers are down, and what they mean
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
@@ -618,6 +624,11 @@ struct Active {
     // is then simply absent, like `vibrancy::set_enabled` returning false.
     #[cfg(target_os = "macos")]
     text_drop: Option<std::rc::Rc<std::cell::RefCell<text_drop_mac::DropInbox>>>,
+    // The X11 receiver's XDND proxy. Inert on native Wayland and in a build
+    // without the `x11` feature, exactly like `x11_blur` beside it, so the field
+    // needs no `cfg` of its own beyond "not macOS".
+    #[cfg(not(target_os = "macos"))]
+    text_drop_x11: text_drop_x11::X11TextDrop,
     // The OS window — LAST so it outlives everything that references it on
     // Drop (see the comment at the top of this struct). On macOS it is an
     // `Arc<dyn Window>` instead of `Box<dyn Window>`: `WgpuBackend::new` (Task
@@ -1615,6 +1626,11 @@ impl App {
         // picom). Inert on Wayland and on a no-x11 build.
         #[cfg(not(target_os = "macos"))]
         let x11_blur = x11_blur::X11Blur::try_init(window.as_ref(), want_blur(&settings));
+        // Text dragged in from another application, X11 half: an XdndProxy
+        // window on rt's own x11rb connection. Inert on native Wayland. The
+        // macOS twin is installed further up, beside the frosted glass.
+        #[cfg(not(target_os = "macos"))]
+        let text_drop_x11 = text_drop_x11::X11TextDrop::try_init(window.as_ref());
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
         // IMEs work: composed text arrives via WindowEvent::Ime(Commit). rt asks
@@ -2005,6 +2021,8 @@ impl App {
             text_drop_ghost: None,
             #[cfg(target_os = "macos")]
             text_drop,
+            #[cfg(not(target_os = "macos"))]
+            text_drop_x11,
         })
     }
 
@@ -3772,7 +3790,6 @@ impl ApplicationHandler for App {
         // Snapshotted before the loop below borrows `self.windows` mutably:
         // `chrome_busy` needs the App-level drag/carry state, which is not
         // reachable from inside that borrow.
-        #[cfg(target_os = "macos")]
         let app_busy = self.drag.is_some() || self.carry.is_some() || self.armed_drag.is_some();
         for (&wid, active) in self.windows.iter_mut() {
             // Text dragged in from another application (macOS today; the
@@ -3783,9 +3800,21 @@ impl ApplicationHandler for App {
             #[cfg(target_os = "macos")]
             if let Some(inbox) = active.text_drop.clone() {
                 let change = inbox.borrow_mut().take_change();
-                if let Some((hover, dropped)) = change {
-                    Self::apply_text_drop(active, Self::chrome_busy(active, app_busy), hover, dropped);
+                if let Some(news) = change {
+                    Self::apply_text_drop(active, Self::chrome_busy(active, app_busy), news);
                 }
+            }
+            // The X11 twin. Its connection's fd is not in winit's poll set, so
+            // this turn of the loop IS its event dispatch; `dragging()` then
+            // holds the loop at the fast poll rate for the rest of the gesture,
+            // or the cue would crawl at IDLE_POLL. See the module doc.
+            #[cfg(not(target_os = "macos"))]
+            if let Some(news) = active.text_drop_x11.pump() {
+                Self::apply_text_drop(active, Self::chrome_busy(active, app_busy), news);
+            }
+            #[cfg(not(target_os = "macos"))]
+            if active.text_drop_x11.dragging() {
+                active.active_until = Instant::now() + ACTIVE_TAIL;
             }
             let (close, interval, died) = Self::tick_active(active, &drag_panes);
             drag_payload_died |= died;
@@ -4399,7 +4428,6 @@ impl App {
     /// than read from `&self`, because every caller is already inside a mutable
     /// borrow of `self.windows` and cannot reach the `App`'s own fields there.
     /// Split, but still ONE predicate: nobody assembles a second copy of it.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Wayland/X11 receivers still to land
     fn chrome_busy(active: &Active, app_busy: bool) -> bool {
         app_busy
             || active.prefs_open
@@ -4413,10 +4441,10 @@ impl App {
     /// Fold one turn's worth of text-drop news into a window: move the cue and
     /// the ghost chip with the pointer, and deliver a completed drop.
     ///
-    /// Deliberately NOT `cfg`'d to macOS. Every platform receiver reduces to the
-    /// same two facts — "a text drag is at P" and "a text drag was released at P
-    /// carrying T" — so the Wayland (`wl_data_device`) and X11 (XDND) receivers
-    /// call this same function, and the behaviour cannot fork per platform.
+    /// Deliberately NOT `cfg`'d to macOS. Every platform receiver reduces its
+    /// traffic to a `textdrop::DropNews` first — AppKit's dragging destination
+    /// and X11's XDND proxy both do, and a Wayland one would — so all of them
+    /// call this, and the behaviour cannot fork per platform.
     ///
     /// `busy` is [`chrome_busy`](App::chrome_busy).
     ///
@@ -4436,13 +4464,8 @@ impl App {
     /// * Focus follows the drop. After dropping a command the user presses
     ///   Return, and it has to go where the text went — the same reason a click
     ///   focuses.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Wayland/X11 receivers still to land
-    fn apply_text_drop(
-        active: &mut Active,
-        busy: bool,
-        hover: Option<((f32, f32), String)>,
-        dropped: Option<((f32, f32), String)>,
-    ) {
+    fn apply_text_drop(active: &mut Active, busy: bool, news: textdrop::DropNews) {
+        let textdrop::DropNews { hover, dropped } = news;
         let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
         let panes = active.session.visible_rects(bounds);
         let bars = active.session.tab_bars(bounds);
