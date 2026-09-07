@@ -2,6 +2,7 @@
 //! to the panel width and scrolls by (wrapped) rows. A version line heads the
 //! text. Scroll position lives in `Active.manual_scroll`.
 use crate::backend::Backend;
+use crate::chrome_scale::logical;
 use crate::chrome::Recti;
 use crate::manual::manual_lines;
 use crate::render::Color;
@@ -14,11 +15,14 @@ pub struct Geom {
     pub total: usize,       // lines.len()
 }
 
-const PAD: f32 = 12.0;
+/// Panel inner padding, in LOGICAL px (registered as
+/// `chrome_scale::logical::MANUAL_PAD`); every use multiplies it by the
+/// display's backing factor.
+pub const PAD: f32 = 12.0;
 
 /// How many character columns fit inside the panel's padded interior.
-pub fn visible_cols(panel_w: f32, cell_w: f32) -> usize {
-    let inner = panel_w - PAD * 2.0;
+pub fn visible_cols(panel_w: f32, cell_w: f32, sc: f32) -> usize {
+    let inner = panel_w - sc * PAD * 2.0;
     if inner <= 0.0 || cell_w <= 0.0 {
         return 0;
     }
@@ -69,12 +73,12 @@ pub fn wrapped(cols: usize) -> Vec<String> {
 }
 
 /// A panel ~85% of the window (a touch wider than before so fewer lines wrap).
-pub fn layout(win_w: f32, win_h: f32, cell_w: f32, cell_h: f32) -> Geom {
-    let w = (win_w * 0.85).min(900.0);
+pub fn layout(win_w: f32, win_h: f32, cell_w: f32, cell_h: f32, sc: f32) -> Geom {
+    let w = (win_w * 0.85).min(sc * logical::MANUAL_MAX_W);
     let h = win_h * 0.85;
     let panel = Recti { x: (win_w - w) / 2.0, y: (win_h - h) / 2.0, w, h };
-    let rows = (((h - PAD * 2.0) / cell_h).floor() as usize).max(1);
-    let lines = wrapped(visible_cols(w, cell_w));
+    let rows = (((h - sc * PAD * 2.0) / cell_h).floor() as usize).max(1);
+    let lines = wrapped(visible_cols(w, cell_w, sc));
     let total = lines.len();
     Geom { panel, rows, lines, total }
 }
@@ -86,7 +90,9 @@ pub fn clamp_scroll(scroll: usize, g: &Geom) -> usize {
 }
 
 /// Draw the panel, the visible wrapped-line slice, and a scrollbar thumb.
-pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, _cell_w: f32, _cell_h: f32) {
+pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, _cell_w: f32, _cell_h: f32, sc: f32) {
+    let pad = sc * PAD;
+    let hair = sc * logical::HAIRLINE;
     let bg = Color::rgb(0x18, 0x1a, 0x1f);
     let border = Color::rgb(0x50, 0x54, 0x60);
     let fg = Color::rgb(0xd0, 0xd2, 0xda);
@@ -94,12 +100,12 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, _cell_w: f32, _cell_h
     let thumb = Color::rgb(0x45, 0x48, 0x54);
     let p = g.panel;
     be.fill_rect(p.x, p.y, p.w, p.h, bg);
-    be.fill_rect(p.x, p.y, p.w, 1.0, border);
-    be.fill_rect(p.x, p.y + p.h - 1.0, p.w, 1.0, border);
-    be.fill_rect(p.x, p.y, 1.0, p.h, border);
-    be.fill_rect(p.x + p.w - 1.0, p.y, 1.0, p.h, border);
-    let ox = p.x + PAD;
-    let oy = p.y + PAD;
+    be.fill_rect(p.x, p.y, p.w, hair, border);
+    be.fill_rect(p.x, p.y + p.h - hair, p.w, hair, border);
+    be.fill_rect(p.x, p.y, hair, p.h, border);
+    be.fill_rect(p.x + p.w - hair, p.y, hair, p.h, border);
+    let ox = p.x + pad;
+    let oy = p.y + pad;
     let scroll = clamp_scroll(scroll, g);
     for (r, line) in g.lines.iter().skip(scroll).take(g.rows).enumerate() {
         // The version header (line 0) is dimmed; everything else is body text.
@@ -110,10 +116,11 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, _cell_w: f32, _cell_h
     }
     // Scrollbar thumb on the right edge, sized to the visible fraction.
     if g.total > g.rows {
-        let track_h = p.h - 2.0;
-        let th = (track_h * g.rows as f32 / g.total as f32).max(12.0);
-        let ty = p.y + 1.0 + (track_h - th) * scroll as f32 / (g.total - g.rows) as f32;
-        be.fill_rect(p.x + p.w - 4.0, ty, 3.0, th, thumb);
+        let inset = sc * logical::MANUAL_SB_TRACK_INSET;
+        let track_h = p.h - inset;
+        let th = (track_h * g.rows as f32 / g.total as f32).max(sc * logical::MANUAL_SB_MIN_THUMB);
+        let ty = p.y + inset * 0.5 + (track_h - th) * scroll as f32 / (g.total - g.rows) as f32;
+        be.fill_rect(p.x + p.w - sc * logical::MANUAL_SB_INSET, ty, sc * logical::MANUAL_SB_W, th, thumb);
     }
 }
 
@@ -123,7 +130,7 @@ mod tests {
 
     #[test]
     fn clamp_keeps_last_page_visible() {
-        let g = layout(1000.0, 700.0, 8.0, 18.0);
+        let g = layout(1000.0, 700.0, 8.0, 18.0, 1.0);
         assert!(g.total > g.rows, "manual is longer than one page");
         let max = g.total - g.rows;
         assert_eq!(clamp_scroll(usize::MAX, &g), max, "cannot scroll past the end");
@@ -133,8 +140,8 @@ mod tests {
     #[test]
     fn visible_cols_fits_inside_the_padded_panel() {
         // 640px panel, 8px cells, 12px padding each side → (640-24)/8 = 77 cols.
-        assert_eq!(visible_cols(640.0, 8.0), 77);
-        assert_eq!(visible_cols(10.0, 8.0), 0); // narrower than padding → 0, no underflow
+        assert_eq!(visible_cols(640.0, 8.0, 1.0), 77);
+        assert_eq!(visible_cols(10.0, 8.0, 1.0), 0); // narrower than padding → 0, no underflow
     }
 
     #[test]

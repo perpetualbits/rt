@@ -16,6 +16,11 @@ mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 #[cfg(not(target_os = "macos"))]
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
 mod chrome; // native (XRender) chrome: menu/search/manual/instruments draw + hit-test
+// Deliberately NOT cfg'd to macOS, for the same reason as `scale_policy` below: it holds
+// every flat chrome constant as a LOGICAL pixel value plus the multiply that turns it
+// physical, with no winit types, so Linux CI runs the HiDPI gates for chrome that only a
+// Retina panel can actually show. A HiDPI Wayland/X11 output takes the same path.
+mod chrome_scale; // logical chrome constants + the backing-factor multiply
 #[cfg(not(target_os = "macos"))]
 mod gl_backend; // the default GL backend: wraps render.rs's Renderer + present resources
 #[cfg(not(target_os = "macos"))]
@@ -428,14 +433,12 @@ const WIRE_BUSY_BYTES: f32 = 4096.0;
 /// Packets travelling along a wire at once.
 const WIRE_PACKETS: u32 = 3;
 
-/// Patch-bay jack disc radii (px), shared by the GL (`paint_instruments`) and
-/// native (`chrome::instruments`) paths so the two never drift. Bumped a notch
-/// from the original 6.0/4.6/4.3 — the ports read as too small against the grab
-/// radius (`jack_at`'s 12px). `RING_W` is the unwired-jack outline width.
-const JACK_R_BACK: f32 = 7.5; // dark backing halo
-const JACK_R_FILL: f32 = 5.8; // filled centre when a wire uses the jack
-const JACK_R_RING: f32 = 5.4; // outline radius when the jack is idle
-const JACK_RING_W: f32 = 1.8; // outline stroke width
+// Patch-bay jack disc radii and the grab radius that must track them now live in
+// `chrome_scale::logical` (JACK_R_BACK / JACK_R_FILL / JACK_R_RING / JACK_RING_W /
+// JACK_GRAB_R), in LOGICAL pixels, multiplied by the window's backing factor at every
+// use site. They are shared by the draw path (`chrome::instruments`) and the hit-test
+// (`App::jack_at`), which is why they sit in one register with a test pinning their
+// ratio at every scale factor: a disc you can see but not hit is the defect.
 
 /// Width (in cells) of the clipboard-history overlay panel.
 const CLIP_PREVIEW_COLS: usize = 44;
@@ -566,6 +569,14 @@ struct Active {
     // diverged. Both are driven by `scale_policy`; see its module doc.
     font_scale: f64,
     scale_pending: bool,
+    // The same factor, sanitised into an `f32` multiplier for every FLAT chrome
+    // constant (window margin, pane padding, jack discs, scrollbar, panel
+    // padding). Held beside `font_scale` because the two must always describe the
+    // same display: the glyph is scaled by `physical_font_px`, the chrome around
+    // it by this, and a frame that mixed the two factors would put the hit-tests
+    // and the pixels on different grids. Updated wherever `font_scale` is.
+    // See `chrome_scale`.
+    chrome_sc: f32,
     instr_tick: bool,                     // advance the instrument animation this frame (6fps, native path)
     last_instr_tick: Instant,             // when the instrument animation last advanced
     last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
@@ -1299,7 +1310,7 @@ impl App {
         let initial_size: winit::dpi::Size = match (self.cli.cols, self.cli.rows) {
             (Some(cols), Some(rows)) if self.windows.is_empty() && cols > 0 && rows > 0 => {
                 let cell = render::cell_size_for(&font_blobs, physical_font_px(settings.font_size, pre_size_scale));
-                window_size_for_grid(cols, rows, cell, settings.show_titlebar).into()
+                window_size_for_grid(cols, rows, cell, settings.show_titlebar, chrome_scale::chrome_scale(pre_size_scale)).into()
             }
             _ => winit::dpi::LogicalSize::new(960.0, 600.0).into(),
         };
@@ -1431,12 +1442,18 @@ impl App {
         // HiDPI: the authoritative scale factor for this window (1.0 on every
         // Linux setup so far; 2.0 on a Retina Mac). Used below to turn
         // `settings.font_size` (LOGICAL) into the PHYSICAL pixel size handed to
-        // the renderer/backend — see `physical_font_px`. All LAYOUT stays in
-        // physical pixels exactly as before; only the font rasterisation size is
-        // scaled, so cell metrics (and everything measured from them: instrument
-        // discs, jack ports, cursors, borders) come out the same APPARENT size on
-        // a 2x display as on a 1x one.
+        // the renderer/backend — see `physical_font_px` — and, via `chrome_sc`
+        // below, to scale the flat chrome constants that are not derived from the
+        // cell. Everything measured FROM the cell (panel widths, row heights,
+        // cursors) follows the glyph; everything flat follows `chrome_sc`; between
+        // them the whole window comes out the same APPARENT size on a 2x display
+        // as on a 1x one.
         let scale_factor = window.scale_factor();
+        // ...and the same factor as the multiplier for the flat chrome constants
+        // (see `chrome_scale`), so the window margin, pane padding, patch-bay
+        // jacks, scrollbar and panel chrome come out the same APPARENT size on a
+        // 2x display as on a 1x one — exactly as the glyph does.
+        let chrome_sc = chrome_scale::chrome_scale(scale_factor);
 
         // --- create the GL context and surface ---------------------------
         // Linux-only, like the display/config band above: no `gl_display`/
@@ -1616,7 +1633,7 @@ impl App {
         let cell = render::cell_size_for(&font_blobs, physical_font_px(settings.font_size, scale_factor));
 
         // --- build the session with real PTY panes -----------------------
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, chrome_sc);
         // RT_EXEC runs a command in every new pane before dropping to an
         // interactive shell (handy for screenshots / demos).
         let exec = std::env::var("RT_EXEC").ok();
@@ -1699,6 +1716,12 @@ impl App {
             Some(pane)
         });
         let mut session = Session::new(bounds, cell, spawn);
+        // Push the display's chrome scale in before anything is laid out: the
+        // session's pane padding, titlebar strip and split dividers are flat
+        // constants too, and `Session::new` had to build the first pane at the
+        // 1.0 default. The relayout two lines down is what makes that first
+        // sizing right.
+        session.set_chrome_scale(chrome_sc);
         // Reserve a per-pane titlebar strip if the settings ask for it, then
         // relayout so the first pane is sized to its content (minus the header).
         session.set_show_titlebar(settings.show_titlebar);
@@ -1842,7 +1865,14 @@ impl App {
             mods: ModifiersState::empty(),
             settings,
             mouse: (0.0, 0.0),
-            touch: touch::Touch::default(),
+            touch: {
+                // The gesture machine compares travel in PHYSICAL pixels against a
+                // LOGICAL threshold, so it needs the same factor everything else here
+                // does. Re-pushed on a scale change alongside `chrome_sc`.
+                let mut t = touch::Touch::default();
+                t.set_scale(chrome_scale::chrome_scale(scale_factor));
+                t
+            },
             menu: None,
             menu_hover: None,
             menu_windows: Vec::new(),
@@ -1930,6 +1960,7 @@ impl App {
             // owed. On Linux this is 1.0 and never changes.
             font_scale: scale_factor,
             scale_pending: false,
+            chrome_sc: chrome_scale::chrome_scale(scale_factor),
             instr_tick: false,
             last_instr_tick: Instant::now(),
             last_autoscroll: Instant::now(),
@@ -2248,7 +2279,7 @@ impl ApplicationHandler for App {
             use chrome::colour_picker as cp;
             let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
-            let g = cp::layout(cw, ch, size.width as f32, size.height as f32);
+            let g = cp::layout(cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
             match &event {
                 WindowEvent::PointerButton { state: ElementState::Pressed, .. }
                     if ptr_button == Some(MouseButton::Left) =>
@@ -2340,10 +2371,10 @@ impl ApplicationHandler for App {
                     let size = active.window.surface_size();
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
-                    let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+                    let cols = (content_bounds(size, active.chrome_sc).w / cw).max(1.0) as usize;
                     let fam = cached_family_status(&mut active.font_status, &active.font_db, &s.font_family);
                     let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols, fam);
-                    let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
+                    let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
                     match &ke.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             active.prefs_open = false;
@@ -2392,10 +2423,10 @@ impl ApplicationHandler for App {
                     let size = active.window.surface_size();
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
-                    let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+                    let cols = (content_bounds(size, active.chrome_sc).w / cw).max(1.0) as usize;
                     let fam = cached_family_status(&mut active.font_status, &active.font_db, &s.font_family);
                     let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols, fam);
-                    let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
+                    let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
                     match chrome::prefs::hit(&g, active.mouse) {
                         Some(chrome::prefs::Hit::Step(i, dir)) => {
                             active.prefs_sel = i;
@@ -2418,7 +2449,7 @@ impl ApplicationHandler for App {
                                 // Open the colour picker on the clicked swatch.
                                 let mut sw = vec![s.foreground, s.background];
                                 sw.extend(s.palette.iter().copied());
-                                let rects = chrome::prefs::swatch_rects(g.rows[i], sw.len(), ch);
+                                let rects = chrome::prefs::swatch_rects(g.rows[i], sw.len(), ch, active.chrome_sc);
                                 if let Some(k) = rects.iter().position(|r| r.contains(active.mouse)) {
                                     let slot = chrome::colour_picker::Slot::from_swatch_index(k);
                                     active.picker =
@@ -2455,7 +2486,7 @@ impl ApplicationHandler for App {
         if active.manual_open {
             let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
-            let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch);
+            let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch, active.chrome_sc);
             match &event {
                 WindowEvent::KeyboardInput { event: ke, .. }
                     if ke.state == ElementState::Pressed =>
@@ -2496,7 +2527,7 @@ impl ApplicationHandler for App {
                     // Positive y = wheel up = scroll toward the top (fewer rows).
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => *y as isize,
-                        MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as isize,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / (active.chrome_sc as f64 * touch::PX_PER_LINE as f64)) as isize,
                     };
                     let next = (active.manual_scroll as isize - lines).max(0) as usize;
                     active.manual_scroll = chrome::manual::clamp_scroll(next, &g);
@@ -2528,7 +2559,7 @@ impl ApplicationHandler for App {
             let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
             let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
-            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
+            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
             match &event {
                 WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
@@ -2642,8 +2673,8 @@ impl ApplicationHandler for App {
             let n = active.clip_history.len();
             let anchor = Self::pane_content_rect(active, active.session.focus())
                 .map(|r| (r.x, r.y))
-                .unwrap_or((40.0, 40.0));
-            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS);
+                .unwrap_or((active.chrome_sc * chrome_scale::logical::CLIP_ANCHOR_FALLBACK, active.chrome_sc * chrome_scale::logical::CLIP_ANCHOR_FALLBACK));
+            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS, active.chrome_sc);
             match &event {
                 WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
                     match &ke.logical_key {
@@ -2846,7 +2877,9 @@ impl ApplicationHandler for App {
                 // Normalise both delta kinds to a signed line count.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as isize, // notch-based devices
-                    MouseScrollDelta::PixelDelta(p) => (p.y / touch::PX_PER_LINE as f64) as isize, // touchpads
+                    // Physical px per line, so a flick of the same distance scrolls
+                    // the same amount on a 2x display as on a 1x one.
+                    MouseScrollDelta::PixelDelta(p) => (p.y / (active.chrome_sc as f64 * touch::PX_PER_LINE as f64)) as isize, // touchpads
                 };
                 Self::scroll_lines(active, lines);
             }
@@ -2862,7 +2895,11 @@ impl ApplicationHandler for App {
                 if matches!(self.armed_drag.as_ref(), Some(a) if a.window == id) {
                     let armed = self.armed_drag.as_ref().expect("just matched");
                     let (dx, dy) = (active.mouse.0 - armed.press.0, active.mouse.1 - armed.press.1);
-                    if (dx * dx + dy * dy).sqrt() > dragdrop::DRAG_THRESHOLD {
+                    // The threshold is a LOGICAL distance and the deltas are
+                    // physical, so it takes the display's factor too — see
+                    // `dragdrop::DRAG_THRESHOLD`'s doc for why a gesture distance
+                    // scales at all.
+                    if (dx * dx + dy * dy).sqrt() > active.chrome_sc * dragdrop::DRAG_THRESHOLD {
                         let armed = self.armed_drag.take().expect("just matched");
                         // Zones are computed from the REAL layout, so a zoomed
                         // pane must be restored before anything can be resolved.
@@ -2878,7 +2915,7 @@ impl ApplicationHandler for App {
                                 let panes = active.session.tab_panes(first_pane).unwrap_or_else(|| vec![first_pane]);
                                 let label = active
                                     .session
-                                    .tab_bars(content_bounds(active.window.surface_size()))
+                                    .tab_bars(content_bounds(active.window.surface_size(), active.chrome_sc))
                                     .into_iter()
                                     .flat_map(|bar| bar.tabs)
                                     .find(|t| t.first_pane == first_pane)
@@ -2949,7 +2986,7 @@ impl ApplicationHandler for App {
                     if overlay_up {
                         Self::clear_carry_cue(active, dim);
                     } else {
-                        let bounds = content_bounds(active.window.surface_size());
+                        let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
                         let (panes, bars) =
                             (active.session.visible_rects(bounds), active.session.tab_bars(bounds));
                         // `payload_panes` only ever matches in the SOURCE
@@ -2962,6 +2999,7 @@ impl ApplicationHandler for App {
                             &bars,
                             bounds,
                             active.mouse,
+                            active.chrome_sc,
                         );
                         active.drag_cue = resolved;
                         active.drag_ghost = Some((active.mouse, carry.label.clone()));
@@ -3147,7 +3185,8 @@ impl ApplicationHandler for App {
                         let (mx, my) = active.mouse;
                         let continuation = matches!(active.last_click, Some((t, (lx, ly)))
                             if now.duration_since(t) < Duration::from_millis(400)
-                                && (mx - lx).abs() < 5.0 && (my - ly).abs() < 5.0);
+                                && (mx - lx).abs() < active.chrome_sc * chrome_scale::logical::CLICK_SLOP
+                                && (my - ly).abs() < active.chrome_sc * chrome_scale::logical::CLICK_SLOP);
                         if continuation {
                             // A Shift+double/triple-click whose first release entered
                             // compose: abandon compose and let the normal word/line
@@ -3193,7 +3232,7 @@ impl ApplicationHandler for App {
                     }
                     {
                         let size = active.window.surface_size();
-                        let bounds = content_bounds(size);
+                        let bounds = content_bounds(size, active.chrome_sc);
                         let (mx, my) = active.mouse;
                         // A second press must never arm a second gesture on top of
                         // a live one: the first would be orphaned (its cues stuck
@@ -3320,8 +3359,8 @@ impl ApplicationHandler for App {
                             let count = match active.last_click {
                                 Some((t, (lx, ly)))
                                     if now.duration_since(t) < Duration::from_millis(400)
-                                        && (mx - lx).abs() < 5.0
-                                        && (my - ly).abs() < 5.0 =>
+                                        && (mx - lx).abs() < active.chrome_sc * chrome_scale::logical::CLICK_SLOP
+                                        && (my - ly).abs() < active.chrome_sc * chrome_scale::logical::CLICK_SLOP =>
                                 {
                                     (active.click_count % 3) + 1 // 1→2→3→1
                                 }
@@ -3499,7 +3538,7 @@ impl ApplicationHandler for App {
                     // `self.enter_carry`, which needs `&mut self` — the same
                     // staging the left-press titlebar/tab arms rely on.
                     if self.carry.is_none() && self.drag.is_none() && self.armed_drag.is_none() {
-                        let bounds = content_bounds(active.window.surface_size());
+                        let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
                         let (mx, my) = active.mouse;
                         let tb_h = active.session.titlebar_h();
                         let pane_hit = if tb_h > 0.0 {
@@ -3917,7 +3956,7 @@ impl App {
                     fx.on_resize(size.width, size.height); // blur region follows the surface
                 }
             }
-            let bounds = content_bounds(size);
+            let bounds = content_bounds(size, active.chrome_sc);
             let t0 = Instant::now();
             if work.reload_fonts {
                 // Re-measure the cell at the settled scale and reflow. Reads
@@ -4544,11 +4583,11 @@ impl App {
             None => None,
             Some(w) => {
                 let (Some(a), Some(drag)) = (self.windows.get(&w), self.drag.as_ref()) else { return };
-                let bounds = content_bounds(a.window.surface_size());
+                let bounds = content_bounds(a.window.surface_size(), a.chrome_sc);
                 let (panes, bars) = (a.session.visible_rects(bounds), a.session.tab_bars(bounds));
                 // `payload_panes` only ever matches in the SOURCE window (pane
                 // ids are process-global); passing it elsewhere is harmless.
-                dragdrop::resolve_drop(drag.payload, &drag.payload_panes, &panes, &bars, bounds, local)
+                dragdrop::resolve_drop(drag.payload, &drag.payload_panes, &panes, &bars, bounds, local, a.chrome_sc)
             }
         };
 
@@ -4706,7 +4745,7 @@ impl App {
                 // dissolving a two-tab group on the way out). Any OTHER strip —
                 // no current index for us there — is a genuine move.
                 rt_session::DropTarget::TabAt { anchor, index } => {
-                    let bounds = content_bounds(active.window.surface_size());
+                    let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
                     match Self::tab_index_in_bar(active, bounds, anchor, first_pane) {
                         Some(current) => {
                             active.session.reorder_tab(first_pane, dragdrop::index_for_reorder(current, index))
@@ -4939,7 +4978,7 @@ impl App {
             if a.session.focus() == departed {
                 a.session.focus_pane(arrival);
             }
-            a.session.relayout(content_bounds(a.window.surface_size()));
+            a.session.relayout(content_bounds(a.window.surface_size(), a.chrome_sc));
             a.force_full = true;
             a.window.request_redraw();
         }
@@ -5183,7 +5222,7 @@ impl App {
         active: &Active,
         payload: dragdrop::DragPayload,
     ) -> Option<CustomCursor> {
-        let bounds = content_bounds(active.window.surface_size());
+        let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
         let rect = match payload {
             dragdrop::DragPayload::Pane(p) => active
                 .session
@@ -5289,7 +5328,7 @@ impl App {
             // The focused pane's tab: find its strip's active entry (first_pane
             // identity), same "first strip with an active tab" convention as
             // `move_focused_tab`.
-            let bounds = content_bounds(active.window.surface_size());
+            let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
             let first = active
                 .session
                 .tab_bars(bounds)
@@ -5313,7 +5352,7 @@ impl App {
         let Some(active) = self.windows.get(&id) else { return };
         let payload = if tab {
             // Same "first strip with an active tab" convention as `detach`.
-            let bounds = content_bounds(active.window.surface_size());
+            let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
             let first = active
                 .session
                 .tab_bars(bounds)
@@ -5448,15 +5487,20 @@ impl App {
     /// stdout jack sits at the right edge upper third, the stderr jack lower third.
     fn jack_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, Stream)> {
         let size = active.window.surface_size();
-        let bounds = content_bounds(size);
-        const R: f32 = 12.0; // grab radius in px
+        let bounds = content_bounds(size, active.chrome_sc);
+        // Grab radius. Scaled by the SAME factor as the discs the user aims at
+        // (`chrome_scale::logical::JACK_R_*`, drawn in `chrome::instruments`), so
+        // the target never shrinks relative to the dot: on a 2x display both
+        // double. Scaling one and not the other is the bug that made the colour
+        // picker unclickable when HiDPI first landed.
+        let grab_r = active.chrome_sc * chrome_scale::logical::JACK_GRAB_R;
         for (id, r) in active.session.visible_rects(bounds) {
             let (ox, oy) = (r.x + r.w, r.y + r.h / 3.0);
-            if (mx - ox).hypot(my - oy) <= R {
+            if (mx - ox).hypot(my - oy) <= grab_r {
                 return Some((id, Stream::Stdout));
             }
             let (ex, ey) = (r.x + r.w, r.y + 2.0 * r.h / 3.0);
-            if (mx - ex).hypot(my - ey) <= R {
+            if (mx - ex).hypot(my - ey) <= grab_r {
                 return Some((id, Stream::Stderr));
             }
         }
@@ -5466,7 +5510,7 @@ impl App {
     /// The pane whose rectangle contains the physical-pixel point `(mx, my)`.
     fn pane_at(active: &Active, mx: f32, my: f32) -> Option<rt_core::PaneId> {
         let size = active.window.surface_size();
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, active.chrome_sc);
         active
             .session
             .visible_rects(bounds)
@@ -5651,7 +5695,7 @@ impl App {
     /// with no tab strip (or a single tab) this is a no-op.
     fn move_focused_tab(active: &mut Active, delta: isize) {
         let size = active.window.surface_size();
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, active.chrome_sc);
         for bar in active.session.tab_bars(bounds) {
             if let Some(idx) = bar.tabs.iter().position(|t| t.active) {
                 let last = bar.tabs.len() as isize - 1;
@@ -5771,7 +5815,7 @@ impl App {
     /// currently visible. Like the per-pane branch of `cell_at`, but keyed by id.
     fn pane_content_rect(active: &Active, pane: rt_core::PaneId) -> Option<Rect> {
         let size = active.window.surface_size();
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, active.chrome_sc);
         active.session.visible_rects(bounds)
             .into_iter()
             .find(|(id, _)| *id == pane)
@@ -5841,7 +5885,7 @@ impl App {
 
     fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
         let size = active.window.surface_size();
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, active.chrome_sc);
         let (cw, ch) = active.backend.cell_size();
         for (id, rect) in active.session.visible_rects(bounds) {
             if rect.contains(mx, my) {
@@ -5966,7 +6010,7 @@ impl App {
     /// the pointer isn't on a scrollbar or the pane has no scrollback.
     fn scrollbar_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, Rect, f32, f32)> {
         let size = active.window.surface_size();
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, active.chrome_sc);
         for (id, full) in active.session.visible_rects(bounds) {
             if !full.contains(mx, my) {
                 continue; // not this pane
@@ -5976,10 +6020,12 @@ impl App {
             if history == 0 {
                 return None; // no scrollback → no scrollbar to grab
             }
-            let (bx, bw, thumb_y, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
+            let (bx, bw, thumb_y, thumb_h) = scrollbar_metrics(rect, offset, history, screen, active.chrome_sc);
             // Within the scrollbar's x-band (a little slop for easy grabbing) and
-            // the grid's vertical extent?
-            if mx >= bx - 2.0 && mx <= bx + bw + 2.0 && my >= rect.y && my <= rect.bottom() {
+            // the grid's vertical extent? The slop scales with the bar it wraps,
+            // so the grab band stays exactly 3x the bar's width at every factor.
+            let slop = active.chrome_sc * chrome_scale::logical::SCROLLBAR_GRAB_SLOP;
+            if mx >= bx - slop && mx <= bx + bw + slop && my >= rect.y && my <= rect.bottom() {
                 return Some((id, rect, thumb_y, thumb_h));
             }
             return None; // in this pane but not on its scrollbar
@@ -5997,7 +6043,7 @@ impl App {
         if history == 0 || rect.h <= 0.0 {
             return;
         }
-        let (_bx, _bw, _ty, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
+        let (_bx, _bw, _ty, thumb_h) = scrollbar_metrics(rect, offset, history, screen, active.chrome_sc);
         // Invert scrollbar_metrics: the thumb travels `rect.h - thumb_h`, and its
         // position maps linearly onto the offset range `history..0` (top..bottom).
         let travel = (rect.h - thumb_h).max(0.0);
@@ -6330,10 +6376,17 @@ impl App {
                 // `ScaleFactorChanged` back to the old display look like a
                 // no-op and strand the window at the wrong size.
                 active.font_scale = scale;
+                // The chrome multiplier moves in lockstep with the glyph's, and
+                // BEFORE the relayout below — `content_bounds` and the session's
+                // pane padding both read it, so a relayout at the old factor
+                // would lay the panes out on the previous display's grid.
+                active.chrome_sc = chrome_scale::chrome_scale(scale);
+                active.touch.set_scale(active.chrome_sc);
                 let cell = active.backend.cell_size(); // new cell metrics
                 active.session.set_cell(cell);
+                active.session.set_chrome_scale(active.chrome_sc);
                 let size = active.window.surface_size();
-                active.session.relayout(content_bounds(size));
+                active.session.relayout(content_bounds(size, active.chrome_sc));
                 true
             }
             Err(e) => {
@@ -6594,7 +6647,7 @@ impl App {
         let cfg_bg = active.settings.background; // configured background RGB
         let bg = Color::rgb(cfg_bg[0], cfg_bg[1], cfg_bg[2]).with_alpha(active.settings.background_opacity);
         let size = active.window.surface_size(); // physical pixels
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, active.chrome_sc);
 
         // Decide this frame's damage. The partial (scissored) path is taken ONLY
         // on software GL with an EGL surface whose buffer we can trust to be
@@ -6716,7 +6769,7 @@ impl App {
                     if !active.session.receives_broadcast(*id) {
                         continue; // not armed: its swatch is static
                     }
-                    let (sx, sy, s) = swatch_rect(*rect, bar_h, ch as f32);
+                    let (sx, sy, s) = swatch_rect(*rect, bar_h, ch as f32, active.chrome_sc);
                     active.damage.add_rect(crate::damage::PxRect {
                         x: sx.floor() as i32,
                         y: sy.floor() as i32,
@@ -6760,6 +6813,7 @@ impl App {
 
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, cell_h) = active.backend.cell_size(); // px per cell
+        let sc = active.chrome_sc; // display backing factor for the flat chrome constants
         let sep = column_separator(active.settings.foreground, cfg_bg); // fg/bg midpoint: visible but not text-weight
         // Reset the clip-history titlebar affordance's hit-rect before the
         // per-pane pass: it is set at most once below (focused pane, non-empty
@@ -6995,7 +7049,7 @@ impl App {
                 if n > 1 {
                     for nc in 1..geom.count as usize {
                         let x = rect.x + nc as f32 * step - (geom.gap as f32 * 0.5) * cell_w; // gap centre
-                        active.backend.fill_rect(x, rect.y, 1.0, rect.h, sep); // 1px vertical rule
+                        active.backend.fill_rect(x, rect.y, sc * chrome_scale::logical::HAIRLINE, rect.h, sep); // hairline vertical rule
                     }
                 }
 
@@ -7003,7 +7057,7 @@ impl App {
                 let (offset, history, screen) = pane.scroll_info();
                 if history > 0 {
                     // Track + thumb; geometry shared with the drag hit-test.
-                    let (bx, bw, thumb_y, thumb_h) = scrollbar_metrics(rect, offset, history, screen);
+                    let (bx, bw, thumb_y, thumb_h) = scrollbar_metrics(rect, offset, history, screen, sc);
                     active.backend.fill_rect(bx, rect.y, bw, rect.h, Color::rgb(0x22, 0x22, 0x2c));
                     let thumb_col = if offset > 0 {
                         Color::rgb(0x88, 0x88, 0x9a) // scrolled up: highlight
@@ -7020,18 +7074,21 @@ impl App {
                         && active.search_pane == Some(id)
                         && !active.search_matches.is_empty()
                     {
-                        let mx = bx - 2.0; // overhang the track a touch so ticks read as markers
-                        let mw = bw + 4.0;
+                        let bleed = sc * chrome_scale::logical::SEARCH_TICK_BLEED;
+                        let mx = bx - bleed; // overhang the track a touch so ticks read as markers
+                        let mw = bw + 2.0 * bleed;
                         let others =
                             hit_marker_ys(active.search_matches.iter().map(|m| m.line), history, screen, rect);
                         for y in others {
-                            active.backend.fill_rect(mx, y, mw, 2.0, Color::rgb(0xb0, 0x90, 0x30));
+                            active.backend.fill_rect(mx, y, mw, sc * chrome_scale::logical::SEARCH_TICK_H, Color::rgb(0xb0, 0x90, 0x30));
                         }
                         if let Some(m) = active.search_matches.get(active.search_index) {
                             if let Some(&y) =
                                 hit_marker_ys(std::iter::once(m.line), history, screen, rect).first()
                             {
-                                active.backend.fill_rect(mx, y - 1.0, mw, 3.0, Color::rgb(0xff, 0xd8, 0x55));
+                                let lift = sc * chrome_scale::logical::HAIRLINE; // taller tick, centred by one rule
+                                let cur_h = sc * chrome_scale::logical::SEARCH_TICK_CUR_H;
+                                active.backend.fill_rect(mx, y - lift, mw, cur_h, Color::rgb(0xff, 0xd8, 0x55));
                             }
                         }
                     }
@@ -7064,9 +7121,10 @@ impl App {
                 let bar_bg = mix(bg, fg, if focused { 0.20 } else { 0.10 });
                 let sep = mix(bg, fg, 0.40); // hairline: a touch more toward fg → a visible edge
                 active.backend.fill_rect(full.x, full.y, full.w, bar_h, bar_bg);
-                active.backend.fill_rect(full.x, full.y + bar_h - 1.0, full.w, 1.0, sep);
+                let hair = sc * chrome_scale::logical::HAIRLINE;
+                active.backend.fill_rect(full.x, full.y + bar_h - hair, full.w, hair, sep);
                 let text_col = if focused { Color::rgb(fg[0], fg[1], fg[2]) } else { mix(fg, bg, 0.40) };
-                let pad = TITLEBAR_PAD; // horizontal inset inside the strip
+                let pad = sc * chrome_scale::logical::TITLEBAR_PAD; // horizontal inset inside the strip
                 let text_top = full.y + (bar_h - cell_h) * 0.5; // vertically centre the glyph line
                 let mut left_x = full.x + pad; // running left cursor (px)
                 // Group swatch, if this pane is in an input group.
@@ -7089,7 +7147,7 @@ impl App {
                     (None, false) => None,
                 };
                 if let Some(col) = swatch {
-                    let (sx, sy, s) = swatch_rect(full, bar_h, cell_h);
+                    let (sx, sy, s) = swatch_rect(full, bar_h, cell_h, sc);
                     // Pulse only while this pane is actually armed to receive: a
                     // static group swatch must stay still, or every grouped pane
                     // would throb whether broadcasting or not.
@@ -7100,7 +7158,7 @@ impl App {
                         col
                     };
                     active.backend.fill_rect(sx, sy, s, s, col);
-                    left_x = sx + s + 5.0; // leave a gap before the title
+                    left_x = sx + s + sc * chrome_scale::logical::GROUP_GAP; // leave a gap before the title
                 }
                 // Size text ("COLSxROWS") pinned to the right edge.
                 let cols = (rect.w / cell_w).max(0.0) as usize; // content columns
@@ -7158,7 +7216,7 @@ impl App {
                 // never fights with the unfocused/dimmed title colour.
                 let composing_here =
                     active.composing && active.selection.is_some_and(|sel| sel.pane == id);
-                let avail = ((left_of - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
+                let avail = ((left_of - sc * chrome_scale::logical::TITLE_GAP - left_x) / cell_w).max(0.0) as usize; // room in cells
                 if composing_here {
                     let sel = active.selection.unwrap();
                     let status = select::status_text(sel.anchor, sel.head, sel.block);
@@ -7177,8 +7235,8 @@ impl App {
             } else if let Some(g) = active.session.group_of(id) {
                 // No titlebar: fall back to a small colour-coded corner square so
                 // group membership is still visible.
-                let m = 10.0; // marker size in pixels
-                let p = 4.0; // inset from the corner
+                let m = sc * chrome_scale::logical::GROUP_MARK; // marker size
+                let p = sc * chrome_scale::logical::GROUP_MARK_INSET; // inset from the corner
                 active.backend.fill_rect(full.right() - m - p, full.y + p, m, m, group_hue(g));
             }
             // (The focused pane used to get a thin blue outline around `full`
@@ -7205,12 +7263,16 @@ impl App {
         // translucent background).
         let divider_col = Color::rgb(0x3a, 0x3a, 0x46);
         for d in active.session.dividers(bounds) {
+            // The gutter `d` is itself scaled (`rt_core`'s `DIVIDER`, and the
+            // grab band around it, both take the session's chrome scale), so the
+            // line stays centred in a gutter that grew with it.
+            let hair = sc * chrome_scale::logical::HAIRLINE;
             if d.w < d.h {
                 // Vertical gutter (left/right split): a vertical line.
-                active.backend.fill_rect(d.x + d.w * 0.5 - 0.5, d.y, 1.0, d.h, divider_col);
+                active.backend.fill_rect(d.x + d.w * 0.5 - hair * 0.5, d.y, hair, d.h, divider_col);
             } else {
                 // Horizontal gutter (top/bottom split): a horizontal line.
-                active.backend.fill_rect(d.x, d.y + d.h * 0.5 - 0.5, d.w, 1.0, divider_col);
+                active.backend.fill_rect(d.x, d.y + d.h * 0.5 - hair * 0.5, d.w, hair, divider_col);
             }
         }
 
@@ -7229,7 +7291,7 @@ impl App {
                 // Label: the pane's title if it has one, else the tab number.
                 // Truncate to what fits in the segment (leaving room for the
                 // number prefix and padding).
-                let max_chars = ((r.w - 16.0) / cell_w).floor().max(1.0) as usize;
+                let max_chars = ((r.w - 2.0 * sc * chrome_scale::logical::TAB_LABEL_INSET) / cell_w).floor().max(1.0) as usize;
                 let label = match active.session.title_of(tab.first_pane) {
                     Some(title) => {
                         let prefixed = format!("{}: {}", tab.number, title); // "1: user@host …"
@@ -7246,10 +7308,11 @@ impl App {
                 let text_top = r.y + (r.h - cell_h) * 0.5; // centre the glyph line
                 let col = if tab.active { txt_on } else { txt_off };
                 for (i, ch) in label.chars().enumerate() {
-                    active.backend.draw_char(r.x + 8.0, text_top, i, 0, ch, col, tab.active, false);
+                    active.backend.draw_char(r.x + sc * chrome_scale::logical::TAB_LABEL_INSET, text_top, i, 0, ch, col, tab.active, false);
                 }
                 // Right separator between tabs.
-                active.backend.fill_rect(r.right() - 1.0, r.y, 1.0, r.h, tab_line);
+                let hair = sc * chrome_scale::logical::HAIRLINE;
+                active.backend.fill_rect(r.right() - hair, r.y, hair, r.h, tab_line);
             }
         }
 
@@ -7291,7 +7354,7 @@ impl App {
         // the pointer) and must still paint it.
         if active.drag_cue.is_some() || active.drag_ghost.is_some() || active.drag_dim.is_some() {
             let dim = active.drag_dim.and_then(|p| {
-                let bounds = content_bounds(active.window.surface_size());
+                let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
                 active.session.visible_rects(bounds).into_iter().find(|(id, _)| *id == p).map(|(_, r)| r)
             });
             let size = active.window.surface_size();
@@ -7303,6 +7366,7 @@ impl App {
                 dim,
                 cell,
                 (size.width as f32, size.height as f32),
+                active.chrome_sc,
             );
         }
         // Preferences (and the colour picker over it): a native dialog on BOTH
@@ -7363,18 +7427,18 @@ impl App {
                 .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
             let has_sel = Self::selected_text(active).is_some();
             let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
-            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
+            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
             let hover = active.menu_hover;
-            chrome::menu::draw(&mut *active.backend, &g, &rows, hover, cw, ch);
+            chrome::menu::draw(&mut *active.backend, &g, &rows, hover, cw, ch, active.chrome_sc);
         } else if active.manual_open {
-            let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch);
+            let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch, active.chrome_sc);
             let scroll = active.manual_scroll;
-            chrome::manual::draw(&mut *active.backend, &g, scroll, cw, ch);
+            chrome::manual::draw(&mut *active.backend, &g, scroll, cw, ch, active.chrome_sc);
         } else if active.search_open {
-            let bar = chrome::search::layout(size.width as f32, cw, ch);
+            let bar = chrome::search::layout(size.width as f32, cw, ch, active.chrome_sc);
             let count = active.search_matches.len();
             let pos = if count == 0 { 0 } else { active.search_index + 1 };
-            chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, cw, ch);
+            chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, cw, ch, active.chrome_sc);
         }
         // Clipboard-history overlay draws on top of everything above (the menu
         // block's early-return means it can't be up at the same time in
@@ -7383,15 +7447,15 @@ impl App {
             let n = active.clip_history.len();
             let anchor = Self::pane_content_rect(active, active.session.focus())
                 .map(|r| (r.x, r.y))
-                .unwrap_or((40.0, 40.0));
+                .unwrap_or((active.chrome_sc * chrome_scale::logical::CLIP_ANCHOR_FALLBACK, active.chrome_sc * chrome_scale::logical::CLIP_ANCHOR_FALLBACK));
             let previews: Vec<String> = active
                 .clip_history
                 .iter()
                 .map(|c| clip_history::preview(c, CLIP_PREVIEW_COLS - 8))
                 .collect();
             let badges: Vec<String> = active.clip_history.iter().map(clip_history::badge).collect();
-            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS);
-            chrome::clip_history::draw(&mut *active.backend, &g, &previews, &badges, Some(sel), sel, cw, ch);
+            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS, active.chrome_sc);
+            chrome::clip_history::draw(&mut *active.backend, &g, &previews, &badges, Some(sel), sel, cw, ch, active.chrome_sc);
         }
     }
 
@@ -7638,7 +7702,7 @@ impl App {
         {
             return;
         }
-        let bounds = content_bounds(active.window.surface_size());
+        let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
         // Jacks sit ON the divider, and a press checks `jack_at` FIRST (a jack
         // wins there). The cursor must agree: "resize" over a jack advertises the
         // wrong action on a small target, which makes the jack hard to trust even
@@ -7670,7 +7734,7 @@ impl App {
         active.prefs_open = true;
         let size = active.window.surface_size();
         let (cw, _ch) = active.backend.cell_size();
-        let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+        let cols = (content_bounds(size, active.chrome_sc).w / cw).max(1.0) as usize;
         let fam =
             cached_family_status(&mut active.font_status, &active.font_db, &active.settings.font_family);
         let rows = chrome::prefs::rows(&active.settings, total_ram_bytes(), cols, fam);
@@ -7717,7 +7781,7 @@ impl App {
         if titlebar_changed {
             active.session.set_show_titlebar(active.settings.show_titlebar);
             let size = active.window.surface_size();
-            active.session.relayout(content_bounds(size));
+            active.session.relayout(content_bounds(size, active.chrome_sc));
         }
         // Colours: rebuild the palette and apply it live to every pane.
         if colours_changed {
@@ -7748,14 +7812,14 @@ impl App {
         let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
         // Exactly how the old egui dialog derived it: a full-width pane at the
         // current font size. There is no `pane.cols()`.
-        let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+        let cols = (content_bounds(size, active.chrome_sc).w / cw).max(1.0) as usize;
         let fam = cached_family_status(&mut active.font_status, &active.font_db, &s.font_family);
         let rows = chrome::prefs::rows(&s, total_ram_bytes(), cols, fam);
-        let g = chrome::prefs::layout(&rows, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
+        let g = chrome::prefs::layout(&rows, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
         let mut sw = vec![Color::rgb(s.foreground[0], s.foreground[1], s.foreground[2])];
         sw.push(Color::rgb(s.background[0], s.background[1], s.background[2]));
         sw.extend(s.palette.iter().map(|c| Color::rgb(c[0], c[1], c[2])));
-        chrome::prefs::draw(&mut *active.backend, &g, &rows, active.prefs_sel, &sw, cw, ch);
+        chrome::prefs::draw(&mut *active.backend, &g, &rows, active.prefs_sel, &sw, cw, ch, active.chrome_sc);
     }
 
     /// Draw the colour picker over the prefs dialog, from its live H/S/V.
@@ -7763,8 +7827,8 @@ impl App {
         let Some(pk) = active.picker else { return };
         let size = active.window.surface_size();
         let (cw, ch) = active.backend.cell_size();
-        let g = chrome::colour_picker::layout(cw, ch, size.width as f32, size.height as f32);
-        chrome::colour_picker::draw(&mut *active.backend, &g, pk.h, pk.s, pk.v, &pk.slot.label(), cw, ch);
+        let g = chrome::colour_picker::layout(cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
+        chrome::colour_picker::draw(&mut *active.backend, &g, pk.h, pk.s, pk.v, &pk.slot.label(), cw, ch, active.chrome_sc);
     }
 
     /// Write the picker's current colour into the pending settings' slot and arm
@@ -7955,7 +8019,7 @@ impl App {
             active.last_meter_tick = now;
             advance_instrument_state(&mut active.meters, &mut active.wires, dt);
         }
-        let bounds = content_bounds(size);
+        let bounds = content_bounds(size, active.chrome_sc);
         let rects = active.session.visible_rects(bounds); // owned Vec — no session borrow lingers
         let ctx = chrome::instruments::InstrCtx {
             rects: &rects,
@@ -7971,6 +8035,7 @@ impl App {
             lat_phase: active.lat_phase,
             stall: active.stall,
             size,
+            sc: active.chrome_sc,
         };
         chrome::instruments::draw(&mut *active.backend, &ctx);
     }
@@ -8114,13 +8179,11 @@ fn blackbody(kelvin: f32) -> (f32, f32, f32) {
     (r, g, b)
 }
 
-/// Standoff (physical px) between the window edge and the terminal content, so
-/// the edge-living features — heat border, patch-bay jacks, latency frame, and
-/// the outermost text cells — have room and aren't clipped by the window edge.
-const WINDOW_MARGIN: f32 = 8.0;
-
-/// Horizontal inset of the titlebar strip's contents.
-const TITLEBAR_PAD: f32 = 6.0;
+// `WINDOW_MARGIN` (the standoff between the window edge and the terminal content, so the
+// edge-living features — heat border, patch-bay jacks, latency frame, outermost text
+// cells — have room) and `TITLEBAR_PAD` (the horizontal inset of the titlebar strip's
+// contents) are now LOGICAL pixels in `chrome_scale::logical`, multiplied by the window's
+// backing factor where they are used. See that module, and `physical_font_px`.
 
 /// How often the broadcast swatch re-paints while it pulses, and how fast it
 /// cycles. 5fps is plenty for a "this is armed" throb and bounds the cost.
@@ -8136,9 +8199,9 @@ const BCAST_PULSE_HZ: f32 = 0.7; // cycles per second
 /// on a milkv over ssh -X). Damaging precisely what changes keeps the pulse on
 /// the scissored path: a ~13x13px redraw instead of the screen. The two callers
 /// must agree to the pixel, so they share this rather than copying it.
-fn swatch_rect(full: Rect, bar_h: f32, cell_h: f32) -> (f32, f32, f32) {
+fn swatch_rect(full: Rect, bar_h: f32, cell_h: f32, sc: f32) -> (f32, f32, f32) {
     let s = cell_h * 0.6; // swatch side length
-    (full.x + TITLEBAR_PAD, full.y + (bar_h - s) * 0.5, s)
+    (full.x + sc * chrome_scale::logical::TITLEBAR_PAD, full.y + (bar_h - s) * 0.5, s)
 }
 
 /// Scale a colour's brightness (alpha untouched) — the broadcast pulse.
@@ -8284,23 +8347,35 @@ fn apply_blur(active: &mut Active) {
 /// exactly a no-op (`font_size * 1.0 == font_size`), which is what keeps
 /// Linux bit-for-bit unchanged.
 ///
-/// All LAYOUT (window/pane/content rects, `content_bounds`,
-/// `window_size_for_grid`'s own `WINDOW_MARGIN`/`pane_chrome` terms) stays in
-/// PHYSICAL pixels exactly as before this change and is NOT touched here —
-/// only the rasterised glyph size is scaled. Everything measured FROM the
-/// resulting cell size (instrument discs, jack ports, cursors, borders, and
-/// `window_size_for_grid`'s cols/rows terms) scales automatically because it
-/// is derived from `cell`, not from `font_size` directly. `WINDOW_MARGIN`
-/// (8px) and `rt_session::PANE_PAD`/`TITLEBAR_PAD` are flat chrome constants,
-/// not derived from font metrics; they are deliberately left unscaled — they
-/// are hairline-sized either way and scaling them would be guessing at an
-/// "intended logical size" for values that were never expressed as one.
+/// This function scales only the GLYPH. Everything measured FROM the resulting
+/// cell size (panel widths, row heights, cursors, column rules) scales with it
+/// automatically, because it is derived from `cell` rather than from
+/// `font_size` directly.
+///
+/// The FLAT chrome constants — `WINDOW_MARGIN`, `TITLEBAR_PAD`,
+/// `rt_session`'s `PANE_PAD`/`TITLEBAR_PAD`, `rt_core`'s `DIVIDER`/`TAB_STRIP`/
+/// divider grab, the patch-bay jacks, the scrollbar, every panel's padding —
+/// are NOT derived from font metrics, and they are scaled separately, by the
+/// same factor, through [`crate::chrome_scale`]. An earlier version of this
+/// comment argued they should be left alone, on the grounds that they were
+/// "hairline-sized either way" and that scaling them would be guessing at an
+/// intended logical size for values never expressed as one. That was wrong, and
+/// a user on a Retina Mac found it: every one of them rendered at half its
+/// apparent size, and the patch-bay jacks became hard to hit. At 1x these values
+/// ARE their logical size — 1x is the only display rt was ever tuned on — so
+/// there is no guess to make. Do not revert this without reading
+/// `chrome_scale`'s module doc first.
 fn physical_font_px(font_size: f32, scale_factor: f64) -> f32 {
     (font_size as f64 * scale_factor) as f32
 }
 
-fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
-    let m = WINDOW_MARGIN;
+/// The content rectangle for a window of `size` at chrome scale `sc`.
+///
+/// `sc` is [`chrome_scale::chrome_scale`] of the window's backing factor — 1.0
+/// on a normal display, 2.0 on a Retina panel — and at 1.0 the margin is
+/// bit-for-bit the physical 8px it always was.
+fn content_bounds(size: winit::dpi::PhysicalSize<u32>, sc: f32) -> Rect {
+    let m = sc * chrome_scale::logical::WINDOW_MARGIN;
     Rect::new(
         m,
         m,
@@ -8314,10 +8389,11 @@ fn content_bounds(size: winit::dpi::PhysicalSize<u32>) -> Rect {
 /// titlebar strip is reserved. Inverts [`content_bounds`] (the window margin) and
 /// [`rt_session::pane_chrome`] (the pane's inner padding + titlebar). A half-cell
 /// slack keeps floating-point rounding from dropping the last row/column.
-fn window_size_for_grid(cols: usize, rows: usize, cell: (f32, f32), show_titlebar: bool) -> winit::dpi::PhysicalSize<u32> {
-    let (pad_w, pad_h) = rt_session::pane_chrome(cell, show_titlebar);
-    let w = cols as f32 * cell.0 + cell.0 * 0.5 + pad_w + 2.0 * WINDOW_MARGIN;
-    let h = rows as f32 * cell.1 + cell.1 * 0.5 + pad_h + 2.0 * WINDOW_MARGIN;
+fn window_size_for_grid(cols: usize, rows: usize, cell: (f32, f32), show_titlebar: bool, sc: f32) -> winit::dpi::PhysicalSize<u32> {
+    let (pad_w, pad_h) = rt_session::pane_chrome(cell, show_titlebar, sc);
+    let margin = sc * chrome_scale::logical::WINDOW_MARGIN;
+    let w = cols as f32 * cell.0 + cell.0 * 0.5 + pad_w + 2.0 * margin;
+    let h = rows as f32 * cell.1 + cell.1 * 0.5 + pad_h + 2.0 * margin;
     winit::dpi::PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
 }
 
@@ -8387,16 +8463,19 @@ fn autoscroll_step(state: (isize, u32), dir: isize, accel: bool, max: u32) -> (u
     (step, (dir, ticks + 1))
 }
 
-fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -> (f32, f32, f32, f32) {
+fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize, sc: f32) -> (f32, f32, f32, f32) {
     let total = (history + screen) as f32; // whole buffer height in lines
     // Draw the scrollbar in the pane's right PADDING gutter (PANE_PAD = 5px, just RIGHT of
     // `content_rect`), NOT inside it — so it never overlaps the last text column. Previously
     // it sat at `right - 7`, covering `7 - slack` px of the final cell in every line.
-    let bw = 4.0; // scrollbar width (fits within the 5px gutter with a hair of margin)
-    let bx = rect.right() + 0.5; // 0.5px into the gutter → clear of every cell
+    // Both terms are LOGICAL px scaled by `sc`, and so is the `PANE_PAD` gutter
+    // they have to fit inside (`rt_session` scales it by the same factor), so the
+    // fit holds at every display scale.
+    let bw = sc * chrome_scale::logical::SCROLLBAR_W; // scrollbar width (fits within the gutter with a hair of margin)
+    let bx = rect.right() + sc * chrome_scale::logical::SCROLLBAR_INSET; // into the gutter → clear of every cell
     // Thumb size = the visible fraction of the buffer, floored so it stays
     // grabbable even for a huge history, and capped at the track height.
-    let thumb_h = (screen as f32 / total * rect.h).max(24.0).min(rect.h);
+    let thumb_h = (screen as f32 / total * rect.h).max(sc * chrome_scale::logical::SCROLLBAR_MIN_THUMB).min(rect.h);
     // Thumb position: it slides over the track region ABOVE its own height as
     // the offset runs 0 (bottom) → history (top). Mapping across this reduced
     // *travel* (not the whole track) — and against `history`, not `total` — is
@@ -8884,12 +8963,12 @@ mod hidpi_tests {
         let rows = 24;
         let cell_1x = (8.0_f32, 16.0_f32);
         let cell_2x = (16.0_f32, 32.0_f32);
-        let size_1x = window_size_for_grid(cols, rows, cell_1x, false);
-        let size_2x = window_size_for_grid(cols, rows, cell_2x, false);
-        // Not exactly 2x (WINDOW_MARGIN/pane padding are flat, unscaled
-        // constants — see `physical_font_px`'s doc comment) but the grid term
-        // dominates, so the 2x cell must produce a visibly larger window, well
-        // over half again as large in both dimensions.
+        let size_1x = window_size_for_grid(cols, rows, cell_1x, false, 1.0);
+        let size_2x = window_size_for_grid(cols, rows, cell_2x, false, 1.0);
+        // Chrome held at 1.0 here on purpose: this test is about the CELL term
+        // alone. (`chrome_scaling_tests` below covers the chrome term.) The grid
+        // term dominates, so the 2x cell must produce a visibly larger window,
+        // well over half again as large in both dimensions.
         assert!(size_2x.width > size_1x.width * 3 / 2, "{} vs {}", size_2x.width, size_1x.width);
         assert!(size_2x.height > size_1x.height * 3 / 2, "{} vs {}", size_2x.height, size_1x.height);
     }
@@ -9649,5 +9728,112 @@ mod platform_parity_tests {
         // Same two-space option indentation as the Linux text, with no blank hole
         // where the dropped line was.
         assert!(h.contains("  --font-size PX    override the configured font size (pixels)\n  -V, --version"), "{h}");
+    }
+}
+
+#[cfg(test)]
+mod chrome_scaling_tests {
+    use super::*;
+
+    /// A window on a 2x display must be inset by TWICE the margin, in physical
+    /// pixels — which is the same apparent standoff as on a 1x one. This is the
+    /// window-level half of the fix; `chrome_scale`'s own tests cover the table.
+    #[test]
+    fn content_bounds_margin_scales_with_the_display() {
+        let size = winit::dpi::PhysicalSize::new(1000_u32, 800_u32);
+        let m = chrome_scale::logical::WINDOW_MARGIN;
+        let at_1x = content_bounds(size, 1.0);
+        assert_eq!((at_1x.x, at_1x.y), (m, m));
+        assert_eq!((at_1x.w, at_1x.h), (1000.0 - 2.0 * m, 800.0 - 2.0 * m));
+
+        let at_2x = content_bounds(size, 2.0);
+        assert_eq!((at_2x.x, at_2x.y), (2.0 * m, 2.0 * m));
+        assert_eq!((at_2x.w, at_2x.h), (1000.0 - 4.0 * m, 800.0 - 4.0 * m));
+    }
+
+    /// And at 1.0 it is bit-identical to the flat-8px behaviour that shipped
+    /// before chrome scaling existed — the hard requirement for Linux.
+    #[test]
+    fn content_bounds_at_scale_one_is_bit_identical() {
+        for &(w, h) in &[(1_u32, 1_u32), (100, 60), (960, 600), (3840, 2160)] {
+            let size = winit::dpi::PhysicalSize::new(w, h);
+            let got = content_bounds(size, 1.0);
+            let m = 8.0_f32; // the literal that used to be `const WINDOW_MARGIN`
+            assert_eq!(got.x.to_bits(), m.to_bits(), "{w}x{h}");
+            assert_eq!(got.y.to_bits(), m.to_bits(), "{w}x{h}");
+            assert_eq!(got.w.to_bits(), (w as f32 - 2.0 * m).max(1.0).to_bits(), "{w}x{h}");
+            assert_eq!(got.h.to_bits(), (h as f32 - 2.0 * m).max(1.0).to_bits(), "{w}x{h}");
+        }
+    }
+
+    /// `--cols`/`--rows` pre-sizing must reserve the SCALED chrome, or the first
+    /// window on a Retina panel comes out short by one margin + one pane pad in
+    /// each direction and the requested grid does not fit.
+    #[test]
+    fn window_size_for_grid_reserves_scaled_chrome() {
+        let cell = (8.0_f32, 16.0_f32);
+        let a = window_size_for_grid(80, 24, cell, true, 1.0);
+        let b = window_size_for_grid(80, 24, cell, true, 2.0);
+        assert!(b.width > a.width, "2x chrome must reserve more width");
+        assert!(b.height > a.height, "2x chrome must reserve more height");
+        // The extra is exactly one more copy of the chrome terms, since the cell
+        // term is identical in both calls.
+        let (pad_w1, pad_h1) = rt_session::pane_chrome(cell, true, 1.0);
+        let (pad_w2, pad_h2) = rt_session::pane_chrome(cell, true, 2.0);
+        let m = chrome_scale::logical::WINDOW_MARGIN;
+        assert_eq!(b.width - a.width, ((pad_w2 - pad_w1) + 2.0 * m) as u32);
+        assert_eq!(b.height - a.height, ((pad_h2 - pad_h1) + 2.0 * m) as u32);
+    }
+
+    /// The scrollbar is the clearest draw/hit pair in `main.rs`:
+    /// `scrollbar_metrics` draws the bar and `scrollbar_at` accepts a band of
+    /// `SCROLLBAR_GRAB_SLOP` either side of it. Both take the same factor, so
+    /// the band stays exactly three bar-widths across at every scale — a bar
+    /// that grew while its grab band did not is the "can see it, can't hit it"
+    /// defect.
+    #[test]
+    fn scrollbar_draw_and_grab_scale_together() {
+        let rect = Rect::new(10.0, 20.0, 400.0, 300.0);
+        for &sc in &[1.0_f32, 1.25, 1.5, 2.0, 3.0] {
+            let (bx, bw, _ty, th) = scrollbar_metrics(rect, 0, 5000, 40, sc);
+            let slop = sc * chrome_scale::logical::SCROLLBAR_GRAB_SLOP;
+            assert_eq!(bw, sc * chrome_scale::logical::SCROLLBAR_W, "bar width at {sc}");
+            assert_eq!(
+                (bw + 2.0 * slop) / bw,
+                2.0,
+                "at {sc}x the grab band must stay 2x the bar",
+            );
+            // The bar must still sit in the pane's right padding gutter, which
+            // `rt_session` scales by the SAME factor — so the fit holds too.
+            let gutter = rt_session::pane_chrome((8.0, 16.0), false, sc).0 * 0.5;
+            assert!(bx >= rect.right(), "bar starts at/after the content edge at {sc}");
+            assert!(bx + bw <= rect.right() + gutter, "bar overflows the gutter at {sc}");
+            assert!(th >= sc * chrome_scale::logical::SCROLLBAR_MIN_THUMB || th >= rect.h);
+        }
+    }
+
+    /// At 1.0 the scrollbar is bit-for-bit the 4px/0.5px/24px bar it always was.
+    #[test]
+    fn scrollbar_at_scale_one_is_bit_identical() {
+        let rect = Rect::new(10.0, 20.0, 400.0, 300.0);
+        let (bx, bw, _ty, th) = scrollbar_metrics(rect, 7, 5000, 40, 1.0);
+        assert_eq!(bw.to_bits(), 4.0_f32.to_bits());
+        assert_eq!(bx.to_bits(), (rect.right() + 0.5_f32).to_bits());
+        assert_eq!(th.to_bits(), (40.0_f32 / 5040.0 * rect.h).max(24.0).min(rect.h).to_bits());
+    }
+
+    /// The patch-bay jack the user actually complained about: the drawn disc and
+    /// the radius `jack_at` accepts must move together. `jack_at` needs a live
+    /// window, so the pairing is asserted on the two constants it and
+    /// `chrome::instruments` read — which is the whole of the coupling.
+    #[test]
+    fn jack_disc_and_grab_radius_move_together() {
+        use chrome_scale::logical as lg;
+        for &sc in &[1.0_f32, 1.25, 1.5, 2.0, 3.0] {
+            let drawn = sc * lg::JACK_R_BACK; // the biggest thing painted
+            let grab = sc * lg::JACK_GRAB_R; // what jack_at accepts
+            assert!(grab > drawn, "at {sc}x the grab radius must exceed the disc");
+            assert_eq!(grab / drawn, lg::JACK_GRAB_R / lg::JACK_R_BACK, "ratio drifted at {sc}");
+        }
     }
 }

@@ -37,15 +37,28 @@ fn mint_global() -> PaneId {
     PaneId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Width in logical pixels of the draggable gutter drawn between split
+/// Width in LOGICAL pixels of the draggable gutter drawn between split
 /// children. Subtracted from the available space before dividing it, so panes
 /// never visually overlap the divider. Kept small; the renderer draws the
 /// handle within this band.
+///
+/// Logical: every layout entry point multiplies it by [`Tree::chrome_scale`],
+/// the display's backing factor, so on a 2x panel the gutter is 12 physical px
+/// and reads the same size as it does on a 1x one. The DRAW side (the hairline
+/// `rt` centres in this gutter) and the HIT side ([`GRAB`], below) both come out
+/// of this same scaled value, so they can never drift apart.
 const DIVIDER: f32 = 6.0;
 
-/// Height in logical pixels of the tab strip drawn at the top of a `Tabs` node.
-/// The active tab's content is laid out below it.
+/// Height in LOGICAL pixels of the tab strip drawn at the top of a `Tabs` node.
+/// The active tab's content is laid out below it. Scaled like [`DIVIDER`] — it
+/// has to be, or a 2x-tall glyph line would not fit in a 1x-tall strip.
 const TAB_STRIP: f32 = 24.0;
+
+/// Slop in LOGICAL pixels added on EACH side of the visual gutter to make a
+/// divider easy to grab (6px alone is too fiddly). Scaled by the same factor as
+/// [`DIVIDER`], so the grab band stays exactly `DIVIDER + 2*GRAB` wide in
+/// apparent terms at every display scale.
+const GRAB: f32 = 5.0;
 
 /// Opaque identity of a pane (a leaf of the tree).
 ///
@@ -121,6 +134,13 @@ impl Node {
 #[derive(Clone, Debug)]
 pub struct Tree {
     root: Node, // the current arrangement
+    /// The display's backing factor, multiplying the flat layout constants
+    /// ([`DIVIDER`], [`TAB_STRIP`], [`GRAB`]). 1.0 — the value every tree is born
+    /// with, and the only one a non-HiDPI display ever sets — makes every
+    /// computation below bit-for-bit what it was before chrome scaling existed.
+    /// Pushed down from the GUI via `Session::set_chrome_scale`; a `Tree` that is
+    /// never told stays at 1.0.
+    scale: f32,
 }
 
 impl Tree {
@@ -133,8 +153,27 @@ impl Tree {
         let first = mint_global();
         let tree = Tree {
             root: Node::Leaf(first), // root starts as a lone leaf
+            scale: 1.0,              // until the GUI reports the display's factor
         };
         (tree, first)
+    }
+
+    /// Report the display's backing factor, so the flat layout constants
+    /// ([`DIVIDER`], [`TAB_STRIP`] and the divider grab slop) come out the right
+    /// APPARENT size on a HiDPI panel. Called by the GUI through
+    /// `Session::set_chrome_scale` at window creation and on every scale change.
+    ///
+    /// A factor that is not a usable number is ignored rather than allowed to
+    /// collapse every pane rect to zero or NaN.
+    pub fn set_chrome_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.scale = scale;
+        }
+    }
+
+    /// The factor [`Tree::set_chrome_scale`] last accepted (1.0 by default).
+    pub fn chrome_scale(&self) -> f32 {
+        self.scale
     }
 
     /// Mint a brand-new, never-before-used `PaneId`.
@@ -667,14 +706,14 @@ impl Tree {
             return Vec::new(); // an emptied tree draws nothing (window is closing)
         }
         let mut out = Vec::new(); // accumulator threaded through the recursion
-        Self::layout_node(&self.root, bounds, &mut out); // fill it
+        Self::layout_node(&self.root, bounds, self.scale, &mut out); // fill it
         out
     }
 
     /// Recursive worker for [`Tree::rects`]. Divides `bounds` among `node`'s
     /// children according to orientation and weights, pushing `(PaneId, Rect)`
     /// for every visible leaf into `out`.
-    fn layout_node(node: &Node, bounds: Rect, out: &mut Vec<(PaneId, Rect)>) {
+    fn layout_node(node: &Node, bounds: Rect, sc: f32, out: &mut Vec<(PaneId, Rect)>) {
         match node {
             // A leaf simply occupies its whole allotted rectangle.
             Node::Leaf(id) => out.push((*id, bounds)),
@@ -684,7 +723,7 @@ impl Tree {
                 let total: f32 = children.iter().map(|c| c.weight).sum();
                 let total = if total > 0.0 { total } else { 1.0 };
                 // Reserve gutters: n children need (n-1) dividers between them.
-                let gutters = DIVIDER * (children.len().saturating_sub(1) as f32);
+                let gutters = sc * DIVIDER * (children.len().saturating_sub(1) as f32);
                 match orient {
                     Orientation::LeftRight => {
                         let usable = (bounds.w - gutters).max(0.0); // width left for panes
@@ -693,8 +732,8 @@ impl Tree {
                             // This child's width is its share of the usable width.
                             let w = usable * (child.weight / total);
                             let r = Rect::new(cursor, bounds.y, w, bounds.h);
-                            Self::layout_node(&child.node, r, out); // recurse into slot
-                            cursor += w + DIVIDER; // advance past pane + gutter
+                            Self::layout_node(&child.node, r, sc, out); // recurse into slot
+                            cursor += w + sc * DIVIDER; // advance past pane + gutter
                         }
                     }
                     Orientation::TopBottom => {
@@ -703,8 +742,8 @@ impl Tree {
                         for child in children {
                             let h = usable * (child.weight / total); // this child's height
                             let r = Rect::new(bounds.x, cursor, bounds.w, h);
-                            Self::layout_node(&child.node, r, out);
-                            cursor += h + DIVIDER; // advance past pane + gutter
+                            Self::layout_node(&child.node, r, sc, out);
+                            cursor += h + sc * DIVIDER; // advance past pane + gutter
                         }
                     }
                 }
@@ -716,11 +755,11 @@ impl Tree {
                     // fills the region below it.
                     let body = Rect::new(
                         bounds.x,
-                        bounds.y + TAB_STRIP,               // push content below the strip
+                        bounds.y + sc * TAB_STRIP,          // push content below the strip
                         bounds.w,
-                        (bounds.h - TAB_STRIP).max(0.0),    // remaining height
+                        (bounds.h - sc * TAB_STRIP).max(0.0), // remaining height
                     );
-                    Self::layout_node(child, body, out);
+                    Self::layout_node(child, body, sc, out);
                 }
             }
         }
@@ -833,28 +872,28 @@ impl Tree {
     /// `Tabs` nodes on the visible (active) path produce a strip.
     pub fn tab_bars(&self, bounds: Rect) -> Vec<TabBar> {
         let mut out = Vec::new();
-        Self::collect_tab_bars(&self.root, bounds, &mut out);
+        Self::collect_tab_bars(&self.root, bounds, self.scale, &mut out);
         out
     }
 
     /// Recursive worker for [`Tree::tab_bars`]. Mirrors [`Tree::layout_node`]'s
     /// rectangle division so tab strips land exactly above their content.
-    fn collect_tab_bars(node: &Node, bounds: Rect, out: &mut Vec<TabBar>) {
+    fn collect_tab_bars(node: &Node, bounds: Rect, sc: f32, out: &mut Vec<TabBar>) {
         match node {
             Node::Leaf(_) => {}
             Node::Split { orient, children } => {
                 // Same weighted division as layout_node (kept in sync by hand).
                 let total: f32 = children.iter().map(|c| c.weight).sum();
                 let total = if total > 0.0 { total } else { 1.0 };
-                let gutters = DIVIDER * (children.len().saturating_sub(1) as f32);
+                let gutters = sc * DIVIDER * (children.len().saturating_sub(1) as f32);
                 match orient {
                     Orientation::LeftRight => {
                         let usable = (bounds.w - gutters).max(0.0);
                         let mut cursor = bounds.x;
                         for child in children {
                             let w = usable * (child.weight / total);
-                            Self::collect_tab_bars(&child.node, Rect::new(cursor, bounds.y, w, bounds.h), out);
-                            cursor += w + DIVIDER;
+                            Self::collect_tab_bars(&child.node, Rect::new(cursor, bounds.y, w, bounds.h), sc, out);
+                            cursor += w + sc * DIVIDER;
                         }
                     }
                     Orientation::TopBottom => {
@@ -862,8 +901,8 @@ impl Tree {
                         let mut cursor = bounds.y;
                         for child in children {
                             let h = usable * (child.weight / total);
-                            Self::collect_tab_bars(&child.node, Rect::new(bounds.x, cursor, bounds.w, h), out);
-                            cursor += h + DIVIDER;
+                            Self::collect_tab_bars(&child.node, Rect::new(bounds.x, cursor, bounds.w, h), sc, out);
+                            cursor += h + sc * DIVIDER;
                         }
                     }
                 }
@@ -876,7 +915,7 @@ impl Tree {
                     .iter()
                     .enumerate()
                     .map(|(i, ch)| Tab {
-                        rect: Rect::new(bounds.x + i as f32 * segw, bounds.y, segw, TAB_STRIP),
+                        rect: Rect::new(bounds.x + i as f32 * segw, bounds.y, segw, sc * TAB_STRIP),
                         first_pane: Self::first_leaf(ch).unwrap_or(PaneId(0)),
                         active: i == *active,
                         number: i + 1,
@@ -885,8 +924,8 @@ impl Tree {
                 out.push(TabBar { tabs });
                 // Recurse into the active tab's body (below the strip).
                 if let Some(child) = children.get(*active) {
-                    let body = Rect::new(bounds.x, bounds.y + TAB_STRIP, bounds.w, (bounds.h - TAB_STRIP).max(0.0));
-                    Self::collect_tab_bars(child, body, out);
+                    let body = Rect::new(bounds.x, bounds.y + sc * TAB_STRIP, bounds.w, (bounds.h - sc * TAB_STRIP).max(0.0));
+                    Self::collect_tab_bars(child, body, sc, out);
                 }
             }
         }
@@ -897,19 +936,19 @@ impl Tree {
     /// creates) are resizable. `None` if the point isn't on a divider.
     pub fn divider_at(&self, px: f32, py: f32, bounds: Rect) -> Option<DragHandle> {
         let mut path = Vec::new();
-        Self::find_divider(&self.root, bounds, px, py, &mut path)
+        Self::find_divider(&self.root, bounds, self.scale, px, py, &mut path)
     }
 
     /// Recursive worker for [`Tree::divider_at`], tracking the child-index path
     /// to the split so the caller can resize it later.
-    fn find_divider(node: &Node, bounds: Rect, px: f32, py: f32, path: &mut Vec<usize>) -> Option<DragHandle> {
+    fn find_divider(node: &Node, bounds: Rect, sc: f32, px: f32, py: f32, path: &mut Vec<usize>) -> Option<DragHandle> {
         match node {
             Node::Leaf(_) => None,
             Node::Split { orient, children } => {
                 let total: f32 = children.iter().map(|c| c.weight).sum();
                 let total = if total > 0.0 { total } else { 1.0 };
                 let n = children.len();
-                let gutters = DIVIDER * (n.saturating_sub(1) as f32);
+                let gutters = sc * DIVIDER * (n.saturating_sub(1) as f32);
                 let horizontal = matches!(orient, Orientation::LeftRight);
                 let (axis_start, axis_len) = if horizontal { (bounds.x, bounds.w) } else { (bounds.y, bounds.h) };
                 let usable = (axis_len - gutters).max(0.0);
@@ -927,24 +966,27 @@ impl Tree {
                     rects.push(rect);
                     cursor += seg;
                     if i < n - 1 {
-                        // Expand the grab zone a few px beyond the visual gutter
-                        // so the divider is easy to grab (6px alone is too fiddly).
-                        const GRAB: f32 = 5.0;
+                        // Expand the grab zone a few px beyond the visual gutter so
+                        // the divider is easy to grab. Both terms take the SAME `sc`
+                        // as the gutter `rt` draws into, so the band the mouse hits
+                        // and the line the eye sees scale together.
+                        let grab = sc * GRAB;
+                        let band = sc * DIVIDER + 2.0 * grab;
                         let g = if horizontal {
-                            Rect::new(cursor - GRAB, bounds.y, DIVIDER + 2.0 * GRAB, bounds.h)
+                            Rect::new(cursor - grab, bounds.y, band, bounds.h)
                         } else {
-                            Rect::new(bounds.x, cursor - GRAB, bounds.w, DIVIDER + 2.0 * GRAB)
+                            Rect::new(bounds.x, cursor - grab, bounds.w, band)
                         };
                         if n == 2 && g.contains(px, py) {
                             return Some(DragHandle { path: path.clone(), horizontal, start: axis_start, len: axis_len });
                         }
-                        cursor += DIVIDER;
+                        cursor += sc * DIVIDER;
                     }
                 }
                 // Not on this split's gutter — descend into the children.
                 for (i, child) in children.iter().enumerate() {
                     path.push(i);
-                    if let Some(h) = Self::find_divider(&child.node, rects[i], px, py, path) {
+                    if let Some(h) = Self::find_divider(&child.node, rects[i], sc, px, py, path) {
                         return Some(h);
                     }
                     path.pop();
@@ -953,9 +995,9 @@ impl Tree {
             }
             Node::Tabs { children, active } => {
                 let child = children.get(*active)?;
-                let body = Rect::new(bounds.x, bounds.y + TAB_STRIP, bounds.w, (bounds.h - TAB_STRIP).max(0.0));
+                let body = Rect::new(bounds.x, bounds.y + sc * TAB_STRIP, bounds.w, (bounds.h - sc * TAB_STRIP).max(0.0));
                 path.push(*active);
-                let r = Self::find_divider(child, body, px, py, path);
+                let r = Self::find_divider(child, body, sc, px, py, path);
                 path.pop();
                 r
             }
@@ -1140,19 +1182,19 @@ impl Tree {
     /// ones `w > h`.
     pub fn dividers(&self, bounds: Rect) -> Vec<Rect> {
         let mut out = Vec::new();
-        Self::collect_dividers(&self.root, bounds, &mut out);
+        Self::collect_dividers(&self.root, bounds, self.scale, &mut out);
         out
     }
 
     /// Recursive worker for [`Tree::dividers`]; mirrors the rectangle division of
     /// [`Tree::layout_node`], emitting a gutter after each child but the last.
-    fn collect_dividers(node: &Node, bounds: Rect, out: &mut Vec<Rect>) {
+    fn collect_dividers(node: &Node, bounds: Rect, sc: f32, out: &mut Vec<Rect>) {
         match node {
             Node::Leaf(_) => {}
             Node::Split { orient, children } => {
                 let total: f32 = children.iter().map(|c| c.weight).sum();
                 let total = if total > 0.0 { total } else { 1.0 };
-                let gutters = DIVIDER * (children.len().saturating_sub(1) as f32);
+                let gutters = sc * DIVIDER * (children.len().saturating_sub(1) as f32);
                 let last = children.len().saturating_sub(1);
                 match orient {
                     Orientation::LeftRight => {
@@ -1160,11 +1202,11 @@ impl Tree {
                         let mut cursor = bounds.x;
                         for (i, child) in children.iter().enumerate() {
                             let w = usable * (child.weight / total);
-                            Self::collect_dividers(&child.node, Rect::new(cursor, bounds.y, w, bounds.h), out);
+                            Self::collect_dividers(&child.node, Rect::new(cursor, bounds.y, w, bounds.h), sc, out);
                             cursor += w;
                             if i < last {
-                                out.push(Rect::new(cursor, bounds.y, DIVIDER, bounds.h)); // vertical gutter
-                                cursor += DIVIDER;
+                                out.push(Rect::new(cursor, bounds.y, sc * DIVIDER, bounds.h)); // vertical gutter
+                                cursor += sc * DIVIDER;
                             }
                         }
                     }
@@ -1173,11 +1215,11 @@ impl Tree {
                         let mut cursor = bounds.y;
                         for (i, child) in children.iter().enumerate() {
                             let h = usable * (child.weight / total);
-                            Self::collect_dividers(&child.node, Rect::new(bounds.x, cursor, bounds.w, h), out);
+                            Self::collect_dividers(&child.node, Rect::new(bounds.x, cursor, bounds.w, h), sc, out);
                             cursor += h;
                             if i < last {
-                                out.push(Rect::new(bounds.x, cursor, bounds.w, DIVIDER)); // horizontal gutter
-                                cursor += DIVIDER;
+                                out.push(Rect::new(bounds.x, cursor, bounds.w, sc * DIVIDER)); // horizontal gutter
+                                cursor += sc * DIVIDER;
                             }
                         }
                     }
@@ -1185,8 +1227,8 @@ impl Tree {
             }
             Node::Tabs { children, active } => {
                 if let Some(child) = children.get(*active) {
-                    let body = Rect::new(bounds.x, bounds.y + TAB_STRIP, bounds.w, (bounds.h - TAB_STRIP).max(0.0));
-                    Self::collect_dividers(child, body, out);
+                    let body = Rect::new(bounds.x, bounds.y + sc * TAB_STRIP, bounds.w, (bounds.h - sc * TAB_STRIP).max(0.0));
+                    Self::collect_dividers(child, body, sc, out);
                 }
             }
         }
@@ -1366,6 +1408,129 @@ impl Default for Tree {
 }
 
 #[cfg(test)]
+mod chrome_scale_tests {
+    use super::*;
+
+    fn split_tree() -> (Tree, PaneId, PaneId) {
+        let (mut t, a) = Tree::new();
+        let b = t.split(a, Orientation::LeftRight).unwrap();
+        (t, a, b)
+    }
+
+    /// A 2x display must get a 12px gutter, not a 6px one — the same apparent
+    /// width. The panes shrink by exactly the extra gutter.
+    #[test]
+    fn the_split_gutter_scales() {
+        let bounds = Rect::new(0.0, 0.0, 806.0, 600.0);
+        let (mut t, _, _) = split_tree();
+
+        let at_1x = t.rects(bounds);
+        assert_eq!(at_1x[0].1.w, 400.0, "806 - 6 gutter, halved");
+
+        t.set_chrome_scale(2.0);
+        let at_2x = t.rects(bounds);
+        assert_eq!(at_2x[0].1.w, 397.0, "806 - 12 gutter, halved");
+        assert_eq!(at_2x[1].1.x - at_1x[1].1.x, 3.0, "the right pane starts one half-gutter later");
+    }
+
+    /// The gutter rectangle `rt` draws its divider hairline into scales with it,
+    /// so the line stays centred in a band that grew around it.
+    #[test]
+    fn the_drawn_gutter_scales() {
+        let bounds = Rect::new(0.0, 0.0, 806.0, 600.0);
+        let (mut t, _, _) = split_tree();
+        assert_eq!(t.dividers(bounds)[0].w, 6.0);
+        t.set_chrome_scale(2.0);
+        assert_eq!(t.dividers(bounds)[0].w, 12.0);
+    }
+
+    /// The pairing that matters: the gutter `dividers()` DRAWS and the band
+    /// `divider_at()` HITS take the same factor, so a divider never becomes
+    /// harder to grab as the display gets denser. Asserted by measuring the real
+    /// grab band's width — the widest offset from the gutter centre that still
+    /// resolves — at each scale.
+    #[test]
+    fn divider_draw_and_grab_scale_together() {
+        let bounds = Rect::new(0.0, 0.0, 806.0, 600.0);
+        for &(sc, want_gutter, want_band) in &[
+            (1.0_f32, 6.0_f32, 16.0_f32),  // DIVIDER 6 + 2*GRAB 5
+            (2.0, 12.0, 32.0),
+            (3.0, 18.0, 48.0),
+        ] {
+            let (mut t, _, _) = split_tree();
+            t.set_chrome_scale(sc);
+            let gutter = t.dividers(bounds)[0];
+            assert_eq!(gutter.w, want_gutter, "drawn gutter at {sc}x");
+            let centre = gutter.x + gutter.w * 0.5;
+            // Probe outward in whole pixels from the gutter's centre; the last
+            // hit marks the grab band's edge.
+            let mut reach = 0.0_f32;
+            let mut probe = 0.0_f32;
+            while probe < 100.0 {
+                if t.divider_at(centre + probe, 300.0, bounds).is_some() {
+                    reach = probe;
+                }
+                probe += 0.5;
+            }
+            // Band is symmetric about the centre, so its width is 2*reach + the
+            // half-pixel probe step's slack; compare against the exact band.
+            assert!(
+                (2.0 * reach - want_band).abs() <= 1.0,
+                "grab band at {sc}x measured {} , expected ~{want_band}",
+                2.0 * reach,
+            );
+            // And the ratio the user feels: the band is always well wider than
+            // the line it wraps, at every scale.
+            assert!(2.0 * reach > gutter.w, "at {sc}x the grab band must exceed the gutter");
+        }
+    }
+
+    /// The tab strip is a flat 24px band that a 2x-tall glyph line has to fit
+    /// inside, so it scales too — otherwise tab labels overflow their strip on a
+    /// Retina panel.
+    #[test]
+    fn the_tab_strip_scales() {
+        let bounds = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let (mut t, a) = Tree::new();
+        t.new_tab(a).unwrap();
+        assert_eq!(t.tab_bars(bounds)[0].tabs[0].rect.h, 24.0);
+        let body_1x = t.rects(bounds)[0].1;
+        assert_eq!(body_1x.y, 24.0, "content sits below the strip");
+
+        t.set_chrome_scale(2.0);
+        assert_eq!(t.tab_bars(bounds)[0].tabs[0].rect.h, 48.0);
+        assert_eq!(t.rects(bounds)[0].1.y, 48.0);
+    }
+
+    /// At 1.0 every rect is bit-for-bit what it was before the tree knew about
+    /// scale factors at all.
+    #[test]
+    fn scale_one_is_bit_identical() {
+        let bounds = Rect::new(0.0, 0.0, 806.0, 600.0);
+        let (mut t, a) = Tree::new();
+        let b = t.split(a, Orientation::LeftRight).unwrap();
+        t.split(b, Orientation::TopBottom).unwrap();
+        let before: Vec<_> = t.rects(bounds).iter().map(|(_, r)| (r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits())).collect();
+        t.set_chrome_scale(1.0); // explicitly setting 1.0 must change nothing
+        let after: Vec<_> = t.rects(bounds).iter().map(|(_, r)| (r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits())).collect();
+        assert_eq!(before, after);
+        assert_eq!(t.dividers(bounds)[0].w.to_bits(), 6.0_f32.to_bits());
+    }
+
+    /// A nonsense factor must be refused, not adopted: a NaN gutter would make
+    /// every pane rect NaN and the window would draw nothing at all.
+    #[test]
+    fn an_unusable_factor_is_refused() {
+        let (mut t, _) = Tree::new();
+        t.set_chrome_scale(2.0);
+        for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            t.set_chrome_scale(bad);
+            assert_eq!(t.chrome_scale(), 2.0, "{bad} must be ignored");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1392,7 +1557,7 @@ mod tests {
                 (1.0, split(Orientation::LeftRight, vec![(1.0, Node::Leaf(bl)), (1.0, Node::Leaf(br))])),
             ],
         );
-        let mut tree = Tree { root };
+        let mut tree = Tree { root, scale: 1.0 };
 
         // Focusing TOP (a direct child of root) rotates the whole window.
         assert!(tree.rotate(top));
@@ -1431,7 +1596,7 @@ mod tests {
                 ),
             ],
         );
-        let mut tree = Tree { root };
+        let mut tree = Tree { root, scale: 1.0 };
         let before = format!("{:?}", tree.root);
         for _ in 0..4 {
             assert!(tree.rotate(a)); // `a` stays a direct child of the rotating root

@@ -14,6 +14,7 @@
 //! on `GlBackend` (which always blends via `glBlendFunc`), so no backend
 //! branch is needed here.
 use crate::backend::Backend;
+use crate::chrome_scale::logical;
 use crate::dragdrop::ResolvedDrop;
 use crate::render::Color;
 
@@ -25,6 +26,13 @@ use crate::render::Color;
 /// glyph cell size. Never panics: an empty `label` just draws a padding-only
 /// chip, and a not-yet-measured (zero) `cell` skips the chip rather than
 /// drawing degenerate geometry.
+///
+/// `sc` is the display's backing factor. The cue RECTANGLES arrive already
+/// scaled — `dragdrop::resolve_drop` computes them from scaled bounds and a
+/// scaled `EDGE_STRIP` — so what `sc` is for here is the flat decoration drawn
+/// ON them: the caret's wings, the zone border, the ghost chip's padding and
+/// offset. Both halves take the same factor, so the cue the user sees still
+/// marks exactly the region the drop resolver accepted.
 pub fn draw(
     backend: &mut dyn Backend,
     cue: Option<&ResolvedDrop>,
@@ -32,6 +40,7 @@ pub fn draw(
     dim: Option<rt_core::Rect>,
     cell: (f32, f32),
     win: (f32, f32),
+    sc: f32,
 ) {
     if cue.is_none() && ghost.is_none() && dim.is_none() {
         return;
@@ -50,16 +59,18 @@ pub fn draw(
     }
     if let Some(c) = cue {
         if c.caret {
-            // A 3px caret between tabs, full strip height, plus little wings.
+            // A thin caret between tabs, full strip height, plus little wings.
+            let wing = sc * logical::DROP_CARET_WING;
             backend.fill_rect(c.cue.x, c.cue.y, c.cue.w, c.cue.h, cue_edge);
-            backend.fill_rect(c.cue.x - 3.0, c.cue.y, c.cue.w + 6.0, 3.0, cue_edge);
+            backend.fill_rect(c.cue.x - wing, c.cue.y, c.cue.w + 2.0 * wing, wing, cue_edge);
         } else {
             backend.fill_rect(c.cue.x, c.cue.y, c.cue.w, c.cue.h, cue_fill);
-            // A 2px border so the zone reads even over busy content.
-            backend.fill_rect(c.cue.x, c.cue.y, c.cue.w, 2.0, cue_edge);
-            backend.fill_rect(c.cue.x, c.cue.y + c.cue.h - 2.0, c.cue.w, 2.0, cue_edge);
-            backend.fill_rect(c.cue.x, c.cue.y, 2.0, c.cue.h, cue_edge);
-            backend.fill_rect(c.cue.x + c.cue.w - 2.0, c.cue.y, 2.0, c.cue.h, cue_edge);
+            // A border so the zone reads even over busy content.
+            let e = sc * logical::DROP_ZONE_EDGE;
+            backend.fill_rect(c.cue.x, c.cue.y, c.cue.w, e, cue_edge);
+            backend.fill_rect(c.cue.x, c.cue.y + c.cue.h - e, c.cue.w, e, cue_edge);
+            backend.fill_rect(c.cue.x, c.cue.y, e, c.cue.h, cue_edge);
+            backend.fill_rect(c.cue.x + c.cue.w - e, c.cue.y, e, c.cue.h, cue_edge);
         }
     }
     if let Some(((x, y), label)) = ghost {
@@ -67,17 +78,18 @@ pub fn draw(
         // label. Guard against a not-yet-measured cell: skip rather than
         // paint a zero-sized/garbage chip.
         if cell.0 > 0.0 && cell.1 > 0.0 {
-            let pad = 6.0;
+            let pad = sc * logical::GHOST_PAD;
             let w = label.chars().count() as f32 * cell.0 + 2.0 * pad;
             let h = cell.1 + 2.0 * pad;
             // Clamp fully inside the window: an un-clamped chip at the
             // cursor's lower-right would spill off-screen (and, on XRender,
             // draw into unallocated backbuffer pixels) near the right/bottom
             // edge.
-            let cx = (x + 12.0).min((win.0 - w).max(0.0)).max(0.0);
-            let cy = (y + 12.0).min((win.1 - h).max(0.0)).max(0.0);
+            let off = sc * logical::GHOST_OFFSET;
+            let cx = (x + off).min((win.0 - w).max(0.0)).max(0.0);
+            let cy = (y + off).min((win.1 - h).max(0.0)).max(0.0);
             backend.fill_rect(cx, cy, w, h, Color::rgb(0x10, 0x10, 0x14).with_alpha(0.85));
-            backend.fill_rect(cx, cy, w, 1.0, cue_edge);
+            backend.fill_rect(cx, cy, w, sc * logical::HAIRLINE, cue_edge);
             let text = Color::rgb(0xd0, 0xd0, 0xd8);
             for (i, ch) in label.chars().enumerate() {
                 backend.draw_char(cx + pad, cy + pad, i, 0, ch, text, false, false);

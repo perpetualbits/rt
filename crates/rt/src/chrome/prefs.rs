@@ -3,6 +3,7 @@
 //! from `draw()` so the geometry is unit-testable with no X server.
 
 use crate::backend::Backend;
+use crate::chrome_scale::logical;
 use crate::chrome::Recti;
 use crate::prefs_model::{enabled, family_advisory, preset_name, FamilyStatus, PrefRow};
 use crate::render::Color;
@@ -71,8 +72,7 @@ pub enum Hit {
     Close,
 }
 
-const PAD_X: f32 = 10.0; // inner horizontal padding
-const ARROW_W: f32 = 2.0; // "◄ " / " ►" width, in cells
+const ARROW_W: f32 = 2.0; // "◄ " / " ►" width, in CELLS — derived, never scaled
 // Room for the widest value. The right "►" arrow is drawn in the LAST `ARROW_W`
 // cells of this field, so the usable text width is `VALUE_COLS - ARROW_W`.
 #[cfg(not(target_os = "macos"))]
@@ -307,13 +307,18 @@ pub fn scroll_for(rows: &[Row], sel: usize, scroll: usize, visible: usize) -> us
 }
 
 /// Lay the dialog out centred, clamped fully on-screen.
-pub fn layout(rows: &[Row], scroll: usize, cell_w: f32, cell_h: f32, win_w: f32, win_h: f32) -> Geom {
-    let row_h = cell_h + 4.0;
-    let w = ((LABEL_COLS + VALUE_COLS) as f32 + ARROW_W * 2.0) * cell_w + PAD_X * 2.0;
+pub fn layout(rows: &[Row], scroll: usize, cell_w: f32, cell_h: f32, win_w: f32, win_h: f32, sc: f32) -> Geom {
+    // `sc` is the display's backing factor, applied to the flat padding and row
+    // pad. `hit` and `swatch_rects` both work off the rects produced here, so the
+    // whole click surface follows the drawing — the colour picker's own
+    // unclickable-at-2x bug is exactly what that arrangement prevents.
+    let pad_x = sc * logical::PREFS_PAD;
+    let row_h = cell_h + sc * logical::PANEL_ROW_PAD;
+    let w = ((LABEL_COLS + VALUE_COLS) as f32 + ARROW_W * 2.0) * cell_w + pad_x * 2.0;
     let w = w.min(win_w); // never wider than the window
     // How many rows fit, leaving the padding at top and bottom.
-    let visible = (((win_h - PAD_X * 2.0) / row_h).floor() as usize).clamp(1, rows.len());
-    let h = visible as f32 * row_h + PAD_X * 2.0;
+    let visible = (((win_h - pad_x * 2.0) / row_h).floor() as usize).clamp(1, rows.len());
+    let h = visible as f32 * row_h + pad_x * 2.0;
     let x = ((win_w - w) * 0.5).max(0.0);
     let y = ((win_h - h) * 0.5).max(0.0);
     let scroll = scroll.min(rows.len().saturating_sub(visible));
@@ -330,14 +335,14 @@ pub fn layout(rows: &[Row], scroll: usize, cell_w: f32, cell_h: f32, win_w: f32,
             right.push(None);
             continue;
         }
-        let ry = y + PAD_X + (i - scroll) as f32 * row_h;
+        let ry = y + pad_x + (i - scroll) as f32 * row_h;
         rrects.push(Recti { x, y: ry, w, h: row_h });
         // Arrow zones sit at the right edge, either side of the value.
         if matches!(r.kind, RowKind::Step) && r.enabled {
             let aw = ARROW_W * cell_w;
-            let vx = x + w - PAD_X - VALUE_COLS as f32 * cell_w;
+            let vx = x + w - pad_x - VALUE_COLS as f32 * cell_w;
             left.push(Some(Recti { x: vx - aw, y: ry, w: aw, h: row_h }));
-            right.push(Some(Recti { x: x + w - PAD_X - aw, y: ry, w: aw, h: row_h }));
+            right.push(Some(Recti { x: x + w - pad_x - aw, y: ry, w: aw, h: row_h }));
         } else {
             left.push(None);
             right.push(None);
@@ -374,14 +379,16 @@ pub fn hit(g: &Geom, p: (f32, f32)) -> Option<Hit> {
 /// The per-swatch rects in a `Swatches` row (`[fg, bg, palette…]`), laid out
 /// right-aligned. Shared by `draw` (to paint them) and the click handler (to
 /// open the colour picker on the one clicked), so the two never drift.
-pub fn swatch_rects(row: Recti, count: usize, cell_h: f32) -> Vec<Recti> {
-    let s = cell_h * 0.6;
+pub fn swatch_rects(row: Recti, count: usize, cell_h: f32, sc: f32) -> Vec<Recti> {
+    let s = cell_h * 0.6; // derived from the cell: already scales with the glyph
+    let gap = sc * logical::PREFS_SWATCH_GAP;
+    let pad_x = sc * logical::PREFS_PAD;
     let y = row.y + (row.h - s) * 0.5;
-    let mut sx = row.x + row.w - PAD_X - count as f32 * (s + 2.0);
+    let mut sx = row.x + row.w - pad_x - count as f32 * (s + gap);
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(Recti { x: sx, y, w: s, h: s });
-        sx += s + 2.0;
+        sx += s + gap;
     }
     out
 }
@@ -395,14 +402,16 @@ const SECTION: Color = Color(0.55, 0.72, 0.90, 1.0);
 
 /// Paint the dialog. `swatches` is `[fg, bg, palette…]`, painted into the
 /// `Swatches` row; `sel` is the selected row index.
-pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: &[Color], cell_w: f32, cell_h: f32) {
-    // Panel: a 1px edge drawn as four thin fills around an opaque body.
+pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: &[Color], cell_w: f32, cell_h: f32, sc: f32) {
+    let pad_x = sc * logical::PREFS_PAD;
+    let hair = sc * logical::HAIRLINE;
+    // Panel: a hairline edge drawn as four thin fills around an opaque body.
     let p = g.panel;
     be.fill_rect(p.x, p.y, p.w, p.h, PANEL_BG);
-    be.fill_rect(p.x, p.y, p.w, 1.0, PANEL_EDGE);
-    be.fill_rect(p.x, p.y + p.h - 1.0, p.w, 1.0, PANEL_EDGE);
-    be.fill_rect(p.x, p.y, 1.0, p.h, PANEL_EDGE);
-    be.fill_rect(p.x + p.w - 1.0, p.y, 1.0, p.h, PANEL_EDGE);
+    be.fill_rect(p.x, p.y, p.w, hair, PANEL_EDGE);
+    be.fill_rect(p.x, p.y + p.h - hair, p.w, hair, PANEL_EDGE);
+    be.fill_rect(p.x, p.y, hair, p.h, PANEL_EDGE);
+    be.fill_rect(p.x + p.w - hair, p.y, hair, p.h, PANEL_EDGE);
 
     for (i, row) in rows.iter().enumerate() {
         // Skip rows scrolled out of view (layout parked them off-panel).
@@ -411,9 +420,10 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: 
         }
         let r = g.rows[i];
         if i == sel {
-            be.fill_rect(r.x + 1.0, r.y, r.w - 2.0, r.h, SEL_BG);
+            let inset = sc * logical::PREFS_SEL_INSET;
+            be.fill_rect(r.x + inset, r.y, r.w - 2.0 * inset, r.h, SEL_BG);
         }
-        let ty = r.y + 2.0;
+        let ty = r.y + sc * logical::PANEL_TEXT_TOP;
         let colour = if !row.enabled {
             TEXT_DIM
         } else {
@@ -424,7 +434,7 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: 
             }
         };
         // Label: sections sit flush, everything else indents one cell.
-        let lx = if matches!(row.kind, RowKind::Section) { r.x + PAD_X } else { r.x + PAD_X + cell_w };
+        let lx = if matches!(row.kind, RowKind::Section) { r.x + pad_x } else { r.x + pad_x + cell_w };
         for (c, ch) in row.label.chars().enumerate() {
             be.draw_char(lx, ty, c, 0, ch, colour, matches!(row.kind, RowKind::Section), false);
         }
@@ -438,7 +448,7 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: 
         }
         // Swatches: fg, bg, then the 16 palette colours, as small squares.
         if matches!(row.kind, RowKind::Swatches) {
-            for (rect, col) in swatch_rects(r, swatches.len(), cell_h).into_iter().zip(swatches) {
+            for (rect, col) in swatch_rects(r, swatches.len(), cell_h, sc).into_iter().zip(swatches) {
                 be.fill_rect(rect.x, rect.y, rect.w, rect.h, *col);
             }
             continue;
@@ -446,7 +456,7 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: 
         // Value, in the value column (right side of the row, sized to the
         // widest value so it lines up across every row and never collides
         // with the arrow zones `layout` reserved at the same `vx`).
-        let vx = r.x + r.w - PAD_X - VALUE_COLS as f32 * cell_w;
+        let vx = r.x + r.w - pad_x - VALUE_COLS as f32 * cell_w;
         for (c, ch) in row.value.chars().enumerate() {
             be.draw_char(vx, ty, c, 0, ch, colour, false, false);
         }
@@ -690,7 +700,7 @@ mod tests {
     #[test]
     fn layout_keeps_the_panel_on_screen_and_rows_inside_it() {
         let rows = rs(&Settings::default());
-        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 700.0);
+        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 700.0, 1.0);
         assert!(g.panel.x >= 0.0 && g.panel.y >= 0.0);
         assert!(g.panel.x + g.panel.w <= 900.0);
         assert!(g.panel.y + g.panel.h <= 700.0);
@@ -703,7 +713,7 @@ mod tests {
     fn a_selection_below_the_fold_scrolls_into_view() {
         let rows = rs(&Settings::default());
         // A window too short to hold every row.
-        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 200.0);
+        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 200.0, 1.0);
         assert!(g.visible < rows.len(), "this window must not fit them all");
         let last = *selectable(&rows).last().unwrap();
         let sc = scroll_for(&rows, last, 0, g.visible);
@@ -762,7 +772,7 @@ mod tests {
     #[test]
     fn clicking_a_step_arrow_returns_the_direction() {
         let rows = rs(&Settings::default());
-        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 700.0);
+        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 700.0, 1.0);
         let i = rows.iter().position(|r| r.pref == Some(PrefRow::FontSize)).unwrap();
         let l = g.left[i].expect("a Step row has a left arrow");
         let r = g.right[i].expect("a Step row has a right arrow");
@@ -773,7 +783,7 @@ mod tests {
     #[test]
     fn clicking_a_row_selects_it_and_clicking_outside_hits_nothing() {
         let rows = rs(&Settings::default());
-        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 700.0);
+        let g = layout(&rows, 0, 11.0, 21.0, 900.0, 700.0, 1.0);
         let i = rows.iter().position(|r| r.pref == Some(PrefRow::Ffm)).unwrap();
         let row = g.rows[i];
         // A click on the label (left of the arrows) selects the row.

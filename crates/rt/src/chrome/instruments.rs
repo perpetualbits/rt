@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 use crate::backend::Backend;
 use crate::render::Color;
+use crate::chrome_scale::logical;
 use crate::{content_bounds, cubic_bezier, flow_point, heat_color, latency_color, Meter, Wire,
-            BUSY_WAKEUPS, FLOW_PACKETS, WIRE_BUSY_BYTES, WIRE_PACKETS,
-            JACK_R_BACK, JACK_R_FILL, JACK_R_RING, JACK_RING_W};
+            BUSY_WAKEUPS, FLOW_PACKETS, WIRE_BUSY_BYTES, WIRE_PACKETS};
 use rt_core::{PaneId, Rect};
 use crate::Stream;
 
@@ -29,6 +29,13 @@ pub struct InstrCtx<'a> {
     pub lat_phase: f32,
     pub stall: f32,
     pub size: winit::dpi::PhysicalSize<u32>,
+    /// The display's backing factor. Every flat size below (`logical::*`) is a
+    /// LOGICAL pixel value multiplied by this, so the heat border, the travelling
+    /// output packets and the patch-bay jacks come out the same APPARENT size on
+    /// a Retina panel as on a 1x one. The jack discs share their register entry
+    /// with `App::jack_at`'s grab radius, which takes the same factor — draw and
+    /// hit scale together or the ports become impossible to aim at.
+    pub sc: f32,
 }
 
 /// Draw all enabled instruments over the already-drawn grid (physical pixels).
@@ -36,6 +43,7 @@ pub struct InstrCtx<'a> {
 pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
     let rects = ctx.rects;
     let size = ctx.size;
+    let sc = ctx.sc; // flat chrome multiplier; 1.0 on a 1x display
     let (inst_output, inst_heat, inst_latency) = (ctx.inst_output, ctx.inst_heat, ctx.inst_latency);
 
     // Per-pane heat borders + orbiting output packets.
@@ -46,7 +54,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         if inst_heat {
             let load = ctx.heat.get(id).copied().unwrap_or(0.0);
             let c = heat_color(load);
-            let t = 2.4;
+            let t = sc * logical::HEAT_BORDER_T;
             be.fill_rect(x, y, w, t, c); // top
             be.fill_rect(x, y + h - t, w, t, c); // bottom
             be.fill_rect(x, y, t, h, c); // left
@@ -65,12 +73,12 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             for k in 0..FLOW_PACKETS {
                 let tt = (m.phase + k as f32 / FLOW_PACKETS as f32).fract();
                 let p = flow_point(x, y, w, h, tt);
-                be.fill_circle(p.0, p.1, 9.0, glow);
+                be.fill_circle(p.0, p.1, sc * logical::PACKET_R_GLOW, glow);
             }
             for k in 0..FLOW_PACKETS {
                 let tt = (m.phase + k as f32 / FLOW_PACKETS as f32).fract();
                 let p = flow_point(x, y, w, h, tt);
-                be.fill_circle(p.0, p.1, 3.4, core);
+                be.fill_circle(p.0, p.1, sc * logical::PACKET_R_CORE, core);
             }
         }
     }
@@ -91,7 +99,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         let (Some(sr), Some(dr)) = (rect_of(w.src), rect_of(w.dst)) else { continue };
         let p0 = jack_pos(sr, if w.stream == Stream::Stdout { 1 } else { 2 });
         let p3 = jack_pos(dr, 0);
-        let ext = ((p3.0 - p0.0).abs() * 0.4 + 40.0).min(180.0);
+        let ext = ((p3.0 - p0.0).abs() * 0.4 + sc * logical::WIRE_CTRL_MIN).min(sc * logical::WIRE_CTRL_MAX);
         let p1 = (p0.0 + ext, p0.1);
         let p2 = (p3.0 - ext, p3.1);
         let hue = if w.stream == Stream::Stdout { (0x40u8, 0xc0u8, 0x54u8) } else { (0xd0, 0x54, 0x30) };
@@ -110,7 +118,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         for i in 1..=N {
             let t = i as f32 / N as f32;
             let pt = cubic_bezier(p0, p1, p2, p3, t);
-            be.stroke_line(prev.0, prev.1, pt.0, pt.1, 2.0, body);
+            be.stroke_line(prev.0, prev.1, pt.0, pt.1, sc * logical::WIRE_W, body);
             prev = pt;
         }
         // Flowing packets: bright dots riding the bezier — glyph stamps, which batch
@@ -119,7 +127,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         for k in 0..WIRE_PACKETS {
             let pp = (w.phase + k as f32 / WIRE_PACKETS as f32).fract();
             let pt = cubic_bezier(p0, p1, p2, p3, pp);
-            be.fill_circle(pt.0, pt.1, 2.6, bright);
+            be.fill_circle(pt.0, pt.1, sc * logical::WIRE_PACKET_R, bright);
         }
     }
 
@@ -128,7 +136,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         if let Some(sr) = rect_of(src) {
             let p0 = jack_pos(sr, if stream == Stream::Stdout { 1 } else { 2 });
             let p3 = (cx, cy);
-            let ext = ((p3.0 - p0.0).abs() * 0.4 + 40.0).min(180.0);
+            let ext = ((p3.0 - p0.0).abs() * 0.4 + sc * logical::WIRE_CTRL_MIN).min(sc * logical::WIRE_CTRL_MAX);
             let p1 = (p0.0 + ext, p0.1);
             let p2 = (p3.0 - ext, p3.1);
             let (hr, hg, hb) = if stream == Stream::Stdout { (0x40u8, 0xc0u8, 0x54u8) } else { (0xd0, 0x54, 0x30) };
@@ -138,7 +146,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             for i in 1..=40u32 {
                 let t = i as f32 / 40.0;
                 let pt = cubic_bezier(p0, p1, p2, p3, t);
-                if i % 2 == 0 { be.stroke_line(prev.0, prev.1, pt.0, pt.1, 1.6, c); }
+                if i % 2 == 0 { be.stroke_line(prev.0, prev.1, pt.0, pt.1, sc * logical::RUBBER_W, c); }
                 prev = pt;
             }
         }
@@ -146,7 +154,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
 
     // Latency: the content-region perimeter, drawn last.
     if inst_latency {
-        let cb = content_bounds(size);
+        let cb = content_bounds(size, sc);
         let (fx, fy, fw, fh) = (cb.x, cb.y, cb.w, cb.h);
         let per = 2.0 * (fw + fh);
         let corners = [
@@ -157,7 +165,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             ((fx, fy), per),
         ];
         const SUB: u32 = 14; // latency-frame segments per edge (trimmed from 26; a thin frame reads fine)
-        const LT: f32 = 2.0; // frame thickness (px)
+        let lt = sc * logical::LATENCY_FRAME_T; // frame thickness (px)
         for e in 0..4 {
             let (pa, da) = corners[e];
             let (pb, db) = corners[e + 1];
@@ -173,8 +181,8 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
                 // and software Xwayland's AA-triangle rasterisation is the one op it
                 // cannot drain fast enough over ssh -X (it stalls typing under load);
                 // FillRectangles is cheap. `fill_rect` also batches by colour there.
-                let (rx, ry) = (prev.0.min(pt.0) - LT / 2.0, prev.1.min(pt.1) - LT / 2.0);
-                let (rw, rh) = ((pt.0 - prev.0).abs() + LT, (pt.1 - prev.1).abs() + LT);
+                let (rx, ry) = (prev.0.min(pt.0) - lt / 2.0, prev.1.min(pt.1) - lt / 2.0);
+                let (rw, rh) = ((pt.0 - prev.0).abs() + lt, (pt.1 - prev.1).abs() + lt);
                 be.fill_rect(rx, ry, rw, rh, c);
                 prev = pt;
             }
@@ -194,7 +202,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         for (_id, r) in rects {
             for which in 0..3u8 {
                 let p = jack_pos(r, which);
-                be.fill_circle(p.0, p.1, JACK_R_BACK, black);
+                be.fill_circle(p.0, p.1, sc * logical::JACK_R_BACK, black);
             }
         }
         for (id, r) in rects {
@@ -202,8 +210,8 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             let has_out = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
             let has_err = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
             let mut fill = |p: (f32, f32), filled: bool, c: crate::render::Color| {
-                if filled { be.fill_circle(p.0, p.1, JACK_R_FILL, c); }
-                else { be.stroke_circle(p.0, p.1, JACK_R_RING, JACK_RING_W, c); }
+                if filled { be.fill_circle(p.0, p.1, sc * logical::JACK_R_FILL, c); }
+                else { be.stroke_circle(p.0, p.1, sc * logical::JACK_R_RING, sc * logical::JACK_RING_W, c); }
             };
             fill(jack_pos(r, 0), has_in, crate::render::Color::rgb(0x88, 0x88, 0x98));
             fill(jack_pos(r, 1), has_out, crate::render::Color::rgb(0x40, 0xc0, 0x54));
