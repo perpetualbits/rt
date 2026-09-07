@@ -868,19 +868,55 @@ fn face_data(
 /// each with coverage fallbacks appended to the regular chain (DejaVu Sans etc.
 /// cover braille that DejaVu Sans Mono lacks). Falls back to a path search if
 /// the database yields no usable primary.
+/// `face_data`, but only if the face rt can actually *rasterise*.
+///
+/// fontdb answering with bytes does not mean fontdue can parse them: a
+/// bitmap-only font (macOS ships `GB18030 Bitmap`) has no outlines, loads
+/// happily, and fails at `Font::from_bytes`. Before this filter existed such a
+/// family did not fall through to the next candidate -- `face_data` returned
+/// `Some`, so `or_else` never ran, `regular` was non-empty so the path loader
+/// never ran either, and the unusable blob went straight to the backend.
+///
+/// That made an unrenderable family a STARTUP FAILURE, not a cosmetic one:
+/// `commit_settings` persists `font_family` before the reload is attempted, so
+/// the next launch read it back, `Renderer::new`/`WgpuBackend::new` failed, and
+/// `build_active` returned with no window. rt could only be recovered by hand-
+/// editing `config.toml`. The rule is therefore: a blob that cannot be parsed
+/// is not a candidate at all.
+fn usable_face(
+    db: &fontdb::Database,
+    family: &str,
+    weight: fontdb::Weight,
+    style: fontdb::Style,
+) -> Option<render::FontBlob> {
+    let blob = face_data(db, family, weight, style)?;
+    match blob.parse() {
+        Ok(_) => Some(blob),
+        Err(e) => {
+            log::warn!(
+                "font family {family:?} ({weight:?}, {style:?}) has no rasterisable outlines ({e}); \
+                 skipping it and using the next candidate"
+            );
+            None
+        }
+    }
+}
+
 fn font_blobs(db: &fontdb::Database, family: &str) -> render::FontBlobs {
     use fontdb::{Style, Weight};
     // Primary regular face: the chosen family, then sensible monospace fallbacks.
-    let primary = face_data(db, family, Weight::NORMAL, Style::Normal)
-        .or_else(|| face_data(db, "DejaVu Sans Mono", Weight::NORMAL, Style::Normal))
-        .or_else(|| face_data(db, "monospace", Weight::NORMAL, Style::Normal));
+    // Every candidate is parse-checked, so an unrenderable family falls through
+    // here instead of reaching a backend that can only fail on it.
+    let primary = usable_face(db, family, Weight::NORMAL, Style::Normal)
+        .or_else(|| usable_face(db, "DejaVu Sans Mono", Weight::NORMAL, Style::Normal))
+        .or_else(|| usable_face(db, "monospace", Weight::NORMAL, Style::Normal));
     let mut regular = Vec::new();
     if let Some(d) = primary {
         regular.push(d);
     }
     // Coverage fallbacks (braille, symbols) appended after the primary.
     for fam in ["DejaVu Sans", "Noto Sans Symbols2", "FreeMono"] {
-        if let Some(d) = face_data(db, fam, Weight::NORMAL, Style::Normal) {
+        if let Some(d) = usable_face(db, fam, Weight::NORMAL, Style::Normal) {
             regular.push(d);
         }
     }
@@ -892,9 +928,9 @@ fn font_blobs(db: &fontdb::Database, family: &str) -> render::FontBlobs {
     }
     render::FontBlobs {
         regular,
-        bold: face_data(db, family, Weight::BOLD, Style::Normal).into_iter().collect(),
-        italic: face_data(db, family, Weight::NORMAL, Style::Italic).into_iter().collect(),
-        bold_italic: face_data(db, family, Weight::BOLD, Style::Italic).into_iter().collect(),
+        bold: usable_face(db, family, Weight::BOLD, Style::Normal).into_iter().collect(),
+        italic: usable_face(db, family, Weight::NORMAL, Style::Italic).into_iter().collect(),
+        bold_italic: usable_face(db, family, Weight::BOLD, Style::Italic).into_iter().collect(),
     }
 }
 
@@ -8894,5 +8930,106 @@ mod font_face_tests {
              ttc_face_index_selects_a_different_face still gates the behaviour with a synthetic one.",
             if probed.is_empty() { "none of the candidate paths exist".to_string() } else { probed.join("; ") }
         );
+    }
+}
+
+
+/// A font family rt cannot rasterise must never reach a backend.
+///
+/// The bug these pin: `font_blobs` accepted any family fontdb had *bytes* for,
+/// so a bitmap-only font (macOS `GB18030 Bitmap`) became the primary face, the
+/// renderer failed to build, and -- because `commit_settings` persists
+/// `font_family` before the reload is attempted -- rt then failed to START on
+/// every subsequent launch, recoverable only by hand-editing `config.toml`.
+#[cfg(test)]
+mod font_fallback_tests {
+    use super::*;
+    use fontdb::{Style, Weight};
+
+    /// A blob whose bytes are a real font but whose face index is past the end
+    /// of the collection: `parse()` must reject it. A portable stand-in for a
+    /// bitmap font, so the predicate is testable on any machine.
+    fn unparseable() -> render::FontBlob {
+        let db = build_font_db();
+        // Any real face will do, and it must NOT be a hardcoded family: neither
+        // "DejaVu Sans Mono" nor "monospace" exists on macOS, and naming them
+        // made this helper panic there while the code under test was fine.
+        let good = monospace_families(&db)
+            .into_iter()
+            .find_map(|f| face_data(&db, &f, Weight::NORMAL, Style::Normal))
+            .expect("some monospace face must exist to build the probe from");
+        let bad = render::FontBlob::new(good.data.clone(), 99);
+        assert!(bad.parse().is_err(), "index 99 must not parse; the probe is worthless otherwise");
+        bad
+    }
+
+    /// Guards the probe: if `parse` ever accepted an out-of-range index, the
+    /// stand-in would silently become parseable and the rest would pass for the
+    /// wrong reason.
+    #[test]
+    fn the_probe_itself_discriminates() {
+        let _ = unparseable();
+    }
+
+    /// The invariant, over a bounded sample: the configured default, a name that
+    /// is not installed at all, and the first few families the picker offers.
+    /// Deliberately NOT every family — parsing all of them takes ~140s (Noto CJK
+    /// alone is 19 MB), which is too slow to run on every commit. The exhaustive
+    /// sweep is the `#[ignore]`d test below.
+    #[test]
+    fn font_blobs_never_yields_an_unrasterisable_primary() {
+        let db = build_font_db();
+        let mut families: Vec<String> = monospace_families(&db).into_iter().take(6).collect();
+        families.push(rt_config::Settings::default().font_family);
+        families.push("this family is not installed".to_string());
+        for fam in families {
+            let blobs = font_blobs(&db, &fam);
+            let primary = blobs
+                .regular
+                .first()
+                .unwrap_or_else(|| panic!("{fam}: no primary face at all"));
+            assert!(
+                primary.parse().is_ok(),
+                "{fam}: font_blobs handed the backend a primary it cannot rasterise",
+            );
+        }
+    }
+
+    /// The real case: a family whose bytes load but whose outlines do not parse.
+    /// macOS has `GB18030 Bitmap`; most Linux installs have none, so skip LOUDLY
+    /// there rather than passing vacuously.
+    #[test]
+    fn an_unrasterisable_family_falls_through_to_a_working_one() {
+        let db = build_font_db();
+        let extra = ["GB18030 Bitmap".to_string()];
+        let bad = monospace_families(&db).into_iter().chain(extra).find(|f| {
+            face_data(&db, f, Weight::NORMAL, Style::Normal).is_some_and(|b| b.parse().is_err())
+        });
+        let Some(bad_family) = bad else {
+            println!("SKIP: no installed family has unparseable outlines on this machine");
+            return;
+        };
+        println!("exercising the real case with {bad_family:?}");
+        let blobs = font_blobs(&db, &bad_family);
+        let primary = blobs.regular.first().expect("must fall back, not give up");
+        assert!(primary.parse().is_ok(), "{bad_family}: fell through to another unusable face");
+    }
+
+    /// The same invariant over EVERY family the picker offers. Slow (~140s: it
+    /// parses every installed monospace face, and some are tens of megabytes),
+    /// so it is opt-in: `cargo test -p rt --bin rt -- --ignored exhaustive`.
+    /// Worth running after touching the fallback chain or upgrading fontdue.
+    #[test]
+    #[ignore = "slow: parses every installed monospace face"]
+    fn exhaustive_no_family_yields_an_unrasterisable_primary() {
+        let db = build_font_db();
+        for fam in monospace_families(&db) {
+            let blobs = font_blobs(&db, &fam);
+            let primary = blobs
+                .regular
+                .first()
+                .unwrap_or_else(|| panic!("{fam}: no primary face at all"));
+            assert!(primary.parse().is_ok(), "{fam}: unrasterisable primary reached the backend");
+        }
     }
 }
