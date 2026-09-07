@@ -5,6 +5,43 @@
 
 use rt_config::Settings;
 
+/// Whether the configured font family is the one actually on screen.
+///
+/// rt cannot draw every family fontdb offers. A bitmap-only font (macOS ships
+/// `GB18030 Bitmap`) hands over megabytes of perfectly valid bytes that carry no
+/// outlines, so `FontBlob::parse` rejects it and `font_blobs` falls through to
+/// the next candidate in the chain — the screen keeps the font it had. Without
+/// this, Preferences went on showing the name of a family that was not
+/// rendering, which is the one thing a settings row must never do.
+///
+/// The same applies to a family that is simply gone: a `config.toml` written on
+/// another machine, or a font uninstalled since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FamilyStatus {
+    /// Installed, and its regular face parses: this IS the font on screen.
+    Usable,
+    /// fontdb has no face under this name at all.
+    Missing,
+    /// A face exists and loads, but rt's rasteriser cannot read it.
+    Unrasterisable,
+}
+
+/// The advisory line under the Family row, or `None` when there is nothing to
+/// say. Deliberately shaped like the `TERM` row's advisory (see
+/// `chrome::prefs::rows`): the row keeps showing the CONFIGURED value — that is
+/// what `config.toml` says and what the arrows edit — and the line beneath says
+/// what is really happening.
+///
+/// Kept to 51 characters or fewer, the width the panel gives a `Display` row;
+/// `chrome::prefs`'s tests pin that.
+pub fn family_advisory(status: FamilyStatus) -> Option<&'static str> {
+    match status {
+        FamilyStatus::Usable => None,
+        FamilyStatus::Missing => Some("not installed here — rt is drawing a fallback font"),
+        FamilyStatus::Unrasterisable => Some("has no outlines — rt is drawing a fallback font"),
+    }
+}
+
 /// Which setting a preferences row edits. `Close` is the dismiss action and
 /// edits nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +128,22 @@ pub fn preset_name(s: &Settings) -> &'static str {
 /// machine actually has terminfo for (`rt_config::term_candidates`). Both are passed in
 /// rather than looked up here so this module stays pure and its tests stay independent of
 /// what happens to be installed on the machine running them.
-pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String], terms: &[String]) {
+///
+/// `usable` answers "can rt actually draw this family?" — asked ONLY by the
+/// Family row, and only about the candidates a single step considers. It is a
+/// callback rather than a pre-filtered list because the answer costs a font
+/// parse: filtering all 129 monospace families up front measured 0.5 s in
+/// release (and two orders of magnitude worse in a debug build), while a step
+/// asks about one family, which the settle was going to parse anyway. The
+/// caller memoises, so walking the list a second time is free.
+pub fn step(
+    s: &mut Settings,
+    row: PrefRow,
+    dir: i32,
+    families: &[String],
+    terms: &[String],
+    usable: &mut dyn FnMut(&str) -> bool,
+) {
     if !enabled(s, row) {
         return; // greyed rows refuse input; see `enabled`
     }
@@ -103,15 +155,30 @@ pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String], terms
             if families.is_empty() {
                 return; // nothing installed to cycle through; leave the name alone
             }
-            let n = families.len();
-            // When the current family isn't installed, land on the natural end
-            // for the direction rather than falling back to 0-then-step (which
-            // would skip index 0 on a first Right / jump to n-1 on a first Left).
-            let next = match families.iter().position(|f| *f == s.font_family) {
-                Some(cur) => (cur as i32 + dir).rem_euclid(n as i32) as usize,
+            let n = families.len() as i32;
+            // Where the walk starts. When the current family isn't installed,
+            // that is the natural end for the direction rather than 0-then-step
+            // (which would skip index 0 on a first Right / jump to n-1 on a
+            // first Left).
+            let from = match families.iter().position(|f| *f == s.font_family) {
+                Some(cur) => cur as i32 + dir,
                 None => if dir > 0 { 0 } else { n - 1 },
             };
-            s.font_family = families[next].clone();
+            // Walk on until a family rt can actually draw. A family whose faces
+            // carry no outlines is not a choice — selecting it would change the
+            // name in this dialog and nothing on screen, which is exactly the
+            // lie this skip exists to prevent.
+            //
+            // Bounded at one lap: an installation where NOTHING parses must
+            // leave the setting alone rather than spin, re-parsing fonts on
+            // every turn with the key still held down.
+            for k in 0..n {
+                let at = (from + k * dir).rem_euclid(n) as usize;
+                if usable(&families[at]) {
+                    s.font_family = families[at].clone();
+                    return;
+                }
+            }
         }
         // Same cycle as Family, over the terminal types this machine has terminfo for.
         // `term_candidates` always includes the configured value, so `position` finds it
@@ -298,6 +365,25 @@ mod tests {
         vec!["Alpha Mono".to_string(), "Beta Mono".to_string(), "Gamma Mono".to_string()]
     }
 
+    /// `super::step` with "rt can draw every family" as the oracle — the case
+    /// every test below the Family ones is about. Shadows the real `step` on
+    /// purpose so a test that does NOT care about rasterisability does not have
+    /// to say so five times per test; the Family tests call `super::step`
+    /// directly with an oracle of their own.
+    fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String], terms: &[String]) {
+        super::step(s, row, dir, families, terms, &mut |_| true)
+    }
+
+    /// An oracle that rejects the named families and accepts everything else,
+    /// counting how many times it was asked. The count is the cost of a step:
+    /// each `true`/`false` here is one font parse in the real caller.
+    fn oracle<'a>(bad: &'static [&'static str], asked: &'a mut usize) -> impl FnMut(&str) -> bool + 'a {
+        move |f: &str| {
+            *asked += 1;
+            !bad.contains(&f)
+        }
+    }
+
     /// A fixed candidate list, NOT `rt_config::term_candidates()` — what terminfo the test
     /// machine happens to have installed must not decide whether these tests pass.
     fn terms() -> Vec<String> {
@@ -436,6 +522,92 @@ mod tests {
         s.font_family = "Not Installed".to_string();
         step(&mut s, PrefRow::FontFamily, -1, &fams(), &terms());
         assert_eq!(s.font_family, "Gamma Mono", "Left from unmatched -> last family");
+    }
+
+    /// The fix: a family rt cannot rasterise is not a choice the stepper offers.
+    /// Landing on one is what made Preferences show a name while the old font
+    /// kept rendering, so the arrow keys must walk straight past it.
+    #[test]
+    fn family_step_skips_a_family_rt_cannot_draw() {
+        let mut asked = 0;
+        let mut s = Settings::default();
+        s.font_family = "Alpha Mono".to_string();
+        super::step(&mut s, PrefRow::FontFamily, 1, &fams(), &terms(), &mut oracle(&["Beta Mono"], &mut asked));
+        assert_eq!(s.font_family, "Gamma Mono", "Right must step over the unusable middle");
+        let mut asked = 0;
+        super::step(&mut s, PrefRow::FontFamily, -1, &fams(), &terms(), &mut oracle(&["Beta Mono"], &mut asked));
+        assert_eq!(s.font_family, "Alpha Mono", "Left must step over it too");
+    }
+
+    /// The ends are where an unusable family hides: a first Right from a name
+    /// that is not in the list lands on index 0, and a first Left on index n-1.
+    #[test]
+    fn family_step_from_an_unmatched_name_skips_an_unusable_end() {
+        let mut asked = 0;
+        let mut s = Settings::default();
+        s.font_family = "Not Installed".to_string();
+        super::step(&mut s, PrefRow::FontFamily, 1, &fams(), &terms(), &mut oracle(&["Alpha Mono"], &mut asked));
+        assert_eq!(s.font_family, "Beta Mono", "Right from unmatched skips an unusable first");
+        let mut asked = 0;
+        let mut s = Settings::default();
+        s.font_family = "Not Installed".to_string();
+        super::step(&mut s, PrefRow::FontFamily, -1, &fams(), &terms(), &mut oracle(&["Gamma Mono"], &mut asked));
+        assert_eq!(s.font_family, "Beta Mono", "Left from unmatched skips an unusable last");
+    }
+
+    /// Every family unusable: one lap, then give up with the name untouched.
+    /// The bound is what keeps the key from hanging rt — without it the walk
+    /// would loop forever, re-parsing fonts on every turn.
+    #[test]
+    fn family_step_gives_up_after_one_lap_when_nothing_is_usable() {
+        let mut asked = 0;
+        let mut s = Settings::default();
+        s.font_family = "Alpha Mono".to_string();
+        super::step(
+            &mut s,
+            PrefRow::FontFamily,
+            1,
+            &fams(),
+            &terms(),
+            &mut oracle(&["Alpha Mono", "Beta Mono", "Gamma Mono"], &mut asked),
+        );
+        assert_eq!(s.font_family, "Alpha Mono", "nothing usable: leave the setting alone");
+        assert_eq!(asked, 3, "exactly one lap, never a second");
+    }
+
+    /// The fast path — the one that runs on every arrow press. A step onto a
+    /// usable family asks the oracle ONCE (one font parse, the same one the
+    /// settle's reload would do), and rows that are not the Family row ask it
+    /// not at all.
+    #[test]
+    fn a_step_costs_at_most_one_question_per_family_it_passes() {
+        let mut asked = 0;
+        let mut s = Settings::default();
+        s.font_family = "Alpha Mono".to_string();
+        super::step(&mut s, PrefRow::FontFamily, 1, &fams(), &terms(), &mut oracle(&[], &mut asked));
+        assert_eq!(asked, 1, "the usual case is one parse, not a sweep of the list");
+        // Every other row: the font database is never touched.
+        let mut asked = 0;
+        for row in [PrefRow::FontSize, PrefRow::Opacity, PrefRow::Preset, PrefRow::Term, PrefRow::Titlebar] {
+            super::step(&mut s, row, 1, &fams(), &terms(), &mut oracle(&[], &mut asked));
+        }
+        assert_eq!(asked, 0, "only the Family row cares whether a font can be drawn");
+    }
+
+    /// The advisory the dialog puts under the Family row: silent when the
+    /// configured family really is what you are looking at, and specific about
+    /// WHICH way it is not otherwise.
+    #[test]
+    fn only_an_unusable_family_gets_an_advisory_and_it_says_which_way() {
+        assert_eq!(family_advisory(FamilyStatus::Usable), None, "nothing to warn about");
+        let missing = family_advisory(FamilyStatus::Missing).expect("must say something");
+        let bad = family_advisory(FamilyStatus::Unrasterisable).expect("must say something");
+        assert!(missing.contains("not installed"), "{missing:?}");
+        assert!(bad.contains("outlines"), "{bad:?}");
+        for line in [missing, bad] {
+            assert!(line.contains("fallback"), "must say what IS on screen: {line:?}");
+        }
+        assert_ne!(missing, bad, "the two failures are different and must read differently");
     }
 
     #[test]

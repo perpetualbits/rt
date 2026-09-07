@@ -4,7 +4,7 @@
 
 use crate::backend::Backend;
 use crate::chrome::Recti;
-use crate::prefs_model::{enabled, preset_name, PrefRow};
+use crate::prefs_model::{enabled, family_advisory, preset_name, FamilyStatus, PrefRow};
 use crate::render::Color;
 use rt_config::Settings;
 
@@ -107,7 +107,12 @@ fn stepper(label: &str, value: String, pref: PrefRow) -> Row {
 /// width — both feed the scrollback guardrail, which is the one piece of real
 /// logic here: it states what a FULL buffer would cost per pane, so sliding the
 /// ceiling up cannot silently pick a size no machine can hold.
-pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row> {
+///
+/// `family` says whether `s.font_family` is the font actually on screen. It is
+/// passed in, not computed, for the same reason `prefs_model::step` takes an
+/// oracle: answering it costs a font parse, and this function runs on every
+/// frame the dialog is painted. The caller memoises (see `Active::font_status`).
+pub fn rows(s: &Settings, mem_total: u64, cols: usize, family: FamilyStatus) -> Vec<Row> {
     // No `families` param: the family VALUE shown is `s.font_family`. Only
     // `prefs_model::step` needs the installed list, to cycle through it.
     let mut v = Vec::new();
@@ -125,6 +130,27 @@ pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row> {
     v.push(sec("Font"));
     v.push(stepper("Size (px)", format!("{:.0}", s.font_size), PrefRow::FontSize));
     v.push(stepper("Family", s.font_family.clone(), PrefRow::FontFamily));
+    // The Family row keeps showing the CONFIGURED name — that is what
+    // `config.toml` holds and what the arrows edit — so when rt cannot draw it,
+    // a line beneath has to say so, exactly as the `TERM` row's advisory does.
+    // Without it the dialog reads as "this family is in use" while the old font
+    // is still on screen, which is the bug this row exists to close.
+    //
+    // Pushed only when there IS something to say, so the common case does not
+    // spend a line of a scrolling panel on silence. That cannot shift the
+    // selection out from under the user: the advisory sits BELOW the Family row,
+    // and the only thing that makes it come or go is stepping that row, which
+    // requires the selection to be on it. `prefs_model::step` never lands on an
+    // unusable family, so from here the line can only disappear, never appear.
+    if let Some(line) = family_advisory(family) {
+        v.push(Row {
+            kind: RowKind::Display,
+            label: String::new(),
+            value: line.to_string(),
+            pref: None,
+            enabled: true,
+        });
+    }
 
     v.push(sec("Appearance"));
     v.push(stepper("Background opacity", format!("{:.2}", s.background_opacity), PrefRow::Opacity));
@@ -438,7 +464,14 @@ mod tests {
     use rt_config::Settings;
 
     fn rs(s: &Settings) -> Vec<Row> {
-        rows(s, 16 * 1024 * 1024 * 1024, 80) // 16 GB of RAM, an 80-column pane
+        // 16 GB of RAM, an 80-column pane, and a font rt can actually draw —
+        // the ordinary case every test below the family ones is about.
+        rows(s, 16 * 1024 * 1024 * 1024, 80, FamilyStatus::Usable)
+    }
+
+    /// The index of the Family row, found by scanning (never hardcoded).
+    fn family_row(rows: &[Row]) -> usize {
+        rows.iter().position(|r| r.pref == Some(PrefRow::FontFamily)).expect("a Family row")
     }
 
     #[test]
@@ -529,6 +562,59 @@ mod tests {
         }
     }
 
+    /// The display half of the bug: a configured family rt cannot draw must not
+    /// be shown as though it were the font on screen. The row still carries the
+    /// name (that IS the setting, and the arrows edit it), and the line beneath
+    /// says a fallback is what is rendering — the same shape as the TERM row.
+    #[test]
+    fn a_family_rt_cannot_draw_is_shown_as_not_in_use() {
+        let s = Settings { font_family: "GB18030 Bitmap".to_string(), ..Settings::default() };
+        for status in [FamilyStatus::Missing, FamilyStatus::Unrasterisable] {
+            let rows = rows(&s, 16 * 1024 * 1024 * 1024, 80, status);
+            let i = family_row(&rows);
+            assert_eq!(rows[i].value, "GB18030 Bitmap", "the configured name stays visible");
+            assert_eq!(rows[i + 1].kind, RowKind::Display, "{status:?}: an advisory must follow it");
+            assert_eq!(
+                rows[i + 1].value,
+                family_advisory(status).unwrap(),
+                "{status:?}: the row must carry the model's advisory, not a second copy"
+            );
+            assert!(rows[i + 1].pref.is_none(), "an advisory is a readout, not a setting");
+        }
+        // And when rt IS drawing the configured family, the dialog says nothing:
+        // no line of a scrolling panel spent on "everything is fine".
+        let rows = rows(&s, 16 * 1024 * 1024 * 1024, 80, FamilyStatus::Usable);
+        let i = family_row(&rows);
+        assert_eq!(rows[i + 1].kind, RowKind::Section, "the usable case goes straight on");
+    }
+
+    /// The advisory must not move the row the user is standing on. It sits below
+    /// the Family row, so the Family row's own index — and every index above it
+    /// — is the same whether or not the advisory is there.
+    #[test]
+    fn the_advisory_never_shifts_the_row_it_explains() {
+        let s = Settings { font_family: "GB18030 Bitmap".to_string(), ..Settings::default() };
+        let usable = rows(&s, 1 << 34, 80, FamilyStatus::Usable);
+        for status in [FamilyStatus::Missing, FamilyStatus::Unrasterisable] {
+            let bad = rows(&s, 1 << 34, 80, status);
+            assert_eq!(family_row(&bad), family_row(&usable), "{status:?}: Family row moved");
+            assert_eq!(bad.len(), usable.len() + 1, "{status:?}: exactly one extra row");
+        }
+    }
+
+    /// A `Display` row is drawn from the label column, so it has the panel's
+    /// inner width minus the one-cell indent to fit in. The advisories are
+    /// fixed strings, so this can be pinned exactly rather than hoped for.
+    #[test]
+    fn every_family_advisory_fits_the_panel() {
+        let budget = LABEL_COLS + VALUE_COLS + ARROW_W as usize * 2 - 1;
+        for status in [FamilyStatus::Usable, FamilyStatus::Missing, FamilyStatus::Unrasterisable] {
+            let Some(line) = family_advisory(status) else { continue };
+            let n = line.chars().count();
+            assert!(n <= budget, "{status:?} advisory is {n} cells, budget {budget}: {line:?}");
+        }
+    }
+
     #[test]
     fn headers_and_readouts_are_not_selectable() {
         let rows = rs(&Settings::default());
@@ -589,7 +675,7 @@ mod tests {
         let mut s = Settings::default();
         s.scrollback = 1_000_000;
         // 16 GB of RAM, 80 columns.
-        let rows = rows(&s, 16 * 1024 * 1024 * 1024, 80);
+        let rows = rows(&s, 16 * 1024 * 1024 * 1024, 80, FamilyStatus::Usable);
         // Find the scrollback readout specifically — there is also a version
         // Display row at the top now.
         let readout = rows

@@ -525,6 +525,11 @@ struct Active {
     font_db: std::sync::Arc<fontdb::Database>, // for reloading fonts on a family change
     font_blobs: render::FontBlobs,        // the current font chains (kept so a size change can reload)
     mono_families: Vec<String>,           // monospace family names for the preferences picker
+    // Which families rt can actually draw, learned lazily and remembered (see
+    // `family_status`). Populated one family at a time, by the preferences
+    // dialog asking about the one it is showing or the one a step is about to
+    // land on — never by a sweep, because each entry costs a font parse.
+    font_status: std::collections::HashMap<String, prefs_model::FamilyStatus>,
     damage: crate::damage::DamageAccumulator, // this frame's accumulated pixel damage
     damage_history: std::collections::VecDeque<crate::damage::FrameDamage>, // recent frames' damage, for buffer-age
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
@@ -900,6 +905,70 @@ fn usable_face(
             None
         }
     }
+}
+
+/// What `usable_face` decided about a family's regular face, as something the
+/// preferences dialog can say out loud.
+///
+/// Split from the lookup so it is testable without a font that happens to be
+/// installed: `font_fallback_tests` feeds it the same unparseable probe the
+/// fallback tests use.
+fn face_status(face: Option<&render::FontBlob>) -> prefs_model::FamilyStatus {
+    match face {
+        None => prefs_model::FamilyStatus::Missing,
+        Some(b) if b.parse().is_ok() => prefs_model::FamilyStatus::Usable,
+        Some(_) => prefs_model::FamilyStatus::Unrasterisable,
+    }
+}
+
+/// Can rt draw `family`, and if not, why not?
+///
+/// The predicate is the REGULAR face's, because that is the face `font_blobs`
+/// makes the primary and the one whose failure sends the whole chain to a
+/// fallback. Bold/italic are optional everywhere else in rt and stay optional
+/// here: a family with an unreadable bold still renders.
+///
+/// Costs one font parse — measured across all 129 monospace families on a Linux
+/// host: 490 ms in release for the lot, median 0.25 ms, worst 150 ms (Unifont,
+/// 5.3 MB). That is cheap for ONE family and far too dear for all of them at
+/// startup, which is why every caller goes through the memo in
+/// `Active::font_status` and only ever asks about a family it is showing or
+/// about to select.
+fn family_status(db: &fontdb::Database, family: &str) -> prefs_model::FamilyStatus {
+    let face = face_data(db, family, fontdb::Weight::NORMAL, fontdb::Style::Normal);
+    face_status(face.as_ref())
+}
+
+/// A memo over [`family_status`]: one font parse per family, ever.
+///
+/// This is what makes the lazy check affordable. `chrome::prefs::rows` runs on
+/// every frame the dialog is painted, and a held arrow key walks the family list
+/// several times a second; without the memo each of those would re-parse a font.
+/// The first pass pays one parse per family it actually reaches — which the
+/// settle's font reload was going to pay anyway for the family it lands on — and
+/// everything after that is a hash lookup.
+///
+/// Never invalidated. `build_font_db` scans the system fonts once at startup and
+/// rt never rescans, so a stale entry would need a font to be installed AND rt
+/// to have already asked about that exact name; picking up newly installed fonts
+/// takes a restart today, and this changes nothing there.
+///
+/// The `warn!` fires once per family, from the memo miss, so a dialog left open
+/// on an unusable family cannot spam the log at frame rate.
+fn cached_family_status(
+    cache: &mut std::collections::HashMap<String, prefs_model::FamilyStatus>,
+    db: &fontdb::Database,
+    family: &str,
+) -> prefs_model::FamilyStatus {
+    if let Some(known) = cache.get(family) {
+        return *known;
+    }
+    let st = family_status(db, family);
+    if st != prefs_model::FamilyStatus::Usable {
+        log::warn!("font family {family:?}: {st:?} — rt is drawing a fallback font instead");
+    }
+    cache.insert(family.to_string(), st);
+    st
 }
 
 fn font_blobs(db: &fontdb::Database, family: &str) -> render::FontBlobs {
@@ -1738,6 +1807,7 @@ impl App {
             font_db: self.font_db.clone(),
             font_blobs,
             mono_families: self.mono_families.clone(),
+            font_status: std::collections::HashMap::new(),
             damage: crate::damage::DamageAccumulator::new(),
             damage_history: std::collections::VecDeque::new(),
             force_full: true, // first frame is always a full redraw
@@ -2143,7 +2213,8 @@ impl ApplicationHandler for App {
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
                     let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols);
+                    let fam = cached_family_status(&mut active.font_status, &active.font_db, &s.font_family);
+                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols, fam);
                     let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
                     match &ke.logical_key {
                         Key::Named(NamedKey::Escape) => {
@@ -2194,7 +2265,8 @@ impl ApplicationHandler for App {
                     let (cw, ch) = active.backend.cell_size();
                     let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
                     let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols);
+                    let fam = cached_family_status(&mut active.font_status, &active.font_db, &s.font_family);
+                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols, fam);
                     let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
                     match chrome::prefs::hit(&g, active.mouse) {
                         Some(chrome::prefs::Hit::Step(i, dir)) => {
@@ -5844,15 +5916,23 @@ impl App {
     /// pane to the new (cols, rows). Shared by the preferences dialog and the
     /// zoom actions.
     ///
-    /// A family whose faces fontdue cannot read (bitmap-only fonts such as macOS
-    /// `GB18030 Bitmap`, and any CFF/OTF-only family) makes `reload_fonts` fail.
-    /// The backend then keeps the fonts it already has, so the screen does not
-    /// change — but the new family name is already committed and shown in
-    /// Preferences, which is confusing. Two things are done about that here:
-    /// the warning NAMES the family and says the previous font was kept, and the
-    /// previous `font_blobs` are restored, so a later zoom (`family_changed ==
-    /// false`) reloads the font that is actually on screen instead of retrying
-    /// the unusable chain and failing too.
+    /// A family whose faces fontdue cannot read (a bitmap-only font such as
+    /// macOS `GB18030 Bitmap`) makes `reload_fonts` fail. The backend then keeps
+    /// the fonts it already has, so the screen does not change. Three things are
+    /// done about that here: the warning NAMES the family and says the previous
+    /// font was kept; the previous `font_blobs` are restored, so a later zoom
+    /// (`family_changed == false`) reloads the font that is actually on screen
+    /// instead of retrying the unusable chain and failing too; and the family is
+    /// recorded as unusable in `font_status`, so Preferences stops showing it as
+    /// the font in use and the stepper stops offering it.
+    ///
+    /// That last one is a backstop, not the main defence: `prefs_model::step`
+    /// consults `cached_family_status` BEFORE landing on a family, so reaching
+    /// here at all means the parse check and the backend disagreed. Recording it
+    /// costs a family that a future reload might have accepted — but the choice
+    /// is between that and a dialog that keeps naming a font nothing is drawing,
+    /// which is the bug. Only on a family change: a failure during a size-only
+    /// reload says nothing about the family.
     fn refresh_fonts(active: &mut Active, family_changed: bool) {
         active.force_full = true; // cell metrics change: every cell→px mapping is stale
         // Keep the old chain: it is what the backend is still rendering, and it
@@ -5885,14 +5965,18 @@ impl App {
             Err(e) => {
                 log::warn!(
                     "font {:?} could not be loaded ({e}); keeping the previous font — \
-                     Preferences will still show {:?}",
+                     Preferences will show it as not in use",
                     active.settings.font_family,
-                    active.settings.font_family
                 );
                 // Put back the chain the backend is actually rendering, so the
                 // next zoom step reloads a font that parses.
                 if let Some(prev) = prev_blobs {
                     active.font_blobs = prev;
+                }
+                if family_changed {
+                    active
+                        .font_status
+                        .insert(active.settings.font_family.clone(), prefs_model::FamilyStatus::Unrasterisable);
                 }
             }
         }
@@ -7212,7 +7296,12 @@ impl App {
         let size = active.window.surface_size();
         let (cw, _ch) = active.backend.cell_size();
         let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-        let rows = chrome::prefs::rows(&active.settings, total_ram_bytes(), cols);
+        let fam = cached_family_status(
+            &mut active.font_status,
+            &active.font_db,
+            &active.settings.font_family.clone(),
+        );
+        let rows = chrome::prefs::rows(&active.settings, total_ram_bytes(), cols, fam);
         active.prefs_sel = chrome::prefs::selectable(&rows).first().copied().unwrap_or(0);
         active.prefs_scroll = 0;
     }
@@ -7288,7 +7377,8 @@ impl App {
         // Exactly how the old egui dialog derived it: a full-width pane at the
         // current font size. There is no `pane.cols()`.
         let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-        let rows = chrome::prefs::rows(&s, total_ram_bytes(), cols);
+        let fam = cached_family_status(&mut active.font_status, &active.font_db, &s.font_family);
+        let rows = chrome::prefs::rows(&s, total_ram_bytes(), cols, fam);
         let g = chrome::prefs::layout(&rows, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
         let mut sw = vec![Color::rgb(s.foreground[0], s.foreground[1], s.foreground[2])];
         sw.push(Color::rgb(s.background[0], s.background[1], s.background[2]));
@@ -7364,7 +7454,18 @@ impl App {
         // depends on what terminfo is installed, and `tic`-ing rt's own entry while rt is
         // running should make `rt` appear in the picker without a restart.
         let terms = rt_config::term_candidates(&s.term);
-        prefs_model::step(&mut s, pref, dir, &active.mono_families, &terms);
+        // The Family row skips what rt cannot draw, so a step can never land on a
+        // family that would leave this dialog showing one name while another font
+        // renders. The oracle is asked lazily — one family per step, memoised —
+        // rather than by filtering the list up front, which would mean parsing
+        // every installed monospace face before the dialog could open.
+        //
+        // Destructured into disjoint field borrows: the family list is read while
+        // the usability memo is written.
+        let Active { font_db, font_status, mono_families, .. } = &mut *active;
+        prefs_model::step(&mut s, pref, dir, mono_families, &terms, &mut |f| {
+            cached_family_status(font_status, font_db, f) == prefs_model::FamilyStatus::Usable
+        });
         active.prefs_pending = Some(s);
         active.prefs_edits += 1;
         active.last_prefs_edit = Instant::now();
@@ -9013,6 +9114,63 @@ mod font_fallback_tests {
         let blobs = font_blobs(&db, &bad_family);
         let primary = blobs.regular.first().expect("must fall back, not give up");
         assert!(primary.parse().is_ok(), "{bad_family}: fell through to another unusable face");
+    }
+
+    /// What Preferences is told about a family, over all three cases — and
+    /// portably: the unparseable case rides the same out-of-range-index probe as
+    /// the fallback tests, so it is exercised on a machine with no bitmap font.
+    #[test]
+    fn a_family_reports_the_reason_rt_cannot_draw_it() {
+        use prefs_model::FamilyStatus;
+        let db = build_font_db();
+        let good = monospace_families(&db)
+            .into_iter()
+            .find_map(|f| face_data(&db, &f, Weight::NORMAL, Style::Normal))
+            .expect("some monospace face must exist");
+        assert_eq!(face_status(Some(&good)), FamilyStatus::Usable);
+        assert_eq!(face_status(Some(&unparseable())), FamilyStatus::Unrasterisable);
+        assert_eq!(face_status(None), FamilyStatus::Missing, "no face at all is a different story");
+        // And through the real lookup: a name nothing is installed under.
+        assert_eq!(family_status(&db, "this family is not installed"), FamilyStatus::Missing);
+    }
+
+    /// `family_status` must answer exactly what `usable_face` decides, or the
+    /// dialog would advertise a family the fallback chain refuses (or hide one it
+    /// accepts). Both go through `FontBlob::parse` on the regular face; this pins
+    /// that they stay the same predicate. Bounded to a handful of families —
+    /// parsing all of them is the `#[ignore]`d sweep's job.
+    #[test]
+    fn family_status_says_what_the_fallback_chain_does() {
+        use prefs_model::FamilyStatus;
+        let db = build_font_db();
+        let mut families: Vec<String> = monospace_families(&db).into_iter().take(4).collect();
+        families.push(rt_config::Settings::default().font_family);
+        families.push("this family is not installed".to_string());
+        for fam in families {
+            let usable = usable_face(&db, &fam, Weight::NORMAL, Style::Normal).is_some();
+            assert_eq!(
+                family_status(&db, &fam) == FamilyStatus::Usable,
+                usable,
+                "{fam}: the dialog and the fallback chain disagree"
+            );
+        }
+    }
+
+    /// The fast path: the memo asks the font database once per family, whatever
+    /// the caller does afterwards. The dialog repaints at frame rate and a held
+    /// arrow key laps the family list, so a second parse per family would put
+    /// hundreds of milliseconds of font parsing on the UI thread.
+    #[test]
+    fn the_usability_memo_asks_about_a_family_once() {
+        let db = build_font_db();
+        let mut cache = std::collections::HashMap::new();
+        let fam = "this family is not installed";
+        let first = cached_family_status(&mut cache, &db, fam);
+        assert_eq!(cache.len(), 1, "the answer must be remembered");
+        for _ in 0..100 {
+            assert_eq!(cached_family_status(&mut cache, &db, fam), first, "and stay the same");
+        }
+        assert_eq!(cache.len(), 1, "100 more asks must not add an entry, nor a parse");
     }
 
     /// The same invariant over EVERY family the picker offers. Slow (~140s: it
