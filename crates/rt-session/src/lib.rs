@@ -663,6 +663,48 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
         }
     }
 
+    /// Paste `text` into ONE named pane, bracketed (or not) by **that pane's
+    /// own** DECSET-2004 state — [`feed_paste`](Session::feed_paste) narrowed
+    /// from "the broadcast targets" to "this pane", sharing the same
+    /// [`wrap_bracketed_paste`] and therefore the same injection guard.
+    ///
+    /// It exists for text dragged in from another application and dropped on a
+    /// pane (`rt::textdrop`). That target is chosen by the POINTER, not by the
+    /// focus, so `feed_paste` cannot express it: its fan-out is
+    /// [`receives_broadcast`](Session::receives_broadcast), which is defined
+    /// entirely relative to `self.focus`. A spatial drop onto a pane that is not
+    /// the focus has no meaning under that rule without redefining broadcast, so
+    /// a drop delivers to exactly the pane it was aimed at and nowhere else.
+    ///
+    /// This is deliberately NOT a second paste path: the per-pane bracketing
+    /// decision — the one `feed_paste`'s doc records a real bug for — is made
+    /// here by the same rule from the same helper. Only the target set differs.
+    ///
+    /// No-op if `id` names no pane in this session (a pane can exit between the
+    /// pointer landing on it and the drop being processed).
+    pub fn paste_to_pane(&self, id: PaneId, text: &[u8]) {
+        if let Some(p) = self.panes.get(&id) {
+            if p.bracketed_paste() {
+                p.write(&wrap_bracketed_paste(text));
+            } else {
+                p.write(text);
+            }
+        }
+    }
+
+    /// Whether pane `id` has bracketed paste (DECSET 2004) on, or `None` if it
+    /// names no pane here.
+    ///
+    /// The one legitimate reason to ask instead of just calling
+    /// [`paste_to_pane`](Session::paste_to_pane): a dropped payload's BODY
+    /// depends on the mode too, not only its wrapper (`rt::textdrop::payload`
+    /// flattens line breaks that would otherwise run as commands in a shell that
+    /// never negotiated the mode). Caller reads it and delivers in the same
+    /// turn, off the same pane, so the two decisions cannot disagree.
+    pub fn pane_bracketed_paste(&self, id: PaneId) -> Option<bool> {
+        self.panes.get(&id).map(|p| p.bracketed_paste())
+    }
+
     /// Write `bytes` to every pane in THIS session carrying `group` — the
     /// cross-window half of `Broadcast::Group` delivery. `Session` only
     /// knows its own panes (see the module doc), so `App` (in `main.rs`)
@@ -1435,6 +1477,98 @@ mod tests {
             b"\x1b[200~line1\nline2\x1b[201~",
             "grouped pane (ON) must get its OWN bracketed wrap",
         );
+    }
+
+    /// A text drop names its pane by where the POINTER was, so it must reach
+    /// that pane and no other — even under `Broadcast::All`, where every
+    /// keystroke goes everywhere. Two panes here, broadcast wide open; only the
+    /// named one may see the bytes.
+    #[test]
+    fn a_drop_reaches_only_the_named_pane_even_under_broadcast() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let buf0 = Rc::new(RefCell::new(Vec::new()));
+        let buf1 = Rc::new(RefCell::new(Vec::new()));
+        let b0 = buf0.clone();
+        let mut s = Session::new(
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            (8.0, 16.0),
+            move |_id, _c, _r| Some(MockPane { writes: b0.clone(), bracketed: false }),
+        );
+        let _focus = s.focus();
+        let id1 = PaneId(u64::MAX - 2000); // see the sentinel note above
+        s.panes.insert(id1, MockPane { writes: buf1.clone(), bracketed: false });
+        s.broadcast = Broadcast::All;
+
+        s.paste_to_pane(id1, b"dropped");
+
+        assert!(buf0.borrow().is_empty(), "a drop must not fan out to the focus");
+        assert_eq!(&buf1.borrow()[..], b"dropped", "the pane under the pointer gets it");
+    }
+
+    /// And it is bracketed by THAT pane's own state, not the focus's — the same
+    /// load-bearing rule `feed_paste` enforces, reached through the same helper.
+    /// The focus here is bracketed OFF and the drop target ON, so a "decide from
+    /// the focus" bug would deliver raw text.
+    #[test]
+    fn a_drop_is_bracketed_by_its_own_panes_state() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let buf0 = Rc::new(RefCell::new(Vec::new()));
+        let buf1 = Rc::new(RefCell::new(Vec::new()));
+        let b0 = buf0.clone();
+        let mut s = Session::new(
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            (8.0, 16.0),
+            move |_id, _c, _r| Some(MockPane { writes: b0.clone(), bracketed: false }),
+        );
+        let id1 = PaneId(u64::MAX - 2001);
+        s.panes.insert(id1, MockPane { writes: buf1.clone(), bracketed: true });
+
+        assert_eq!(s.pane_bracketed_paste(id1), Some(true));
+        assert_eq!(s.pane_bracketed_paste(s.focus()), Some(false));
+        s.paste_to_pane(id1, b"one\ntwo");
+
+        assert_eq!(&buf1.borrow()[..], b"\x1b[200~one\ntwo\x1b[201~");
+    }
+
+    /// Dropped text carrying a bracketed-paste END marker must not be able to
+    /// close the bracket early and inject a command — the same guard the
+    /// clipboard path has, reached because both build the wrap in one place.
+    #[test]
+    fn a_drop_cannot_break_out_of_its_own_bracket() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let b = buf.clone();
+        let mut s = Session::new(
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            (8.0, 16.0),
+            move |_id, _c, _r| Some(MockPane { writes: b.clone(), bracketed: true }),
+        );
+        let id = s.focus();
+        s.paste_to_pane(id, b"safe\x1b[201~rm -rf /");
+        assert_eq!(&buf.borrow()[..], b"\x1b[200~saferm -rf /\x1b[201~");
+        let _ = &mut s;
+    }
+
+    /// A pane can exit between the pointer landing on it and the drop being
+    /// processed. That must be a quiet no-op, not a panic and not a misdelivery.
+    #[test]
+    fn a_drop_onto_a_dead_pane_is_a_no_op() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let b = buf.clone();
+        let s = Session::new(
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            (8.0, 16.0),
+            move |_id, _c, _r| Some(MockPane { writes: b.clone(), bracketed: false }),
+        );
+        let gone = PaneId(u64::MAX - 2002);
+        assert_eq!(s.pane_bracketed_paste(gone), None);
+        s.paste_to_pane(gone, b"nowhere");
+        assert!(buf.borrow().is_empty());
     }
 
     // ----- Cross-window Group broadcast (Task 12) ---------------------------

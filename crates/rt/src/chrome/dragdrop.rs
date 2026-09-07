@@ -18,6 +18,21 @@ use crate::chrome_scale::logical;
 use crate::dragdrop::ResolvedDrop;
 use crate::render::Color;
 
+/// Everything one frame's drag cues consist of, gathered so the painter takes a
+/// cue set rather than a growing list of parallel `Option`s.
+#[derive(Default)]
+pub struct Cues<'a> {
+    /// rt's own pane/tab drag: where a release would land, plus its rect.
+    pub drop: Option<&'a ResolvedDrop>,
+    /// Text dragged in from another application: the whole receiving pane.
+    pub text: Option<rt_core::Rect>,
+    /// The chip riding the cursor: (position, label). Shared by both gestures —
+    /// they can never be live at once.
+    pub ghost: Option<&'a ((f32, f32), String)>,
+    /// The pane being dragged, drawn dimmed at the place it came from.
+    pub dim: Option<rt_core::Rect>,
+}
+
 /// Draw every active drag cue: the dim over the pane being dragged, the
 /// drop-target highlight/caret, and the ghost chip riding the cursor.
 ///
@@ -33,16 +48,17 @@ use crate::render::Color;
 /// ON them: the caret's wings, the zone border, the ghost chip's padding and
 /// offset. Both halves take the same factor, so the cue the user sees still
 /// marks exactly the region the drop resolver accepted.
-pub fn draw(
-    backend: &mut dyn Backend,
-    cue: Option<&ResolvedDrop>,
-    ghost: Option<&((f32, f32), String)>,
-    dim: Option<rt_core::Rect>,
-    cell: (f32, f32),
-    win: (f32, f32),
-    sc: f32,
-) {
-    if cue.is_none() && ghost.is_none() && dim.is_none() {
+///
+/// `text_cue` is the SAME cue for a different gesture: text dragged in from
+/// another application (`crate::textdrop`), where the payload is bytes rather
+/// than a pane and the target is always a whole pane. It is drawn with the
+/// zone fill + border, identical to a pane drop zone, on purpose — a drop cue
+/// should look like a drop cue whatever is being dropped. The two can never be
+/// live at once (`App::chrome_busy` refuses a foreign drop while rt's own drag
+/// is running), so they share the `ghost` chip rather than stacking two.
+pub fn draw(backend: &mut dyn Backend, cues: Cues<'_>, cell: (f32, f32), win: (f32, f32), sc: f32) {
+    let Cues { drop: cue, text: text_cue, ghost, dim } = cues;
+    if cue.is_none() && text_cue.is_none() && ghost.is_none() && dim.is_none() {
         return;
     }
     // See the module doc: this whole painter runs inside an instrument layer
@@ -72,6 +88,15 @@ pub fn draw(
             backend.fill_rect(c.cue.x, c.cue.y, e, c.cue.h, cue_edge);
             backend.fill_rect(c.cue.x + c.cue.w - e, c.cue.y, e, c.cue.h, cue_edge);
         }
+    }
+    if let Some(r) = text_cue {
+        // A whole-pane zone, drawn exactly like the pane-drop zone above.
+        let e = sc * logical::DROP_ZONE_EDGE;
+        backend.fill_rect(r.x, r.y, r.w, r.h, cue_fill);
+        backend.fill_rect(r.x, r.y, r.w, e, cue_edge);
+        backend.fill_rect(r.x, r.y + r.h - e, r.w, e, cue_edge);
+        backend.fill_rect(r.x, r.y, e, r.h, cue_edge);
+        backend.fill_rect(r.x + r.w - e, r.y, e, r.h, cue_edge);
     }
     if let Some(((x, y), label)) = ghost {
         // A small chip to the lower-right of the cursor with the payload

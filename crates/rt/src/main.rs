@@ -84,6 +84,19 @@ mod render; // the GL glyph-atlas renderer
 // too — a HiDPI Wayland/X11 output reports 2.0 and hits exactly the same path.
 mod scale_policy; // pure decision table for WindowEvent::ScaleFactorChanged
 mod select; // pure head-navigation logic for anchored selection
+mod textdrop; // pure policy for text dragged in from ANOTHER app (browser selection -> pane)
+// The macOS half of that feature: an NSDraggingDestination for
+// NSPasteboardTypeString. winit registers the NSWindow for FILE drops only and
+// refuses everything else before an event exists, so the receiver has to sit
+// below winit -- see the module doc.
+#[cfg(target_os = "macos")]
+mod text_drop_mac; // AppKit receiver for dragged-in text
+// And the X11 half: an XdndProxy window on rt's own x11rb connection. winit's
+// X11 backend does speak XDND, but hardcodes text/uri-list, and XDND client
+// messages reach only the client that created the window -- so the protocol's
+// own proxy mechanism is what lets rt receive them. See the module doc.
+#[cfg(not(target_os = "macos"))]
+mod text_drop_x11; // XDND receiver for dragged-in text (inert without the x11 feature)
 mod touch; // pure multi-touch gesture state: which fingers are down, and what they mean
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
@@ -605,6 +618,24 @@ struct Active {
     // stands down entirely: a carry outlives motion, so nothing may reset the
     // shape until the carry ends. Cleared for every window by `cancel_carry`.
     carry_cursor: bool,
+    // Text dragged in from ANOTHER application (a browser selection), which is
+    // a different gesture from the three fields above: rt is the DESTINATION,
+    // the payload is bytes rather than a pane, and no part of it is rt's to
+    // cancel. The cue rect + ghost chip are painted by the same
+    // `chrome::dragdrop::draw` the internal drag uses, so both gestures speak
+    // one visual language. Not `cfg`'d: every platform's receiver writes here.
+    text_drop_cue: Option<rt_core::Rect>, // the pane a release would land in (its whole rect)
+    text_drop_ghost: Option<((f32, f32), String)>, // the chip riding the cursor: (position, label)
+    // The macOS receiver's mailbox, polled once per turn in `about_to_wait`.
+    // `None` when the AppKit destination could not be installed — the feature
+    // is then simply absent, like `vibrancy::set_enabled` returning false.
+    #[cfg(target_os = "macos")]
+    text_drop: Option<std::rc::Rc<std::cell::RefCell<text_drop_mac::DropInbox>>>,
+    // The X11 receiver's XDND proxy. Inert on native Wayland and in a build
+    // without the `x11` feature, exactly like `x11_blur` beside it, so the field
+    // needs no `cfg` of its own beyond "not macOS".
+    #[cfg(not(target_os = "macos"))]
+    text_drop_x11: text_drop_x11::X11TextDrop,
     // The OS window — LAST so it outlives everything that references it on
     // Drop (see the comment at the top of this struct). On macOS it is an
     // `Arc<dyn Window>` instead of `Box<dyn Window>`: `WgpuBackend::new` (Task
@@ -1585,6 +1616,13 @@ impl App {
                 window.set_blur(want);
             }
         }
+        // Text dragged in from another application. Installed AFTER the glass on
+        // purpose: vibrancy adds its effect view to the window's FRAME view (one
+        // level up, below the content view) while this adds a click-through view
+        // INSIDE the content view, so neither can be mistaken for the other's,
+        // and the order between them is free. Both degrade to a quiet no-op.
+        #[cfg(target_os = "macos")]
+        let text_drop = text_drop_mac::install(window.as_ref());
         // Cross-compositor blur via the ext-background-effect-v1 staging protocol
         // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
         // translucent — blur behind an opaque surface is wasted compositor work.
@@ -1595,6 +1633,11 @@ impl App {
         // picom). Inert on Wayland and on a no-x11 build.
         #[cfg(not(target_os = "macos"))]
         let x11_blur = x11_blur::X11Blur::try_init(window.as_ref(), want_blur(&settings));
+        // Text dragged in from another application, X11 half: an XdndProxy
+        // window on rt's own x11rb connection. Inert on native Wayland. The
+        // macOS twin is installed further up, beside the frosted glass.
+        #[cfg(not(target_os = "macos"))]
+        let text_drop_x11 = text_drop_x11::X11TextDrop::try_init(window.as_ref());
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
         // IMEs work: composed text arrives via WindowEvent::Ime(Commit). rt asks
@@ -1981,6 +2024,12 @@ impl App {
             drag_ghost: None,
             drag_dim: None,
             carry_cursor: false,
+            text_drop_cue: None,
+            text_drop_ghost: None,
+            #[cfg(target_os = "macos")]
+            text_drop,
+            #[cfg(not(target_os = "macos"))]
+            text_drop_x11,
         })
     }
 
@@ -3745,7 +3794,35 @@ impl ApplicationHandler for App {
             .chain(self.carry.iter().flat_map(|c| c.payload_panes.iter().copied()))
             .collect();
         let mut drag_payload_died = false;
+        // Snapshotted before the loop below borrows `self.windows` mutably:
+        // `chrome_busy` needs the App-level drag/carry state, which is not
+        // reachable from inside that borrow.
+        let app_busy = self.drag.is_some() || self.carry.is_some() || self.armed_drag.is_some();
         for (&wid, active) in self.windows.iter_mut() {
+            // Text dragged in from another application (macOS today; the
+            // Wayland/X11 receivers land in the same `apply_text_drop`). Read
+            // once per turn of the loop, from a mailbox the AppKit destination
+            // fills on the same thread — see `text_drop_mac`'s module doc for
+            // why that is as timely as a winit event.
+            #[cfg(target_os = "macos")]
+            if let Some(inbox) = active.text_drop.clone() {
+                let change = inbox.borrow_mut().take_change();
+                if let Some(news) = change {
+                    Self::apply_text_drop(active, Self::chrome_busy(active, app_busy), news);
+                }
+            }
+            // The X11 twin. Its connection's fd is not in winit's poll set, so
+            // this turn of the loop IS its event dispatch; `dragging()` then
+            // holds the loop at the fast poll rate for the rest of the gesture,
+            // or the cue would crawl at IDLE_POLL. See the module doc.
+            #[cfg(not(target_os = "macos"))]
+            if let Some(news) = active.text_drop_x11.pump() {
+                Self::apply_text_drop(active, Self::chrome_busy(active, app_busy), news);
+            }
+            #[cfg(not(target_os = "macos"))]
+            if active.text_drop_x11.dragging() {
+                active.active_until = Instant::now() + ACTIVE_TAIL;
+            }
             let (close, interval, died) = Self::tick_active(active, &drag_panes);
             drag_payload_died |= died;
             if close {
@@ -4342,6 +4419,109 @@ impl App {
 }
 
 impl App {
+    /// Does rt's own chrome own the pointer right now, so that text dragged in
+    /// from another application must NOT reach a pane?
+    ///
+    /// Two halves. An **overlay** — preferences (and the colour picker over it),
+    /// the context menu, the manual, the search bar, the clipboard history — is
+    /// drawn over panes and takes the pointer; a drop landing on it would insert
+    /// into whatever pane happens to be underneath, which the user cannot even
+    /// see. A **live internal drag or carry** is a different gesture already
+    /// using the pointer, and letting a foreign drop resolve mid-way through it
+    /// would commit two things at once.
+    ///
+    /// Handed to `textdrop::resolve` as its `busy` argument. `app_busy` is the
+    /// App-level half — "a pane/tab drag or carry is live" — passed in rather
+    /// than read from `&self`, because every caller is already inside a mutable
+    /// borrow of `self.windows` and cannot reach the `App`'s own fields there.
+    /// Split, but still ONE predicate: nobody assembles a second copy of it.
+    fn chrome_busy(active: &Active, app_busy: bool) -> bool {
+        app_busy
+            || active.prefs_open
+            || active.picker.is_some()
+            || active.menu.is_some()
+            || active.manual_open
+            || active.search_open
+            || active.clip_overlay.is_some()
+    }
+
+    /// Fold one turn's worth of text-drop news into a window: move the cue and
+    /// the ghost chip with the pointer, and deliver a completed drop.
+    ///
+    /// Deliberately NOT `cfg`'d to macOS. Every platform receiver reduces its
+    /// traffic to a `textdrop::DropNews` first — AppKit's dragging destination
+    /// and X11's XDND proxy both do, and a Wayland one would — so all of them
+    /// call this, and the behaviour cannot fork per platform.
+    ///
+    /// `busy` is [`chrome_busy`](App::chrome_busy).
+    ///
+    /// The delivery is the interesting part:
+    ///
+    /// * The pane is the one **under the pointer** (`textdrop::resolve`), not
+    ///   the focused one — that is the whole point of dropping.
+    /// * The bytes go out through `Session::paste_to_pane`, the same
+    ///   wrap-and-strip `feed_paste` uses, so the drop is bracketed by the
+    ///   TARGET pane's own DECSET-2004 state and cannot break out of its own
+    ///   bracket. It reaches that one pane only, never the broadcast set: a
+    ///   spatial drop has no meaning under a focus-relative fan-out rule.
+    /// * `textdrop::payload` decides the body first, from the same pane's
+    ///   bracketed-paste state read in the same turn — that is where a
+    ///   multi-line payload is stopped from running as a series of commands in a
+    ///   shell that never negotiated the mode. See its doc.
+    /// * Focus follows the drop. After dropping a command the user presses
+    ///   Return, and it has to go where the text went — the same reason a click
+    ///   focuses.
+    fn apply_text_drop(active: &mut Active, busy: bool, news: textdrop::DropNews) {
+        let textdrop::DropNews { hover, dropped } = news;
+        let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
+        let panes = active.session.visible_rects(bounds);
+        let bars = active.session.tab_bars(bounds);
+
+        // The hover cue: where a release would land, and the chip naming the
+        // payload. The chip rides wherever the pointer is (so the user can see
+        // rt noticed the drag at all); the cue appears only where the text would
+        // actually be inserted, which is the honest "no" over rt's own chrome.
+        let cue = hover.as_ref().and_then(|(at, _)| textdrop::resolve(&panes, &bars, *at, busy)).map(|t| t.cue);
+        let ghost = hover;
+        if cue != active.text_drop_cue || ghost != active.text_drop_ghost {
+            active.text_drop_cue = cue;
+            active.text_drop_ghost = ghost;
+            // The cue/chip are chrome over unchanged pane content, so there is
+            // no engine cell-damage to drive a partial frame.
+            active.force_full = true;
+            active.window.request_redraw();
+        }
+
+        let Some((at, text)) = dropped else { return };
+        // The gesture is over either way: the cue goes with it.
+        if active.text_drop_cue.is_some() || active.text_drop_ghost.is_some() {
+            active.text_drop_cue = None;
+            active.text_drop_ghost = None;
+            active.force_full = true;
+            active.window.request_redraw();
+        }
+        let Some(target) = textdrop::resolve(&panes, &bars, at, busy) else {
+            log::debug!("text drop at {at:?} hit no pane (chrome or gutter); discarded");
+            return;
+        };
+        let Some(bracketed) = active.session.pane_bracketed_paste(target.pane) else {
+            return; // the pane exited between the release and this turn
+        };
+        let body = textdrop::payload(&text, bracketed);
+        if body.is_empty() {
+            return; // whitespace-only payload: nothing to insert
+        }
+        log::debug!(
+            "text drop: {} bytes into pane {:?} (bracketed={bracketed})",
+            body.len(),
+            target.pane,
+        );
+        active.session.paste_to_pane(target.pane, body.as_bytes());
+        active.session.focus_at(at.0, at.1); // the next Return belongs to this pane
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
     /// Abandon any pane/tab drag: forget the App-level state and wipe the cue
     /// fields off the window that was showing them. Used by Escape, by a second
     /// mouse button pressed mid-drag, by a payload pane dying mid-drag, and by
@@ -7364,7 +7544,16 @@ impl App {
         // `drag_dim` alone is enough: while the pointer is hovering ANOTHER
         // window, the source keeps only the dim (its cue and ghost went with
         // the pointer) and must still paint it.
-        if active.drag_cue.is_some() || active.drag_ghost.is_some() || active.drag_dim.is_some() {
+        // The text-drop cue (text dragged in from ANOTHER application) is drawn
+        // by the same painter, in the same pass: it is the same gesture from the
+        // user's side, and the two can never be live together — see
+        // `App::chrome_busy`, which is why they can share the ghost chip.
+        if active.drag_cue.is_some()
+            || active.drag_ghost.is_some()
+            || active.drag_dim.is_some()
+            || active.text_drop_cue.is_some()
+            || active.text_drop_ghost.is_some()
+        {
             let dim = active.drag_dim.and_then(|p| {
                 let bounds = content_bounds(active.window.surface_size(), active.chrome_sc);
                 active.session.visible_rects(bounds).into_iter().find(|(id, _)| *id == p).map(|(_, r)| r)
@@ -7373,9 +7562,12 @@ impl App {
             let cell = active.backend.cell_size();
             chrome::dragdrop::draw(
                 &mut *active.backend,
-                active.drag_cue.as_ref(),
-                active.drag_ghost.as_ref(),
-                dim,
+                chrome::dragdrop::Cues {
+                    drop: active.drag_cue.as_ref(),
+                    text: active.text_drop_cue,
+                    ghost: active.drag_ghost.as_ref().or(active.text_drop_ghost.as_ref()),
+                    dim,
+                },
                 cell,
                 (size.width as f32, size.height as f32),
                 active.chrome_sc,

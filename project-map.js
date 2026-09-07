@@ -136,6 +136,22 @@ window.PROJECT_MAP = {
       deps: ["rt-session"]
     },
 
+    {
+      id: "text-drop", label: "Dropped-in text", layer: "frontend", status: "active",
+      tags: ["macOS", "X11", "Wayland pending"],
+      desc: "Text dragged in from ANOTHER application (select in Chrome/Firefox, drag onto a pane, drop) is inserted like a paste \u2014 the feature terminator and gnome-terminal have and Alacritty does not. winit surfaces FILE drops only (WindowEvent::DragEntered carries Vec<PathBuf>; its macOS delegate registers NSFilenamesPboardType alone and refuses everything else), so each platform needs a receiver below winit. macOS is done: an NSDraggingDestination NSView registered for NSPasteboardTypeString, added as a click-through \"glass\" subview of winit's content view (hitTest: returns nil, so mouse/IME/cursor still land on winit's view) writing into an Rc<RefCell<DropInbox>> the run-loop reads in about_to_wait. The pane under the POINTER takes the drop (not the focus) and then becomes the focus; delivery is Session::paste_to_pane, the same per-pane bracketed-paste wrap + end-marker strip feed_paste uses, so it reaches exactly one pane and cannot break out of its own bracket. Both decisions \u2014 which pane, and what bytes \u2014 live in the un-cfg'd textdrop module so Linux CI tests them. X11 is done too, by a different mechanism: winit-x11 speaks XDND but hardcodes text/uri-list, and XDND client messages reach only the window's creating client, so rt names a 1x1 window of its own as the toplevel's XdndProxy and receives the whole exchange there. Wayland is the one left, and it is blocked on a regression risk rather than on reachability -- see the Wayland part below.",
+      files: ["crates/rt/src/textdrop.rs", "crates/rt/src/text_drop_mac.rs", "crates/rt/src/text_drop_x11.rs", "crates/rt/src/main.rs", "crates/rt/src/chrome/dragdrop.rs", "crates/rt-session/src/lib.rs"],
+      parts: [
+        { label: "Drop policy (pure, tested)", status: "done", desc: "textdrop::resolve picks the pane under the cursor and refuses tab strips, gutters and open overlays; textdrop::payload normalises CRLF, never delivers a trailing newline, and flattens line breaks when the target has no bracketed paste. 18 unit tests, run on Linux." },
+        { label: "Paste path (one path, not two)", status: "done", desc: "Session::paste_to_pane + pane_bracketed_paste: feed_paste's wrap-and-strip narrowed to the pane the pointer named, never the broadcast set." },
+        { label: "macOS receiver", status: "done", desc: "NSDraggingDestination glass subview for NSPasteboardTypeString; file drops still reach winit untouched." },
+        { label: "Drop cue", status: "done", desc: "The receiving pane lights up with the same zone fill/border and ghost chip chrome::dragdrop draws for an internal pane drag." },
+        { label: "Wayland receiver", status: "planned", desc: "Blocked on a regression risk, not on reachability: winit-wayland has NO data-device code at all, but smithay-clipboard (rt's Wayland clipboard) already owns one for the seat, so a DnD device would be the client's second. A compositor that delivers wl_data_device events to only one resource per client-seat could then send `selection` to the wrong one and silently break paste. Needs testing on Mutter/KWin, or rt owning both clipboard and DnD on one device." },
+        { label: "X11 receiver", status: "done", desc: "XDND via the protocol's own XdndProxy property: a 1x1 unmapped window on rt's own x11rb connection is named as the toplevel's proxy, so sources send every XDND ClientMessage there (they are sent with mask 0 and reach only the creating client, so no second connection could listen in otherwise). GTK, Qt and Chromium all read XdndProxy. Costs winit's uri-list file drop on X11, which rt never handled." }
+      ],
+      deps: ["rt-app", "rt-session"]
+    },
+
     /* ---- Chrome & Interaction ---- */
     {
       id: "selection", label: "Text selection", layer: "chrome", status: "done",
