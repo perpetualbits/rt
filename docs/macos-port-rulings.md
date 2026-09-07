@@ -243,7 +243,7 @@ that is not in the tree:
 - **Reversal cost:** trivial.
 - **Affects Linux?** No (the Linux arms are unchanged and still covered by four tests).
 
-### 2.6 The macOS backend advertises no damage capability at all — every frame is a full redraw
+### 2.6 The macOS backend advertises no damage capability at all — every frame is a full redraw — UPHELD 2026-09-07, now measured
 - **Decided:** `partial_present_available() → false`, `buffer_age() → 0`,
   `x11_present_active() → false`, `present()` ignores its damage argument,
   `supports_scroll_blit()` stays false, and `is_gl()` returns **true** (it distinguishes
@@ -255,6 +255,66 @@ that is not in the tree:
   frame on macOS, so all of rt's damage-tracking work is inert there.
 - **Reversal cost:** structural.
 - **Affects Linux?** No.
+
+**Re-examined and upheld, with numbers.** The original ruling rested on the assertion that
+"a full terminal-grid redraw on an Apple GPU is negligible", which nobody had measured. It
+now is, by `crates/rt/src/wgpu_offscreen/bench.rs` on an Apple M5 (macOS 26.6.2, release
+build, medians of 7 interleaved repetitions of 60 back-to-back frames):
+
+| path (3024x1964 Retina, 177x61 = 10 797 cells) | cpu | gpu | total |
+|---|---|---|---|
+| **FULL redraw — today's macOS path** | 109us | 287us | **396us** |
+| the surface-sized blit alone, drawing nothing | 0us | 118us | 118us |
+| offscreen+blit, 1 row (a keystroke / cursor blink) | 2us | 120us | 122us (3.25x faster) |
+| offscreen+blit, 10% of rows (a busy pane) | 11us | 139us | 150us (2.63x faster) |
+| offscreen+blit, 50% of rows | 55us | 191us | 246us (1.61x faster) |
+| offscreen+blit, every row (full-screen redraw) | 105us | 331us | 435us (1.10x **slower**) |
+
+On a 1x external monitor (1920x1080, a *denser* 213x67 grid) the full redraw costs 502us and
+the one-row case 79us — same shape, 6.35x at the best end, 1.06x slower at the worst.
+
+The assertion holds: **a full redraw is 2.4% of a 60Hz frame and 4.8% of a 120Hz ProMotion
+frame.** The partial path is genuinely 3-6x cheaper on a keystroke, but the absolute saving
+is ~274us/frame, and it is bought with:
+
+- a persistent 23.8 MB surface-sized texture **per window** (rt is multi-window);
+- a surface-sized blit every frame whatever the damage — 118us of the partial path's 122us
+  *is* the blit, so the design's floor is ~30% of the full redraw it replaces;
+- changing `main.rs`'s `!backend.is_software()` full-damage gate (`main.rs:6702`), which is
+  shared with the Linux GL path. That gate is rt's existing position that hardware GPUs do
+  not need damage tracking, and this measurement is evidence *for* it, not against.
+
+Damage tracking exists in rt for slow boards and `ssh -X`, where it is worth ten times this.
+Wiring it into wgpu would make every partial-redraw correctness hazard live — resize,
+scale-factor change, the vibrancy alpha, the two-`end_frame`-per-frame overlay batching, the
+6fps instrument tick, the pane border bands — to recover under 2% of a frame. **Not landed.**
+
+What *did* land is the pair of latent bugs that would have gone live the moment anyone
+flipped the flag; see §2.6a.
+
+### 2.6a Two latent bugs in the scissored path, fixed even though damage did not land
+- **What they were:** unreachable only because `partial_present_available()` is false.
+  1. `begin_frame_scissored` recorded a full-surface `LoadOp::Clear`. A load op is the tile
+     initialiser — it runs over the whole attachment before any fragment exists — so
+     `set_scissor_rect`, which only discards fragments, cannot clip it. A partial redraw
+     would have blanked every pane outside the damage rect, every frame.
+  2. `pass.set_scissor_rect(r.x as u32, …)` cast `PxRect`'s `i32` fields to `u32`. rt's
+     damage rects legitimately go negative, and `-10 as u32` is 4294967286, which fails
+     wgpu's `x + width <= attachment width` validation. wgpu's default error handler
+     **panics**, so this is a process death mid-frame where `glScissor` merely clamps.
+- **Fixed in:** `wgpu_frame::background_op` (the load-op decision) and
+  `wgpu_frame::scissor_rect` (an i64 clamp), both pure and therefore covered by Linux CI;
+  `wgpu_text::paint_background` paints the scissored background as an **unblended**
+  screen-covering quad, which the scissor does clip, and which *replaces* rather than
+  composites — rt's background is translucent, so blending it would darken the damage rect a
+  little more on every repaint.
+- **Verified on hardware:** `crates/rt/src/wgpu_offscreen.rs` renders into a real offscreen
+  Metal target and reads the pixels back — the macOS counterpart of Linux's
+  `tests/damage_pixel_identity.rs`. Reintroducing bug 1 turns the corner pixel from the
+  previous frame's colour into the background; reintroducing bug 2 reproduces
+  `Scissor Rect { x: 4294967276, … } is not contained in the render target` verbatim.
+- **Affects Linux?** No. `wgpu_frame.rs` is deliberately not `cfg`'d so its tests run in
+  Linux CI, but nothing it decides is reachable from a Linux build.
 
 ### 2.7 Surface configuration: first available format, AutoVsync, PostMultiplied when offered
 - **Decided:** `format: caps.formats[0]` taken as-is (no sRGB preference, explicitly left

@@ -11,8 +11,21 @@
 //! `buffer_age()` is 0 ("unknown → redraw all"). `main.rs` therefore marks damage
 //! full every frame here. That is deliberate: damage tracking exists for slow
 //! boards and `ssh -X`, and a full terminal-grid redraw on an Apple GPU is
-//! negligible. Scissored *drawing* still works (`begin_frame_scissored` maps onto
-//! a render-pass scissor rect); only damage-limited *presenting* is unavailable.
+//! negligible.
+//!
+//! "Negligible" is measured, not assumed — see `wgpu_offscreen/bench.rs`, which
+//! is the whole argument. On an M5 a full 177x61 redraw at 3024x1964 costs
+//! **396us**, or 2.4% of a 60Hz frame and 4.8% of a 120Hz one. Without a buffer
+//! age the only *sound* partial path is a persistent surface-sized texture
+//! blitted to the drawable every frame, and that blit alone costs 118us — so the
+//! design's floor is ~30% of the full redraw it would replace, for a saving of
+//! ~274us on a keystroke frame, at 23.8 MB of texture per window. Not worth the
+//! correctness surface. `docs/macos-port-rulings.md` §2.6 carries the table.
+//!
+//! Scissored *drawing* still works (`begin_frame_scissored` maps onto a
+//! render-pass scissor rect) and is now correct rather than merely present —
+//! §2.6a, `wgpu_frame::background_op` and `wgpu_frame::scissor_rect`. Only
+//! damage-limited *presenting* is unavailable.
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -188,12 +201,22 @@ impl WgpuBackend {
         })
     }
 
-    /// Begin a frame, clearing to `bg`. `scissor` limits later draws.
+    /// Begin a frame, clearing to `bg`. `scissor` limits later draws — and, since
+    /// this backend's fix for it landed, the clear too.
     ///
-    /// The clear is RECORDED here, not issued: it becomes the `LoadOp::Clear` of the
-    /// first render pass `end_frame` opens (see `needs_clear`). A pass of its own would
-    /// be a full framebuffer store + load on a tile-based GPU for a pass that draws
-    /// nothing.
+    /// The clear is RECORDED here, not issued: the first render pass `end_frame` opens
+    /// applies it (see `needs_clear`). A pass of its own would be a full framebuffer
+    /// store + load on a tile-based GPU for a pass that draws nothing.
+    ///
+    /// *How* it is applied depends on `scissor`, and that distinction is not
+    /// cosmetic. Unscissored it is the pass's `LoadOp::Clear`, which is free on a
+    /// tile-based GPU. Scissored it CANNOT be: a load op is the tile initialiser,
+    /// it covers the whole attachment before any fragment exists, and
+    /// `set_scissor_rect` only ever discards fragments — so a scissored frame with
+    /// a load-op clear would blank every pane outside the damage rect and repaint
+    /// only what is inside it. `end_frame` therefore loads and paints the
+    /// background as an unblended quad instead; see `wgpu_frame::background_op`
+    /// and `wgpu_text::paint_background`.
     fn start(&mut self, bg: Color, scissor: Option<PxRect>) {
         self.clear = bg;
         self.scissor = scissor;
@@ -402,7 +425,7 @@ impl Backend for WgpuBackend {
     // underneath everything painted since ("menu under panes, disks under
     // titlebars"), double-blending through rt's translucent background.
     fn end_frame(&mut self) {
-        use crate::wgpu_frame::{end_frame_action, EndFrameAction};
+        use crate::wgpu_frame::{background_op, end_frame_action, scissor_rect, BackgroundOp, EndFrameAction};
         let action =
             end_frame_action(self.frame.is_some(), self.needs_clear, self.text.pending_vertex_count());
         let clear = match action {
@@ -417,6 +440,12 @@ impl Backend for WgpuBackend {
             EndFrameAction::Submit { clear } => clear,
         };
         let Some(frame) = self.frame.as_ref() else { return }; // Submit implies Some
+        // How this pass lays the background down. `LoadOp::Clear` is only legal
+        // when the frame owns the WHOLE surface: a load op is the tile
+        // initialiser, running before any fragment exists, so the scissor set
+        // below cannot clip it. A scissored frame loads and paints the
+        // background as a quad instead. See `wgpu_frame::background_op`.
+        let bg = background_op(clear, self.scissor.is_some());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let view = frame.texture.create_view(&Default::default());
         {
@@ -427,25 +456,22 @@ impl Backend for WgpuBackend {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: if clear {
+                        load: match bg {
                             // render.rs's Color is already normalised 0..1 AND carries
-                            // alpha, so this is a straight widen. The alpha matters in
-                            // Task 8: it is what lets the vibrancy show through, and at
-                            // 1.0 the frosted glass is invisible. A load op is not
-                            // affected by the scissor rect set below -- the clear covers
-                            // the whole attachment either way, exactly as the separate
-                            // clear pass did.
-                            wgpu::LoadOp::Clear(wgpu::Color {
+                            // alpha, so this is a straight widen. The alpha matters:
+                            // it is what lets the vibrancy show through, and at 1.0 the
+                            // frosted glass is invisible.
+                            BackgroundOp::ClearAll => wgpu::LoadOp::Clear(wgpu::Color {
                                 r: self.clear.0 as f64,
                                 g: self.clear.1 as f64,
                                 b: self.clear.2 as f64,
                                 a: self.clear.3 as f64,
-                            })
-                        } else {
-                            // Later passes of the same frame: the clear and the earlier
-                            // pass's geometry are already on the texture, and clearing
-                            // again would erase them.
-                            wgpu::LoadOp::Load
+                            }),
+                            // Later passes of the same frame: the background and the
+                            // earlier pass's geometry are already on the texture, and
+                            // clearing again would erase them. A scissored FIRST pass
+                            // also loads -- it paints its background below instead.
+                            BackgroundOp::LoadAndPaint | BackgroundOp::LoadOnly => wgpu::LoadOp::Load,
                         },
                         store: wgpu::StoreOp::Store,
                     },
@@ -453,7 +479,17 @@ impl Backend for WgpuBackend {
                 ..Default::default()
             });
             if let Some(r) = self.scissor {
-                pass.set_scissor_rect(r.x as u32, r.y as u32, r.w as u32, r.h as u32);
+                // Clamped, not cast: `PxRect` is signed and wgpu's scissor is
+                // u32-and-validated, so `r.x as u32` turns a negative origin
+                // into ~4 billion and panics the frame. See
+                // `wgpu_frame::scissor_rect`.
+                let (x, y, w, h) = scissor_rect(r, self.config.width, self.config.height);
+                pass.set_scissor_rect(x, y, w, h);
+            }
+            if bg == BackgroundOp::LoadAndPaint {
+                // Where the load-op clear would have been, in the same place in
+                // the order -- but as fragments, which the scissor above clips.
+                self.text.paint_background(&self.queue, &mut pass, self.clear);
             }
             self.text.flush(&self.queue, &mut pass);
         }

@@ -48,6 +48,13 @@ mod wgpu_text; // glyph atlas + pipeline for wgpu_backend
 // decisions as plain data (no wgpu types), so Linux CI can run the tests for a bug that
 // has already been introduced twice in a file no Linux build can even compile.
 mod wgpu_frame; // pure end_frame decision table for wgpu_backend
+// Test-only: a headless Metal device + offscreen target, so the two things that
+// can only be settled with real pixels on real hardware can be. It carries the
+// macOS counterpart of Linux's damage_pixel_identity gate (a scissored frame
+// must leave everything outside the damage rect alone) and the measurement that
+// decided whether damage tracking should be wired up here at all.
+#[cfg(all(test, target_os = "macos"))]
+mod wgpu_offscreen;
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard / macOS arboard)
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 // Also deliberately NOT cfg'd, and for the same reason as the two above: the process-tree

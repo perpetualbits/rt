@@ -73,9 +73,94 @@ pub fn end_frame_action(has_frame: bool, needs_clear: bool, pending_verts: usize
     }
 }
 
+/// How a pass puts rt's background colour onto the attachment.
+///
+/// This is a separate decision from [`end_frame_action`] because it depends on
+/// something `end_frame_action` cannot see: whether the frame is scissored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundOp {
+    /// `LoadOp::Clear(bg)`. Correct only for a frame that owns the whole
+    /// surface, because a load-op clear covers the entire attachment.
+    ClearAll,
+    /// `LoadOp::Load`, then paint `bg` as one screen-covering quad with blending
+    /// OFF, so the scissor rect clips it. Same pixels as a clear, only inside
+    /// the damage rect.
+    LoadAndPaint,
+    /// `LoadOp::Load` and nothing else: a later pass of a frame whose background
+    /// is already on the attachment.
+    LoadOnly,
+}
+
+/// Decide how this pass lays down the background. `owns_background` is
+/// [`EndFrameAction::Submit`]'s `clear` (true only for the first pass of a
+/// frame); `scissored` is whether `begin_frame_scissored` set a damage rect.
+///
+/// The rule is one sentence: **a scissor cannot clip a load-op clear.** A
+/// `LoadOp` is the tile initialiser — it runs before any fragment exists, over
+/// the whole attachment — while `set_scissor_rect` only ever discards fragments.
+/// So a scissored frame that asks for `LoadOp::Clear` blanks the entire drawable
+/// and then repaints only the damage rect, wiping every pane outside it.
+///
+/// The scissored answer therefore loads, and paints the background as a quad
+/// instead, which the scissor *does* clip. It has to be painted with blending
+/// **off** rather than through rt's normal alpha-blended pipeline: rt's
+/// background is deliberately translucent (that is what lets the macOS vibrancy
+/// layer show through), and blending a translucent colour over the previous
+/// frame composites with it instead of replacing it — the damage rect would
+/// darken a little more on every frame it was redrawn. With blending off the
+/// fragment's RGBA is written straight to the attachment, which is exactly what
+/// a clear does.
+///
+/// The unscissored case keeps the load-op clear: on a tile-based deferred GPU
+/// that initialises tile memory instead of reading the previous drawable in, and
+/// it is the path every macOS frame actually takes today.
+pub fn background_op(owns_background: bool, scissored: bool) -> BackgroundOp {
+    match (owns_background, scissored) {
+        (false, _) => BackgroundOp::LoadOnly,
+        (true, false) => BackgroundOp::ClearAll,
+        (true, true) => BackgroundOp::LoadAndPaint,
+    }
+}
+
+/// Turn a damage rectangle into the `(x, y, w, h)` quadruple
+/// [`wgpu::RenderPass::set_scissor_rect`] takes, clamped to a `surface_w` x
+/// `surface_h` attachment.
+///
+/// `PxRect` is signed and rt's damage rects legitimately go negative or overhang
+/// the surface — border bands inset by `BORDER_PX`, a scroll-blit shifts a
+/// content rect up by whole lines, and damage recorded before a window shrank is
+/// unioned into the next frame's plan by `plan_frame`'s history ring. The GL
+/// backend never had to care: `glScissor` takes signed ints and silently clamps
+/// to the drawable. wgpu's `set_scissor_rect` takes **u32** and validates
+/// `x + width <= attachment width`, so a straight `r.x as u32` turns -10 into
+/// 4294967286 and the frame dies in a validation panic rather than drawing a
+/// slightly wrong rectangle.
+///
+/// So the clamp is not cosmetic — it is the whole difference between the two
+/// APIs, and it is done here in i64 because `r.x + r.w` overflows i32 for a
+/// sufficiently silly rect (which panics in a debug build before wgpu ever sees
+/// it). An empty result is a legitimate answer, not an error: the pass still
+/// runs and simply draws nothing, which is correct for damage that no longer
+/// intersects the surface.
+pub fn scissor_rect(r: crate::damage::PxRect, surface_w: u32, surface_h: u32) -> (u32, u32, u32, u32) {
+    let clamp = |lo: i64, len: i64, limit: u32| -> (u32, u32) {
+        let limit = limit as i64;
+        let x0 = lo.clamp(0, limit);
+        // `lo + len` in i64: the i32 sum can overflow, and `len` may be negative
+        // (a degenerate rect), in which case `x1 < x0` and the max() floors the
+        // extent at zero rather than letting the subtraction go negative.
+        let x1 = lo.saturating_add(len).clamp(0, limit);
+        (x0 as u32, (x1 - x0).max(0) as u32)
+    };
+    let (x, w) = clamp(r.x as i64, r.w as i64, surface_w);
+    let (y, h) = clamp(r.y as i64, r.h as i64, surface_h);
+    (x, y, w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::damage::PxRect;
 
     #[test]
     fn a_frame_that_never_acquired_a_drawable_drops_its_geometry() {
@@ -137,5 +222,115 @@ mod tests {
             }
         }
         assert_eq!(loads, vec![true, false], "one clear, then loads");
+    }
+
+    // ---------------------------------------------------------------------
+    // `background_op` — a scissor cannot clip a load-op clear.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_scissored_frame_must_not_reach_for_a_load_op_clear() {
+        // THE bug. `begin_frame_scissored` records the same `needs_clear` an
+        // unscissored `begin_frame` does, and `end_frame` turns it into
+        // `LoadOp::Clear` on the pass's colour attachment. A `LoadOp` is not a
+        // draw: it is the tile initialiser, it runs before any fragment exists,
+        // and `set_scissor_rect` — which only ever discards fragments — cannot
+        // touch it. So a partial redraw of a 200x20 damage rect would clear the
+        // WHOLE 3024x1964 drawable to the background and then repaint 200x20 of
+        // it: every pane outside the damage rect blanked, every frame.
+        //
+        // Asserting `ClearAll` here (today's behaviour) is what fails.
+        assert_eq!(background_op(true, true), BackgroundOp::LoadAndPaint);
+    }
+
+    #[test]
+    fn an_unscissored_frame_still_clears_the_cheap_way() {
+        // The full-redraw path must be untouched: a load-op clear is free on a
+        // tile-based GPU (it initialises tile memory instead of reading the
+        // previous contents in), and rt takes this path on every macOS frame.
+        // Replacing it with a painted quad would add a full-surface blend for
+        // no reason.
+        assert_eq!(background_op(true, false), BackgroundOp::ClearAll);
+    }
+
+    #[test]
+    fn a_later_pass_never_lays_the_background_down_twice() {
+        // `redraw_full`/`redraw_scissored` call `end_frame` twice. The second
+        // pass must LOAD whatever the first drew — scissored or not. Clearing
+        // again erases the panes; painting the background quad again would too.
+        assert_eq!(background_op(false, false), BackgroundOp::LoadOnly);
+        assert_eq!(background_op(false, true), BackgroundOp::LoadOnly);
+    }
+
+    #[test]
+    fn a_whole_scissored_frame_lays_the_background_down_exactly_once() {
+        // Walk a scissored frame the way `redraw_scissored` does and check the
+        // background ops in order. The pairing with `end_frame_action` is the
+        // part that matters: `clear` means "this pass owns the frame's
+        // background", and only the first pass may act on it.
+        let mut needs_clear = true;
+        let mut ops = Vec::new();
+        for pending in [900_usize, 40, 0] {
+            match end_frame_action(true, needs_clear, pending) {
+                EndFrameAction::Submit { clear } => {
+                    ops.push(background_op(clear, true));
+                    needs_clear = false;
+                }
+                EndFrameAction::Skip => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(ops, vec![BackgroundOp::LoadAndPaint, BackgroundOp::LoadOnly]);
+    }
+
+    // ---------------------------------------------------------------------
+    // `scissor_rect` — the i32 -> u32 cast that panics instead of clamping.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_negative_scissor_origin_clamps_to_the_attachment_instead_of_wrapping() {
+        // THE bug. `PxRect` is i32 and rt's damage rects legitimately go
+        // negative: `pane_border_rects` insets by BORDER_PX, the scroll-blit
+        // path shifts a content rect up by whole lines, and a window shrink
+        // leaves history rects hanging off the top-left. `glScissor` takes
+        // signed ints and clamps, so the GL backend never noticed; wgpu's
+        // `set_scissor_rect` takes u32 and VALIDATES `x + width <= attachment
+        // width`, so `-10 as u32` == 4294967286 is not a stale pixel, it is a
+        // validation error and a panic in the middle of a frame.
+        assert_eq!(
+            scissor_rect(PxRect { x: -10, y: -5, w: 100, h: 50 }, 800, 600),
+            (0, 0, 90, 45),
+            "a rect that starts off the top-left must be trimmed, not wrapped"
+        );
+    }
+
+    #[test]
+    fn a_scissor_past_the_right_or_bottom_edge_is_trimmed() {
+        // The other half of the same validation rule: `x + width` must not
+        // exceed the attachment. A window that shrank between the damage being
+        // recorded and the frame being drawn produces exactly this.
+        assert_eq!(scissor_rect(PxRect { x: 700, y: 500, w: 400, h: 400 }, 800, 600), (700, 500, 100, 100));
+        assert_eq!(scissor_rect(PxRect { x: 0, y: 0, w: 800, h: 600 }, 800, 600), (0, 0, 800, 600), "an exact fit is left alone");
+    }
+
+    #[test]
+    fn a_scissor_entirely_outside_the_attachment_is_empty_not_negative() {
+        // Trimming must never produce a negative width (which would wrap to ~4
+        // billion all over again). A rect wholly off any edge scissors to zero
+        // area: the pass runs and draws nothing, which is the correct answer
+        // for damage that no longer intersects the surface.
+        assert_eq!(scissor_rect(PxRect { x: 900, y: 10, w: 50, h: 50 }, 800, 600), (800, 10, 0, 50));
+        assert_eq!(scissor_rect(PxRect { x: -200, y: -200, w: 100, h: 100 }, 800, 600), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_degenerate_or_absurd_rect_cannot_wrap_or_overflow() {
+        // `w`/`h` are i32 and `DamageAccumulator` drops empty rects, but the
+        // scissor is the last line of defence and must be total: a negative
+        // extent is zero area, and `x + w` must not be computed in i32 (it
+        // overflows, which panics in a debug build).
+        assert_eq!(scissor_rect(PxRect { x: 10, y: 10, w: -5, h: -5 }, 800, 600), (10, 10, 0, 0));
+        assert_eq!(scissor_rect(PxRect { x: i32::MAX, y: i32::MAX, w: i32::MAX, h: i32::MAX }, 800, 600), (800, 600, 0, 0));
+        assert_eq!(scissor_rect(PxRect { x: i32::MIN, y: i32::MIN, w: i32::MAX, h: i32::MAX }, 800, 600), (0, 0, 0, 0));
     }
 }

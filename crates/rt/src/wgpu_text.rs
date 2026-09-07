@@ -158,7 +158,17 @@ struct Glyph {
 pub struct TextPipeline {
     device: wgpu::Device, // cheap handle clone; needed to grow `vbuf` in `flush`
     pipeline: wgpu::RenderPipeline,
+    /// Identical to `pipeline` except that blending is OFF. The one thing it
+    /// draws is [`paint_background`](TextPipeline::paint_background)'s
+    /// screen-covering quad, which must *replace* the attachment's RGBA the way
+    /// a `LoadOp::Clear` does rather than composite onto it — see that method.
+    bg_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    /// Six vertices, nothing else: the background quad, kept apart from `vbuf`
+    /// so it can be drawn BEFORE the frame's painter's-order geometry without
+    /// having to be pushed to the front of `verts` (where it would ride the
+    /// alpha-blended `pipeline` and composite instead of replace).
+    bgbuf: wgpu::Buffer,
     vbuf: wgpu::Buffer,
     vbuf_cap: usize, // vertices `vbuf` can currently hold
     ubuf: wgpu::Buffer,
@@ -369,39 +379,56 @@ impl TextPipeline {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rt text pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[Vertex::layout()],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
+        // Built twice from one descriptor, differing ONLY in `blend`. The
+        // alpha-blended one draws everything rt paints; the unblended one draws
+        // only the background quad, which has to land on the attachment
+        // untouched (see `paint_background`).
+        let make_pipeline = |label, blend| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[Vertex::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("rt text pipeline", Some(wgpu::BlendState::ALPHA_BLENDING));
+        let bg_pipeline = make_pipeline("rt background pipeline", None);
+
+        let bgbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rt background quad"),
+            size: (6 * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         Ok(Self {
             device: device.clone(),
             pipeline,
+            bg_pipeline,
             bind_group,
+            bgbuf,
             vbuf,
             vbuf_cap: INITIAL_VERT_CAP,
             ubuf,
@@ -661,6 +688,46 @@ impl TextPipeline {
     /// grow it without limit. See `wgpu_frame::EndFrameAction::DiscardGeometry`.
     pub fn discard_pending(&mut self) {
         self.verts.clear();
+    }
+
+    /// Lay rt's background colour down as a screen-covering quad, with blending
+    /// off, clipped by whatever scissor the pass already carries.
+    ///
+    /// This is what a scissored frame uses instead of `LoadOp::Clear`. A load op
+    /// is the tile initialiser: it runs over the whole attachment before any
+    /// fragment exists, so `set_scissor_rect` cannot clip it and a partial
+    /// redraw that asked for one would blank every pane outside the damage rect.
+    /// A quad is fragments, and fragments the scissor does discard.
+    ///
+    /// Two details make it equivalent to a clear rather than merely similar:
+    ///
+    ///  * it draws through `bg_pipeline`, whose blend is `None`, so the
+    ///    fragment's RGBA is written straight to the attachment. rt's background
+    ///    is translucent on purpose — that is what the macOS vibrancy layer
+    ///    shows through — and alpha-blending it over the previous frame would
+    ///    composite with it, darkening the damage rect a little more each time
+    ///    it was repainted.
+    ///  * the quad's UV is texel (0,0) of the atlas, which `new` seeds to full
+    ///    coverage, so the shader's `color.a * cov` passes the alpha through
+    ///    unchanged.
+    ///
+    /// It must be called INSIDE the pass and BEFORE [`flush`](Self::flush), the
+    /// same place in the order a load op would have run.
+    pub fn paint_background(&mut self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass, c: Color) {
+        let t = 0.5 / ATLAS_SIZE as f32; // centre of the full-coverage seed texel
+        let (w, h) = (self.screen[0], self.screen[1]);
+        let col = [c.0, c.1, c.2, c.3];
+        let v = |px, py| Vertex { pos: [px, py], uv: [t, t], color: col };
+        let quad = [v(0.0, 0.0), v(w, 0.0), v(w, h), v(0.0, 0.0), v(w, h), v(0.0, h)];
+        // `flush` also writes `ubuf`, but it early-returns on an empty vertex
+        // list — a frame whose damage rect contains no cells still has to get
+        // its background painted, so the uniform is written here too.
+        queue.write_buffer(&self.ubuf, 0, bytemuck::cast_slice(&self.screen));
+        queue.write_buffer(&self.bgbuf, 0, bytemuck::cast_slice(&quad));
+        pass.set_pipeline(&self.bg_pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.bgbuf.slice(..));
+        pass.draw(0..6, 0..1);
     }
 
     /// Upload this frame's vertices and issue ONE draw call, then reset.
