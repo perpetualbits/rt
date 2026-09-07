@@ -47,17 +47,27 @@ The user-facing version of this list, with the workarounds, is
 [`docs/MACOS.md`](MACOS.md#known-issues-on-macos). ⌘Q's patch-bay leak is above,
 under Input / keyboard.
 
-- ☐ **A display change does not resize the glyphs.** `ScaleFactorChanged` has a
-  real arm that logs and deliberately does nothing (`main.rs`), so dragging the
-  window between a Retina and a 1x display leaves text rasterised at the old
-  scale — half or double size. It self-heals at the next font reload, which any
-  zoom step or Preferences commit triggers (both read `window.scale_factor()`
-  fresh). Deferred because re-measuring the cell mid-flight collides with the
-  `surface_pending`/`RESIZE_SETTLE` deferred-resize machinery.
-- ☐ **Window chrome is not HiDPI-scaled.** Only the rasterised glyph size is
-  multiplied by the scale factor; `WINDOW_MARGIN` (8px) and `rt-session`'s
-  `PANE_PAD`/`TITLEBAR_PAD` stay flat physical pixels, so at 2x they read as
-  hairlines. Cosmetic; also applies to a HiDPI Linux setup.
+- ☑ **A display change did not resize the glyphs.** `ScaleFactorChanged` logged
+  and did nothing, so dragging the window between a Retina and a 1x display left
+  text rasterised at the old scale. Fixed by routing it through the existing
+  resize settle rather than reloading inline — the event never travels alone:
+  winit-appkit queues `ScaleFactorChanged` and then immediately queues
+  `SurfaceResized` for the same window, so an inline reload would reflow at a
+  size superseded microseconds later and then reflow again at the settle. The
+  comparison is against `Active::font_scale`, the factor the glyphs ON SCREEN
+  were rasterised at, because `window.scale_factor()` already reports the new
+  value by the time the event arrives. Not gated to macOS: a HiDPI Wayland or
+  X11 output had the same bug. User-verified on the Mac across two displays,
+  2026-09-07.
+- ☑ **Window chrome was not HiDPI-scaled.** Only the glyph size followed the
+  backing factor, so at 2x every flat constant rendered at half its intended
+  apparent size — which is what was reported as the jack ports being "quite
+  small and hard to hit". 62 logical constants now scale (`chrome_scale.rs`),
+  with a frozen `REGISTER` naming all of them so a new raw value cannot creep
+  into a draw path unnoticed, and draw/hit pairs pinned by test. The factor
+  reaches `rt-session`/`rt-core` as a plain number, not a window handle.
+  Bit-identical at 1.0 — the pixel-identity gate proves it. User-verified on the
+  Mac, 2026-09-07.
 - ☑ **`Ctrl`+click on a URL did nothing.** `App::open_url` spawned `xdg-open`,
   which macOS does not have. Fixed: the program name now comes from
   `opener_command(cfg!(target_os = "macos"))` — `open` on a Mac, `xdg-open`
@@ -86,14 +96,25 @@ under Input / keyboard.
   `cpu_heat`'s `a_busy_child_measures_about_one_core` measures a real busy
   process on whatever platform the suite runs on and fails at both 0.0 and 0.024,
   so neither mistake can come back silently.
-- ☐ **A `.ttc` font family collapses to its first face.** `face_data` hands
-  fontdue the whole collection and discards fontdb's face `index`, and
-  `FontSettings::default()` then takes collection index 0. Measured on macOS
-  26.6.2: `Menlo` renders bold and italic as regular, and `PT Mono` — whose
-  first face is PT Mono **Bold** — renders everything in bold. `Courier New`
-  (the macOS default) and `Andale Mono` are plain `.ttf` and are unaffected;
-  `GB18030 Bitmap` fails to parse at all, and rt then keeps the previous font
-  while Preferences shows the new name.
+- ☑ **A `.ttc` font family collapsed to its first face.** `face_data` handed
+  fontdue the whole collection and discarded fontdb's face `index`, and
+  `FontSettings::default()` takes collection index 0 — so `Menlo` rendered bold
+  and italic as regular, and `PT Mono`, whose first face IS PT Mono Bold,
+  rendered everything bold. Fixed: `FontBlob` carries the index, and
+  `FontBlob::settings()` is the only construction of `collection_index` in the
+  tree, so a future parse site cannot reach for `FontSettings::default()`
+  without also holding the blob that carries it.
+- ☑ **An unrasterisable font family stopped rt STARTING.** Separately from the
+  above, `GB18030 Bitmap` (bitmap-only, no outlines) yields 7MB of bytes that do
+  not parse. `font_blobs` took "fontdb has bytes" as an answer, so `or_else`
+  never ran, the path loader never ran, and the unusable blob reached the
+  backend — and since `commit_settings` persists `font_family` BEFORE the reload
+  is attempted, the next launch failed too, recoverable only by hand-editing
+  `config.toml`. Every candidate is now parse-checked. Preferences also stopped
+  lying: the stepper skips families rt cannot draw, and a configured-but-unusable
+  one is shown as not in use, with the reason. (The trigger is bitmap-only
+  fonts, not CFF/OTF — measured: Fira Mono, OCR B, Inter Display and the 19MB
+  Noto Sans CJK JP all parse.)
 - ☑ **`--backend` / `RT_BACKEND` were accepted and ignored** (a macOS build has
   exactly one backend, and `choose_backend_on` returns `Wgpu` before reading the
   override), yet `rt --help` still listed `--backend gl|xrender`. Fixed in

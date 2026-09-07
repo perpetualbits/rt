@@ -364,23 +364,37 @@ that is not in the tree:
 - **Reversal cost:** n/a (nothing to reverse — this is work not done).
 - **Affects Linux?** Yes, the bug is platform-neutral.
 
-### 3.5 Nothing on macOS was ever visually verified
-- **What:** every rendering task (4, 5, 5b, 5c, 6, 7, 8) ends with "a human must run it on the
-  Mac". `ssh kiku` has no bound WindowServer, so winit's `resumed()` never fires and no window
-  opens; all macOS evidence is unit tests plus `cargo build`.
-- **Unverified specifically:** glyph baseline sign (upside-down/offset text), the initial
-  `set_screen` seeding (text scattered off-window), bell hazard-stripe geometry, instrument
-  disc/ring anti-aliasing, `caps.formats[0]` colour correctness, and whether the frosted glass
-  sits behind the terminal rather than over it.
+### 3.5 Nothing on macOS was ever visually verified — CLOSED 2026-09-07
+- **What it was:** every rendering task ended with "a human must run it on the Mac".
+  `ssh kiku` has no bound WindowServer, so winit's `resumed()` never fires and no window
+  opens; all macOS evidence was unit tests plus `cargo build`.
+- **Now:** verified by Roland at the machine, in batches, over 2026-09-05..07. Confirmed
+  working: text and fonts, HiDPI sizing, z-order, the frosted glass (and its material
+  picker), keybindings and the ⌘ set, right-click, wires, tear-off/reattach, the cursor,
+  jack ports, the colour picker, the native menu bar, per-display rescaling across two
+  monitors, the scaled chrome, and the `.app` bundle launched from Finder.
+- **Still unverified:** menu latency (last measured at ~5s BEFORE the HiDPI, z-order and
+  menu-bar work; never re-measured), and anything requiring a second Mac or an older macOS.
 - **Reversal cost:** n/a. **Affects Linux?** No.
+- **The standing risk this leaves:** the loaner goes back, so nothing macOS-visual can be
+  re-verified after 2026-09-07. Treat every future change to `wgpu_backend.rs`,
+  `wgpu_text.rs`, `vibrancy.rs` or `menubar.rs` as unverifiable until hardware exists again,
+  and prefer the pure-decision-module pattern (`wgpu_frame`, `vibrancy_policy`,
+  `menubar_model`, `scale_policy`, `chrome_scale`, `cpu_heat`, `app_bundle`) which is the
+  only macOS coverage Linux CI can give.
 
-### 3.6 Retina coordinate-space risk in hit-testing was identified and not chased
-- **What:** `cp::layout` builds panel rects from `window.surface_size()` (physical) and
-  `backend.cell_size()`, while `active.mouse` comes from winit's event position. Task 13 named
-  a logical/physical mismatch as a plausible cause of phantom `Hit::Sv`/`Hit::Hue`.
-- **Breaks when:** clicking chrome (picker, prefs, menus) on a Retina display lands in the
-  wrong control. Nobody has checked.
-- **Reversal cost:** contained. **Affects Linux?** Possibly, on HiDPI.
+### 3.6 Retina coordinate-space risk in hit-testing — CLOSED 2026-09-07, no code change
+- **What it was:** `cp::layout` builds panel rects from `window.surface_size()` (physical)
+  and `backend.cell_size()`, while `active.mouse` comes from winit's event position. A
+  logical/physical mismatch was named as a plausible cause of phantom picker hits.
+- **Audited, consumer by consumer:** `scale_factor` is applied in exactly ONE place in the
+  tree (`physical_font_px`, glyph rasterisation). winit-appkit converts the cursor with
+  `to_physical(scale_factor())` before emitting it, so `active.mouse` is physical by type.
+  Every hit path shares its `surface_size`/`cell_size` pair with the paint path that drew
+  it — picker, prefs, menus, clip history, manual, jacks, scrollbars, drag/drop. The one
+  `LogicalSize` in the codebase is the initial 960x600 window request, never compared to
+  anything. **Risk closed with no change**, and user-verified on both displays afterwards.
+- **Reversal cost:** n/a. **Affects Linux?** No.
 
 ### 3.7 Kitty keyboard handoff is export-only, and the inactive screen's stack is dropped
 - **What:** `PaneWire` carries one stack; there is no `import_term` anywhere in `crates/`, so
