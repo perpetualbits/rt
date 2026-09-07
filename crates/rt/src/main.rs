@@ -642,6 +642,17 @@ struct Active {
     // needs no `cfg` of its own beyond "not macOS".
     #[cfg(not(target_os = "macos"))]
     text_drop_x11: text_drop_x11::X11TextDrop,
+    // …and the native-Wayland receiver, riding the `wl_data_device` the
+    // `clipboard` field further up already owns. Inert on X11, and on a Wayland
+    // window whose surface could not be resolved, so it needs no `cfg` beyond
+    // "not macOS" either. Exactly one of the two Linux receivers is ever live:
+    // a native-Wayland window has no X11 window handle for `text_drop_x11` to
+    // find, and an X11 (or XWayland) window gets `Clipboard::X11`, which has no
+    // data device to attach to. Shutdown needs no ordering between this and
+    // `clipboard`: both ends of the pair are `Arc`s, so whichever drops second
+    // simply drops the last reference.
+    #[cfg(not(target_os = "macos"))]
+    text_drop_wl: wl_clipboard::WaylandTextDrop,
     // The OS window — LAST so it outlives everything that references it on
     // Drop (see the comment at the top of this struct). On macOS it is an
     // `Arc<dyn Window>` instead of `Box<dyn Window>`: `WgpuBackend::new` (Task
@@ -1672,6 +1683,15 @@ impl App {
             .ok()
             .and_then(|h| clipboard::Clipboard::from_display(h.as_raw()));
 
+        // Text dragged in from another application, Wayland half. It rides the
+        // `wl_data_device` the clipboard above already owns -- rt must not ask
+        // the compositor for a second one, because Mutter answers that by
+        // silently unlinking the first, which is the clipboard's. See
+        // `wl_clipboard`'s module doc. Inert on X11, and on any Wayland window
+        // whose surface could not be adopted onto the worker's connection.
+        #[cfg(not(target_os = "macos"))]
+        let text_drop_wl = Self::attach_wayland_text_drop(window.as_ref(), clipboard.as_ref(), event_loop);
+
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.surface_size(); // physical pixel size
         #[cfg(not(target_os = "macos"))]
@@ -2036,6 +2056,8 @@ impl App {
             text_drop,
             #[cfg(not(target_os = "macos"))]
             text_drop_x11,
+            #[cfg(not(target_os = "macos"))]
+            text_drop_wl,
         })
     }
 
@@ -2047,6 +2069,51 @@ impl App {
             event_loop.exit();
         }
         None
+    }
+
+    /// Point the Wayland clipboard's data device at this window, so drags over
+    /// its surface become [`textdrop::DropNews`]. Degrades to an inert receiver
+    /// on X11, on a headless backend, on a build with no clipboard at all, and
+    /// on any failure — the feature is then simply absent, never an error the
+    /// caller has to handle.
+    ///
+    /// Adopting winit's `wl_surface` is the same move `blur.rs` and
+    /// `bg_effect.rs` make: the worker's connection wraps the SAME `wl_display`
+    /// (`Backend::from_foreign_display`), so an id minted from winit's pointer is
+    /// valid on it and compares equal to the surface the compositor names in
+    /// `wl_data_device.enter`. That comparison is the whole reason the id is
+    /// needed — a data device is per SEAT, so with two rt windows open both
+    /// would otherwise light up for a drag over either.
+    #[cfg(not(target_os = "macos"))]
+    fn attach_wayland_text_drop(
+        window: &dyn Window,
+        clipboard: Option<&clipboard::Clipboard>,
+        event_loop: &dyn ActiveEventLoop,
+    ) -> wl_clipboard::WaylandTextDrop {
+        use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+        use wayland_client::Proxy as _;
+        let Some(clipboard::Clipboard::Wayland(wl)) = clipboard else {
+            return wl_clipboard::WaylandTextDrop::none(); // X11, headless, or none
+        };
+        let Ok(RawWindowHandle::Wayland(h)) = window.window_handle().map(|h| h.as_raw()) else {
+            return wl_clipboard::WaylandTextDrop::none();
+        };
+        // SAFETY: the pointer comes straight from winit's live wl_surface for
+        // this window, which outlives the receiver (the window is dropped last
+        // in `Active`); `from_ptr` borrows it and takes no ownership.
+        let id = unsafe {
+            wayland_client::backend::ObjectId::from_ptr(
+                wayland_client::protocol::wl_surface::WlSurface::interface(),
+                h.surface.as_ptr().cast(),
+            )
+        };
+        match id {
+            Ok(id) => wl.attach_text_drop(id, event_loop.create_proxy()),
+            Err(_) => {
+                log::debug!("text drop: could not adopt the wl_surface; Wayland drops disabled");
+                wl_clipboard::WaylandTextDrop::none()
+            }
+        }
     }
 }
 
@@ -3827,6 +3894,24 @@ impl ApplicationHandler for App {
             }
             #[cfg(not(target_os = "macos"))]
             if active.text_drop_x11.dragging() {
+                active.active_until = Instant::now() + ACTIVE_TAIL;
+            }
+            // The native-Wayland twin, on the clipboard's own data device. Unlike
+            // X11's, its events are dispatched by a worker THREAD, which wakes
+            // this loop through winit's `EventLoopProxy` — so a turn happens per
+            // motion and the cue does not wait on the idle poll. The `dragging()`
+            // tail is still worth having for a drag that pauses mid-window.
+            //
+            // The scale factor is read here rather than on the worker thread:
+            // Wayland reports the drag position in surface-local (logical)
+            // coordinates and only this side knows what to multiply them by. See
+            // `wl_clipboard::dnd`.
+            #[cfg(not(target_os = "macos"))]
+            if let Some(news) = active.text_drop_wl.take_change(active.window.scale_factor()) {
+                Self::apply_text_drop(active, Self::chrome_busy(active, app_busy), news);
+            }
+            #[cfg(not(target_os = "macos"))]
+            if active.text_drop_wl.dragging() {
                 active.active_until = Instant::now() + ACTIVE_TAIL;
             }
             let (close, interval, died) = Self::tick_active(active, &drag_panes);

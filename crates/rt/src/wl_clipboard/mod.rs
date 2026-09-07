@@ -66,15 +66,23 @@ use sctk::reexports::calloop::channel::{self, Sender};
 use sctk::reexports::client::Connection;
 use sctk::reexports::client::backend::Backend;
 
+mod dnd;
 mod mime;
 mod state;
 mod worker;
+
+pub use dnd::WaylandTextDrop;
 
 /// Access to a Wayland clipboard.
 pub struct Clipboard {
     request_sender: Sender<worker::Command>,
     request_receiver: Receiver<Result<String>>,
     clipboard_thread: Option<std::thread::JoinHandle<()>>,
+    /// rt's addition: the slot the worker reads a drag-and-drop target out of.
+    /// Created empty by [`Clipboard::new`] and filled at most once by
+    /// [`Clipboard::attach_text_drop`], so the clipboard's own construction path
+    /// is exactly the one that shipped.
+    dnd: std::sync::Arc<dnd::DndShared>,
 }
 
 impl Clipboard {
@@ -94,10 +102,36 @@ impl Clipboard {
         // Create channel to get data from the clipboard thread.
         let (clipboard_reply_sender, request_receiver) = mpsc::channel();
 
-        let name = String::from("smithay-clipboard");
-        let clipboard_thread = worker::spawn(name, connection, rx_chan, clipboard_reply_sender);
+        let name = String::from("rt-wl-selection");
+        let dnd = std::sync::Arc::new(dnd::DndShared::default());
+        let clipboard_thread =
+            worker::spawn(name, connection, rx_chan, clipboard_reply_sender, dnd.clone());
 
-        Self { request_receiver, request_sender, clipboard_thread }
+        Self { request_receiver, request_sender, clipboard_thread, dnd }
+    }
+
+    /// rt's addition. Start receiving **text dragged in from another
+    /// application** onto `surface`, on the data device this clipboard already
+    /// owns — see the module doc for why it cannot be a second one.
+    ///
+    /// `wake` is winit's [`EventLoopProxy`](winit::event_loop::EventLoopProxy):
+    /// the worker runs on its own thread with its own `calloop` loop, so without
+    /// a wake-up the cue would only move on the event loop's idle poll (100 ms),
+    /// the way the X11 receiver's does. Waking on each drag event costs one
+    /// coalesced wake per pointer motion, and only while a drag is in flight.
+    ///
+    /// Call once per window, right after the window exists. Calling it twice
+    /// replaces the target rather than adding one, because there is one device.
+    pub fn attach_text_drop(
+        &self,
+        surface: sctk::reexports::client::backend::ObjectId,
+        wake: winit::event_loop::EventLoopProxy,
+    ) -> WaylandTextDrop {
+        let inbox = std::sync::Arc::new(std::sync::Mutex::new(dnd::DropInbox::default()));
+        *self.dnd.target.lock().unwrap() =
+            Some(std::sync::Arc::new(dnd::DndTarget { surface, inbox: inbox.clone(), wake }));
+        log::info!("text drop: watching for Wayland drags on the window's own surface");
+        WaylandTextDrop::new(inbox)
     }
 
     /// Load clipboard data.

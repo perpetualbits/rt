@@ -61,6 +61,24 @@ pub struct State {
 
     data_sources: Vec<CopyPasteSource>,
     data_selection_content: Rc<[u8]>,
+
+    // --- rt's additions: dragged-in text on the same wl_data_device ---------
+    /// Where drags should be reported, once a window has asked for them.
+    dnd: std::sync::Arc<super::dnd::DndShared>,
+    /// The flavour rt accepted for the drag currently over its surface, in the
+    /// SOURCE's own spelling — `wl_data_offer.receive` is matched against it
+    /// verbatim. `None` means no drag of ours is live.
+    dnd_mime: Option<String>,
+    /// Where the last `motion` (or `enter`) put the pointer, surface-local.
+    /// `wl_data_device.drop` carries no position of its own, exactly as
+    /// `XdndDrop` does not, so this is what the drop lands on.
+    dnd_at: Option<(f64, f64)>,
+    /// Bumped for every drop transfer, and captured by that transfer's pipe
+    /// reader and its deadline timer. It is how each of the two knows whether it
+    /// is still the current one: a reader that finishes after its deadline fired
+    /// discards its bytes, and a deadline that fires after its reader finished
+    /// does nothing.
+    dnd_gen: u64,
 }
 
 impl State {
@@ -70,6 +88,7 @@ impl State {
         queue_handle: &QueueHandle<Self>,
         loop_handle: LoopHandle<'static, Self>,
         reply_tx: Sender<Result<String>>,
+        dnd: std::sync::Arc<super::dnd::DndShared>,
     ) -> Option<Self> {
         // NOTE: while it's mutable, it's not part of the hash compute.
         #[allow(clippy::mutable_key_type)]
@@ -104,6 +123,10 @@ impl State {
             seat_state,
             reply_tx,
             seats,
+            dnd,
+            dnd_mime: None,
+            dnd_at: None,
+            dnd_gen: 0,
         })
     }
 
@@ -389,27 +412,312 @@ impl PointerHandler for State {
     }
 }
 
+// ===========================================================================
+// rt's addition: dragged-in text, on this same wl_data_device.
+//
+// Upstream left all four of these empty -- the crate wanted the device only for
+// selections. Note what is NOT here: nothing below touches
+// `data_selection_content`, `primary_selection_content`, `data_sources`,
+// `primary_sources`, `latest_seat` or any `ClipboardSeatState`. The drag
+// callbacks are reached only from `wl_data_device`'s DRAG events, which no
+// clipboard or PRIMARY path ever raises, and the drag state they do touch is
+// four fields nothing else reads. That is the whole argument for why filling
+// them in cannot regress copy, paste or middle-click paste.
+// ===========================================================================
+
+/// How long a drop's pipe transfer may take before rt gives up on it, matching
+/// the X11 receiver's `TRANSFER_DEADLINE`. The guard is against a source that
+/// accepts the drop and then neither writes nor closes: without it, `dragging()`
+/// would stay true for the rest of the session and hold the event loop at its
+/// fast poll rate forever. A source that merely DIES needs no deadline — its end
+/// of the pipe closes, the reader sees EOF, and the drop resolves as empty.
+const TRANSFER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The only drag action rt ever advertises.
+///
+/// **Copy, never Move.** `Move` tells the source that rt has taken ownership and
+/// it should delete what was dragged — which for a text editor dragging text out
+/// of a document means deleting it there. A terminal inserts a copy and destroys
+/// nothing, so offering `Move` would be a lie with a destructive consequence.
+///
+/// And never `Ask`, which means "put a menu up and tell me which"; rt has no
+/// such menu, so the answer would have nowhere to come from.
+///
+/// A source offering only `Move` therefore intersects with rt to nothing, and
+/// the compositor settles on `none`. `drop_performed` treats that as a cancel —
+/// the protocol says a destination may only `receive` when the action came out
+/// `copy` or `move`, and does NOT promise the `drop` event is withheld.
+const RT_DND_ACTION: DndAction = DndAction::Copy;
+
+impl State {
+    /// The drop target, if a window has asked for one AND `surface` is that
+    /// window's own. See `dnd::DndTarget::surface` for why the comparison
+    /// matters: one data device serves the seat, not a surface.
+    fn dnd_target_for(&self, surface: &WlSurface) -> Option<std::sync::Arc<super::dnd::DndTarget>> {
+        let guard = self.dnd.target.lock().ok()?;
+        let target = guard.as_ref()?;
+        (target.surface == surface.id()).then(|| std::sync::Arc::clone(target))
+    }
+
+    /// The drop target for an event that carries no surface (`leave`, `motion`,
+    /// `drop`). Those only ever follow an `enter` rt claimed, which is what
+    /// `dnd_mime` records — so the surface has already been checked.
+    fn dnd_target_live(&self) -> Option<std::sync::Arc<super::dnd::DndTarget>> {
+        self.dnd_mime.as_ref()?;
+        let guard = self.dnd.target.lock().ok()?;
+        guard.as_ref().map(std::sync::Arc::clone)
+    }
+
+    /// The drag offer currently on this device, if any.
+    fn drag_offer(device: &WlDataDevice) -> Option<DragOffer> {
+        device.data::<sctk::data_device_manager::data_device::DataDeviceData>()?.drag_offer()
+    }
+
+    /// Note where the pointer is and wake the event loop to repaint the cue.
+    fn dnd_moved(&mut self, target: &super::dnd::DndTarget, x: f64, y: f64) {
+        self.dnd_at = Some((x, y));
+        if let Ok(mut inbox) = target.inbox.lock() {
+            inbox.hover = Some((x, y));
+            inbox.accepted = true;
+            inbox.changed = true;
+        }
+        target.wake.wake_up();
+    }
+
+    /// Forget the current drag and take the cue off the screen.
+    fn dnd_end(&mut self) {
+        self.dnd_mime = None;
+        self.dnd_at = None;
+        if let Some(target) =
+            self.dnd.target.lock().ok().and_then(|g| g.as_ref().map(std::sync::Arc::clone))
+        {
+            if let Ok(mut inbox) = target.inbox.lock() {
+                inbox.clear();
+            }
+            target.wake.wake_up();
+        }
+    }
+}
+
 impl DataDeviceHandler for State {
+    /// A drag has entered one of this client's surfaces. This is the one place
+    /// the accept/reject decision is made, and it is made on the offered MIME
+    /// types alone — never on where in the window the pointer is.
+    ///
+    /// That is deliberate, and it matches both other receivers: the worker
+    /// thread has no copy of the window's layout, and mirroring it here to
+    /// change a cursor badge would mean keeping two copies in sync across every
+    /// split, resize and tab switch. The honest signal for "this will not land"
+    /// is the ABSENCE of the drop cue, which the app paints one turn later from
+    /// `textdrop::resolve`. A drop over rt's own chrome is then discarded there.
     fn enter(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlDataDevice,
-        _: f64,
-        _: f64,
-        _: &WlSurface,
+        device: &WlDataDevice,
+        x: f64,
+        y: f64,
+        surface: &WlSurface,
     ) {
+        self.dnd_mime = None;
+        self.dnd_at = None;
+        // Not our window (or no window is watching): stay completely out of it.
+        // Answering here would fight the sibling window's device for the same
+        // source, and refusing would refuse on its behalf.
+        let Some(target) = self.dnd_target_for(surface) else { return };
+        let Some(offer) = Self::drag_offer(device) else { return };
+
+        let mime = offer.with_mime_types(|m| {
+            crate::textdrop::pick_drop_mime(m).map(str::to_string)
+        });
+        // `accept(None)` is a real refusal, and worth making even though rt does
+        // not depend on it: it is what puts a no-drop cursor under the user's
+        // hand, and in practice compositors stop short of sending `drop` after
+        // one. The protocol does not actually promise that, which is why the
+        // refusal below is a state change too — with no `dnd_mime` recorded,
+        // `drop_performed` finds no live drag and declines a drop that arrives
+        // anyway.
+        offer.accept_mime_type(offer.serial, mime.clone());
+        let Some(mime) = mime else {
+            log::debug!("wayland drag carries no text rt can read; declined");
+            return;
+        };
+        offer.set_actions(RT_DND_ACTION, RT_DND_ACTION);
+        self.dnd_mime = Some(mime);
+        self.dnd_moved(&target, x, y);
     }
 
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        // Only ours to clear: a `leave` for a drag we never claimed (another
+        // window's, or one with no text) must not wipe a cue we are not showing.
+        if self.dnd_mime.is_some() {
+            self.dnd_end();
+        }
+    }
 
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, x: f64, y: f64) {
+        let Some(target) = self.dnd_target_live() else { return };
+        self.dnd_moved(&target, x, y);
+    }
 
-    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    /// The user let go. Ask for the bytes; the answer arrives on a pipe, which
+    /// is read on this thread's own event loop so nothing blocks.
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, device: &WlDataDevice) {
+        let Some(target) = self.dnd_target_live() else { return };
+        let (Some(mime), Some(at)) = (self.dnd_mime.take(), self.dnd_at.take()) else {
+            self.dnd_end();
+            return;
+        };
+        let Some(offer) = Self::drag_offer(device) else {
+            self.dnd_end();
+            return;
+        };
+        // What the compositor settled on. `wl_data_offer.receive` is only
+        // sanctioned once that is `copy` or `move`; `none` means the source and
+        // rt found no common action, and `ask` means the destination is supposed
+        // to open a menu, which rt has none of — both are a cancel. Version 2
+        // offers have no action negotiation at all, so there is nothing to check
+        // and the drop proceeds (it just never gets a `finish`).
+        let version = offer.inner().version();
+        let action = offer.selected_action.bits();
+        if version >= 3 && action & (crate::textdrop::DND_COPY | crate::textdrop::DND_MOVE) == 0 {
+            log::debug!("wayland drop: compositor selected no usable action; cancelled");
+            offer.destroy();
+            self.dnd_end();
+            return;
+        }
+        let read_pipe = match offer.receive(mime) {
+            Ok(pipe) => pipe,
+            Err(err) => {
+                log::debug!("wayland drop: source would not open a pipe ({err}); discarded");
+                offer.destroy();
+                self.dnd_end();
+                return;
+            }
+        };
+        if set_non_blocking(read_pipe.as_raw_fd()).is_err() {
+            offer.destroy();
+            self.dnd_end();
+            return;
+        }
+
+        self.dnd_gen = self.dnd_gen.wrapping_add(1);
+        let generation = self.dnd_gen;
+        let mut buffer = [0u8; 4096];
+        let mut content: Vec<u8> = Vec::new();
+        // Whether it will be legal to say `finish` when the bytes stop coming,
+        // decided HERE rather than then. By the time the compositor sends `drop`
+        // it has already settled the action (both sides called `set_actions`
+        // during the drag), so this is the answer; re-reading the device later
+        // could just as easily find a DIFFERENT drag's offer. Getting it wrong in
+        // the permissive direction is the `invalid_finish` protocol error, which
+        // tears down rt's whole `wl_display` and every pane with it.
+        let finishable = Self::drag_offer_finishable(&offer);
+        let finish_offer = offer.clone();
+        let done_target = std::sync::Arc::clone(&target);
+        let read = self.loop_handle.insert_source(read_pipe, move |_, file, state| {
+            let file = unsafe { file.get_mut() };
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => {
+                        // The deadline below may already have written this drag
+                        // off; if so these bytes are stale and go nowhere.
+                        if state.dnd_gen == generation {
+                            let text = String::from_utf8_lossy(&content).into_owned();
+                            if let Ok(mut inbox) = done_target.inbox.lock() {
+                                inbox.clear();
+                                if !text.is_empty() {
+                                    inbox.dropped = Some((at, text));
+                                }
+                            }
+                            done_target.wake.wake_up();
+                            state.dnd_gen = state.dnd_gen.wrapping_add(1);
+                        }
+                        // Tell the source the operation completed, then let the
+                        // offer go -- both unconditionally on whether the bytes
+                        // were still wanted, because the source is waiting
+                        // either way. (Should a newer drag have made sctk
+                        // destroy this offer meanwhile, both are no-ops:
+                        // wayland-client drops a request on a dead proxy rather
+                        // than putting it on the wire.)
+                        if finishable {
+                            finish_offer.finish();
+                        }
+                        finish_offer.destroy();
+                        break PostAction::Remove;
+                    }
+                    Ok(n) => content.extend_from_slice(&buffer[..n]),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break PostAction::Continue,
+                    Err(err) => {
+                        log::debug!("wayland drop: read failed ({err}); discarded");
+                        if state.dnd_gen == generation {
+                            if let Ok(mut inbox) = done_target.inbox.lock() {
+                                inbox.clear();
+                            }
+                            done_target.wake.wake_up();
+                            state.dnd_gen = state.dnd_gen.wrapping_add(1);
+                        }
+                        finish_offer.destroy();
+                        break PostAction::Remove;
+                    }
+                }
+            }
+        });
+
+        // A loop that would not take the pipe leaves nothing to wait for: end
+        // the gesture now rather than showing a cue until the deadline.
+        if read.is_err() {
+            log::debug!("wayland drop: could not watch the transfer pipe; discarded");
+            offer.destroy();
+            self.dnd_end();
+            return;
+        }
+
+        // The deadline. Fires once; does nothing unless its transfer is still
+        // the current one and still unfinished.
+        let timer = sctk::reexports::calloop::timer::Timer::from_duration(TRANSFER_DEADLINE);
+        let _ = self.loop_handle.insert_source(timer, move |_, _, state| {
+            if state.dnd_gen == generation {
+                log::debug!("wayland drop: no data within the deadline; abandoned");
+                if let Ok(mut inbox) = target.inbox.lock() {
+                    inbox.clear();
+                }
+                target.wake.wake_up();
+                state.dnd_gen = state.dnd_gen.wrapping_add(1);
+            }
+            sctk::reexports::calloop::timer::TimeoutAction::Drop
+        });
+    }
 
     // The selection is finished and ready to be used.
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
 }
+
+impl State {
+    /// Whether `wl_data_offer.finish` is legal on this offer, read straight off
+    /// the offer's own reported state. The RULE is
+    /// [`crate::textdrop::may_finish_drop`], where Linux CI can test it; this is
+    /// only the three values it needs.
+    fn drag_offer_finishable(offer: &DragOffer) -> bool {
+        crate::textdrop::may_finish_drop(
+            offer.inner().version(),
+            offer.dropped,
+            offer.selected_action.bits(),
+        )
+    }
+}
+
+/// `textdrop` spells the `dnd_action` bits out as plain integers so the rule
+/// above can be tested without a compositor to mint a `DndAction`. This is the
+/// join: if wayland-client's generated bitflags ever stop agreeing with them,
+/// the build stops here rather than the guard quietly answering yes to a `none`
+/// action and taking rt's `wl_display` down with an `invalid_finish`.
+const _: () = {
+    assert!(DndAction::Copy.bits() == crate::textdrop::DND_COPY);
+    assert!(DndAction::Move.bits() == crate::textdrop::DND_MOVE);
+    assert!(DndAction::Ask.bits() == crate::textdrop::DND_ASK);
+    assert!(DndAction::empty().bits() == 0);
+};
 
 impl DataSourceHandler for State {
     fn send_request(
@@ -444,15 +752,32 @@ impl DataSourceHandler for State {
 }
 
 impl DataOfferHandler for State {
+    /// The source has told us which actions it supports. rt's answer never
+    /// changes — [`RT_DND_ACTION`], and only that — but it has to be re-sent
+    /// here: the compositor recomputes the selected action from the last
+    /// `set_actions` each time the source's own offer changes, and a source that
+    /// narrows its actions mid-drag would otherwise leave rt with none, and the
+    /// drop with nothing to `finish` on.
+    ///
+    /// sctk has already recorded `actions` on the offer by the time this runs,
+    /// so there is nothing to store; the read at drop time takes the offer's
+    /// current state.
     fn source_actions(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &mut DragOffer,
-        _: DndAction,
+        offer: &mut DragOffer,
+        _actions: DndAction,
     ) {
+        if self.dnd_mime.is_some() {
+            offer.set_actions(RT_DND_ACTION, RT_DND_ACTION);
+        }
     }
 
+    /// The compositor has settled on an action. Nothing to do: rt asked for
+    /// Copy and behaves identically whatever comes back, and the only place the
+    /// answer matters — whether `wl_data_offer.finish` is legal — reads it off
+    /// the offer at that moment rather than from a copy kept here.
     fn selected_action(
         &mut self,
         _: &Connection,

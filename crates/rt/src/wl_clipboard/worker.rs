@@ -8,20 +8,26 @@ use sctk::reexports::calloop_wayland_source::WaylandSource;
 use sctk::reexports::client::Connection;
 use sctk::reexports::client::globals::registry_queue_init;
 
+use super::dnd::DndShared;
 use super::state::{SelectionTarget, State};
 
 /// Spawn a clipboard worker, which dispatches its own `EventQueue` and handles
 /// clipboard requests.
+///
+/// `dnd` is rt's addition: the slot the drag-and-drop target appears in, later,
+/// if a window asks for one. Threaded through rather than fetched, so nothing on
+/// the clipboard's own path has to know it exists.
 pub fn spawn(
     name: String,
     display: Connection,
     rx_chan: Channel<Command>,
     worker_replier: Sender<Result<String>>,
+    dnd: std::sync::Arc<DndShared>,
 ) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(name)
         .spawn(move || {
-            worker_impl(display, rx_chan, worker_replier);
+            worker_impl(display, rx_chan, worker_replier, dnd);
         })
         .ok()
 }
@@ -46,6 +52,7 @@ fn worker_impl(
     connection: Connection,
     rx_chan: Channel<Command>,
     reply_tx: Sender<Result<String>>,
+    dnd: std::sync::Arc<DndShared>,
 ) {
     let (globals, event_queue) = match registry_queue_init(&connection) {
         Ok(data) => data,
@@ -55,11 +62,11 @@ fn worker_impl(
     let mut event_loop = EventLoop::<State>::try_new().unwrap();
     let loop_handle = event_loop.handle();
 
-    let mut state = match State::new(&globals, &event_queue.handle(), loop_handle.clone(), reply_tx)
-    {
-        Some(state) => state,
-        None => return,
-    };
+    let mut state =
+        match State::new(&globals, &event_queue.handle(), loop_handle.clone(), reply_tx, dnd) {
+            Some(state) => state,
+            None => return,
+        };
 
     loop_handle
         .insert_source(rx_chan, |event, _, state| {

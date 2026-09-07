@@ -281,6 +281,41 @@ pub fn pick_drop_mime(offered: &[String]) -> Option<&str> {
 /// a NaN, so this is belt and braces — but "no position" is the honest value,
 /// and it makes the discard explicit at the receiver instead of implicit three
 /// calls away.
+/// The three `wl_data_device_manager.dnd_action` bits, as the protocol numbers
+/// them. Spelled out here so [`may_finish_drop`] is testable without a live
+/// compositor to mint a `DndAction` from — the receiver passes
+/// `DndAction::bits()` straight in, and these are what those bits mean.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub const DND_COPY: u32 = 1;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub const DND_MOVE: u32 = 2;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub const DND_ASK: u32 = 4;
+
+/// Whether `wl_data_offer.finish` may be sent for an offer in this state.
+///
+/// This one is a guard, not a feature. `finish` is how rt tells a drag source
+/// "I took it, you can stop" — and sending it at the wrong moment is the
+/// `invalid_finish` protocol error, which does not fail the request: it tears
+/// down rt's whole `wl_display`, and with it every pane, tab and shell in the
+/// process. Hence a pure function with the protocol's three preconditions
+/// written out, tested, and read straight off the offer rather than off rt's
+/// belief about the drag:
+///
+/// * **version ≥ 3** — `finish` does not exist before it (nor does the `action`
+///   event that decides the third condition).
+/// * **dropped** — the request is "the drop is done", so there must have been
+///   one. A drag that merely left is finished by destroying the offer.
+/// * **a real action was selected** — `none` means the compositor settled on
+///   nothing, and `ask` means "show a menu and tell me which", which rt has no
+///   menu for and never requests. Only `copy` (what rt asks for) or `move`
+///   counts. `ask` alongside a real action is fine: the real one is what
+///   happened.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn may_finish_drop(version: u32, dropped: bool, selected_action: u32) -> bool {
+    version >= 3 && dropped && selected_action & (DND_COPY | DND_MOVE) != 0
+}
+
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn surface_to_physical(x: f64, y: f64, scale: f64) -> Option<(f32, f32)> {
     if !x.is_finite() || !y.is_finite() || !scale.is_finite() || scale <= 0.0 {
@@ -558,6 +593,40 @@ mod tests {
         assert_eq!(surface_to_physical(10.0, 20.0, 1.0), Some((10.0, 20.0)));
         assert_eq!(surface_to_physical(10.0, 20.0, 2.0), Some((20.0, 40.0)));
         assert_eq!(surface_to_physical(10.0, 20.0, 1.5), Some((15.0, 30.0)));
+    }
+
+    // --- may_finish_drop --------------------------------------------------
+
+    /// The happy path, and the only one that says yes: a version-3 offer that
+    /// really was dropped, with a real action settled on it.
+    #[test]
+    fn a_dropped_v3_offer_with_a_real_action_may_be_finished() {
+        assert!(may_finish_drop(3, true, DND_COPY));
+        assert!(may_finish_drop(5, true, DND_COPY));
+        // rt only ever asks for Copy, but a compositor that answers Move has
+        // still settled on something, and `finish` is legal.
+        assert!(may_finish_drop(3, true, DND_MOVE));
+    }
+
+    /// Each of the three ways it becomes the `invalid_finish` protocol error —
+    /// which does not fail the request, it kills rt's whole `wl_display` and
+    /// every pane and shell on it.
+    #[test]
+    fn an_untimely_finish_is_refused() {
+        assert!(!may_finish_drop(3, false, DND_COPY), "not dropped yet");
+        assert!(!may_finish_drop(3, true, 0), "no action was selected");
+        assert!(!may_finish_drop(2, true, DND_COPY), "v2 has no finish request");
+        assert!(!may_finish_drop(1, true, DND_COPY));
+    }
+
+    /// `ask` means "put a menu up and tell me which"; rt has no such menu and
+    /// never asks for the action, so an `ask` answer is not something it may
+    /// declare finished.
+    #[test]
+    fn an_ask_action_alone_is_not_finishable() {
+        assert!(!may_finish_drop(3, true, DND_ASK));
+        // …but ask ALONGSIDE a real action is: the real one is what happened.
+        assert!(may_finish_drop(3, true, DND_ASK | DND_COPY));
     }
 
     /// A garbage scale or position must not become a NaN that hit-tests as some
