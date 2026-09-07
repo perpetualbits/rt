@@ -295,7 +295,11 @@ EXAMPLES   (type these in the panes; wire them as noted)
 
 
 APPEARANCE  &  PREFERENCES   (right-click menu -> Preferences...)
-  Font               family (steps through installed monospace fonts) & size
+  Font               family & size. The family stepper offers only fonts rt can
+                     actually rasterise, and skips the rest (macOS's bitmap-only
+                     GB18030 Bitmap is the one that bites). A family named in
+                     config.toml that rt cannot draw keeps its row, with a line
+                     under it saying a fallback font is what you are looking at.
   Appearance         background opacity, compositor blur (Wayland
                      ext-background-effect / KDE; X11 KDE blur-behind)
   Colours            preset schemes (rt default, Solarized Dark, Dracula,

@@ -7296,11 +7296,8 @@ impl App {
         let size = active.window.surface_size();
         let (cw, _ch) = active.backend.cell_size();
         let cols = (content_bounds(size).w / cw).max(1.0) as usize;
-        let fam = cached_family_status(
-            &mut active.font_status,
-            &active.font_db,
-            &active.settings.font_family.clone(),
-        );
+        let fam =
+            cached_family_status(&mut active.font_status, &active.font_db, &active.settings.font_family);
         let rows = chrome::prefs::rows(&active.settings, total_ram_bytes(), cols, fam);
         active.prefs_sel = chrome::prefs::selectable(&rows).first().copied().unwrap_or(0);
         active.prefs_scroll = 0;
@@ -9114,6 +9111,32 @@ mod font_fallback_tests {
         let blobs = font_blobs(&db, &bad_family);
         let primary = blobs.regular.first().expect("must fall back, not give up");
         assert!(primary.parse().is_ok(), "{bad_family}: fell through to another unusable face");
+
+        // The display half, on the real trigger. Everything below rides the scan
+        // above rather than repeating it: finding `bad_family` costs a parse of
+        // every monospace family (~7s in a debug build), and once is enough.
+        use prefs_model::{FamilyStatus, PrefRow};
+        assert_eq!(
+            family_status(&db, &bad_family),
+            FamilyStatus::Unrasterisable,
+            "{bad_family}: Preferences would show it as the font in use"
+        );
+        // And the stepper walks past it: from the family just before it in the
+        // picker's list, one Right must land somewhere else entirely.
+        let families = monospace_families(&db);
+        let Some(at) = families.iter().position(|f| *f == bad_family) else {
+            println!("SKIP (stepper half): {bad_family:?} is not in the picker's list");
+            return;
+        };
+        let mut cache = std::collections::HashMap::new();
+        let mut s = rt_config::Settings {
+            font_family: families[(at + families.len() - 1) % families.len()].clone(),
+            ..Default::default()
+        };
+        prefs_model::step(&mut s, PrefRow::FontFamily, 1, &families, &[], &mut |f| {
+            cached_family_status(&mut cache, &db, f) == FamilyStatus::Usable
+        });
+        assert_ne!(s.font_family, bad_family, "a step landed on a family rt cannot draw");
     }
 
     /// What Preferences is told about a family, over all three cases — and

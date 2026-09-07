@@ -328,11 +328,22 @@ families your Mac actually has. On a stock macOS 26 install that is
   first face out of a collection.** Menlo works, but its bold and italic render
   as regular. PT Mono is worse: its *first* face is PT Mono **Bold**, so
   choosing PT Mono renders everything in bold.
-- **`GB18030 Bitmap` cannot be parsed at all.** rt refuses the change, logs
-  `font reload failed`, and keeps the font you had — so the Preferences row will
-  show the new name while the screen shows the old font.
+- **`GB18030 Bitmap` cannot be rasterised at all** — it is bitmap-only: seven
+  megabytes of perfectly valid font that carries no outlines. The Family stepper
+  therefore walks straight past it, so it cannot be picked. A `config.toml` that
+  names it (or any family this Mac no longer has) still shows that name in the
+  row — it is what the file says — with a line under it saying rt is drawing a
+  fallback font instead. Earlier versions showed the new name while the screen
+  kept the old font, with nothing to say so.
 - **`.SF NS Mono`** is the hidden system family; its first face is the *Light*
   weight, and bold resolves to it too.
+
+Note that rt's own default, `DejaVu Sans Mono`, is not installed on a stock Mac
+either — it is a Linux ubiquity, not a portable one. Out of the box Preferences
+therefore shows `DejaVu Sans Mono` in the Family row with *"not installed here —
+rt is drawing a fallback font"* underneath, which is the honest description of
+the Courier New you are looking at. Pick a family from the list to make the row
+and the screen agree.
 
 ### Opening URLs
 
