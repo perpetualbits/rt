@@ -854,11 +854,17 @@ const REGULAR_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
 ];
-// macOS: fontdue reads TrueType only, and most system fonts (incl. Menlo) ship
-// as `.ttc` collections, which are unusable here. Courier New is a complete,
-// self-consistent four-weight TrueType monospace family (regular/bold/italic/
-// bold-italic all share the same advance width), so it is the primary rather
-// than SF Mono — mixing SF Mono (regular) with Courier New (bold/italic) would
+// macOS: fontdue reads TrueType only, and most system monospace faces (incl.
+// Menlo) ship as `.ttc` collections. Those are not unusable — fontdue parses
+// them — but rt only ever gets their FIRST face: `face_data` hands over whole
+// file bytes and drops fontdb's face `index`, and `FontSettings::default()`
+// then takes collection index 0. Measured on macOS 26.6.2 with fontdue 0.9.3 /
+// fontdb 0.23: `Menlo` draws bold and italic as regular, and `PT Mono` — whose
+// index-0 face IS its Bold — draws everything bold. Courier New is a complete,
+// self-consistent four-weight TrueType monospace family in four separate `.ttf`
+// files (regular/bold/italic/bold-italic all share the same advance width), so
+// it avoids that entirely and is the primary rather than SF Mono — mixing SF
+// Mono (regular) with Courier New (bold/italic) would
 // give the bold/italic faces a different advance width than the grid cell,
 // which is sized from the regular face, and glyphs would overflow their cell.
 // SF Mono is kept as a secondary regular fallback. Apple Braille/Symbol/

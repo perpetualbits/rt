@@ -67,6 +67,9 @@ Press **F1** in rt for the full built-in manual.
 
 ### On macOS: the Command keys
 
+**New to rt on a Mac? Start at [`docs/MACOS.md`](docs/MACOS.md)** — build,
+install, the frosted glass, what differs from Linux, and the macOS known issues.
+
 The Linux bindings above are all `Ctrl+Shift+…`, which no Mac user would guess. macOS
 builds therefore add a **Command (⌘) set on top** — nothing is taken away, so every
 `Ctrl+Shift` key you already know keeps working:
@@ -141,6 +144,17 @@ There's also a text-mode multiplexer that hosts the same panes inside any termin
 ```sh
 cargo install --path crates/rt-mux
 ```
+
+### On macOS
+
+No apt line and no X11 — just Xcode Command Line Tools (`xcode-select --install`)
+and a Rust toolchain, then `cargo install --path crates/rt`. macOS draws through
+wgpu/Metal rather than OpenGL, so `--backend` and the `--no-default-features`
+line above do not apply there. If you ever replace the installed binary by hand,
+`rm -f` the old one first — a plain `cp` over it can make the next `rt` die with
+`Killed: 9` before anything runs. **[`docs/MACOS.md`](docs/MACOS.md)** has the
+whole story: the ⌘ keys, the frosted glass, what differs from Linux, and the
+macOS known issues.
 
 ## Desktop integration
 

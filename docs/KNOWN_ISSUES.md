@@ -28,15 +28,62 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   Command chord is swallowed, as in Terminal.app. Ctrl and Alt are untouched
   (`Ctrl+C` is still `0x03`), and off macOS the guard is a folded constant
   `false`.
-- ☐ **macOS: ⌘Q skips rt's patch-bay cleanup.** ⌘Q is AppKit's menu item and
-  calls `terminate:`, which exits the process without running `exit_clean()`, so
-  the session's `rt-<pid>` jack directory is left behind. The startup sweep that
-  would collect it (`sweep_stale_jacks`) tests liveness with
-  `Path::new("/proc/<pid>").exists()`, which is always false on macOS — so it
-  both fails to protect a *live* sibling session's directory and never learns
-  that a dead one is dead. Pre-existing, and independent of the keybindings; the
-  fix is a portable liveness check (`kill(pid, 0)`) plus an
-  `applicationShouldTerminate` hook or an `atexit` handler.
+- ☐ **macOS: ⌘Q skips rt's patch-bay cleanup, and the startup sweep then eats a
+  live session's jacks.** ⌘Q is AppKit's menu item and calls `terminate:`, which
+  exits the process without running `exit_clean()`, so the session's `rt-<pid>`
+  jack directory is left behind. The startup sweep that would collect it
+  (`sweep_stale_jacks`) tests liveness with `Path::new("/proc/<pid>").exists()`,
+  which is always false on macOS — so it never learns that a dead directory is
+  dead, and, user-visibly, **starting a second rt process removes a still-running
+  first one's directory**, breaking its patch-bay wires. Pre-existing, and
+  independent of the keybindings; the fix is a portable liveness check
+  (`kill(pid, 0)`) plus an `applicationShouldTerminate` hook or an `atexit`
+  handler.
+
+## macOS (2026-09-07)
+The user-facing version of this list, with the workarounds, is
+[`docs/MACOS.md`](MACOS.md#known-issues-on-macos). ⌘Q's patch-bay leak is above,
+under Input / keyboard.
+
+- ☐ **A display change does not resize the glyphs.** `ScaleFactorChanged` has a
+  real arm that logs and deliberately does nothing (`main.rs`), so dragging the
+  window between a Retina and a 1x display leaves text rasterised at the old
+  scale — half or double size. It self-heals at the next font reload, which any
+  zoom step or Preferences commit triggers (both read `window.scale_factor()`
+  fresh). Deferred because re-measuring the cell mid-flight collides with the
+  `surface_pending`/`RESIZE_SETTLE` deferred-resize machinery.
+- ☐ **Window chrome is not HiDPI-scaled.** Only the rasterised glyph size is
+  multiplied by the scale factor; `WINDOW_MARGIN` (8px) and `rt-session`'s
+  `PANE_PAD`/`TITLEBAR_PAD` stay flat physical pixels, so at 2x they read as
+  hairlines. Cosmetic; also applies to a HiDPI Linux setup.
+- ☐ **`Ctrl`+click on a URL does nothing.** `App::open_url` spawns `xdg-open`,
+  which macOS does not have (`open` is the equivalent; rt does not call it).
+- ☐ **No PRIMARY selection, so copy-on-select is a silent no-op and middle-click
+  pastes nothing.** Deliberate — PRIMARY is an X11 concept — but it means a Mac
+  user must press ⌘C after selecting, where a Linux user need not.
+- ☐ **The CPU-heat instrument always reads zero.** `subtree_cpu_ticks` sums
+  `/proc/<pid>/stat` over the pane's process subtree. Output-flow and latency
+  are fine.
+- ☐ **A `.ttc` font family collapses to its first face.** `face_data` hands
+  fontdue the whole collection and discards fontdb's face `index`, and
+  `FontSettings::default()` then takes collection index 0. Measured on macOS
+  26.6.2: `Menlo` renders bold and italic as regular, and `PT Mono` — whose
+  first face is PT Mono **Bold** — renders everything in bold. `Courier New`
+  (the macOS default) and `Andale Mono` are plain `.ttf` and are unaffected;
+  `GB18030 Bitmap` fails to parse at all, and rt then keeps the previous font
+  while Preferences shows the new name.
+- ☐ **`--backend` / `RT_BACKEND` are accepted and ignored** (a macOS build has
+  exactly one backend, and `choose_backend_on` returns `Wgpu` before reading the
+  override), yet `rt --help` still lists `--backend gl|xrender`.
+- ☐ **Damage tracking is inert.** `WgpuBackend` advertises no damage capability,
+  so `main.rs` marks full damage every frame — every macOS frame is a full
+  redraw.
+- ☑ **The Command key did nothing / an unbound ⌘ chord typed a stray letter** —
+  see Input / keyboard above.
+- ☑ **The frosted glass ignored `background_blur` and took AppKit's deprecated
+  default material.** Fixed: install/removal now hang off
+  `Settings::wants_background_blur()` and the material is chosen explicitly via
+  `macos_glass_material`. See `docs/APPEARANCE.md`.
 
 ## Rendering / fonts
 - ☑ **Braille (U+2800–U+28FF) rendered as tofu** (visible in `spiral_stress`).
