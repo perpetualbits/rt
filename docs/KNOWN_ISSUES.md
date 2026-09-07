@@ -28,17 +28,19 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   Command chord is swallowed, as in Terminal.app. Ctrl and Alt are untouched
   (`Ctrl+C` is still `0x03`), and off macOS the guard is a folded constant
   `false`.
-- ☐ **macOS: ⌘Q skips rt's patch-bay cleanup, and the startup sweep then eats a
-  live session's jacks.** ⌘Q is AppKit's menu item and calls `terminate:`, which
-  exits the process without running `exit_clean()`, so the session's `rt-<pid>`
-  jack directory is left behind. The startup sweep that would collect it
-  (`sweep_stale_jacks`) tests liveness with `Path::new("/proc/<pid>").exists()`,
-  which is always false on macOS — so it never learns that a dead directory is
-  dead, and, user-visibly, **starting a second rt process removes a still-running
-  first one's directory**, breaking its patch-bay wires. Pre-existing, and
-  independent of the keybindings; the fix is a portable liveness check
-  (`kill(pid, 0)`) plus an `applicationShouldTerminate` hook or an `atexit`
-  handler.
+- ☑ **macOS: a second rt destroyed the first one's patch bay** (and ⌘Q leaked its
+  own). Two faults in the same place, one of them destructive. `sweep_stale_jacks`
+  tested liveness with `Path::new("/proc/<pid>").exists()`, which is *always* false
+  on macOS: every pid looked dead, so starting a second rt `remove_dir_all`'d the
+  running first one's fifos — unrepairably, since its panes' shells already held
+  those paths in `$RT_IN`/`$RT_OUT`. Separately, ⌘Q is AppKit's menu item and calls
+  `terminate:`, which exits without running `exit_clean()`, leaving the quitting
+  session's own `rt-<pid>` behind. Fixed: liveness now goes through
+  `proc_liveness::probe`, a portable `kill(pid, 0)` where **only `ESRCH` means
+  gone** (`EPERM` — a live process owned by someone else — and any unexpected errno
+  mean *alive*, so the sweep errs toward leaking rather than deleting); and
+  `install_exit_cleanup` registers `cleanup_own_jacks` with `atexit(3)`, which
+  `terminate:`'s `exit(0)` runs, as does every other `process::exit` in rt.
 
 ## macOS (2026-09-07)
 The user-facing version of this list, with the workarounds, is

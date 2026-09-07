@@ -48,6 +48,7 @@ mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
+mod proc_liveness; // portable "is this pid still alive?" for the patch-bay sweep
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
 mod render; // the GL glyph-atlas renderer
 mod select; // pure head-navigation logic for anchored selection
@@ -317,6 +318,50 @@ fn exit_clean() -> ! {
     std::process::exit(0);
 }
 
+/// `atexit(3)` trampoline for [`cleanup_own_jacks`] — see [`install_exit_cleanup`].
+extern "C" fn cleanup_own_jacks_at_exit() {
+    cleanup_own_jacks();
+}
+
+/// Make the patch-bay cleanup run on EVERY exit, not just the ones that remember
+/// to call [`exit_clean`].
+///
+/// The motivating case is macOS: Cmd+Q is AppKit's own menu item, it calls
+/// `-[NSApplication terminate:]`, and that never returns through winit's run loop —
+/// so the quitting session leaves its `rt-<pid>` directory behind. Linux has the
+/// same shape of hole in its error paths (`process::exit(1)` after a font or event
+/// loop failure).
+///
+/// Of the three ways to hook macOS termination, this is `atexit`:
+///
+/// * `applicationShouldTerminate:` would mean replacing or subclassing winit's own
+///   `NSApplicationDelegate` — winit installs one and drives the whole run loop
+///   through it, so taking it over is both fragile and version-coupled.
+/// * An `NSApplicationWillTerminate` observer needs a block or an objc2 class to
+///   receive it, i.e. a new dependency and a new Objective-C object, for a
+///   four-line `remove_dir_all`.
+/// * `atexit` is three lines, needs no AppKit at all, and catches strictly more:
+///   `terminate:` ends in `exit(0)`, which runs atexit handlers, and so does every
+///   other `process::exit` in rt. That makes it the only option that also covers
+///   the non-macOS error exits, which is why it is registered unconditionally
+///   rather than behind `cfg(target_os = "macos")`.
+///
+/// It is registered from `main`, so it is inherited by the fork half of every pane
+/// spawn — which is safe *because* the child never reaches `exit()`: `std`'s
+/// `Command` ends a failed exec (and a failed `pre_exec` hook) with `_exit(2)`,
+/// which by definition does not run atexit handlers, and a successful exec
+/// replaces the image and its handler table outright.
+///
+/// What it does not cover is what nothing could: `SIGKILL`, a crash, `abort()`.
+/// Those still leave a directory behind, and that is now merely untidy —
+/// `sweep_stale_jacks` reclaims it at the next start, correctly (see
+/// [`proc_liveness`]).
+fn install_exit_cleanup() {
+    // SAFETY: `atexit` only records the function pointer; the handler itself runs
+    // in ordinary (non-signal) context at exit, so allocating in it is fine.
+    unsafe { libc::atexit(cleanup_own_jacks_at_exit) };
+}
+
 /// On startup, sweep away `rt-<pid>` patch-bay dirs left by sessions that have
 /// since died — a crash, a kill, or any exit that skipped cleanup. Scans both
 /// the current base and the temp dir (to catch dirs from older builds that used
@@ -334,8 +379,12 @@ fn sweep_stale_jacks() {
             else {
                 continue; // not an `rt-<pid>` dir
             };
-            // Keep our own dir and any dir whose pid is still alive.
-            if pid == me || Path::new(&format!("/proc/{pid}")).exists() {
+            // Keep our own dir and any dir whose pid is still alive. The liveness
+            // test lives in `proc_liveness` so it can be unit-tested; it must be
+            // portable, because `/proc` (the test this used to make) does not
+            // exist on macOS, where it therefore called EVERY pid dead and let a
+            // second rt delete the first one's live fifos.
+            if !proc_liveness::should_reclaim_pid(pid, me) {
                 continue;
             }
             let _ = std::fs::remove_dir_all(entry.path()); // dead owner → reclaim (EPERM ignored)
@@ -1929,7 +1978,8 @@ impl ApplicationHandler for App {
 
         // The colour picker sits modally over the prefs dialog (opened by clicking
         // a swatch). Pointer-driven: drag the SV square or hue strip; Esc / Done /
-        // a press outside commit the pending colour and close it. All input
+        // a press outside all commit the pending colour and close it — one rule
+        // for all three, decided in `prefs_model::picker_dismiss`. All input
         // swallowed; lifecycle events fall through. A drag writes the chosen RGB
         // into `prefs_pending` and arms the settle, so the terminal recolours once
         // (via `commit_settings`) rather than per pointer-move — cheap over ssh -X.
@@ -1943,11 +1993,15 @@ impl ApplicationHandler for App {
                     if ptr_button == Some(MouseButton::Left) =>
                 {
                     if !g.panel.contains(active.mouse) {
-                        Self::close_picker(active); // a click outside dismisses
+                        // A press outside the panel dismisses — and, like every
+                        // other way out, KEEPS the colour. See
+                        // `prefs_model::picker_dismiss` for why that is the
+                        // deliberate choice and not an oversight.
+                        Self::close_picker(active, prefs_model::PickerDismiss::ClickedOutside);
                         return;
                     }
                     match cp::hit(&g, active.mouse) {
-                        cp::Hit::Close => Self::close_picker(active),
+                        cp::Hit::Close => Self::close_picker(active, prefs_model::PickerDismiss::Done),
                         cp::Hit::Sv => {
                             let (s, v) = cp::sv_at(&g, active.mouse);
                             {
@@ -2001,7 +2055,7 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
                     if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
-                        Self::close_picker(active);
+                        Self::close_picker(active, prefs_model::PickerDismiss::Escape);
                     }
                     return; // swallow every key while the picker is up
                 }
@@ -3544,7 +3598,11 @@ impl App {
         }
         // Preferences: one commit per run of edits, not one per keystroke (see
         // PREFS_SETTLE and `commit_settings`).
-        if active.prefs_pending.is_some() && now.duration_since(active.last_prefs_edit) >= PREFS_SETTLE {
+        if prefs_model::settle_due(
+            active.prefs_pending.is_some(),
+            now.duration_since(active.last_prefs_edit),
+            PREFS_SETTLE,
+        ) {
             let new = active.prefs_pending.take().unwrap();
             let n = std::mem::take(&mut active.prefs_edits);
             let t0 = Instant::now();
@@ -7168,13 +7226,35 @@ impl App {
         active.last_prefs_edit = Instant::now();
     }
 
-    /// Close the picker (prefs stays open) and commit any pending colour now,
-    /// rather than stranding it behind PREFS_SETTLE — mirrors the prefs Esc path.
-    fn close_picker(active: &mut Active) {
+    /// Close the picker (prefs stays open), doing whatever
+    /// [`prefs_model::picker_dismiss`] says this way out owes the pending colour.
+    ///
+    /// Today that is Commit for all three ways — the same rule the prefs dialog's
+    /// own Esc/Close follow. The reasoning is written out at `picker_dismiss`; the
+    /// short version is that `prefs_pending` is a debounce buffer, not a
+    /// transaction, and PREFS_SETTLE has usually applied and persisted the colour
+    /// before a dismissing click can even happen. Committing here just avoids
+    /// stranding an edit younger than the settle behind a closed picker.
+    ///
+    /// `way` is threaded through rather than assumed so the decision is made in
+    /// one tested place; if it ever becomes Discard, this is where the restore
+    /// goes.
+    fn close_picker(active: &mut Active, way: prefs_model::PickerDismiss) {
         active.picker = None;
-        if let Some(new) = active.prefs_pending.take() {
-            active.prefs_edits = 0;
-            Self::commit_settings(active, new);
+        match prefs_model::picker_dismiss(way) {
+            prefs_model::Dismiss::Commit => {
+                if let Some(new) = active.prefs_pending.take() {
+                    active.prefs_edits = 0;
+                    Self::commit_settings(active, new);
+                }
+            }
+            // Unreachable today (see `picker_dismiss`). Left as an explicit arm so
+            // a future change to that decision fails to compile here instead of
+            // silently keeping the commit.
+            prefs_model::Dismiss::Discard => {
+                active.prefs_pending = None;
+                active.prefs_edits = 0;
+            }
         }
         active.window.request_redraw();
     }
@@ -7996,6 +8076,10 @@ fn main() {
     // every tab, pane and shell with it when it dies, and three crashes had
     // produced nothing to go on — no core (apport skips unpackaged binaries),
     // no stderr (the desktop launcher keeps none), no log.
+    // Cover every exit path with the patch-bay cleanup, including the ones that
+    // never come back through the run loop (macOS Cmd+Q) — see its doc. Registered
+    // first so it is in place before anything below can decide to exit.
+    install_exit_cleanup();
     crashlog::capture_stderr_if_not_a_tty();
     crashlog::install_panic_hook();
     crashlog::selftest_if_asked();
@@ -8346,5 +8430,57 @@ mod jacks_dir_tests {
         assert!(fifo_path.exists(), "second ensure_jacks_dir call wiped a live fifo");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The destructive half of the macOS bug, end to end through the real sweep:
+    /// a second rt starting must not delete a *running* rt's patch bay.
+    ///
+    /// `sweep_stale_jacks` always scans `std::env::temp_dir()` (as well as
+    /// `$XDG_RUNTIME_DIR`) so the two directories below are in its path on every
+    /// platform. Before the fix this passed on Linux and failed on macOS, where
+    /// `/proc/<pid>` does not exist and every pid therefore looked dead.
+    #[test]
+    fn the_startup_sweep_keeps_a_live_owner_and_reclaims_a_dead_one() {
+        let base = std::env::temp_dir();
+
+        // A live owner: a real child process we start and hold open.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in for a running rt");
+        let live = jacks_base_join(&base, child.id());
+
+        // A dead owner: the same, but killed and reaped before the sweep runs.
+        let mut corpse = std::process::Command::new("sleep").arg("30").spawn().expect("spawn");
+        let dead_pid = corpse.id();
+        corpse.kill().expect("kill the child we started");
+        corpse.wait().expect("reap the child we started");
+        let dead = jacks_base_join(&base, dead_pid);
+
+        for d in [&live, &dead] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir(d).expect("stage a patch-bay dir");
+            std::fs::write(d.join("0.in"), b"").expect("stage a jack inside it");
+        }
+
+        sweep_stale_jacks();
+
+        let live_survived = live.join("0.in").exists();
+        let dead_reclaimed = !dead.exists();
+
+        // Tidy up before asserting, so a failure does not also leave litter.
+        let _ = std::fs::remove_dir_all(&live);
+        let _ = std::fs::remove_dir_all(&dead);
+        child.kill().expect("kill the child we started");
+        child.wait().expect("reap the child we started");
+
+        assert!(live_survived, "the sweep deleted a LIVE owner's patch bay — the destructive bug");
+        assert!(dead_reclaimed, "the sweep failed to reclaim a dead owner's patch bay");
+    }
+
+    /// `<base>/rt-<pid>` — the same name `jacks_dir_for` builds, but under a base
+    /// the test chooses rather than the ambient one.
+    fn jacks_base_join(base: &Path, pid: u32) -> PathBuf {
+        base.join(format!("rt-{pid}"))
     }
 }
