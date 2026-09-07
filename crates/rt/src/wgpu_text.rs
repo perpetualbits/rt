@@ -23,20 +23,24 @@ use std::collections::HashMap;
 
 use fontdue::Font;
 
-use crate::render::{Color, FontBlobs};
+use crate::render::{Color, FontBlob, FontBlobs};
 
 pub const ATLAS_SIZE: u32 = 2048;
 
 /// Parse every blob in a fallback chain that fontdue can read, skipping (not
 /// failing on) any it can't -- e.g. CFF/OTF, which fontdue doesn't support.
+/// Each blob names its own face index inside its bytes, which is what makes a
+/// `.ttc` family (Menlo, PT Mono -- the common case on macOS, this backend's
+/// only platform) load its bold/italic members rather than four copies of the
+/// collection's face 0.
 /// Mirrors `render.rs`'s `parse_chain`; unlike it, this returns `Vec<Font>`
 /// unconditionally (never a `Result`) because the ONE fatal case -- an empty
 /// `regular` chain -- is checked by the caller against the parsed result,
 /// exactly as render.rs checks `fonts.is_empty()` after calling its version.
-fn parse_chain(blobs: &[Vec<u8>]) -> Vec<Font> {
+fn parse_chain(blobs: &[FontBlob]) -> Vec<Font> {
     let mut out = Vec::new();
     for (i, blob) in blobs.iter().enumerate() {
-        match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
+        match blob.parse() {
             Ok(f) => out.push(f),
             Err(e) => log::warn!("wgpu_text: skipping unparseable font #{i}: {e}"),
         }

@@ -248,7 +248,7 @@ fn test_fonts() -> FontBlobs {
     ];
     for p in CANDIDATES {
         if let Ok(bytes) = std::fs::read(p) {
-            return FontBlobs { regular: vec![bytes], ..Default::default() };
+            return FontBlobs { regular: vec![bytes.into()], ..Default::default() };
         }
     }
     panic!("no test font found; install DejaVu Sans Mono or adjust CANDIDATES");

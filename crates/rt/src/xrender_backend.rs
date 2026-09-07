@@ -644,10 +644,13 @@ fn argb32_format(formats: &render::QueryPictFormatsReply) -> Option<Pictformat> 
         .map(|f| f.id)
 }
 
+/// Parse the regular chain (this backend draws every style from it). Each blob
+/// names its own face inside its bytes, so a `.ttc` member loads as the face
+/// fontdb matched rather than the collection's face 0.
 fn parse_fonts(blobs: &FontBlobs) -> Option<Vec<Font>> {
     let mut out = Vec::new();
     for b in &blobs.regular {
-        if let Ok(f) = Font::from_bytes(b.as_slice(), fontdue::FontSettings::default()) {
+        if let Ok(f) = b.parse() {
             out.push(f);
         }
     }

@@ -27,15 +27,74 @@ use glow::HasContext; // brings the raw GL methods into scope
 /// render blank); a production version would grow or evict.
 const ATLAS: i32 = 1024;
 
-/// The font byte blobs for each weight/style the renderer needs. Each is a
+/// One font FACE: the bytes of the file it lives in, plus WHICH face inside
+/// those bytes it is.
+///
+/// A plain `.ttf` holds exactly one face, so its index is 0 and it behaves
+/// exactly as a bare `Vec<u8>` did — which is nearly every face on Linux. A
+/// `.ttc` (TrueType Collection) packs several faces — typically a family's
+/// regular/bold/italic/bold-italic — into ONE file, and the index is the *only*
+/// thing that distinguishes them: the bytes handed to the rasteriser are
+/// byte-for-byte identical for all four. Carrying the bytes without the index
+/// therefore silently collapses a whole family onto its face 0. Measured on
+/// macOS 26.6.2, where `/System/Library/Fonts/Menlo.ttc` and
+/// `…/Supplemental/PTMono.ttc` are real collections: Menlo drew bold and italic
+/// as regular, and PT Mono drew *everything* bold, because face 0 of PTMono.ttc
+/// IS PT Mono Bold.
+///
+/// A named struct rather than a `(Vec<u8>, u32)` tuple: the two members are not
+/// interchangeable, and they are consumed far from where they are built — three
+/// separate parse sites in three backends (`render.rs`, `wgpu_text.rs`,
+/// `xrender_backend.rs`). `blob.index` says what `.1` would not.
+///
+/// [`FontBlob::settings`] is the ONE place `collection_index` is ever set, so a
+/// future parse site cannot re-introduce the bug by reaching for
+/// `FontSettings::default()` — it has no bytes to reach for without also having
+/// the blob that carries the index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FontBlob {
+    pub data: Vec<u8>, // the whole file: one face for `.ttf`, the collection for `.ttc`
+    pub index: u32,    // which face inside `data` (0 for a single-face file)
+}
+
+impl FontBlob {
+    /// A face at an explicit collection index (what fontdb's query reports).
+    pub fn new(data: Vec<u8>, index: u32) -> Self {
+        FontBlob { data, index }
+    }
+
+    /// The fontdue settings that select *this* face. The only construction of
+    /// `collection_index` in rt.
+    pub fn settings(&self) -> fontdue::FontSettings {
+        fontdue::FontSettings { collection_index: self.index, ..Default::default() }
+    }
+
+    /// Rasteriser-ready face, or fontdue's parse error (CFF/OTF, a corrupt file,
+    /// or an index past the end of the collection). The single choke point every
+    /// backend parses through.
+    pub fn parse(&self) -> Result<Font, &'static str> {
+        Font::from_bytes(self.data.as_slice(), self.settings())
+    }
+}
+
+/// A single-face file (`.ttf`): index 0, i.e. exactly the old `Vec<u8>`
+/// behaviour. Keeps the path loader and the tests that build blobs from one
+/// known file free of an index that would always be 0.
+impl From<Vec<u8>> for FontBlob {
+    fn from(data: Vec<u8>) -> Self {
+        FontBlob { data, index: 0 }
+    }
+}
+
+/// The font faces for each weight/style the renderer needs. Each is a
 /// fallback chain (first entry preferred). Any but `regular` may be empty; when
 /// a style has no face installed, the renderer falls back to `regular`.
 #[derive(Default)]
 pub struct FontBlobs {
-    pub regular: Vec<Vec<u8>>,     // upright normal weight (must be non-empty)
-    pub bold: Vec<Vec<u8>>,        // bold weight
-    pub italic: Vec<Vec<u8>>,      // oblique/italic
-    pub bold_italic: Vec<Vec<u8>>, // bold + oblique
+    pub regular: Vec<FontBlob>,     // upright normal weight (must be non-empty)
+    pub bold: Vec<FontBlob>,        // bold weight
+    pub italic: Vec<FontBlob>,      // oblique/italic
+    pub bold_italic: Vec<FontBlob>, // bold + oblique
 }
 
 /// An RGBA colour in 0..=1 floats, matching the shader's vertex colour input.
@@ -75,12 +134,14 @@ struct Glyph {
 const FLOATS_PER_VERTEX: usize = 8;
 
 /// Parse a slice of font blobs into `Font`s, skipping any that fail to parse
-/// (e.g. CFF/OTF that fontdue can't read). If `primary_required`, the first blob
-/// must parse. Shared by `Renderer::new` and `reload_fonts`.
-fn parse_chain(blobs: &[Vec<u8>], primary_required: bool) -> Result<Vec<Font>, String> {
+/// (e.g. CFF/OTF that fontdue can't read). Each blob names its own face inside
+/// its bytes (`FontBlob::parse`), so a `.ttc` member is loaded as the face
+/// fontdb matched rather than as the collection's face 0. If `primary_required`,
+/// the first blob must parse. Shared by `Renderer::new` and `reload_fonts`.
+fn parse_chain(blobs: &[FontBlob], primary_required: bool) -> Result<Vec<Font>, String> {
     let mut out: Vec<Font> = Vec::new();
     for (i, blob) in blobs.iter().enumerate() {
-        match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
+        match blob.parse() {
             Ok(f) => out.push(f), // usable font
             Err(e) if i == 0 && primary_required => {
                 return Err(format!("primary font parse failed: {e}")); // fatal

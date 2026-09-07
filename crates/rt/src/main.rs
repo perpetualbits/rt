@@ -840,16 +840,28 @@ fn monospace_families(db: &fontdb::Database) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// Fetch the raw bytes of the `family` face nearest the given weight/style, or
-/// `None` if the family isn't installed.
-fn face_data(db: &fontdb::Database, family: &str, weight: fontdb::Weight, style: fontdb::Style) -> Option<Vec<u8>> {
+/// Fetch the `family` face nearest the given weight/style, or `None` if the
+/// family isn't installed.
+///
+/// Returns BOTH halves of the face's address: the file's bytes and fontdb's
+/// face `index` within them. For a `.ttf` the index is always 0, but for a
+/// `.ttc` collection the bytes are the whole collection and the index is the
+/// only thing separating regular from bold from italic — dropping it (as this
+/// did) makes every weight of a `.ttc` family resolve to the collection's face
+/// 0. See [`render::FontBlob`].
+fn face_data(
+    db: &fontdb::Database,
+    family: &str,
+    weight: fontdb::Weight,
+    style: fontdb::Style,
+) -> Option<render::FontBlob> {
     let id = db.query(&fontdb::Query {
         families: &[fontdb::Family::Name(family)],
         weight,
         stretch: fontdb::Stretch::Normal,
         style,
     })?;
-    db.with_face_data(id, |data, _index| data.to_vec())
+    db.with_face_data(id, |data, index| render::FontBlob::new(data.to_vec(), index))
 }
 
 /// Build the four font chains (regular/bold/italic/bold-italic) for `family`,
@@ -889,82 +901,92 @@ fn font_blobs(db: &fontdb::Database, family: &str) -> render::FontBlobs {
 // Regular chain: a monospace primary (first match) then coverage fallbacks
 // for ranges DejaVu Sans Mono lacks (e.g. braille). TrueType only (fontdue
 // can't read CFF/OTF); the renderer skips any that fail to parse.
+//
+// Each entry is `(path, face index)`. The index is part of a face's ADDRESS,
+// not a property of the path: a `.ttc` collection found by path is no more
+// "face 0" than one found by fontdb (see `render::FontBlob`). Every path listed
+// below is a single-face `.ttf`, so every index here is 0 — but it is stated
+// per entry rather than assumed, so adding a `.ttc` (e.g. Menlo on macOS, now
+// that rt can address its members) is a one-token change and cannot silently
+// re-collapse a family onto its first face.
 #[cfg(not(target_os = "macos"))]
-const REGULAR_FONTS: &[&str] = &[
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+const REGULAR_FONTS: &[(&str, u32)] = &[
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0),
+    ("/usr/share/fonts/dejavu/DejaVuSansMono.ttf", 0),
+    ("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 0),
+    ("/usr/share/fonts/liberation/LiberationMono-Regular.ttf", 0),
+    ("/usr/share/fonts/TTF/DejaVuSansMono.ttf", 0),
+    ("/usr/share/fonts/noto/NotoSansMono-Regular.ttf", 0),
     // coverage fallbacks (appended after the primary):
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+    ("/usr/share/fonts/truetype/agave/agave-r-autohinted.ttf", 0),
+    ("/usr/share/fonts/truetype/freefont/FreeMono.ttf", 0),
+    ("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf", 0),
 ];
 // macOS: fontdue reads TrueType only, and most system monospace faces (incl.
-// Menlo) ship as `.ttc` collections. Those are not unusable — fontdue parses
-// them — but rt only ever gets their FIRST face: `face_data` hands over whole
-// file bytes and drops fontdb's face `index`, and `FontSettings::default()`
-// then takes collection index 0. Measured on macOS 26.6.2 with fontdue 0.9.3 /
-// fontdb 0.23: `Menlo` draws bold and italic as regular, and `PT Mono` — whose
-// index-0 face IS its Bold — draws everything bold. Courier New is a complete,
+// Menlo) ship as `.ttc` collections. rt used to get only their FIRST face —
+// `face_data` handed over whole file bytes and dropped fontdb's face `index`,
+// and `FontSettings::default()` then took collection index 0. Measured on macOS
+// 26.6.2 with fontdue 0.9.3 / fontdb 0.23: `Menlo` drew bold and italic as
+// regular, and `PT Mono` — whose index-0 face IS its Bold — drew everything
+// bold. That is fixed (`render::FontBlob` carries the index), so a `.ttc` may
+// now be listed here with its face index. This list is still all-`.ttf`:
+// Courier New is a complete,
 // self-consistent four-weight TrueType monospace family in four separate `.ttf`
 // files (regular/bold/italic/bold-italic all share the same advance width), so
-// it avoids that entirely and is the primary rather than SF Mono — mixing SF
+// it avoids the question entirely and is the primary rather than SF Mono — mixing SF
 // Mono (regular) with Courier New (bold/italic) would
 // give the bold/italic faces a different advance width than the grid cell,
 // which is sized from the regular face, and glyphs would overflow their cell.
 // SF Mono is kept as a secondary regular fallback. Apple Braille/Symbol/
 // ZapfDingbats are appended as coverage fallbacks (`.ttc` collections excluded).
 #[cfg(target_os = "macos")]
-const REGULAR_FONTS: &[&str] = &[
-    "/System/Library/Fonts/Supplemental/Courier New.ttf",
-    "/System/Library/Fonts/SFNSMono.ttf",
-    "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+const REGULAR_FONTS: &[(&str, u32)] = &[
+    ("/System/Library/Fonts/Supplemental/Courier New.ttf", 0),
+    ("/System/Library/Fonts/SFNSMono.ttf", 0),
+    ("/System/Library/Fonts/Supplemental/Andale Mono.ttf", 0),
     // coverage fallbacks (appended after the primary):
-    "/System/Library/Fonts/Apple Braille.ttf",
-    "/System/Library/Fonts/Symbol.ttf",
-    "/System/Library/Fonts/ZapfDingbats.ttf",
+    ("/System/Library/Fonts/Apple Braille.ttf", 0),
+    ("/System/Library/Fonts/Symbol.ttf", 0),
+    ("/System/Library/Fonts/ZapfDingbats.ttf", 0),
 ];
 
 // Bold, italic, and bold-italic chains — all optional; each falls back to
 // the regular face when absent.
 #[cfg(not(target_os = "macos"))]
-const BOLD_FONTS: &[&str] = &[
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+const BOLD_FONTS: &[(&str, u32)] = &[
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 0),
+    ("/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
 ];
 #[cfg(target_os = "macos")]
-const BOLD_FONTS: &[&str] = &["/System/Library/Fonts/Supplemental/Courier New Bold.ttf"];
+const BOLD_FONTS: &[(&str, u32)] = &[("/System/Library/Fonts/Supplemental/Courier New Bold.ttf", 0)];
 
 #[cfg(not(target_os = "macos"))]
-const ITALIC_FONTS: &[&str] = &[
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+const ITALIC_FONTS: &[(&str, u32)] = &[
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf", 0),
+    ("/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf", 0),
 ];
 // Courier New Italic first, deliberately: regular/bold are Courier New, and
 // cell_w is derived only from the regular face's advance width (wgpu_text.rs),
 // so italic must stay in the same family or its glyphs can overflow the cell.
 // SF Mono Italic is kept only as a fallback if Courier New Italic is missing.
 #[cfg(target_os = "macos")]
-const ITALIC_FONTS: &[&str] = &[
-    "/System/Library/Fonts/Supplemental/Courier New Italic.ttf",
-    "/System/Library/Fonts/SFNSMonoItalic.ttf",
+const ITALIC_FONTS: &[(&str, u32)] = &[
+    ("/System/Library/Fonts/Supplemental/Courier New Italic.ttf", 0),
+    ("/System/Library/Fonts/SFNSMonoItalic.ttf", 0),
 ];
 
 #[cfg(not(target_os = "macos"))]
-const BOLD_ITALIC_FONTS: &[&str] = &[
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+const BOLD_ITALIC_FONTS: &[(&str, u32)] = &[
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf", 0),
+    ("/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf", 0),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf", 0),
 ];
 #[cfg(target_os = "macos")]
-const BOLD_ITALIC_FONTS: &[&str] =
-    &["/System/Library/Fonts/Supplemental/Courier New Bold Italic.ttf"];
+const BOLD_ITALIC_FONTS: &[(&str, u32)] =
+    &[("/System/Library/Fonts/Supplemental/Courier New Bold Italic.ttf", 0)];
 
 /// Locate a monospace font (plus fallback fonts for coverage gaps) on the
 /// system. rt does not ship fonts (to avoid bundling a binary in git); it probes
@@ -975,14 +997,19 @@ const BOLD_ITALIC_FONTS: &[&str] =
 /// The fallbacks matter because the usual primary — DejaVu Sans Mono — lacks
 /// some ranges (notably braille U+2800–U+28FF, used by `spiral_stress`). We add
 /// TrueType fonts that DO cover them so the renderer can fall back per glyph.
+///
+/// Each table entry carries its own face index (all 0 today — every listed path
+/// is a single-face `.ttf`), so this loader addresses a face exactly the way the
+/// fontdb path does and a `.ttc` could be listed without reintroducing the
+/// "always face 0" bug.
 fn load_fonts() -> Option<render::FontBlobs> {
-    // Read every existing path in `paths` into a chain of byte blobs.
-    let load = |paths: &[&str], label: &str| -> Vec<Vec<u8>> {
+    // Read every existing path in `paths` into a chain of face blobs.
+    let load = |paths: &[(&str, u32)], label: &str| -> Vec<render::FontBlob> {
         let mut out = Vec::new();
-        for p in paths {
+        for (p, index) in paths {
             if let Ok(bytes) = std::fs::read(p) {
-                log::info!("{label} font {p}"); // record each face we picked
-                out.push(bytes);
+                log::info!("{label} font {p} (face {index})"); // record each face we picked
+                out.push(render::FontBlob::new(bytes, *index));
             }
         }
         out
@@ -5780,11 +5807,28 @@ impl App {
     /// font chains if the family changed), re-measure the cell, and resize every
     /// pane to the new (cols, rows). Shared by the preferences dialog and the
     /// zoom actions.
+    ///
+    /// A family whose faces fontdue cannot read (bitmap-only fonts such as macOS
+    /// `GB18030 Bitmap`, and any CFF/OTF-only family) makes `reload_fonts` fail.
+    /// The backend then keeps the fonts it already has, so the screen does not
+    /// change — but the new family name is already committed and shown in
+    /// Preferences, which is confusing. Two things are done about that here:
+    /// the warning NAMES the family and says the previous font was kept, and the
+    /// previous `font_blobs` are restored, so a later zoom (`family_changed ==
+    /// false`) reloads the font that is actually on screen instead of retrying
+    /// the unusable chain and failing too.
     fn refresh_fonts(active: &mut Active, family_changed: bool) {
         active.force_full = true; // cell metrics change: every cell→px mapping is stale
-        if family_changed {
-            active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
-        }
+        // Keep the old chain: it is what the backend is still rendering, and it
+        // is what must come back if the new family turns out to be unusable.
+        let prev_blobs = if family_changed {
+            Some(std::mem::replace(
+                &mut active.font_blobs,
+                font_blobs(&active.font_db, &active.settings.font_family),
+            ))
+        } else {
+            None
+        };
         // HiDPI: read the window's CURRENT scale factor fresh (never cached),
         // same helper and same source as `build_active` uses for the initial
         // load — that consistency is what stops the window changing apparent
@@ -5802,7 +5846,19 @@ impl App {
                 let size = active.window.surface_size();
                 active.session.relayout(content_bounds(size));
             }
-            Err(e) => log::warn!("font reload failed: {e}"),
+            Err(e) => {
+                log::warn!(
+                    "font {:?} could not be loaded ({e}); keeping the previous font — \
+                     Preferences will still show {:?}",
+                    active.settings.font_family,
+                    active.settings.font_family
+                );
+                // Put back the chain the backend is actually rendering, so the
+                // next zoom step reloads a font that parses.
+                if let Some(prev) = prev_blobs {
+                    active.font_blobs = prev;
+                }
+            }
         }
     }
 
@@ -8482,5 +8538,361 @@ mod jacks_dir_tests {
     /// the test chooses rather than the ambient one.
     fn jacks_base_join(base: &Path, pid: u32) -> PathBuf {
         base.join(format!("rt-{pid}"))
+    }
+}
+
+/// The `.ttc` face-index gate.
+///
+/// A TrueType Collection (`.ttc`) is ONE file holding SEVERAL faces — typically
+/// a family's regular/bold/italic/bold-italic. Loading one is a two-part
+/// address: the bytes *and* the index of the face inside them. rt used to carry
+/// only the bytes (`FontBlobs` was four `Vec<Vec<u8>>`) and every parse site
+/// used `fontdue::FontSettings::default()`, whose `collection_index` is 0 — so
+/// whichever face fontdb matched, rt always rasterised face 0. Measured on
+/// macOS 26.6.2: `Menlo` drew bold and italic as regular, `PT Mono` drew
+/// *everything* bold (face 0 of `PTMono.ttc` IS PT Mono Bold). Latent on Linux
+/// for any `.ttc` family.
+///
+/// These tests are CPU-only — fontdue rasterises without a GPU or a display, and
+/// fontdb reads files — so they run on every platform in ordinary `cargo test`.
+#[cfg(test)]
+mod font_face_tests {
+    use super::*;
+    use fontdue::{Font, FontSettings};
+    use render::FontBlob;
+
+    /// Common single-face monospace `.ttf` pairs (regular, bold) to build a
+    /// synthetic collection from. The two members must genuinely differ — a bold
+    /// face's coverage bitmap for 'M' is not its regular's — or a pass would be
+    /// vacuous; the test asserts that up front.
+    const TTF_PAIRS: &[(&str, &str)] = &[
+        // Linux
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        ),
+        ("/usr/share/fonts/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/dejavu/DejaVuSansMono-Bold.ttf"),
+        ("/usr/share/fonts/TTF/DejaVuSansMono.ttf", "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf"),
+        (
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+        ),
+        (
+            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationMono-Bold.ttf",
+        ),
+        ("/usr/share/fonts/noto/NotoSansMono-Regular.ttf", "/usr/share/fonts/noto/NotoSansMono-Bold.ttf"),
+        // macOS — Courier New is rt's macOS primary (four separate `.ttf` files).
+        (
+            "/System/Library/Fonts/Supplemental/Courier New.ttf",
+            "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+        ),
+    ];
+
+    /// Real installed `.ttc` collections worth probing, most interesting first.
+    ///
+    /// `Menlo.ttc` is `[Regular, Bold, Italic, Bold Italic]` — the exact file the
+    /// bug was measured on. The Linux entries are the CJK collections common
+    /// distro packages ship; several are CFF/OTF (`OTTO`), which fontdue cannot
+    /// read at all, so the probe moves on.
+    const SYSTEM_TTCS: &[&str] = &[
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Supplemental/PTMono.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+        "/usr/share/fonts/truetype/arphic/ukai.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    ];
+
+    /// Splice whole standalone sfnt files into ONE valid TrueType Collection.
+    ///
+    /// A `.ttc` is a `ttcf` header of absolute offsets to each member's *table
+    /// directory*; the table records inside a member hold offsets that are
+    /// absolute **within the whole file**. A standalone `.ttf` is written as if
+    /// it began at 0, so each member's records are rebased by the offset the
+    /// member lands at. `head.checkSumAdjustment` goes stale as a result —
+    /// neither ttf-parser (fontdue's backend) nor fontdb verifies it, and a
+    /// checksum is not what these tests are about.
+    fn build_ttc(fonts: &[&[u8]]) -> Vec<u8> {
+        let n = fonts.len();
+        let header_len = 12 + 4 * n; // ttcTag, version, numFonts, offsets[]
+        let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut offsets: Vec<u32> = Vec::with_capacity(n);
+
+        let mut cursor = header_len;
+        for f in fonts {
+            cursor = (cursor + 3) & !3; // sfnt directories are 4-byte aligned
+            let base = cursor as u32;
+            offsets.push(base);
+
+            let mut body = f.to_vec();
+            let num_tables = u16::from_be_bytes([body[4], body[5]]) as usize;
+            for t in 0..num_tables {
+                let rec = 12 + 16 * t; // tag(4) checkSum(4) offset(4) length(4)
+                let off =
+                    u32::from_be_bytes([body[rec + 8], body[rec + 9], body[rec + 10], body[rec + 11]]);
+                body[rec + 8..rec + 12].copy_from_slice(&(off + base).to_be_bytes());
+            }
+            cursor += body.len();
+            bodies.push(body);
+        }
+
+        let mut out = Vec::with_capacity(cursor);
+        out.extend_from_slice(b"ttcf");
+        out.extend_from_slice(&1u16.to_be_bytes()); // majorVersion
+        out.extend_from_slice(&0u16.to_be_bytes()); // minorVersion
+        out.extend_from_slice(&(n as u32).to_be_bytes());
+        for o in &offsets {
+            out.extend_from_slice(&o.to_be_bytes());
+        }
+        for (body, off) in bodies.iter().zip(&offsets) {
+            while out.len() < *off as usize {
+                out.push(0); // alignment padding
+            }
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    /// The first fully readable `(regular, bold)` pair from [`TTF_PAIRS`].
+    fn ttf_pair() -> Option<(Vec<u8>, Vec<u8>)> {
+        TTF_PAIRS.iter().find_map(|(r, b)| Some((std::fs::read(r).ok()?, std::fs::read(b).ok()?)))
+    }
+
+    /// What the user SEES for 'M': its advance width and its coverage bitmap.
+    /// This is the fingerprint that matters for the bug — a bold face drawn as
+    /// regular is exactly these two being wrong.
+    fn render_fingerprint(font: &Font) -> (u32, Vec<u8>) {
+        let (m, bitmap) = font.rasterize('M', 24.0);
+        (m.advance_width.to_bits(), bitmap)
+    }
+
+    /// Which FACE this is, independent of any one glyph.
+    ///
+    /// Needed for real system collections, where two members can share their
+    /// whole Latin range and differ only elsewhere — `uming.ttc`'s members are
+    /// AR PL UMing TW/CN/HK/TW MBE, whose 'M' is byte-identical while their
+    /// names and CJK cmaps are not. `render_fingerprint` alone would call those
+    /// "the same face" and wrongly fail.
+    fn face_fingerprint(font: &Font) -> (Option<String>, u16, usize, u32, (u32, Vec<u8>)) {
+        (
+            font.name().map(str::to_owned),
+            font.glyph_count(),
+            font.chars().len(),
+            font.units_per_em().to_bits(),
+            render_fingerprint(font),
+        )
+    }
+
+    /// `numFonts` from a `ttcf` header, or `None` if these bytes are not a
+    /// collection.
+    fn ttc_face_count(bytes: &[u8]) -> Option<u32> {
+        if bytes.first_chunk::<4>() != Some(b"ttcf") || bytes.len() < 12 {
+            return None;
+        }
+        Some(u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]))
+    }
+
+    /// THE gate: a [`FontBlob`] carrying index 1 of a real collection must
+    /// rasterise the face at index 1, not face 0. Platform-independent — the
+    /// collection is built here out of two ordinary `.ttf` files.
+    #[test]
+    fn ttc_face_index_selects_a_different_face() {
+        let Some((regular, bold)) = ttf_pair() else {
+            panic!(
+                "no (regular, bold) monospace .ttf pair found; install DejaVu Sans Mono \
+                 (fonts-dejavu-core) or extend TTF_PAIRS"
+            );
+        };
+        let ttc = build_ttc(&[&regular, &bold]);
+
+        // Non-vacuity: the two source faces really do rasterise differently.
+        let src_regular = Font::from_bytes(regular.as_slice(), FontSettings::default()).expect("regular .ttf");
+        let src_bold = Font::from_bytes(bold.as_slice(), FontSettings::default()).expect("bold .ttf");
+        assert_ne!(
+            render_fingerprint(&src_regular),
+            render_fingerprint(&src_bold),
+            "the two source faces rasterise identically — pick a pair that genuinely differs"
+        );
+
+        // The fixture really is a well-formed collection: face 0 is the regular.
+        let face0 = FontBlob::new(ttc.clone(), 0).parse().expect("synthetic .ttc face 0");
+        assert_eq!(
+            render_fingerprint(&face0),
+            render_fingerprint(&src_regular),
+            "face 0 of the collection is not the regular face it was built from"
+        );
+
+        // The gate itself: index 1 must reach the bold face.
+        let blob = FontBlob::new(ttc, 1);
+        assert_eq!(blob.index, 1, "FontBlob must carry the index it was built with");
+        let face1 = blob.parse().expect("synthetic .ttc face 1");
+        assert_ne!(
+            render_fingerprint(&face1),
+            render_fingerprint(&face0),
+            "face 1 of a .ttc rasterised identically to face 0 — the face index is being dropped"
+        );
+        assert_eq!(
+            render_fingerprint(&face1),
+            render_fingerprint(&src_bold),
+            "face 1 of the collection is not the bold face it was built from"
+        );
+    }
+
+    /// `face_data` must hand back the index fontdb reports, not 0.
+    ///
+    /// Deterministic on every platform: a private `fontdb::Database` is fed the
+    /// synthetic two-face collection built above, so the bold face fontdb matches
+    /// is known to live at index 1 of a file whose bytes are shared with the
+    /// regular face at index 0. Against the old code both queries returned the
+    /// same bytes with no index at all.
+    #[test]
+    fn face_data_reports_fontdbs_face_index() {
+        let Some((regular, bold)) = ttf_pair() else {
+            panic!("no (regular, bold) monospace .ttf pair found; install DejaVu Sans Mono");
+        };
+        let ttc = build_ttc(&[&regular, &bold]);
+
+        let mut db = fontdb::Database::new();
+        db.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(ttc.clone())));
+
+        // The family both faces of the synthetic collection declare.
+        let family = db
+            .faces()
+            .find(|f| f.weight == fontdb::Weight::BOLD)
+            .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+            .expect("the synthetic collection registered no bold face");
+
+        let reg = face_data(&db, &family, fontdb::Weight::NORMAL, fontdb::Style::Normal)
+            .expect("regular face of the synthetic collection");
+        let bld = face_data(&db, &family, fontdb::Weight::BOLD, fontdb::Style::Normal)
+            .expect("bold face of the synthetic collection");
+
+        assert_eq!(reg.index, 0, "the regular face of the collection is at index 0");
+        assert_eq!(
+            bld.index, 1,
+            "face_data returned index {} for the bold face of a .ttc — fontdb reported 1; \
+             the index is being discarded",
+            bld.index
+        );
+        // The whole point: identical bytes, different faces.
+        assert_eq!(reg.data, bld.data, "both faces of one .ttc must carry the same file bytes");
+        assert_ne!(
+            render_fingerprint(&bld.parse().expect("bold blob")),
+            render_fingerprint(&reg.parse().expect("regular blob")),
+            "the two blobs rasterise identically — the index is not reaching fontdue"
+        );
+    }
+
+    /// A plain `.ttf` still gets index 0 and parses exactly as it did before —
+    /// this is the ~all-of-Linux case and must be bit-identical.
+    #[test]
+    fn ttf_blob_defaults_to_face_zero() {
+        let Some((regular, _)) = ttf_pair() else {
+            panic!("no monospace .ttf found; install DejaVu Sans Mono or extend TTF_PAIRS");
+        };
+        let blob = FontBlob::from(regular.clone());
+        assert_eq!(blob.index, 0, "a bare Vec<u8> must mean face 0");
+        assert_eq!(
+            blob.settings().collection_index,
+            FontSettings::default().collection_index,
+            "an index-0 blob must produce exactly the old default settings"
+        );
+        let via_default = Font::from_bytes(regular.as_slice(), FontSettings::default()).expect("default parse");
+        assert_eq!(
+            render_fingerprint(&blob.parse().expect("blob parse")),
+            render_fingerprint(&via_default),
+            ".ttf rendering changed — index-0 blobs must be identical to the old path"
+        );
+    }
+
+    /// Every face in `load_fonts`' path-search chains is a single-face `.ttf`,
+    /// so every index it produces is 0. Guards the `(path, index)` tables against
+    /// a `.ttc` sneaking in at a stale index 0 — the exact bug, re-entering by
+    /// the back door.
+    #[test]
+    fn path_loaded_faces_are_single_face_files() {
+        for (table, label) in [
+            (REGULAR_FONTS, "regular"),
+            (BOLD_FONTS, "bold"),
+            (ITALIC_FONTS, "italic"),
+            (BOLD_ITALIC_FONTS, "bold-italic"),
+        ] {
+            for (path, index) in table {
+                let Ok(bytes) = std::fs::read(path) else { continue }; // not installed here
+                let is_collection = bytes.first_chunk::<4>() == Some(b"ttcf");
+                assert!(
+                    !is_collection || *index != 0 || bytes.len() < 12,
+                    "{label} font {path} is a .ttc listed at face 0 — state the face you \
+                     actually want, or every weight collapses onto the collection's first face"
+                );
+                assert!(
+                    is_collection || *index == 0,
+                    "{label} font {path} is a single-face file but is listed at face {index}"
+                );
+            }
+        }
+    }
+
+    /// The same proof against a REAL installed collection — on macOS that is
+    /// `Menlo.ttc`, the file the bug was measured on.
+    ///
+    /// Walks every face of the first parseable collection found and requires at
+    /// least one of them to be a genuinely different face from face 0
+    /// ([`face_fingerprint`], not just 'M' — see its doc). A collection whose
+    /// members were all identical would carry no information to lose, so that is
+    /// reported rather than failed.
+    ///
+    /// Skips *loudly* (a printed `SKIP:` line naming what it probed) when the
+    /// machine has no fontdue-parseable `.ttc`; many Linux boxes ship only
+    /// CFF/OTF collections, which fontdue cannot read at all. The synthetic tests
+    /// above are the platform-independent gate, so a skip here never means the
+    /// fix is untested.
+    #[test]
+    fn system_ttc_face_differs_from_face_zero() {
+        let mut probed: Vec<String> = Vec::new();
+        for path in SYSTEM_TTCS {
+            let Ok(bytes) = std::fs::read(path) else { continue };
+            let Some(n_faces) = ttc_face_count(&bytes) else {
+                probed.push(format!("{path}: not a TrueType Collection"));
+                continue;
+            };
+            let Ok(face0) = FontBlob::new(bytes.clone(), 0).parse() else {
+                // Almost always CFF/OTF ("OTTO"), which fontdue does not support.
+                probed.push(format!("{path}: fontdue cannot parse it (CFF/OTF collection?)"));
+                continue;
+            };
+            let want = face_fingerprint(&face0);
+
+            let mut differing = Vec::new();
+            for idx in 1..n_faces {
+                let blob = FontBlob::new(bytes.clone(), idx);
+                let Ok(face) = blob.parse() else {
+                    probed.push(format!("{path}: face {idx} did not parse"));
+                    continue;
+                };
+                if face_fingerprint(&face) != want {
+                    differing.push((idx, face.name().map(str::to_owned)));
+                }
+            }
+            assert!(
+                !differing.is_empty(),
+                "{path}: all {n_faces} faces came back identical to face 0 — the face index is \
+                 being dropped (or this collection is degenerate)"
+            );
+            eprintln!(
+                "system .ttc checked: {path} ({n_faces} faces); face 0 = {:?}; \
+                 faces differing from it: {differing:?}",
+                face0.name()
+            );
+            return; // one real collection proved is enough
+        }
+        eprintln!(
+            "SKIP: system_ttc_face_differs_from_face_zero — no fontdue-parseable .ttc installed.\n\
+             Probed: {}\n\
+             This machine cannot exercise a REAL collection; \
+             ttc_face_index_selects_a_different_face still gates the behaviour with a synthetic one.",
+            if probed.is_empty() { "none of the candidate paths exist".to_string() } else { probed.join("; ") }
+        );
     }
 }
