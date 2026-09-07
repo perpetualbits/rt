@@ -194,8 +194,8 @@ window.PROJECT_MAP = {
     {
       id: "instruments", label: "Border instruments", layer: "chrome", status: "done",
       tags: ["gauges"],
-      desc: "Live gauges painted on each pane's edge: output flow, CPU heat (blackbody colour), and render latency. Composited into the border and idle-throttled, so they cost nothing when a pane is quiet.",
-      files: ["crates/rt/src/chrome/instruments.rs"],
+      desc: "Live gauges painted on each pane's edge: output flow, CPU heat (blackbody colour), and render latency. Composited into the border and idle-throttled, so they cost nothing when a pane is quiet. Heat sums the CPU time of the pane's whole process subtree; the walk is portable and only its two leaf queries are per-platform (/proc on Linux, proc_pid_rusage + proc_listchildpids on macOS, where the mach-absolute-time units must be converted or an Apple Silicon reading is 41x low).",
+      files: ["crates/rt/src/chrome/instruments.rs", "crates/rt/src/cpu_heat.rs"],
       specs: [{ label: "Instrument compositing design", href: "docs/superpowers/specs/2026-07-14-instrument-compositing-design.md" }],
       parts: [],
       deps: ["rt-app"]

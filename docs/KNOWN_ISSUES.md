@@ -58,14 +58,34 @@ under Input / keyboard.
   multiplied by the scale factor; `WINDOW_MARGIN` (8px) and `rt-session`'s
   `PANE_PAD`/`TITLEBAR_PAD` stay flat physical pixels, so at 2x they read as
   hairlines. Cosmetic; also applies to a HiDPI Linux setup.
-- ☐ **`Ctrl`+click on a URL does nothing.** `App::open_url` spawns `xdg-open`,
-  which macOS does not have (`open` is the equivalent; rt does not call it).
+- ☑ **`Ctrl`+click on a URL did nothing.** `App::open_url` spawned `xdg-open`,
+  which macOS does not have. Fixed: the program name now comes from
+  `opener_command(cfg!(target_os = "macos"))` — `open` on a Mac, `xdg-open`
+  everywhere else. Both take the URL as a single argv and neither re-parses it
+  through a shell, so the security shape is unchanged [review RT-PRIV-001]: still
+  one argument, still no shell, still only a redacted URL in the log. A missing
+  opener (a bare Linux box with no xdg-utils) is still non-fatal, and now says so
+  by name at `warn`, which `env_logger`'s default filter shows.
 - ☐ **No PRIMARY selection, so copy-on-select is a silent no-op and middle-click
   pastes nothing.** Deliberate — PRIMARY is an X11 concept — but it means a Mac
   user must press ⌘C after selecting, where a Linux user need not.
-- ☐ **The CPU-heat instrument always reads zero.** `subtree_cpu_ticks` sums
-  `/proc/<pid>/stat` over the pane's process subtree. Output-flow and latency
-  are fine.
+- ☑ **The CPU-heat instrument always read zero.** `subtree_cpu_ticks` summed
+  `/proc/<pid>/stat` over the pane's process subtree, and macOS has no `/proc`.
+  Fixed by implementing the macOS path rather than hiding the gauge: the walk
+  moved to `crates/rt/src/cpu_heat.rs`, which keeps the traversal portable and
+  swaps only its two leaf queries per platform — `proc_pid_rusage` for a
+  process's CPU time and `proc_listchildpids` for its children, the exact
+  counterparts of `/proc/<pid>/stat` and `/proc/<pid>/task/<pid>/children`, so
+  the cost stays O(the pane's own processes) with no `KERN_PROC_ALL` scan.
+  **The trap:** `ri_user_time`/`ri_system_time` are **mach absolute time units**,
+  not nanoseconds. On Intel the timebase is 1/1 and the two are the same number;
+  on Apple Silicon it is 125/3, so raw units read 41.67× low — a busy pane looks
+  like a 2% idle one, which is worse than reading zero. Measured on an M5 against
+  `ps`: raw 0.024 cores where `ps` said 100.0%, converted 1.0003 cores; over a
+  four-process subtree burning three cores, 3.001 vs `ps`'s 3.010 (0.3%).
+  `cpu_heat`'s `a_busy_child_measures_about_one_core` measures a real busy
+  process on whatever platform the suite runs on and fails at both 0.0 and 0.024,
+  so neither mistake can come back silently.
 - ☐ **A `.ttc` font family collapses to its first face.** `face_data` hands
   fontdue the whole collection and discards fontdb's face `index`, and
   `FontSettings::default()` then takes collection index 0. Measured on macOS
@@ -74,9 +94,16 @@ under Input / keyboard.
   (the macOS default) and `Andale Mono` are plain `.ttf` and are unaffected;
   `GB18030 Bitmap` fails to parse at all, and rt then keeps the previous font
   while Preferences shows the new name.
-- ☐ **`--backend` / `RT_BACKEND` are accepted and ignored** (a macOS build has
+- ☑ **`--backend` / `RT_BACKEND` were accepted and ignored** (a macOS build has
   exactly one backend, and `choose_backend_on` returns `Wgpu` before reading the
-  override), yet `rt --help` still lists `--backend gl|xrender`.
+  override), yet `rt --help` still listed `--backend gl|xrender`. Fixed in
+  `backend.rs`, next to the selection rule that cannot honour them:
+  `backend_help_line` returns `None` on macOS so `--help` advertises no choice,
+  and `check_backend_override` refuses every value there. `--backend` is the
+  explicit form and exits 2 with the reason; `RT_BACKEND` is easy to leave behind
+  in a shell profile, so it warns once at `warn` and rt still starts. Linux is
+  byte-for-byte unchanged — `linux_backend_flag_is_unchanged` and
+  `help_is_byte_identical_on_linux` are the gates on that.
 - ☐ **Damage tracking is inert.** `WgpuBackend` advertises no damage capability,
   so `main.rs` marks full damage every frame — every macOS frame is a full
   redraw.

@@ -171,9 +171,106 @@ pub fn choose_backend_on(
     }
 }
 
+/// The `--help` line that advertises `--backend`, or `None` on a build that has
+/// no choice to advertise.
+///
+/// A macOS rt links exactly ONE backend: `gl_backend` and `xrender_backend` are
+/// `cfg`'d out of the binary entirely, so `--backend gl` names a module that is
+/// not there. Printing the flag in `--help` on that build is a CLI that lies, so
+/// the line is dropped instead of being listed and ignored.
+///
+/// Platform is an argument, not a `cfg!` in the body, for the same reason
+/// [`choose_backend_on`] takes one: the macOS answer is then testable ON LINUX,
+/// which is the only CI rt has.
+pub fn backend_help_line(is_macos: bool) -> Option<&'static str> {
+    if is_macos {
+        None
+    } else {
+        Some("--backend gl|xrender  override the auto-selected rendering backend")
+    }
+}
+
+/// Can this build honour a `--backend` / `RT_BACKEND` value of `value`?
+///
+/// `source` is the spelling to blame in the message — `"--backend"` or
+/// `"RT_BACKEND"` — so one rule serves both entry points while each still reads
+/// correctly to the user.
+///
+/// The macOS arm comes first, mirroring [`choose_backend_on`]: there the override
+/// is discarded *before* it is consulted, which is right (there is nothing to
+/// switch to) but was silent, so `rt --backend xrender` on a Mac started normally
+/// and did nothing. Now the value is refused with a reason.
+///
+/// The Linux arm is byte-for-byte the message `parse_cli` printed before this
+/// function existed; the `--backend` behaviour on Linux is unchanged.
+pub fn check_backend_override(source: &str, value: &str, is_macos: bool) -> Result<(), String> {
+    if is_macos {
+        return Err(format!(
+            "{source} is not available in this build: a macOS rt contains exactly one rendering \
+             backend (Metal, via wgpu), so '{value}' cannot be honoured"
+        ));
+    }
+    if !value.eq_ignore_ascii_case("gl") && !value.eq_ignore_ascii_case("xrender") {
+        return Err(format!("{source} must be 'gl' or 'xrender', got '{value}'"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- `--backend` / `RT_BACKEND` honesty (see `backend_help_line`) ---------
+    // These take the platform as data, so the macOS answers are asserted here on
+    // Linux. Nothing else can check them: no CI compiles the macOS backend.
+
+    /// Linux keeps every byte of the pre-existing `--help` line and the
+    /// pre-existing rejection message. This is the regression gate for "Linux
+    /// behaviour must not change".
+    #[test]
+    fn linux_backend_flag_is_unchanged() {
+        assert_eq!(
+            backend_help_line(false),
+            Some("--backend gl|xrender  override the auto-selected rendering backend")
+        );
+        assert_eq!(check_backend_override("--backend", "gl", false), Ok(()));
+        assert_eq!(check_backend_override("--backend", "xrender", false), Ok(()));
+        assert_eq!(check_backend_override("--backend", "XRender", false), Ok(())); // case-insensitive
+        assert_eq!(
+            check_backend_override("--backend", "vulkan", false),
+            Err("--backend must be 'gl' or 'xrender', got 'vulkan'".to_string())
+        );
+    }
+
+    /// macOS advertises no choice, because it has none.
+    #[test]
+    fn macos_advertises_no_backend_choice() {
+        assert_eq!(backend_help_line(true), None);
+    }
+
+    /// The defect: on macOS every value was accepted and silently dropped. Every
+    /// value must now be refused — including `gl` and `xrender`, which are real
+    /// backend names but are not in a macOS binary.
+    #[test]
+    fn macos_refuses_every_backend_override() {
+        for v in ["gl", "xrender", "wgpu", "nonsense"] {
+            let err = check_backend_override("--backend", v, true)
+                .expect_err("a macOS build can honour no --backend value");
+            assert!(err.contains("--backend"), "message must name the flag: {err}");
+            assert!(err.contains(v), "message must quote the rejected value: {err}");
+        }
+    }
+
+    /// The env-var spelling gets its own wording; `RT_BACKEND` is warned about
+    /// rather than fatal (it is easy to leave one in a shell profile), so the
+    /// message must not say `--backend`.
+    #[test]
+    fn the_message_names_the_source_it_was_given() {
+        let err = check_backend_override("RT_BACKEND", "gl", true).unwrap_err();
+        assert!(err.starts_with("RT_BACKEND"), "{err}");
+        assert!(!err.contains("--backend"), "{err}");
+    }
+
     /// Asserts Linux selection through the platform-sensitive wrapper; meaningless
     /// on macOS which has exactly one backend.
     #[cfg(not(target_os = "macos"))]

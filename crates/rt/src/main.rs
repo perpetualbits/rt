@@ -40,6 +40,11 @@ mod wgpu_text; // glyph atlas + pipeline for wgpu_backend
 mod wgpu_frame; // pure end_frame decision table for wgpu_backend
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard / macOS arboard)
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
+// Also deliberately NOT cfg'd, and for the same reason as the two above: the process-tree
+// walk behind the heat instrument is plain graph logic, and only the two leaf queries it
+// calls are per-platform. It read `/proc` inline in this file until macOS — which has no
+// `/proc` — made every pane read zero.
+mod cpu_heat; // per-pane CPU load: the pane's whole process subtree, in nanoseconds
 mod damage; // pure pixel-rect damage accumulator
 mod dragdrop; // pure drop-target resolver for cross-window pane/tab drag-and-drop
 mod carry_card; // pure RGBA held-pane card builder
@@ -488,8 +493,8 @@ struct Active {
     meters: std::collections::HashMap<rt_core::PaneId, Meter>, // per-pane output-activity instrument
     last_meter_tick: Instant,             // wall-clock of the last instrument advance
     heat: std::collections::HashMap<rt_core::PaneId, f32>, // per-pane CPU load (heat instrument)
-    heat_ticks: std::collections::HashMap<rt_core::PaneId, u64>, // last session CPU ticks per pane
-    heat_last: Instant,                   // wall-clock of the last /proc heat sample
+    heat_ns: std::collections::HashMap<rt_core::PaneId, u64>,    // last session CPU nanoseconds per pane
+    heat_last: Instant,                   // wall-clock of the last heat sample
     lat_phase: f32,                       // phase of the latency frame's undulation
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
@@ -690,8 +695,12 @@ fn parse_cli() -> Cli {
             "--font-size" => cli.font_size = Some(parse_f32(&value("--font-size"), "--font-size")),
             "--backend" => {
                 let v = value("--backend");
-                if !v.eq_ignore_ascii_case("gl") && !v.eq_ignore_ascii_case("xrender") {
-                    eprintln!("rt: --backend must be 'gl' or 'xrender', got '{v}'");
+                // The rule lives in `backend.rs` next to `choose_backend_on`, which is what
+                // actually honours (or, on macOS, cannot honour) the value. On Linux this
+                // prints exactly the message it always did; on macOS it refuses, instead of
+                // accepting a flag the binary has no second backend to satisfy.
+                if let Err(msg) = backend::check_backend_override("--backend", &v, cfg!(target_os = "macos")) {
+                    eprintln!("rt: {msg}");
                     std::process::exit(2);
                 }
                 cli.backend = Some(v);
@@ -705,19 +714,7 @@ fn parse_cli() -> Cli {
                 std::process::exit(0);
             }
             "-h" | "--help" => {
-                println!(
-                    "rt — Wayland-native terminal multiplexer\n\n\
-                     Usage: rt [OPTIONS]\n\n\
-                     Options:\n  \
-                     --cols N          pin the initial grid width (cells)\n  \
-                     --rows N          pin the initial grid height (cells)\n  \
-                     --font \"Family\"   override the configured font family\n  \
-                     --font-size PX    override the configured font size (pixels)\n  \
-                     --backend gl|xrender  override the auto-selected rendering backend\n  \
-                     -V, --version     print version and exit\n  \
-                     -h, --help        show this message\n\n\
-                     Everything else is configured in Preferences / config.toml."
-                );
+                println!("{}", help_text(cfg!(target_os = "macos")));
                 std::process::exit(0);
             }
             other => {
@@ -727,6 +724,64 @@ fn parse_cli() -> Cli {
         }
     }
     cli
+}
+
+/// The text `-h`/`--help` prints, as a pure function of the platform.
+///
+/// Built rather than written out as one literal so the option list can *differ*
+/// per platform without a `cfg!` buried in a `println!`: a macOS build contains
+/// exactly one rendering backend, so it must not advertise `--backend gl|xrender`
+/// (see [`backend::backend_help_line`]). Taking `is_macos` as an argument is what
+/// lets Linux CI assert the macOS wording — no Mac compiles in CI.
+///
+/// The `is_macos == false` output is byte-for-byte the text rt has always
+/// printed; `help_is_byte_identical_on_linux` is the gate on that.
+fn help_text(is_macos: bool) -> String {
+    // "Wayland-native" is rt's Linux identity and is simply false on a Mac, where
+    // the window is AppKit and the backend is Metal.
+    let tagline = if is_macos {
+        "rt — a terminal multiplexer"
+    } else {
+        "rt — Wayland-native terminal multiplexer"
+    };
+    let mut s = format!(
+        "{tagline}\n\n\
+         Usage: rt [OPTIONS]\n\n\
+         Options:\n  \
+         --cols N          pin the initial grid width (cells)\n  \
+         --rows N          pin the initial grid height (cells)\n  \
+         --font \"Family\"   override the configured font family\n  \
+         --font-size PX    override the configured font size (pixels)\n  "
+    );
+    if let Some(line) = backend::backend_help_line(is_macos) {
+        s.push_str(line);
+        s.push_str("\n  ");
+    }
+    s.push_str(
+        "-V, --version     print version and exit\n  \
+         -h, --help        show this message\n\n\
+         Everything else is configured in Preferences / config.toml.",
+    );
+    s
+}
+
+/// The command that hands a URL to the desktop's default handler.
+///
+/// `xdg-open` is a freedesktop.org tool and simply does not exist on macOS, whose
+/// equivalent is `open(1)`. Both take the URL as a *single argument* and neither
+/// re-parses it through a shell, so [`App::open_url`]'s security shape
+/// (`Command::new(..).arg(url)`, no shell, only a redacted form logged —
+/// [review RT-PRIV-001]) is identical either way and the only difference is the
+/// program name.
+///
+/// Platform is an argument, not a `cfg!` inside the body, so the macOS answer is
+/// testable on Linux — see `opener_is_platform_correct`.
+fn opener_command(is_macos: bool) -> &'static str {
+    if is_macos {
+        "open"
+    } else {
+        "xdg-open"
+    }
 }
 
 /// Parse a `usize` CLI value or exit(2) with a clear message.
@@ -1668,6 +1723,16 @@ impl App {
         let display_env = std::env::var("DISPLAY").ok();
         let is_x11 = display_env.is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none();
         let backend_override = self.cli.backend.clone().or_else(|| std::env::var("RT_BACKEND").ok());
+        // On macOS `--backend` is already fatal in `parse_cli`, so anything still here came
+        // from the environment. An `RT_BACKEND` left in a shell profile must not stop rt from
+        // starting — but it must not be silently swallowed either, which is what it was: say
+        // once, at the default log level, that it cannot be honoured, then carry on.
+        #[cfg(target_os = "macos")]
+        if let Some(v) = backend_override.as_deref() {
+            if let Err(msg) = backend::check_backend_override("RT_BACKEND", v, true) {
+                log::warn!("{msg}; ignoring it");
+            }
+        }
         #[allow(unused_mut)] // only the Linux arm below can re-point this
         let mut backend_kind = backend::choose_backend(display_env.as_deref(), is_x11, backend_override.as_deref());
         // A GL renderer that would not initialise takes the GL backend off the
@@ -1803,7 +1868,7 @@ impl App {
             meters: std::collections::HashMap::new(),
             last_meter_tick: Instant::now(),
             heat: std::collections::HashMap::new(),
-            heat_ticks: std::collections::HashMap::new(),
+            heat_ns: std::collections::HashMap::new(),
             heat_last: Instant::now(),
             lat_phase: 0.0,
             stall: 0.0,
@@ -3814,7 +3879,7 @@ impl App {
             }
             active.meters.remove(&id); // forget the closed pane's instrument state
             active.heat.remove(&id);
-            active.heat_ticks.remove(&id);
+            active.heat_ns.remove(&id);
             active.jacks.borrow_mut().remove(&id); // Drop -> remove its fifos
             active.wires.retain(|w| w.src != id && w.dst != id); // unplug its wires
             active.force_full = true; // clear removed-wire ghosts (relayout usually rescues, but be explicit)
@@ -3924,7 +3989,7 @@ impl App {
         // into `anim` rather than forcing a repaint — on a software renderer each
         // repaint is real CPU, so animation-only repaints are throttled below.
         let mut anim = false;
-        // Always pump the patch-bay (moves bytes) and sample heat (/proc) — these
+        // Always pump the patch-bay (moves bytes) and sample heat — these
         // are side effects that must run every tick. Whether they DRIVE an
         // animation repaint is gated: on the remote XRender backend the animated
         // chrome lives on the pane borders, so a repaint re-sends the whole screen
@@ -6064,18 +6129,35 @@ impl App {
         }
     }
 
-    /// Open a URL with the desktop's default handler via `xdg-open`, detached so
-    /// it never blocks rt. Failures are logged, not fatal (rt's no-crash policy).
+    /// Open a URL with the desktop's default handler, detached so it never blocks
+    /// rt. Failures are logged, not fatal (rt's no-crash policy).
+    ///
+    /// The handler is [`opener_command`]'s: `xdg-open` on Linux/BSD, `open` on
+    /// macOS, which has no `xdg-open` at all — so `Ctrl`+click did nothing there.
     fn open_url(url: &str) {
         // Log a REDACTED form — a URL from terminal text can carry password-reset tokens,
         // signed-object credentials, or private paths that must not leak into logs. The full
-        // URL is still passed to xdg-open as a single argv (no shell), which is safe.
+        // URL is still passed to the opener as a single argv (no shell), which is safe:
+        // `open`, like `xdg-open`, takes the URL as one argument and never re-parses it.
         // [review RT-PRIV-001]
         let redacted = Self::redact_url(url);
-        // Spawn xdg-open without waiting; ignore the handle so it runs detached.
-        match std::process::Command::new("xdg-open").arg(url).spawn() {
-            Ok(_) => log::info!("opened URL: {redacted}"),
-            Err(e) => log::warn!("xdg-open failed for {redacted}: {e}"),
+        let opener = opener_command(cfg!(target_os = "macos"));
+        // Spawn without waiting; ignore the handle so it runs detached.
+        match std::process::Command::new(opener).arg(url).spawn() {
+            Ok(_) => log::info!("opened URL with {opener}: {redacted}"),
+            // Non-fatal, but not silent: `warn` is the default `env_logger` level, so this
+            // reaches stderr, and `crashlog` keeps stderr in ~/.cache/rt/stderr.log when rt
+            // was launched from a desktop rather than a shell. A missing opener is the one
+            // failure a user can act on (a bare Linux box with no xdg-utils installed), so
+            // it says so instead of only echoing the OS error.
+            Err(e) => {
+                let hint = if e.kind() == std::io::ErrorKind::NotFound {
+                    format!(" — `{opener}` is not on PATH; install it, or copy the URL and open it yourself")
+                } else {
+                    String::new()
+                };
+                log::warn!("could not open {redacted}: {opener}: {e}{hint}");
+            }
         }
     }
 
@@ -7825,10 +7907,15 @@ impl App {
         moved
     }
 
-    /// Sample `/proc` (~2 Hz) to update each pane's CPU load — the heat
+    /// Sample the OS (~2 Hz) to update each pane's CPU load — the heat
     /// instrument. Load is summed over the pane's session (shell + children), so
     /// whatever it's running counts. Returns whether it actually sampled this
     /// call (self-throttled); ported from rt-mux.
+    ///
+    /// The per-platform half — how to ask what a process has burned, and who its
+    /// children are — lives in [`cpu_heat`], which is why this reads the same on
+    /// Linux and macOS. It used to inline a `/proc` walk here, and macOS has no
+    /// `/proc`, so every Mac pane read exactly zero forever.
     fn sample_heat(active: &mut Active) -> bool {
         let now = Instant::now();
         let dt = now.duration_since(active.heat_last).as_secs_f32();
@@ -7836,56 +7923,18 @@ impl App {
             return false; // throttle to ~2 Hz
         }
         active.heat_last = now;
-        const HZ: f32 = 100.0; // _SC_CLK_TCK on Linux
+        const NS_PER_SEC: f32 = 1.0e9;
         for id in active.session.tree().all_panes() {
             let Some(pid) = active.session.pane(id).and_then(|p| p.pid()) else { continue };
-            // Read only this pane's process subtree, not one stat per system
-            // process — an idle shell is ~2 file reads instead of dozens/hundreds.
-            let ticks = Self::subtree_cpu_ticks(pid);
-            let prev = active.heat_ticks.insert(id, ticks).unwrap_or(ticks);
-            let load = ticks.saturating_sub(prev) as f32 / (dt * HZ); // fraction of one core
+            // Read only this pane's process subtree, not one query per system
+            // process — an idle shell is ~2 kernel calls instead of dozens/hundreds.
+            let ns = cpu_heat::subtree_cpu_ns(pid);
+            let prev = active.heat_ns.insert(id, ns).unwrap_or(ns);
+            let load = ns.saturating_sub(prev) as f32 / (dt * NS_PER_SEC); // fraction of one core
             let e = active.heat.entry(id).or_insert(0.0);
             *e = *e * 0.5 + load * 0.5; // smooth
         }
         true
-    }
-
-    /// Sum CPU ticks (utime+stime) over `root` and its descendants, reading only
-    /// their `/proc` entries via the kernel's per-task `children` list — O(the
-    /// pane's own processes), not O(all system processes). This keeps the heat
-    /// instrument from dominating idle CPU on slow machines: an idle shell has no
-    /// children, so it costs a single `stat` + an empty `children` read per
-    /// sample. Still catches a silent CPU hog (it lives in this subtree).
-    fn subtree_cpu_ticks(root: u32) -> u64 {
-        let mut total: u64 = 0;
-        let mut stack = vec![root];
-        let mut visited = 0u32;
-        while let Some(pid) = stack.pop() {
-            visited += 1;
-            if visited > 4096 {
-                break; // safety cap against pathological/looping process trees
-            }
-            if let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                // Fields after the parenthesised comm: [11]=utime(14), [12]=stime(15).
-                if let Some(rp) = content.rfind(')') {
-                    let toks: Vec<&str> = content[rp + 1..].split_whitespace().collect();
-                    if toks.len() >= 13 {
-                        total += toks[11].parse::<u64>().unwrap_or(0) + toks[12].parse::<u64>().unwrap_or(0);
-                    }
-                }
-            }
-            // Direct children of this process's main thread. Needs CONFIG_PROC_CHILDREN
-            // (on by default in Debian/Ubuntu); if absent we simply miss grandchildren,
-            // never crash.
-            if let Ok(kids) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-                for k in kids.split_whitespace() {
-                    if let Ok(cpid) = k.parse::<u32>() {
-                        stack.push(cpid);
-                    }
-                }
-            }
-        }
-        total
     }
 
     /// Optionally advance the instrument animation by wall-clock time (see
@@ -9511,5 +9560,94 @@ mod font_fallback_tests {
                 .unwrap_or_else(|| panic!("{fam}: no primary face at all"));
             assert!(primary.parse().is_ok(), "{fam}: unrasterisable primary reached the backend");
         }
+    }
+}
+
+/// macOS-parity decisions that live in this file, asserted on Linux.
+///
+/// Each of these is a rule whose *macOS* answer is the one that was wrong, in a
+/// binary no CI compiles for macOS. So the rules take the platform as a plain
+/// argument — the same shape as `wgpu_frame`, `vibrancy_policy`, `proc_liveness`
+/// and `menubar_model` — and both answers are checked here, on the machine that
+/// does run the suite.
+#[cfg(test)]
+mod platform_parity_tests {
+    use super::*;
+
+    // --- Ctrl+click on a URL -------------------------------------------------
+
+    /// The defect: `open_url` hard-coded `xdg-open`, which macOS does not ship,
+    /// so `Ctrl`+click was a no-op there and a log line nobody saw.
+    #[test]
+    fn opener_is_platform_correct() {
+        assert_eq!(opener_command(false), "xdg-open", "Linux must be untouched");
+        assert_eq!(opener_command(true), "open", "macOS has no xdg-open; `open` is the equivalent");
+    }
+
+    /// The security shape of the spawn must survive the fix: the URL goes to the
+    /// opener as EXACTLY ONE argument, and never through a shell. A URL is
+    /// attacker-influenced text lifted off the terminal grid, so a second argument
+    /// or a `sh -c` would be a command-injection hole. [review RT-PRIV-001]
+    #[test]
+    fn the_url_is_one_argument_and_never_a_shell() {
+        for is_macos in [false, true] {
+            let opener = opener_command(is_macos);
+            let url = "https://example.com/a b;rm -rf ~/$(whoami)`id`&";
+            let cmd = std::process::Command::new(opener);
+            let mut cmd = cmd;
+            cmd.arg(url);
+            let args: Vec<_> = cmd.get_args().collect();
+            assert_eq!(args, vec![std::ffi::OsStr::new(url)], "the URL must be the only argument");
+            assert!(
+                !opener.contains("sh") && !opener.contains("-c"),
+                "the opener must be the handler itself, not a shell: {opener}"
+            );
+        }
+    }
+
+    /// Only the scheme and host may reach a log: a URL scraped from terminal text
+    /// can carry a password-reset token or a signed-URL credential. Guarding this
+    /// here too, because the fix rewrote the line that logs it.
+    /// [review RT-PRIV-001]
+    #[test]
+    fn logging_stays_redacted() {
+        assert_eq!(App::redact_url("https://host.example/reset?token=SECRET"), "https://host.example/…");
+        assert_eq!(App::redact_url("mailto:someone@example.com"), "mailto:…");
+    }
+
+    // --- `--help` honesty ----------------------------------------------------
+
+    /// The regression gate on "Linux's `--help` stays exactly as it is": the text
+    /// below is the literal `parse_cli` printed before `help_text` existed.
+    #[test]
+    fn help_is_byte_identical_on_linux() {
+        let expected = "rt — Wayland-native terminal multiplexer\n\n\
+                        Usage: rt [OPTIONS]\n\n\
+                        Options:\n  \
+                        --cols N          pin the initial grid width (cells)\n  \
+                        --rows N          pin the initial grid height (cells)\n  \
+                        --font \"Family\"   override the configured font family\n  \
+                        --font-size PX    override the configured font size (pixels)\n  \
+                        --backend gl|xrender  override the auto-selected rendering backend\n  \
+                        -V, --version     print version and exit\n  \
+                        -h, --help        show this message\n\n\
+                        Everything else is configured in Preferences / config.toml.";
+        assert_eq!(help_text(false), expected);
+    }
+
+    /// The defect: macOS `--help` listed `--backend gl|xrender`, neither of which
+    /// is in a macOS binary. Everything else about the help must survive.
+    #[test]
+    fn macos_help_drops_the_backend_line_and_keeps_the_rest() {
+        let h = help_text(true);
+        assert!(!h.contains("--backend"), "macOS has one backend; it must not be advertised:\n{h}");
+        assert!(!h.contains("xrender"), "{h}");
+        assert!(!h.contains("Wayland"), "a Mac window is AppKit, not Wayland:\n{h}");
+        for kept in ["--cols N", "--rows N", "--font \"Family\"", "--font-size PX", "-V, --version", "-h, --help"] {
+            assert!(h.contains(kept), "macOS --help lost `{kept}`:\n{h}");
+        }
+        // Same two-space option indentation as the Linux text, with no blank hole
+        // where the dropped line was.
+        assert!(h.contains("  --font-size PX    override the configured font size (pixels)\n  -V, --version"), "{h}");
     }
 }
