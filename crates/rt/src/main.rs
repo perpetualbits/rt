@@ -56,6 +56,11 @@ mod prefs_model; // which setting each preferences row edits, and how a step cla
 mod proc_liveness; // portable "is this pid still alive?" for the patch-bay sweep
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
 mod render; // the GL glyph-atlas renderer
+// Deliberately NOT cfg'd to macOS, for the same reason as `vibrancy_policy` and
+// `wgpu_frame`: it holds the HiDPI scale-change decision as plain data (no winit types),
+// and a Retina display is the one thing no CI here has. Linux at scale 1.0 exercises it
+// too — a HiDPI Wayland/X11 output reports 2.0 and hits exactly the same path.
+mod scale_policy; // pure decision table for WindowEvent::ScaleFactorChanged
 mod select; // pure head-navigation logic for anchored selection
 mod touch; // pure multi-touch gesture state: which fingers are down, and what they mean
 
@@ -547,6 +552,15 @@ struct Active {
     resize_pending: bool,                 // a Resized arrived; the reflow waits for the drag to settle
     last_resize_at: Instant,              // when the most recent Resized arrived (drives the settle)
     deferred_resizes: u64,                // Resized events coalesced into the pending reflow (diagnostics)
+    // HiDPI. `font_scale` is the scale factor the glyphs CURRENTLY on screen
+    // were rasterised at (`physical_font_px(font_size, font_scale)`), kept next
+    // to the metrics it describes rather than re-derived from the window —
+    // `Window::scale_factor()` reports the display's factor NOW, which is
+    // exactly the value a `ScaleFactorChanged` has to be compared AGAINST.
+    // `scale_pending` says the settle owes a font reload because the two have
+    // diverged. Both are driven by `scale_policy`; see its module doc.
+    font_scale: f64,
+    scale_pending: bool,
     instr_tick: bool,                     // advance the instrument animation this frame (6fps, native path)
     last_instr_tick: Instant,             // when the instrument animation last advanced
     last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
@@ -1845,6 +1859,12 @@ impl App {
             resize_pending: false,
             last_resize_at: Instant::now(),
             deferred_resizes: 0,
+            // The fonts above were loaded at exactly this factor (every backend
+            // construction path uses `physical_font_px(.., scale_factor)`), so
+            // the window starts in agreement with its display and no reload is
+            // owed. On Linux this is 1.0 and never changes.
+            font_scale: scale_factor,
+            scale_pending: false,
             instr_tick: false,
             last_instr_tick: Instant::now(),
             last_autoscroll: Instant::now(),
@@ -3494,25 +3514,63 @@ impl ApplicationHandler for App {
 
             // HiDPI: the window moved to a display with a different scale factor
             // (e.g. dragged from a Retina panel to an external 1x monitor, or
-            // back). Deliberately NOT wired to a live re-scale here: doing that
-            // correctly means re-measuring the cell, resizing the backend and
-            // relayout-ing the session (the same work `refresh_fonts` does), and
-            // that interacts with the deferred-resize/settle machinery
-            // (`surface_pending`/`RESIZE_SETTLE`) that this same event usually
-            // fires alongside — a combination that can't be verified without a
-            // real multi-monitor Retina setup, which this task explicitly forbids
-            // launching a GUI to test against. So: logged (never silently
-            // dropped), and cell metrics stay at the previous scale until the
-            // user next triggers a font reload (zoom in/out/reset, or opening
-            // Preferences) — `refresh_fonts` reads `window.scale_factor()` FRESH
-            // each time (see its comment), so that next reload self-heals to the
-            // new display's scale rather than staying wrong indefinitely.
+            // back), or the display's own factor changed under it.
+            //
+            // Everything is deferred to the SAME settle a resize uses, and
+            // nothing is re-measured here. Two reasons, and they are the two the
+            // old "logged and dropped" comment was worried about:
+            //
+            //  - This event never travels alone. winit's AppKit backend queues
+            //    `SurfaceResized` immediately after it (see
+            //    `handle_scale_factor_changed`), and X11/Wayland re-request a
+            //    surface size off the back of it too — so a reload done here
+            //    would reflow at a size that is superseded microseconds later,
+            //    and then reflow AGAIN at the settle. A reflow is the 676ms
+            //    median operation the whole deferred-resize design exists to pay
+            //    for exactly once (see the `SurfaceResized` handler).
+            //  - macOS emits this DURING a slow drag across the boundary between
+            //    two displays, not once at the end, so "re-measure on arrival"
+            //    is really "re-measure per event".
+            //
+            // So: record that a reload is owed, suspend painting (a frame drawn
+            // now would put the OLD cell metrics on the NEW surface — the
+            // half/double-size text this fixes), and let the settle in
+            // `tick_active` pay for surface + fonts + reflow once the size and
+            // scale have both held still. `refresh_fonts` reads
+            // `window.scale_factor()` FRESH at that point, so the value this
+            // event carries is only ever used to decide WHETHER to act.
+            //
+            // Not macOS-only: a HiDPI Wayland/X11 output reports 2.0 and takes
+            // exactly this path. At 1.0 (every Linux setup so far) the factor
+            // never changes, so `on_scale_factor_changed` returns `IGNORE` and
+            // this is the same no-op it always was.
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let arm = scale_policy::on_scale_factor_changed(active.font_scale, scale_factor);
+                if arm == scale_policy::IGNORE {
+                    log::debug!(
+                        "scale factor reported as {scale_factor}, unchanged from the \
+                         loaded font scale {}: nothing to do",
+                        active.font_scale,
+                    );
+                    return;
+                }
                 log::info!(
-                    "scale factor changed to {scale_factor}; cell metrics stay at the \
-                     previous scale until fonts are next reloaded (zoom, Preferences, \
-                     or a restart)"
+                    "scale factor changed {} -> {scale_factor}: font reload + reflow deferred \
+                     to the resize settle",
+                    active.font_scale,
                 );
+                if arm.reload_owed {
+                    active.scale_pending = true;
+                }
+                if arm.suspend_painting {
+                    // Value unread — the settle always uses the CURRENT size (see
+                    // below); `Some` is what suspends painting.
+                    active.surface_pending = Some(active.window.surface_size());
+                }
+                if arm.arm_settle {
+                    active.resize_pending = true;
+                    active.last_resize_at = Instant::now();
+                }
             }
 
             _ => {} // ignore the many other window events for now
@@ -3776,7 +3834,15 @@ impl App {
             // A window resize also owes the surface work, skipped per-event above.
             // Use the CURRENT size: every intermediate one collapses into this.
             let size = active.window.surface_size();
-            if active.surface_pending.take().is_some() {
+            // A HiDPI scale change arms this same settle and owes one extra
+            // thing: the glyphs must be re-rasterised at the new display's
+            // scale. `settle_work` keeps the two kinds of owed work straight —
+            // in particular that a scale settle must NOT also relayout
+            // directly, since `refresh_fonts` ends in a relayout of its own and
+            // a settle may only ever reflow once. See `scale_policy`.
+            let work = scale_policy::settle_work(active.surface_pending.is_some(), active.scale_pending);
+            if work.resize_surface {
+                active.surface_pending = None; // painting resumes after this settle
                 if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
                     active.backend.resize_surface(w, h); // back buffer + instrument layer
                 }
@@ -3788,11 +3854,33 @@ impl App {
             }
             let bounds = content_bounds(size);
             let t0 = Instant::now();
-            active.session.relayout(bounds); // reflow + push the settled size to the PTYs
+            if work.reload_fonts {
+                // Re-measure the cell at the settled scale and reflow. Reads
+                // `window.scale_factor()` fresh, so the display the window has
+                // actually come to rest on is the one that wins — not whichever
+                // value the last `ScaleFactorChanged` of the drag happened to
+                // carry. Clear the flag FIRST: a reload that fails (an
+                // unrasterisable font) leaves the old metrics up and must not
+                // re-arm itself every settle forever.
+                active.scale_pending = false;
+                if !Self::refresh_fonts(active, false) {
+                    // The reload failed (an unrasterisable font — see
+                    // `refresh_fonts`), so it re-measured nothing and reflowed
+                    // nothing. The SURFACE still changed under us, so the one
+                    // reflow this settle owes is still owed: pay it directly.
+                    // The glyphs stay at the old scale, which is exactly where
+                    // they were a moment ago; the next successful reload heals
+                    // it, as it always did.
+                    active.session.relayout(bounds);
+                }
+            }
+            if work.relayout {
+                active.session.relayout(bounds); // reflow + push the settled size to the PTYs
+            }
             let took = t0.elapsed();
             log::info!(
-                "resize settled at {}x{}: relayout={:.1}ms, {} event(s) coalesced into 1 reflow",
-                size.width, size.height, took.as_secs_f32() * 1e3, active.deferred_resizes,
+                "resize settled at {}x{} (scale {}): relayout={:.1}ms, {} event(s) coalesced into 1 reflow",
+                size.width, size.height, active.font_scale, took.as_secs_f32() * 1e3, active.deferred_resizes,
             );
             active.resize_pending = false;
             active.deferred_resizes = 0;
@@ -6123,7 +6211,12 @@ impl App {
     /// is between that and a dialog that keeps naming a font nothing is drawing,
     /// which is the bug. Only on a family change: a failure during a size-only
     /// reload says nothing about the family.
-    fn refresh_fonts(active: &mut Active, family_changed: bool) {
+    ///
+    /// Returns whether the reload took. `false` means the cell metrics and the
+    /// session layout are both UNCHANGED — nothing was re-measured and no
+    /// relayout happened — which matters to the one caller (the resize settle)
+    /// that is relying on this call to pay the reflow it owes.
+    fn refresh_fonts(active: &mut Active, family_changed: bool) -> bool {
         active.force_full = true; // cell metrics change: every cell→px mapping is stale
         // Keep the old chain: it is what the backend is still rendering, and it
         // is what must come back if the new family turns out to be unusable.
@@ -6142,15 +6235,24 @@ impl App {
         // here (rather than from a field captured once at startup) also means
         // that if the window was dragged to a display with a different scale
         // factor since startup, the very next font reload (zoom, Preferences)
-        // picks up the new value — see the `ScaleFactorChanged` handler in
-        // `window_event` for why that's not done proactively.
-        let px = physical_font_px(active.settings.font_size, active.window.scale_factor());
+        // picks up the new value — and `ScaleFactorChanged` (see its handler)
+        // arms a settle that comes straight back here, so it no longer WAITS
+        // for a user-triggered reload; that path remains the backstop.
+        let scale = active.window.scale_factor();
+        let px = physical_font_px(active.settings.font_size, scale);
         match active.backend.reload_fonts(&active.font_blobs, px) {
             Ok(()) => {
+                // The glyphs on screen are now this scale's. Recorded only on
+                // success — a failed reload leaves the PREVIOUS raster up, so
+                // claiming the new scale here would make a later
+                // `ScaleFactorChanged` back to the old display look like a
+                // no-op and strand the window at the wrong size.
+                active.font_scale = scale;
                 let cell = active.backend.cell_size(); // new cell metrics
                 active.session.set_cell(cell);
                 let size = active.window.surface_size();
                 active.session.relayout(content_bounds(size));
+                true
             }
             Err(e) => {
                 log::warn!(
@@ -6168,6 +6270,7 @@ impl App {
                         .font_status
                         .insert(active.settings.font_family.clone(), prefs_model::FamilyStatus::Unrasterisable);
                 }
+                false
             }
         }
     }
