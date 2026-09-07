@@ -7,6 +7,7 @@
 //! saturation to an edge never loses the hue (the classic picker bug).
 
 use crate::backend::Backend;
+use crate::chrome_scale::logical;
 use crate::chrome::Recti;
 use crate::render::Color;
 
@@ -129,15 +130,19 @@ pub struct Geom {
 const SV_CELLS: f32 = 8.0; // SV square side, in cell-heights (DPI-aware)
 
 /// Lay the picker out centred and clamped on-screen.
-pub fn layout(cell_w: f32, cell_h: f32, win_w: f32, win_h: f32) -> Geom {
+pub fn layout(cell_w: f32, cell_h: f32, win_w: f32, win_h: f32, sc: f32) -> Geom {
+    // Most of this is cell-derived and already scales with the glyph; `sc` is for
+    // the flat FLOORS (which would otherwise stop being floors on a 2x display)
+    // and the row pads. `hit`, `sv_at` and `hue_at` all read the `Geom` this
+    // returns, so the click surface can never fall behind the drawing.
     let pad = (cell_w * 1.5).round();
     let gap = cell_w;
-    let sv_side = (cell_h * SV_CELLS).max(140.0);
-    let hue_w = (cell_w * 2.0).max(14.0);
-    let title_h = cell_h + 4.0;
+    let sv_side = (cell_h * SV_CELLS).max(sc * logical::PICKER_SV_MIN);
+    let hue_w = (cell_w * 2.0).max(sc * logical::PICKER_HUE_MIN);
+    let title_h = cell_h + sc * logical::PANEL_ROW_PAD;
     let sw_h = cell_h; // preview swatch
     let hex_h = cell_h;
-    let close_h = cell_h + 4.0;
+    let close_h = cell_h + sc * logical::PANEL_ROW_PAD;
     let inner_w = sv_side + gap + hue_w;
     let panel_w = (inner_w + pad * 2.0).min(win_w);
     let panel_h = (pad + title_h + sv_side + gap + sw_h + gap + hex_h + gap + close_h + pad).min(win_h);
@@ -214,16 +219,17 @@ fn outline(be: &mut dyn Backend, x: f32, y: f32, w: f32, h: f32, t: f32, col: Co
 }
 
 /// Paint the picker for state `(h,s,v)`, titled `title`.
-pub fn draw(be: &mut dyn Backend, g: &Geom, h: f32, s: f32, v: f32, title: &str, cell_w: f32, cell_h: f32) {
+pub fn draw(be: &mut dyn Backend, g: &Geom, h: f32, s: f32, v: f32, title: &str, cell_w: f32, cell_h: f32, sc: f32) {
+    let hair = sc * logical::HAIRLINE;
     let p = g.panel;
     be.fill_rect(p.x, p.y, p.w, p.h, PANEL_BG);
-    be.fill_rect(p.x, p.y, p.w, 1.0, PANEL_EDGE);
-    be.fill_rect(p.x, p.y + p.h - 1.0, p.w, 1.0, PANEL_EDGE);
-    be.fill_rect(p.x, p.y, 1.0, p.h, PANEL_EDGE);
-    be.fill_rect(p.x + p.w - 1.0, p.y, 1.0, p.h, PANEL_EDGE);
+    be.fill_rect(p.x, p.y, p.w, hair, PANEL_EDGE);
+    be.fill_rect(p.x, p.y + p.h - hair, p.w, hair, PANEL_EDGE);
+    be.fill_rect(p.x, p.y, hair, p.h, PANEL_EDGE);
+    be.fill_rect(p.x + p.w - hair, p.y, hair, p.h, PANEL_EDGE);
 
     // Title, top-left inside the padding.
-    let ty = p.y + 4.0;
+    let ty = p.y + sc * logical::PANEL_ROW_PAD;
     for (i, ch) in title.chars().enumerate() {
         be.draw_char(p.x + cell_w * 1.5, ty, i, 0, ch, TEXT, true, false);
     }
@@ -249,17 +255,21 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, h: f32, s: f32, v: f32, title: &str,
     // SV marker: a small black-then-white hollow square at (s, v).
     let mx = g.sv.x + s.clamp(0.0, 1.0) * g.sv.w;
     let my = g.sv.y + (1.0 - v.clamp(0.0, 1.0)) * g.sv.h;
-    outline(be, mx - 5.0, my - 5.0, 10.0, 10.0, 2.0, BLACK);
-    outline(be, mx - 4.0, my - 4.0, 8.0, 8.0, 1.0, WHITE);
+    let mo = sc * logical::PICKER_SV_MARK_OUT;
+    let mi = sc * logical::PICKER_SV_MARK_IN;
+    outline(be, mx - mo * 0.5, my - mo * 0.5, mo, mo, 2.0 * hair, BLACK);
+    outline(be, mx - mi * 0.5, my - mi * 0.5, mi, mi, hair, WHITE);
     // Hue caret: a horizontal bar across the strip at hue h.
     let hy = g.hue.y + (h.rem_euclid(360.0) / 360.0) * g.hue.h;
-    be.fill_rect(g.hue.x - 2.0, hy - 2.0, g.hue.w + 4.0, 4.0, BLACK);
-    be.fill_rect(g.hue.x - 2.0, hy - 1.0, g.hue.w + 4.0, 2.0, WHITE);
+    let co = sc * logical::PICKER_HUE_CARET_OUT;
+    let ci = sc * logical::PICKER_HUE_CARET_IN;
+    be.fill_rect(g.hue.x - co * 0.5, hy - co * 0.5, g.hue.w + co, co, BLACK);
+    be.fill_rect(g.hue.x - co * 0.5, hy - ci * 0.5, g.hue.w + co, ci, WHITE);
 
     // Preview swatch + edge.
     let rgb = hsv_to_rgb(h, s, v);
     be.fill_rect(g.preview.x, g.preview.y, g.preview.w, g.preview.h, c(rgb));
-    outline(be, g.preview.x, g.preview.y, g.preview.w, g.preview.h, 1.0, PANEL_EDGE);
+    outline(be, g.preview.x, g.preview.y, g.preview.w, g.preview.h, hair, PANEL_EDGE);
 
     // Hex readout.
     let hex = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
@@ -269,7 +279,7 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, h: f32, s: f32, v: f32, title: &str,
 
     // Close button: a highlighted bar with centred text.
     be.fill_rect(g.close.x, g.close.y, g.close.w, g.close.h, Color(0.18, 0.20, 0.28, 1.0));
-    outline(be, g.close.x, g.close.y, g.close.w, g.close.h, 1.0, PANEL_EDGE);
+    outline(be, g.close.x, g.close.y, g.close.w, g.close.h, hair, PANEL_EDGE);
     let label = "Done  (Esc)";
     let lw = label.chars().count() as f32 * cell_w;
     let lx = g.close.x + (g.close.w - lw) * 0.5;
@@ -330,7 +340,7 @@ mod tests {
 
     #[test]
     fn layout_stays_on_screen() {
-        let g = layout(11.0, 21.0, 900.0, 700.0);
+        let g = layout(11.0, 21.0, 900.0, 700.0, 1.0);
         assert!(g.panel.x >= 0.0 && g.panel.y >= 0.0);
         assert!(g.panel.x + g.panel.w <= 900.0 + 0.01);
         assert!(g.panel.y + g.panel.h <= 700.0 + 0.01);
@@ -343,7 +353,7 @@ mod tests {
 
     #[test]
     fn hit_picks_the_control_under_the_point() {
-        let g = layout(11.0, 21.0, 900.0, 700.0);
+        let g = layout(11.0, 21.0, 900.0, 700.0, 1.0);
         assert_eq!(hit(&g, (g.sv.x + 5.0, g.sv.y + 5.0)), Hit::Sv);
         assert_eq!(hit(&g, (g.hue.x + 2.0, g.hue.y + 5.0)), Hit::Hue);
         assert_eq!(hit(&g, (g.close.x + 5.0, g.close.y + 2.0)), Hit::Close);
@@ -352,7 +362,7 @@ mod tests {
 
     #[test]
     fn sv_and_hue_map_corners_and_ends() {
-        let g = layout(11.0, 21.0, 900.0, 700.0);
+        let g = layout(11.0, 21.0, 900.0, 700.0, 1.0);
         // Top-left of the SV square = zero saturation, full value.
         let (s, v) = sv_at(&g, (g.sv.x, g.sv.y));
         assert!(s.abs() < 1e-6 && (v - 1.0).abs() < 1e-6);

@@ -1,6 +1,7 @@
 //! Native context menu: laid out from `menu::rows`, drawn as fills + glyphs.
 use crate::backend::Backend;
 use crate::chrome::{hit, Recti};
+use crate::chrome_scale::logical;
 use crate::menu::Row;
 use crate::render::Color;
 
@@ -16,28 +17,31 @@ pub struct Geom {
     clickable: Vec<bool>,
 }
 
-const PAD_X: f32 = 8.0; // inner horizontal padding
-const SEP_H: f32 = 7.0; // separator row height
-
 /// Lay the menu out anchored at `anchor`, clamped fully on-screen.
-pub fn layout(rows: &[Row], anchor: (f32, f32), cell_w: f32, cell_h: f32, win_w: f32, win_h: f32) -> Geom {
-    let row_h = cell_h + 4.0;
+///
+/// `sc` is the display's backing factor. `hit_row` tests the rects this
+/// produces, so scaling the layout scales the hit-test with it — there is no
+/// separate copy of the geometry that could be left behind.
+pub fn layout(rows: &[Row], anchor: (f32, f32), cell_w: f32, cell_h: f32, win_w: f32, win_h: f32, sc: f32) -> Geom {
+    let pad_x = sc * logical::MENU_PAD; // inner padding (used across AND down)
+    let sep_h = sc * logical::MENU_SEP_H; // separator row height
+    let row_h = cell_h + sc * logical::PANEL_ROW_PAD;
     // Width = widest "label   accel" in cells, plus padding.
     let cols = rows.iter().map(|r| {
         let a = r.accel.as_deref().map(|s| s.chars().count() + 3).unwrap_or(0);
         r.label.chars().count() + a
     }).max().unwrap_or(8);
-    let w = cols as f32 * cell_w + PAD_X * 2.0;
+    let w = cols as f32 * cell_w + pad_x * 2.0;
     // A separator is the only row with an empty label; info rows (version footer)
     // carry a label but no action, so they get a full-height row like any other.
-    let h: f32 = rows.iter().map(|r| if r.label.is_empty() { SEP_H } else { row_h }).sum::<f32>() + PAD_X;
+    let h: f32 = rows.iter().map(|r| if r.label.is_empty() { sep_h } else { row_h }).sum::<f32>() + pad_x;
     // Clamp so the whole panel stays visible.
     let x = anchor.0.min(win_w - w).max(0.0);
     let y = anchor.1.min(win_h - h).max(0.0);
     let mut rrects = Vec::with_capacity(rows.len());
-    let mut cy = y + PAD_X * 0.5;
+    let mut cy = y + pad_x * 0.5;
     for r in rows {
-        let rh = if r.label.is_empty() { SEP_H } else { row_h };
+        let rh = if r.label.is_empty() { sep_h } else { row_h };
         rrects.push(Recti { x, y: cy, w, h: rh });
         cy += rh;
     }
@@ -58,7 +62,9 @@ pub fn hit_row(g: &Geom, p: (f32, f32)) -> Option<usize> {
 }
 
 /// Draw the panel, hovered highlight, labels, accelerators, and separators.
-pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], hover: Option<usize>, cell_w: f32, cell_h: f32) {
+pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], hover: Option<usize>, cell_w: f32, cell_h: f32, sc: f32) {
+    let pad_x = sc * logical::MENU_PAD;
+    let hair = sc * logical::HAIRLINE;
     let bg = Color::rgb(0x20, 0x22, 0x28);
     let border = Color::rgb(0x50, 0x54, 0x60);
     let fg = Color::rgb(0xe0, 0xe0, 0xe6);
@@ -68,26 +74,26 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], hover: Option<usize>, 
     let sep = Color::rgb(0x40, 0x43, 0x4d);
     // Panel + 1px border.
     be.fill_rect(g.panel.x, g.panel.y, g.panel.w, g.panel.h, bg);
-    be.fill_rect(g.panel.x, g.panel.y, g.panel.w, 1.0, border);
-    be.fill_rect(g.panel.x, g.panel.y + g.panel.h - 1.0, g.panel.w, 1.0, border);
-    be.fill_rect(g.panel.x, g.panel.y, 1.0, g.panel.h, border);
-    be.fill_rect(g.panel.x + g.panel.w - 1.0, g.panel.y, 1.0, g.panel.h, border);
+    be.fill_rect(g.panel.x, g.panel.y, g.panel.w, hair, border);
+    be.fill_rect(g.panel.x, g.panel.y + g.panel.h - hair, g.panel.w, hair, border);
+    be.fill_rect(g.panel.x, g.panel.y, hair, g.panel.h, border);
+    be.fill_rect(g.panel.x + g.panel.w - hair, g.panel.y, hair, g.panel.h, border);
     for (i, (row, rect)) in rows.iter().zip(&g.rows).enumerate() {
         // A separator is the only row with an empty label (matches `layout`); an
         // info row like the version footer has a label but no action and draws as
         // dimmed text, not a rule.
         if row.label.is_empty() {
             // Separator: a thin line centred in its rect.
-            be.fill_rect(rect.x + PAD_X, rect.y + rect.h / 2.0, rect.w - PAD_X * 2.0, 1.0, sep);
+            be.fill_rect(rect.x + pad_x, rect.y + rect.h / 2.0, rect.w - pad_x * 2.0, hair, sep);
             continue;
         }
         if hover == Some(i) && row.enabled {
-            be.fill_rect(rect.x + 1.0, rect.y, rect.w - 2.0, rect.h, hl);
+            be.fill_rect(rect.x + hair, rect.y, rect.w - 2.0 * hair, rect.h, hl);
         }
         let colr = if !row.enabled { fg_off } else { fg };
         // Label at the left; draw_char places glyphs on the cell grid, so map the
         // row's pixel origin to (col,row) = (0,0) with the origin as the offset.
-        let ox = rect.x + PAD_X;
+        let ox = rect.x + pad_x;
         let oy = rect.y + (rect.h - cell_h) / 2.0;
         for (c, ch) in row.label.chars().enumerate() {
             be.draw_char(ox, oy, c, 0, ch, colr, false, false);
@@ -95,7 +101,7 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], hover: Option<usize>, 
         // Accelerator, right-aligned in a dim colour.
         if let Some(acc) = &row.accel {
             let n = acc.chars().count();
-            let ax = rect.x + rect.w - PAD_X - n as f32 * cell_w;
+            let ax = rect.x + rect.w - pad_x - n as f32 * cell_w;
             for (c, ch) in acc.chars().enumerate() {
                 be.draw_char(ax, oy, c, 0, ch, fg_dim, false, false);
             }
@@ -117,7 +123,7 @@ mod tests {
     fn panel_clamps_onto_screen() {
         let rows = sample();
         // Anchor near the bottom-right corner: the panel must shift fully on-screen.
-        let g = layout(&rows, (795.0, 795.0), 8.0, 18.0, 800.0, 800.0);
+        let g = layout(&rows, (795.0, 795.0), 8.0, 18.0, 800.0, 800.0, 1.0);
         assert!(g.panel.x + g.panel.w <= 800.0 + 0.01);
         assert!(g.panel.y + g.panel.h <= 800.0 + 0.01);
     }
@@ -130,7 +136,7 @@ mod tests {
     #[test]
     fn panel_taller_than_the_window_pins_to_the_top() {
         let rows = sample();
-        let g = layout(&rows, (795.0, 595.0), 8.0, 18.0, 800.0, 300.0);
+        let g = layout(&rows, (795.0, 595.0), 8.0, 18.0, 800.0, 300.0, 1.0);
         assert!(g.panel.h > 300.0, "this case only means anything when the menu overflows");
         assert_eq!(g.panel.y, 0.0, "pinned to the top edge");
         assert!(g.panel.x + g.panel.w <= 800.0 + 0.01, "still clamped horizontally");
@@ -139,7 +145,7 @@ mod tests {
     #[test]
     fn hit_row_skips_separators() {
         let rows = sample();
-        let g = layout(&rows, (10.0, 10.0), 8.0, 18.0, 800.0, 600.0);
+        let g = layout(&rows, (10.0, 10.0), 8.0, 18.0, 800.0, 600.0, 1.0);
         // The 3rd row in a no-url menu is the separator after Copy/Paste.
         let sep_idx = rows.iter().position(|r| r.action.is_none()).unwrap();
         let mid = (g.rows[sep_idx].x + 2.0, g.rows[sep_idx].y + g.rows[sep_idx].h / 2.0);

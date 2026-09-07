@@ -13,9 +13,18 @@
 //! Deliberately free of winit types: a finger is the `usize` behind winit's
 //! `FingerId`, so the whole gesture machine is unit-testable with no display.
 
-/// Pixels of two-finger travel that make one scrolled line. Matches the
-/// pixel-delta wheel conversion in the run loop, so a touchpad flick and a
-/// two-finger drag of the same distance move the scrollback equally far.
+/// Pixels of two-finger travel that make one scrolled line, in LOGICAL pixels.
+/// Matches the pixel-delta wheel conversion in the run loop, so a touchpad flick
+/// and a two-finger drag of the same distance move the scrollback equally far.
+///
+/// Logical, because winit reports touch and pixel-delta positions in PHYSICAL
+/// pixels: the same finger travel across the same glass produces twice the
+/// number on a 2x display. Multiplied by the display's backing factor via
+/// [`Touch::set_scale`] (and, for the wheel, in the run loop) so a flick moves
+/// the same distance whatever the display. Registered in
+/// `chrome_scale::logical::PX_PER_LINE`, which pins this value; it is defined
+/// here rather than there because this module is also compiled into the
+/// `rt_app` library, which has no `chrome_scale`.
 pub const PX_PER_LINE: f32 = 20.0;
 
 /// What the caller should do with the touch event it just reported.
@@ -41,9 +50,22 @@ pub struct Touch {
     points: Vec<(usize, (f32, f32))>, // fingers down, in the order they landed
     accum: f32,                       // sub-line remainder of two-finger travel
     multi: bool,                      // a multi-finger gesture is under way
+    scale: Option<f32>,               // display backing factor; None = 1.0 (see set_scale)
 }
 
 impl Touch {
+    /// Tell the gesture machine the display's backing factor, so `PX_PER_LINE`
+    /// (a LOGICAL distance) is compared against the PHYSICAL positions winit
+    /// reports. `None`/never-called means 1.0, which is what every 1x display
+    /// gets and is bit-for-bit the old behaviour.
+    pub fn set_scale(&mut self, scale: f32) {
+        self.scale = Some(if scale.is_finite() && scale > 0.0 { scale } else { 1.0 });
+    }
+
+    /// Physical pixels of travel per scrolled line on the current display.
+    fn px_per_line(&self) -> f32 {
+        self.scale.unwrap_or(1.0) * PX_PER_LINE
+    }
     /// A finger landed at `pos`.
     pub fn press(&mut self, id: usize, pos: (f32, f32)) -> Verdict {
         // winit reuses a `FingerId` once its finger is gone, so an id we still
@@ -81,9 +103,10 @@ impl Touch {
         // doesn't lurch when one finger moves and the other rests. This event
         // moved one finger, so it contributes 1/n of that mean.
         self.accum += (pos.1 - prev.1) / self.points.len() as f32;
-        let lines = (self.accum / PX_PER_LINE) as isize; // truncates toward zero
+        let ppl = self.px_per_line();
+        let lines = (self.accum / ppl) as isize; // truncates toward zero
         if lines != 0 {
-            self.accum -= lines as f32 * PX_PER_LINE;
+            self.accum -= lines as f32 * ppl;
             // Dragging DOWN pulls the content down and so reveals OLDER lines —
             // the direction a wheel-up gives, which is the wheel's positive.
             return Verdict::Scroll(lines);

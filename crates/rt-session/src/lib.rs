@@ -143,6 +143,7 @@ pub struct Session<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> {
     broadcast: Broadcast,              // current input fan-out mode
     bounds: Rect,                      // window content rectangle in pixels
     cell: (f32, f32),                  // (width, height) of one character cell in px
+    chrome_scale: f32,                 // display backing factor for the flat pads below (1.0 = as it always was)
     show_titlebar: bool,               // reserve a header strip atop each pane
     spawn: F,                          // factory that creates a new backend
 }
@@ -194,11 +195,20 @@ pub enum DropTarget {
     RootEdge { orient: Orientation, before: bool },
 }
 
-/// Vertical padding added to the cell height to size a per-pane titlebar strip.
+/// Vertical padding added to the cell height to size a per-pane titlebar strip,
+/// in LOGICAL pixels.
+///
+/// Logical, like [`PANE_PAD`] below: the cell height it is added to already
+/// doubles on a 2x display (the glyph is rasterised at the scaled size), so a
+/// pad that stayed at a flat 4 physical px would shrink to half its intended
+/// share of the strip. Every use multiplies it by the session's chrome scale —
+/// [`Session::set_chrome_scale`], or the `scale` argument of [`pane_chrome`].
 const TITLEBAR_PAD: f32 = 4.0;
 
-/// Inner padding (px) between a pane's edge and its terminal text, so the pane
-/// border / heat tint / latency frame never overlap the first characters.
+/// Inner padding between a pane's edge and its terminal text, in LOGICAL pixels,
+/// so the pane border / heat tint / latency frame never overlap the first
+/// characters. It is also the gutter `rt` draws the scrollbar in — and `rt`
+/// scales the scrollbar by the same factor, so the fit holds at every scale.
 const PANE_PAD: f32 = 5.0;
 
 /// The pixel overhead `(horizontal, vertical)` that [`Session::content_rect`]
@@ -207,9 +217,10 @@ const PANE_PAD: f32 = 5.0;
 /// single full-window pane comes out to an exact cols×rows grid (the `--cols` /
 /// `--rows` startup flags). Context-free on purpose — `main` calls it before any
 /// `Session` exists. Must stay in lockstep with `content_rect`/`titlebar_h`.
-pub fn pane_chrome(cell: (f32, f32), show_titlebar: bool) -> (f32, f32) {
-    let titlebar = if show_titlebar { cell.1 + TITLEBAR_PAD } else { 0.0 };
-    (2.0 * PANE_PAD, 2.0 * PANE_PAD + titlebar)
+pub fn pane_chrome(cell: (f32, f32), show_titlebar: bool, scale: f32) -> (f32, f32) {
+    let pad = scale * PANE_PAD;
+    let titlebar = if show_titlebar { cell.1 + scale * TITLEBAR_PAD } else { 0.0 };
+    (2.0 * pad, 2.0 * pad + titlebar)
 }
 
 impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
@@ -239,6 +250,9 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
             broadcast: Broadcast::Off,
             bounds,
             cell,
+            // 1.0 until the GUI reports the display's factor (it does so before the
+            // first relayout); 1.0 is exactly the pre-HiDPI behaviour.
+            chrome_scale: 1.0,
             show_titlebar: false, // off until the GUI enables it from settings
             spawn,
         }
@@ -741,7 +755,7 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
     /// text line plus a little padding, so it scales with the font size.
     pub fn titlebar_h(&self) -> f32 {
         if self.show_titlebar {
-            self.cell.1 + TITLEBAR_PAD
+            self.cell.1 + self.chrome_scale * TITLEBAR_PAD
         } else {
             0.0
         }
@@ -754,7 +768,7 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
     /// both the layout (PTY sizing) and the renderer (drawing/hit-testing) route
     /// through it so nothing can desync the grid from what the mouse hits.
     pub fn content_rect(&self, rect: Rect) -> Rect {
-        let p = PANE_PAD;
+        let p = self.chrome_scale * PANE_PAD;
         let top = self.titlebar_h() + p; // titlebar (0 if off) + top padding
         Rect::new(
             rect.x + p,
@@ -768,6 +782,31 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
     /// [`Session::relayout`] converts pane rectangles to (cols, rows) correctly.
     pub fn set_cell(&mut self, cell: (f32, f32)) {
         self.cell = cell;
+    }
+
+    /// Report the display's backing factor, so the flat chrome this session owns
+    /// — the pane padding, the titlebar strip's pad, and (forwarded to the tree)
+    /// the split gutters, the tab strips and the divider grab band — comes out
+    /// the right APPARENT size on a HiDPI panel.
+    ///
+    /// A plain number rather than a window handle on purpose: `rt-session` knows
+    /// nothing about winit and must keep it that way. The GUI reads
+    /// `Window::scale_factor()`, sanitises it (`rt`'s `chrome_scale`), and pushes
+    /// the result down here. Call it BEFORE the relayout that should use it —
+    /// [`Session::content_rect`] and the tree's layout both read it.
+    ///
+    /// Ignores a factor that is not a usable number: keeping the last good scale
+    /// beats laying every pane out at zero.
+    pub fn set_chrome_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.chrome_scale = scale;
+            self.tree.set_chrome_scale(scale); // gutters, tab strips, divider grab
+        }
+    }
+
+    /// The factor [`Session::set_chrome_scale`] last accepted (1.0 by default).
+    pub fn chrome_scale(&self) -> f32 {
+        self.chrome_scale
     }
 
     /// Recompute every pane's (cols, rows) from the current tree layout and
@@ -1214,6 +1253,101 @@ fn strip_paste_end_marker(text: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod chrome_scale_tests {
+    use super::*;
+
+    /// The smallest possible stand-in for a PTY pane: these tests are about
+    /// geometry, and never write, resize or paste.
+    struct Stub;
+    impl Backend for Stub {
+        fn write(&self, _bytes: &[u8]) {}
+        fn resize(&mut self, _c: usize, _r: usize) {}
+        fn set_palette(&mut self, _p: rt_engine::Palette) {}
+        fn bracketed_paste(&self) -> bool {
+            false
+        }
+    }
+
+    fn session() -> Session<Stub, impl FnMut(PaneId, usize, usize) -> Option<Stub>> {
+        Session::new(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }, (8.0, 16.0), |_id, _c, _r| Some(Stub))
+    }
+
+    /// The pane chrome this crate owns is FLAT — a 5px inner pad and a 4px
+    /// titlebar pad — while the cell it sits around doubles on a Retina panel.
+    /// Left unscaled it would shrink to half its intended share of the pane, so
+    /// it takes the display's factor too.
+    #[test]
+    fn pane_chrome_scales_with_the_display() {
+        let cell = (8.0_f32, 16.0_f32);
+        // No titlebar: chrome is 2*PANE_PAD on both axes.
+        assert_eq!(pane_chrome(cell, false, 1.0), (10.0, 10.0));
+        assert_eq!(pane_chrome(cell, false, 2.0), (20.0, 20.0));
+        // With one: the strip is cell height (already scaled by the caller,
+        // which measures the cell at the scaled font size) plus a scaled pad.
+        assert_eq!(pane_chrome(cell, true, 1.0), (10.0, 10.0 + 16.0 + 4.0));
+        assert_eq!(pane_chrome(cell, true, 2.0), (20.0, 20.0 + 16.0 + 8.0));
+    }
+
+    /// And at 1.0 it is bit-for-bit the flat 5px/4px it always was — the hard
+    /// requirement that keeps every Linux frame unchanged.
+    #[test]
+    fn pane_chrome_at_scale_one_is_bit_identical() {
+        for &cell in &[(8.0_f32, 16.0_f32), (11.0, 21.0), (6.5, 13.25)] {
+            let (w, h) = pane_chrome(cell, true, 1.0);
+            assert_eq!(w.to_bits(), (2.0_f32 * 5.0).to_bits());
+            assert_eq!(h.to_bits(), (2.0_f32 * 5.0 + cell.1 + 4.0).to_bits());
+        }
+    }
+
+    /// A factor that is not a usable number must be refused rather than laid out
+    /// against — a NaN pad would make every pane rect NaN and the grid vanish.
+    #[test]
+    fn an_unusable_factor_is_refused() {
+        let mut s = session();
+        assert_eq!(s.chrome_scale(), 1.0, "a session starts at 1.0");
+        s.set_chrome_scale(2.0);
+        assert_eq!(s.chrome_scale(), 2.0);
+        for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            s.set_chrome_scale(bad);
+            assert_eq!(s.chrome_scale(), 2.0, "{bad} must be ignored, not adopted");
+        }
+    }
+
+    /// `content_rect` is the single definition of "where a pane's grid lives" —
+    /// both the PTY sizing and the renderer/hit-test route through it — so
+    /// scaling it moves draw and hit in one step, by construction.
+    #[test]
+    fn content_rect_padding_and_titlebar_scale_together() {
+        let mut s = session();
+        s.set_show_titlebar(true);
+        let pane = Rect { x: 100.0, y: 50.0, w: 400.0, h: 300.0 };
+
+        let at_1x = s.content_rect(pane);
+        assert_eq!(s.titlebar_h(), 16.0 + 4.0);
+        assert_eq!(at_1x.x, 100.0 + 5.0);
+        assert_eq!(at_1x.y, 50.0 + 20.0 + 5.0);
+        assert_eq!(at_1x.w, 400.0 - 10.0);
+
+        s.set_chrome_scale(2.0);
+        let at_2x = s.content_rect(pane);
+        assert_eq!(s.titlebar_h(), 16.0 + 8.0, "the strip's PAD doubles; the cell is the caller's");
+        assert_eq!(at_2x.x, 100.0 + 10.0);
+        assert_eq!(at_2x.y, 50.0 + 24.0 + 10.0);
+        assert_eq!(at_2x.w, 400.0 - 20.0);
+    }
+
+    /// A session pushes its factor down into the layout tree, so the split
+    /// gutters, tab strips and the divider GRAB band scale with the padding
+    /// around them rather than being left behind in `rt-core`.
+    #[test]
+    fn the_scale_reaches_the_layout_tree() {
+        let mut s = session();
+        s.set_chrome_scale(2.0);
+        assert_eq!(s.tree().chrome_scale(), 2.0);
+    }
 }
 
 #[cfg(test)]
