@@ -129,6 +129,15 @@ enum Entry {
     /// A menu-bar-only row: no right-click counterpart, so it carries its own
     /// (Mac-idiomatic) label. Always enabled.
     Extra(Action, &'static str),
+    /// A row that exists in the right-click menu but must be LABELLED
+    /// differently in the bar. Enabled-state still comes from `menu::rows`, so
+    /// the two renderers cannot drift on anything but the word.
+    ///
+    /// The application menu is the case: macOS 13 renamed "Preferences…" to
+    /// "Settings…", and that row is the strongest naming convention the platform
+    /// has. rt's own context menu keeps "Preferences…", which is what it is
+    /// called everywhere else in rt and on Linux.
+    Relabel(Action, &'static str),
 }
 
 /// The application menu's rt-specific rows.
@@ -136,7 +145,7 @@ enum Entry {
 /// Settings lives here and nowhere else: ⌘, in the app menu is the strongest
 /// convention macOS has, and putting a second "Preferences…" in a File/Shell
 /// menu is the thing that marks a port as a port.
-const APP_MENU: &[Entry] = &[Entry::Ctx(Action::Preferences)];
+const APP_MENU: &[Entry] = &[Entry::Relabel(Action::Preferences, "Settings…")];
 
 /// The menu bar, left to right. Named after what a Mac terminal user reaches
 /// for, not after rt's internals: Terminal.app and iTerm2 both call the
@@ -257,6 +266,19 @@ pub fn model(keymap: &Keymap, has_selection: bool, suspended: bool) -> BarModel 
                     if let Some((label, enabled)) = ctx.iter().find(|(a, ..)| *a == action).map(|(_, l, e)| (l.clone(), *e)) {
                         out.push(BarItem {
                             label,
+                            key: key_equivalent(keymap, action),
+                            action: Some(action),
+                            enabled: enabled && !suspended,
+                        });
+                    }
+                }
+                Entry::Relabel(action, label) => {
+                    // Same lookup as `Ctx` -- only the label differs, so the
+                    // enabled-state and the "must exist in the context menu"
+                    // invariant both still hold.
+                    if let Some(enabled) = ctx.iter().find(|(a, ..)| *a == action).map(|(_, _, e)| *e) {
+                        out.push(BarItem {
+                            label: label.to_string(),
                             key: key_equivalent(keymap, action),
                             action: Some(action),
                             enabled: enabled && !suspended,
@@ -419,12 +441,16 @@ mod tests {
             .iter()
             .chain(categories().iter().flat_map(|(_, e)| e.iter()))
             .filter_map(|e| match e {
-                Entry::Ctx(a) if !ctx.contains(a) => Some(format!("{a:?}")),
+                // `Relabel` resolves through the same context-menu lookup as
+                // `Ctx` (only the label differs), so it carries the same
+                // requirement: no row there means the bar item silently
+                // disappears.
+                Entry::Ctx(a) | Entry::Relabel(a, _) if !ctx.contains(a) => Some(format!("{a:?}")),
                 _ => None,
             })
             .collect();
         orphans.sort();
-        assert!(orphans.is_empty(), "Entry::Ctx names actions the context menu has no row for: {orphans:?}");
+        assert!(orphans.is_empty(), "Entry::Ctx/Relabel name actions the context menu has no row for: {orphans:?}");
     }
 
     #[test]
@@ -537,6 +563,19 @@ mod tests {
         for menu in &m.menus {
             assert!(!menu.items.iter().any(|i| i.action == Some(Action::Preferences)), "{} duplicates Settings", menu.title);
         }
+        // …and it is deliberately RELABELLED: macOS 13 renamed Preferences to
+        // Settings, and the application menu is where that convention is
+        // strongest. rt's own context menu keeps "Preferences…", which is what
+        // it is called everywhere else in rt and on Linux. Pin both halves, so
+        // neither can drift into matching the other by accident.
+        let item = m.app_menu.iter().find(|i| i.action == Some(Action::Preferences)).expect("a Settings row");
+        assert_eq!(item.label, "Settings…", "the application menu must use the macOS 13+ name");
+        let ctx_label = context_rows(&Keymap::defaults(), true)
+            .into_iter()
+            .find(|(a, ..)| *a == Action::Preferences)
+            .map(|(_, l, _)| l)
+            .expect("the context menu still offers Preferences");
+        assert_eq!(ctx_label, "Preferences…", "rt's own menu keeps rt's own name");
     }
 
     #[test]
