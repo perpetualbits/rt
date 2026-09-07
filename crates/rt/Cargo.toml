@@ -110,11 +110,20 @@ wayland-client = "0.31"
 # The KWin dep above is kept for older Plasma; this is the cross-compositor path.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
-# Clipboard + PRIMARY selection over the Wayland connection: pure Wayland, ties
-# into the window's wl_display, keeps the default tree free of X11 crates. The
-# X11 build pairs this with arboard (above) via the cross-backend `clipboard`
-# module.
-smithay-clipboard = "0.7"
+# Clipboard + PRIMARY selection + dragged-in text over the Wayland connection:
+# pure Wayland, ties into the window's wl_display, keeps the default tree free of
+# X11 crates. The X11 build pairs this with arboard (above) via the cross-backend
+# `clipboard` module.
+#
+# This was `smithay-clipboard = "0.7"` until text drag-and-drop. That crate owns
+# a `wl_data_device` for the seat and exposes no drag hook, and a client cannot
+# safely own a SECOND one -- Mutter's `get_data_device` unlinks the client's
+# existing device, silently killing paste on GNOME. So `crates/rt/src/wl_clipboard`
+# is that crate's code (MIT, verbatim) with the drag callbacks filled in, and rt
+# depends on the toolkit under it directly. smithay-client-toolkit was already in
+# the graph via winit-wayland AND via smithay-clipboard, so this swap REMOVES a
+# crate (smithay-clipboard) and adds none.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 # X11 background blur (`_KDE_NET_WM_BLUR_BEHIND_REGION`), only under `x11`.
 x11rb = { version = "0.13", optional = true }
 

@@ -218,6 +218,78 @@ pub fn ghost_label(text: &str) -> String {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const GHOST_CHARS: usize = 28;
 
+/// The flavours rt will take from a foreign drag, best first, in their
+/// **canonical** (lower-case, space-free) spelling. The same preference order
+/// the X11 receiver interns as atoms, so a drag from Firefox delivers the same
+/// bytes on either display server.
+///
+/// `STRING`/`TEXT` are Latin-1 and undefined-encoding respectively by the letter
+/// of the ICCCM, and sit last as a floor: every source that still offers them
+/// sends UTF-8 in practice, and taking them beats refusing the drop.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub const DROP_MIMES: [&str; 5] =
+    ["text/plain;charset=utf-8", "utf8_string", "text/plain", "string", "text"];
+
+/// **The accept/reject decision**, and with it the flavour to ask for: the best
+/// of the MIME types a Wayland drag source is offering, or `None` — refuse this
+/// drag — when none of them is text rt can read.
+///
+/// Returns a borrow of the string as the SOURCE spelled it, which is the whole
+/// reason this is not just an index into [`DROP_MIMES`]. `wl_data_offer.accept`
+/// and `wl_data_offer.receive` are matched against the offered strings verbatim
+/// by the source; answering with rt's own canonical spelling would be accepted
+/// by the compositor and then deliver nothing.
+///
+/// Matching is on a normalised form — ASCII-lower-cased with every whitespace
+/// character removed — because `text/plain;charset=utf-8`,
+/// `text/plain; charset=UTF-8` and `TEXT/PLAIN;charset=utf-8` are the same type
+/// and all three occur (GTK writes the first, Qt and XWayland bridges have been
+/// seen with the others). The X11 receiver needs no such rule: it compares
+/// interned atoms, so it just lists both spellings it cares about.
+///
+/// Note what is deliberately NOT special-cased: a file drag from a file manager
+/// offers `text/uri-list` **and** `text/plain`, and will be accepted here as
+/// text — inserting the `file://` URI. That is exactly what the X11 receiver
+/// already does, and one behaviour across the two is worth more than a cleverer
+/// rule on one of them.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn pick_drop_mime(offered: &[String]) -> Option<&str> {
+    let canonical: Vec<String> = offered
+        .iter()
+        .map(|m| m.chars().filter(|c| !c.is_whitespace()).map(|c| c.to_ascii_lowercase()).collect())
+        .collect();
+    DROP_MIMES
+        .iter()
+        .find_map(|want| canonical.iter().position(|c| c == want))
+        .map(|i| offered[i].as_str())
+}
+
+/// A Wayland drag position, converted into the space the rest of the feature
+/// works in: physical pixels from the top-left of the window's content area.
+///
+/// `wl_data_device.enter`/`motion` report **surface-local** coordinates, which
+/// are logical — the compositor has already divided out the scale (and, under
+/// `wp_fractional_scale_v1`, the fractional one). Everything downstream —
+/// `Session::visible_rects`, `resolve`, winit's own `CursorMoved` — is in
+/// physical pixels. This is the same multiplication winit's Wayland pointer
+/// handler does (`LogicalPosition::to_physical(scale_factor)`), which is what
+/// put the pane rects on that grid to begin with; using anything else would put
+/// the cue under the pointer on a 1× display and nowhere near it on a 1.5× one.
+///
+/// `None` for a non-finite or non-positive input rather than a NaN that would
+/// hit-test as some arbitrary pane. `Rect::contains` already answers `false` to
+/// a NaN, so this is belt and braces — but "no position" is the honest value,
+/// and it makes the discard explicit at the receiver instead of implicit three
+/// calls away.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn surface_to_physical(x: f64, y: f64, scale: f64) -> Option<(f32, f32)> {
+    if !x.is_finite() || !y.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let (px, py) = (x * scale, y * scale);
+    (px.is_finite() && py.is_finite()).then_some((px as f32, py as f32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +481,93 @@ mod tests {
         for s in ["", "\n", "\r\n\r\n", "é".repeat(200).as_str(), "\t\t\t"] {
             let _ = ghost_label(s);
         }
+    }
+
+    // --- pick_drop_mime ---------------------------------------------------
+
+    /// The whole point of returning a borrow of the OFFER: rt must answer with
+    /// the spelling the source used, not with its own canonical one.
+    /// `wl_data_offer.accept`/`receive` match on the exact string, so echoing a
+    /// normalised form back gets nothing.
+    #[test]
+    fn the_offered_spelling_comes_back_verbatim() {
+        let offered = vec!["text/plain; charset=UTF-8".to_string()];
+        assert_eq!(pick_drop_mime(&offered), Some("text/plain; charset=UTF-8"));
+    }
+
+    /// utf-8 `text/plain` wins wherever it sits in the list a browser offers.
+    #[test]
+    fn utf8_text_plain_wins() {
+        let offered = mimes(&["text/html", "text/plain", "text/plain;charset=utf-8", "STRING"]);
+        assert_eq!(pick_drop_mime(&offered), Some("text/plain;charset=utf-8"));
+    }
+
+    /// Case, and the optional space after the `;`, are noise: GTK writes
+    /// `text/plain;charset=utf-8`, Qt has been seen with both a space and an
+    /// upper-case `UTF-8`, and all of them mean the same thing.
+    #[test]
+    fn charset_case_and_spacing_do_not_matter() {
+        for spelling in
+            ["text/plain;charset=UTF-8", "TEXT/PLAIN;CHARSET=utf-8", "text/plain; charset=utf-8"]
+        {
+            let offered = mimes(&["text/html", spelling]);
+            assert_eq!(pick_drop_mime(&offered), Some(spelling));
+        }
+    }
+
+    /// The fallbacks, taken strictly in order — the same preference list the
+    /// X11 receiver interns as atoms.
+    #[test]
+    fn the_fallbacks_are_taken_in_order() {
+        let pick = |v: &[&str]| pick_drop_mime(&mimes(v)).map(str::to_string);
+        assert_eq!(pick(&["STRING", "UTF8_STRING", "text/plain"]).as_deref(), Some("UTF8_STRING"));
+        assert_eq!(pick(&["STRING", "text/plain"]).as_deref(), Some("text/plain"));
+        assert_eq!(pick(&["TEXT", "STRING"]).as_deref(), Some("STRING"));
+        assert_eq!(pick(&["TEXT"]).as_deref(), Some("TEXT"));
+    }
+
+    /// The accept/reject decision. A drag carrying nothing rt can read must be
+    /// REFUSED, so the source shows the user a no-drop cursor instead of
+    /// pretending rt will take it — and so the compositor never sends a drop.
+    #[test]
+    fn a_drag_with_no_text_flavour_is_refused() {
+        let offered = mimes(&["image/png", "text/html", "application/x-qt-image"]);
+        assert_eq!(pick_drop_mime(&offered), None);
+        assert_eq!(pick_drop_mime(&[]), None);
+    }
+
+    /// A source may repeat a type, or offer an empty or malformed one. None of
+    /// that may panic or change the answer.
+    #[test]
+    fn odd_offer_lists_are_harmless() {
+        let offered = mimes(&["", "text/plain", "text/plain", ";;;", "\u{0}"]);
+        assert_eq!(pick_drop_mime(&offered), Some("text/plain"));
+    }
+
+    fn mimes(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- surface_to_physical ----------------------------------------------
+
+    /// Wayland reports a drag position in SURFACE-local coordinates, which are
+    /// logical; rt hit-tests panes in physical pixels. This is winit's own
+    /// conversion, which is what put the pane rects on that grid to begin with.
+    #[test]
+    fn surface_coordinates_scale_to_physical_pixels() {
+        assert_eq!(surface_to_physical(10.0, 20.0, 1.0), Some((10.0, 20.0)));
+        assert_eq!(surface_to_physical(10.0, 20.0, 2.0), Some((20.0, 40.0)));
+        assert_eq!(surface_to_physical(10.0, 20.0, 1.5), Some((15.0, 30.0)));
+    }
+
+    /// A garbage scale or position must not become a NaN that hit-tests as some
+    /// arbitrary pane: it becomes "no position", and the drop is discarded.
+    #[test]
+    fn non_finite_input_yields_no_position() {
+        assert_eq!(surface_to_physical(f64::NAN, 1.0, 1.0), None);
+        assert_eq!(surface_to_physical(1.0, f64::INFINITY, 1.0), None);
+        assert_eq!(surface_to_physical(1.0, 1.0, f64::NAN), None);
+        assert_eq!(surface_to_physical(1.0, 1.0, 0.0), None);
+        assert_eq!(surface_to_physical(1.0, 1.0, -2.0), None);
     }
 }

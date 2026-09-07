@@ -1,20 +1,13 @@
 │   │   │   │   └── bitflags v2.13.0 (*)
 │   │   │       │   └── libc v0.2.186
-│   │   │           │   └── memchr v2.8.2
 │   │   │   │   └── owned_ttf_parser v0.25.1
 │   │   │   │       └── ttf-parser v0.25.1 (*)
-│   │   │   │   └── wayland-sys v0.31.11 (*)
 │   │   │   │   ├── ab_glyph_rasterizer v0.1.10
 │   │   │   │   ├── cfg-if v1.0.4
-│   │   │   │   ├── downcast-rs v1.2.1
-│   │   │   │   ├── rustix v1.1.4 (*)
-│   │   │   │   ├── scoped-tls v1.0.1
-│   │   │   │   ├── smallvec v1.15.2
 │   │   │       └── libc v0.2.186
 │   │   │   └── libloading v0.8.9 (*)
 │   │       │   └── memchr v2.8.2
 │   │       │   └── proc-macro2 v1.0.106 (*)
-│   │   │           └── quote v1.0.46 (*)
 │   │       │   └── regex-syntax v0.8.11
 │   │   │   └── rustix v1.1.4 (*)
 │   │   │   └── scopeguard v1.2.0
@@ -22,18 +15,11 @@
 │   │   │   └── signal-hook-registry v1.4.8
 │   │   │   └── smol_str v0.3.6
 │   │   │           └── strict-num v0.1.1
-│   │   │       └── syn v2.0.118 (*)
-│   │   │   └── thiserror-impl v2.0.18 (proc-macro)
 │   │   │       └── tiny-skia-path v0.12.0
 │   │   │   └── tiny-skia v0.12.0
-│   │   │       └── tracing-core v0.1.36
-│   │   │   └── tracing v0.1.44
 │   │       │   └── unicode-ident v1.0.24
 │   │   │   └── utf8parse v0.2.2
-│   │   │   └── wayland-backend v0.3.15 (*)
-│   │   │   └── wayland-client v0.31.14
-│   │   │       └── wayland-scanner v0.31.10 (proc-macro)
-│   │   │   └── xcursor v0.3.10
+│   │   │   └── wayland-sys v0.31.11 (*)
 │   │   │   └── zerocopy v0.8.52
 │   │   │   ├── ab_glyph v0.2.32
 │   │       │   ├── aho-corasick v1.1.4 (*)
@@ -41,36 +27,30 @@
 │   │   │       ├── arrayvec v0.7.8
 │   │   │   ├── bitflags v2.13.0 (*)
 │   │   │       ├── bytemuck v1.25.0
-│   │   │   ├── calloop v0.14.4 (*)
 │   │   │   ├── cfg-if v1.0.4
 │   │   │   ├── cursor-icon v1.2.0
+│   │   │   ├── downcast-rs v1.2.1
 │   │   │   ├── dpi v0.1.2
 │   │   │       ├── errno v0.3.14
 │   │   │   ├── getrandom v0.3.4
 │   │   │   ├── keyboard-types v0.8.3
 │   │   │   ├── libc v0.2.186
-│   │   │       ├── log v0.4.33
+│   │   │   ├── log v0.4.33
 │   │       │   ├── memchr v2.8.2
 │   │   │   ├── memmap2 v0.9.11 (*)
 │   │   │   ├── once_cell v1.21.4
-│   │   │       ├── pin-project-lite v0.2.17
-│   │   │   ├── polling v3.11.0 (*)
-│   │   │           ├── proc-macro2 v1.0.106 (*)
-│   │   │           ├── quick-xml v0.39.4
-│   │   │       ├── quote v1.0.46 (*)
 │   │   │   ├── raw-window-handle v0.6.2
 │   │   │   ├── rustix v1.1.4 (*)
-│   │   │   ├── slab v0.4.12
+│   │   │   ├── scoped-tls v1.0.1
+│   │   │   ├── smallvec v1.15.2
 │   │   │   ├── smithay-client-toolkit v0.20.0 (*)
-│   │   │   ├── wayland-backend v0.3.15
-│   │   │   ├── wayland-client v0.31.14 (*)
-│   │   │   ├── wayland-protocols v0.32.13 (*)
 │       │   └── cfg-if v1.0.4
 │   │   └── foldhash v0.1.5
 │   │   └── libc v0.2.186
 │       │       └── linux-raw-sys v0.12.1
 │   │       └── once_cell v1.21.4
 │   │   └── parking_lot_core v0.9.12
+│   │           └── quote v1.0.46 (*)
 │   │       └── regex-syntax v0.8.11
 │   │   └── regex v1.12.4
 │   │   └── roxmltree v0.20.0
@@ -80,15 +60,22 @@
 │   │       └── serde v1.0.228 (*)
 │   │       └── smallvec v1.15.2
 │   │       └── syn v2.0.118
+│   │   └── thiserror-impl v2.0.18 (proc-macro)
 │   │   └── tinyvec_macros v0.1.1
+│   │       └── tracing-core v0.1.36
+│   │   └── tracing v0.1.44
 │   │           └── unicode-ident v1.0.24
 │   │   └── utf8parse v0.2.2
 │   │   └── vte v0.15.0 ((WORKSPACE)/vendor/vte)
+│   │   └── wayland-backend v0.3.15 (*)
+│   │   └── wayland-client v0.31.14
+│   │       └── wayland-scanner v0.31.10 (proc-macro)
 │   │   └── winit-core v0.31.0-beta.2 (*)
 │       │   └── winnow v1.0.3
 │   │   └── x11-dl v2.21.0
+│   │   └── xcursor v0.3.10
 │   │   └── xkbcommon-dl v0.4.2
-│   │   └── xkeysym v0.2.1
+│   │       └── xkeysym v0.2.1
 │   │   ├── ahash v0.8.12
 │   │       ├── aho-corasick v1.1.4
 │   │   ├── allocator-api2 v0.2.21
@@ -98,8 +85,7 @@
 │   │       ├── arrayvec v0.7.8
 │   │   ├── base64 v0.22.1
 │       │       ├── bitflags v2.13.0
-│   │   ├── calloop v0.14.4
-│   │   ├── calloop-wayland-source v0.4.1
+│   │   ├── calloop v0.14.4 (*)
 │   │       ├── cfg-if v1.0.4
 │   │   ├── colorchoice v1.0.5
 │   │       ├── cursor-icon v1.2.0
@@ -115,8 +101,10 @@
 │   │   ├── memmap2 v0.9.11 (*)
 │   │       ├── once_cell v1.21.4
 │   │   ├── parking_lot v0.12.5 (*)
+│   │       ├── pin-project-lite v0.2.17
 │   │   ├── polling v3.11.0
 │   │       ├── proc-macro2 v1.0.106
+│   │           ├── quick-xml v0.39.4
 │   │       ├── quote v1.0.46
 │   │   ├── raw-window-handle v0.6.2
 │   │       ├── regex-automata v0.4.14
@@ -126,21 +114,15 @@
 │   │   ├── serde_core v1.0.228
 │   │   ├── serde v1.0.228 (*)
 │   │   ├── signal-hook v0.4.4
+│   │   ├── slab v0.4.12
 │   │   ├── smithay-client-toolkit v0.20.0 (*)
 │   │   ├── smol_str v0.3.6
-│   │   ├── thiserror v2.0.18
 │   │   ├── tracing v0.1.44 (*)
 │   │   ├── unicode-width v0.2.2
-│   │   ├── wayland-backend v0.3.15 (*)
+│   │   ├── wayland-backend v0.3.15
 │   │   ├── wayland-client v0.31.14 (*)
-│   │   ├── wayland-csd-frame v0.3.0
-│   │   ├── wayland-cursor v0.31.14
-│   │   ├── wayland-protocols-experimental v20250721.0.1
-│   │   ├── wayland-protocols-misc v0.3.12
 │   │   ├── wayland-protocols-plasma v0.3.12 (*)
-│   │   ├── wayland-protocols v0.32.13
-│   │   ├── wayland-protocols-wlr v0.3.12
-│   │   ├── wayland-scanner v0.31.10 (proc-macro) (*)
+│   │   ├── wayland-protocols v0.32.13 (*)
 │   │   ├── winit-common v0.31.0-beta.2 (*)
 │   │   ├── winit-core v0.31.0-beta.2
 │   │   ├── x11-dl v2.21.0 (*)
@@ -154,7 +136,6 @@
 │   └── ttf-parser v0.25.1
 │       └── vt-parser v0.3.19 ((WORKSPACE)/crates/vt-parser)
 │   └── vt-term v0.3.19 ((WORKSPACE)/crates/vt-term)
-│   └── wayland-backend v0.3.15 (*)
 │   └── wayland-scanner v0.31.10 (proc-macro) (*)
 │   └── winit-x11 v0.31.0-beta.2
 │       └── winnow v0.7.15
@@ -162,13 +143,15 @@
 │   └── x11rb v0.13.2
 │       └── xcursor v0.3.10
 │       └── xkbcommon-dl v0.4.2 (*)
+│   └── xkeysym v0.2.1
 │   ├── alacritty_terminal v0.26.1-dev ((WORKSPACE)/vendor/alacritty_terminal)
 │   ├── anstream v1.0.0
 │   ├── anstyle v1.0.14
 │       ├── as-raw-xcb-connection v1.0.1
 │   ├── bitflags v2.13.0 (*)
 │       ├── bytemuck v1.25.0
-│       ├── calloop v0.14.4 (*)
+│   ├── calloop v0.14.4
+│   ├── calloop-wayland-source v0.4.1
 │   ├── cursor-icon v1.2.0
 │   ├── dpi v0.1.2
 │   ├── env_filter v2.0.0
@@ -194,8 +177,8 @@
 │       ├── serde_spanned v1.1.1
 │   ├── serde v1.0.228
 │   ├── slotmap v1.1.1
-│   ├── smithay-client-toolkit v0.20.0
 │   ├── smol_str v0.3.6
+│   ├── thiserror v2.0.18
 │   ├── tinyvec v1.11.0
 │       ├── toml_datetime v0.7.5+spec-1.1.0
 │       ├── toml_parser v1.1.2+spec-1.1.0
@@ -204,7 +187,13 @@
 │       ├── unicode-width v0.2.2
 │   ├── wayland-backend v0.3.15 (*)
 │   ├── wayland-client v0.31.14 (*)
-│   ├── wayland-protocols v0.32.13 (*)
+│   ├── wayland-csd-frame v0.3.0
+│   ├── wayland-cursor v0.31.14
+│   ├── wayland-protocols-experimental v20250721.0.1
+│   ├── wayland-protocols-misc v0.3.12
+│   ├── wayland-protocols v0.32.13
+│   ├── wayland-protocols-wlr v0.3.12
+│   ├── wayland-scanner v0.31.10 (proc-macro) (*)
 │   ├── wayland-sys v0.31.11
 │   ├── winit-common v0.31.0-beta.2
 │   ├── winit-core v0.31.0-beta.2 (*)
@@ -226,7 +215,7 @@
 ├── rt-core v0.3.19 ((WORKSPACE)/crates/rt-core)
 ├── rt-engine v0.3.19 ((WORKSPACE)/crates/rt-engine)
 ├── rt-session v0.3.19 ((WORKSPACE)/crates/rt-session)
-├── smithay-clipboard v0.7.3
+├── smithay-client-toolkit v0.20.0
 ├── wayland-client v0.31.14 (*)
 ├── wayland-protocols-plasma v0.3.12
 ├── wayland-protocols v0.32.13 (*)

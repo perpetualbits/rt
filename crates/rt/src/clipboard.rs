@@ -1,5 +1,5 @@
-//! Cross-backend clipboard: Wayland (smithay-clipboard) or X11 (arboard, behind
-//! the `x11` feature), chosen at runtime from the window's display handle.
+//! Cross-backend clipboard: Wayland ([`crate::wl_clipboard`]) or X11 (arboard,
+//! behind the `x11` feature), chosen at runtime from the window's display handle.
 //!
 //! Both back ends provide the CLIPBOARD *and* PRIMARY selections, so the four
 //! methods below match how `main.rs` uses the clipboard: `store`/`load` for the
@@ -11,9 +11,10 @@ use raw_window_handle::RawDisplayHandle;
 
 /// A live clipboard connection for one of the supported windowing backends.
 pub enum Clipboard {
-    /// Wayland: smithay-clipboard, tied to the window's `wl_display`.
+    /// Wayland: rt's own `wl_data_device` worker, tied to the window's
+    /// `wl_display` — the same one that receives dragged-in text.
     #[cfg(not(target_os = "macos"))]
-    Wayland(smithay_clipboard::Clipboard),
+    Wayland(crate::wl_clipboard::Clipboard),
     /// X11: arboard (only compiled with the `x11` feature).
     #[cfg(all(feature = "x11", not(target_os = "macos")))]
     X11(X11Clipboard),
@@ -31,7 +32,7 @@ impl Clipboard {
             // SAFETY: the display pointer comes from winit's live Wayland display.
             #[cfg(not(target_os = "macos"))]
             RawDisplayHandle::Wayland(d) => {
-                Some(Clipboard::Wayland(unsafe { smithay_clipboard::Clipboard::new(d.display.as_ptr()) }))
+                Some(Clipboard::Wayland(unsafe { crate::wl_clipboard::Clipboard::new(d.display.as_ptr()) }))
             }
             #[cfg(all(feature = "x11", not(target_os = "macos")))]
             RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => {

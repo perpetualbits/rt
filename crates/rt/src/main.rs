@@ -55,7 +55,13 @@ mod wgpu_frame; // pure end_frame decision table for wgpu_backend
 // decided whether damage tracking should be wired up here at all.
 #[cfg(all(test, target_os = "macos"))]
 mod wgpu_offscreen;
-mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard / macOS arboard)
+mod clipboard; // cross-backend clipboard (Wayland in-tree / X11 arboard / macOS arboard)
+// rt's Wayland CLIPBOARD + PRIMARY + drag-and-drop, all on the one wl_data_device
+// a client may safely own. Was the smithay-clipboard crate until text drop needed
+// a data device too; Mutter EVICTS a client's older device when it asks for a
+// second, which would silently kill paste on GNOME. See the module doc.
+#[cfg(not(target_os = "macos"))]
+mod wl_clipboard;
 mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 // Also deliberately NOT cfg'd, and for the same reason as the two above: the process-tree
 // walk behind the heat instrument is plain graph logic, and only the two leaf queries it
