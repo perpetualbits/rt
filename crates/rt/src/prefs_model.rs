@@ -173,6 +173,122 @@ pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String], terms
     }
 }
 
+// --- dismissal semantics --------------------------------------------------
+
+/// How the colour picker was dismissed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerDismiss {
+    /// The "Done (Esc)" button.
+    Done,
+    /// The Escape key.
+    Escape,
+    /// A press anywhere outside the picker panel.
+    ClickedOutside,
+}
+
+/// What a dismissal does with the colour edited since the picker opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dismiss {
+    /// Apply and persist it.
+    Commit,
+    /// Throw it away and restore the colour the slot had before.
+    // Nothing constructs this today — `picker_dismiss` always says Commit. It is
+    // kept so `close_picker`'s match is exhaustive over a real choice rather than
+    // a single-variant rubber stamp: changing the decision above is then a
+    // one-line edit that the compiler forces the caller to handle.
+    #[allow(dead_code)]
+    Discard,
+}
+
+/// What a dismissal does with the colour edited since the picker opened.
+///
+/// **All three ways out commit**, and this function exists to say so on purpose
+/// rather than by accident — a review flagged the outside-click path as an
+/// oversight, and it is worth writing down why it is not.
+///
+/// 1. **rt's preferences are live-apply with no Cancel.** There is no such row
+///    ([`PrefRow::Close`] is "Close", not "Cancel"), no snapshot of the settings
+///    as they were when the dialog opened, and every other exit — Escape, the
+///    Close row, Enter/Space on it — commits. An outside click that discarded
+///    would be the only destructive exit in the dialog, and the least announced
+///    one.
+/// 2. **`prefs_pending` is a debounce buffer, not a transaction.** Its whole
+///    purpose (see `PREFS_SETTLE`) is to pay for a font reflow or a palette
+///    rebuild once per run of edits instead of once per pointer-move. It holds
+///    the *newest* value, never the *original* one, so there is nothing to roll
+///    back to.
+/// 3. **The settle already committed it.** The `PREFS_SETTLE` tick fires 150 ms
+///    after the last edit whether or not the picker is still up, so by the time a
+///    hand has moved the pointer out of the panel and pressed, the colour is
+///    applied and written to `config.toml`. Discarding here could therefore only
+///    abandon the last sub-150 ms of a drag while keeping everything before it —
+///    not a cancel, an arbitrary partial rewind that leaves the user with a
+///    colour they did not stop on. Making Discard *mean* anything would take a
+///    real modal transaction: snapshot on open, suppress the settle while the
+///    picker is up (re-introducing the per-move recolour the settle exists to
+///    avoid), and un-persist. That is a different dialog.
+///
+/// So: dismissing keeps what you were looking at. That also matches what the
+/// picker shows — the terminal behind it has been wearing the new colour for the
+/// whole drag, and taking it away on the way out would be the surprise.
+pub fn picker_dismiss(way: PickerDismiss) -> Dismiss {
+    match way {
+        PickerDismiss::Done | PickerDismiss::Escape | PickerDismiss::ClickedOutside => {
+            Dismiss::Commit
+        }
+    }
+}
+
+/// Is a pending preferences edit due to be applied and persisted now?
+///
+/// `since_last_edit` is how long the pending value has held still and `settle` is
+/// `PREFS_SETTLE`. Extracted from the run-loop tick so the rule above can be
+/// stated as a test rather than only as prose.
+///
+/// Note what this function is NOT given: whether the preferences dialog or the
+/// colour picker is still open. That is the point — the settle is unconditional,
+/// which is what makes [`Dismiss::Discard`] incoherent for any edit older than
+/// `settle`.
+pub fn settle_due(has_pending: bool, since_last_edit: std::time::Duration, settle: std::time::Duration) -> bool {
+    has_pending && since_last_edit >= settle
+}
+
+#[cfg(test)]
+mod dismiss_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The decision under review: every way out of the picker keeps the colour.
+    /// Exhaustive over [`PickerDismiss`], so adding a fourth way to dismiss
+    /// without deciding what it does will not compile past this loop unnoticed.
+    #[test]
+    fn every_way_out_of_the_picker_commits() {
+        for way in [PickerDismiss::Done, PickerDismiss::Escape, PickerDismiss::ClickedOutside] {
+            assert_eq!(picker_dismiss(way), Dismiss::Commit, "{way:?} must commit");
+        }
+    }
+
+    /// The invariant that makes a discard-on-dismiss impossible to implement
+    /// honestly: the settle commits a pending edit once it has held still, with
+    /// no knowledge of any overlay still being on screen. A user who drags the
+    /// picker, pauses, then clicks outside has already had the colour applied and
+    /// persisted before the click happened.
+    #[test]
+    fn the_settle_commits_regardless_of_what_is_still_on_screen() {
+        let settle = Duration::from_millis(150);
+        assert!(settle_due(true, settle, settle), "an edit that has held still commits");
+        assert!(settle_due(true, Duration::from_millis(400), settle));
+    }
+
+    /// The two ways it must not fire: nothing pending, or the value still moving.
+    #[test]
+    fn the_settle_waits_for_a_pending_edit_to_hold_still() {
+        let settle = Duration::from_millis(150);
+        assert!(!settle_due(false, Duration::from_secs(10), settle), "nothing to commit");
+        assert!(!settle_due(true, Duration::from_millis(149), settle), "still being dragged");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
