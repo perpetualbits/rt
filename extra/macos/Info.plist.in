@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for rt.app/Contents/Info.plist. `bundle.sh` substitutes @VERSION@
+  and writes the result; every other value is fixed and explained below.
+  Keep the bundle identifier identical to extra/linux/io.github.perpetualbits.rt.desktop
+  — one identity for rt on every platform.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+
+  <!-- The file inside Contents/MacOS that LaunchServices execs. -->
+  <key>CFBundleExecutable</key>
+  <string>rt</string>
+
+  <!-- Same identity as the Linux desktop file. LaunchServices, TCC (privacy
+       permissions), the Dock and `defaults` all key off this. -->
+  <key>CFBundleIdentifier</key>
+  <string>io.github.perpetualbits.rt</string>
+
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+
+  <!-- Both names are "rt", deliberately. AppKit titles the bold first menu from
+       the bundle name, and winit's AppKit backend builds "About rt" / "Hide rt"
+       / "Quit rt" from NSBundle.mainBundle().name() (falling back to the process
+       name when unbundled). Setting these to "rt" is what makes the menu bar read
+       the same bundled as it does from a shell. -->
+  <key>CFBundleName</key>
+  <string>rt</string>
+  <key>CFBundleDisplayName</key>
+  <string>rt</string>
+
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+
+  <!-- Both come from crates/rt/Cargo.toml. ShortVersionString is what the Finder
+       "Get Info" panel and the About panel show; CFBundleVersion is the build
+       number and must be monotonic, which a released version already is. -->
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+
+  <!-- Contents/Resources/rt.icns, generated from extra/logo/rt.svg. -->
+  <key>CFBundleIconFile</key>
+  <string>rt.icns</string>
+
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+
+  <!-- THE one key that must not be missing. Without it macOS gives the app a
+       1x backing store and scales the result up: every glyph in the terminal
+       would be a blurred 1x bitmap on a Retina display, silently undoing rt's
+       whole HiDPI path (scale factor, glyph rasterisation, chrome scaling). It
+       has no effect at all when rt is run from a shell — only a bundle is asked. -->
+  <key>NSHighResolutionCapable</key>
+  <true/>
+
+  <!-- rt draws through wgpu/Metal. On a dual-GPU Mac this lets the window server
+       keep rt on the integrated GPU instead of waking the discrete one. -->
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+
+  <!-- Take the system appearance, including Dark Mode. rt's frosted glass is an
+       NSVisualEffectView whose material follows the effective appearance; forcing
+       Aqua would freeze it light while rt drew a dark terminal behind it. -->
+  <key>NSRequiresAquaSystemAppearance</key>
+  <false/>
+
+  <!-- Measured, not guessed: `otool -l` on the release binary reports
+       LC_BUILD_VERSION minos 11.0, which is rustc's default deployment target
+       for aarch64-apple-darwin and also the oldest macOS any Apple-silicon Mac
+       runs. Claiming less would be a lie the dynamic loader would catch; claiming
+       more would lock out Macs the binary actually runs on. -->
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+
+  <key>NSHumanReadableCopyright</key>
+  <string>GPL-3.0-or-later. See COPYING in the rt source tree.</string>
+
+  <!-- Privacy strings, and why a terminal needs them at all.
+       TCC attributes a permission request to the *responsible* application, and
+       for anything you run in a pane that is rt.app. A CLI that touches the
+       camera, the microphone, Contacts, Calendars, Reminders or AppleScript is
+       killed outright — no prompt, no message — when the responsible bundle has
+       no usage string for it. These are the strings the prompt shows.
+       (Alacritty carries the same set; the wording is rt's.) -->
+  <key>NSAppleEventsUsageDescription</key>
+  <string>A program running in rt wants to control another application with AppleScript.</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>A program running in rt wants to read your calendars.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>A program running in rt wants to use the camera.</string>
+  <key>NSContactsUsageDescription</key>
+  <string>A program running in rt wants to read your contacts.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>A program running in rt wants to use the microphone.</string>
+  <key>NSRemindersUsageDescription</key>
+  <string>A program running in rt wants to read your reminders.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>A program running in rt wants your location.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>A program running in rt wants to read files on your Desktop.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>A program running in rt wants to read files in your Documents folder.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>A program running in rt wants to read files in your Downloads folder.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>A program running in rt wants to read files on a removable volume.</string>
+  <key>NSSystemAdministrationUsageDescription</key>
+  <string>A program running in rt is asking for administrator privileges.</string>
+</dict>
+</plist>

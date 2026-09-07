@@ -113,10 +113,149 @@ stays occupied until rt exits.
 - **The manual**: `⇧⌘?` (or `Fn`+`F1`). It is the complete key reference and it
   has a macOS appendix.
 
-There is no `.app` bundle and no installer. `extra/linux/install.sh` in the
-README's "Desktop integration" section is Linux-only — it installs a `.desktop`
-file and an icon into a freedesktop icon theme, neither of which macOS has.
-On a Mac, `cargo install` places the binary and that is the whole installation.
+`extra/linux/install.sh`, from the README's "Desktop integration" section, is
+Linux-only — it installs a `.desktop` file and an icon into a freedesktop icon
+theme, neither of which macOS has. The Mac equivalent is `extra/macos`, below.
+
+---
+
+## The `rt.app` bundle
+
+`cargo install` gives you a command. A Mac user also wants an *application*: an
+icon in `/Applications`, a Dock entry, a Spotlight hit, something to double-click.
+That is what `extra/macos` builds.
+
+```sh
+./extra/macos/install.sh            # build the bundle, install to /Applications
+./extra/macos/install.sh --user     # ~/Applications instead
+./extra/macos/install.sh --uninstall
+```
+
+`install.sh` calls `extra/macos/bundle.sh`, which is also usable on its own:
+
+```sh
+./extra/macos/bundle.sh             # cargo build --release, then target/macos/rt.app
+./extra/macos/bundle.sh --no-build  # wrap an rt you have already built
+```
+
+What comes out:
+
+```
+rt.app/Contents/Info.plist
+rt.app/Contents/MacOS/rt            the release binary
+rt.app/Contents/Resources/rt.icns   generated from extra/logo/rt.svg
+rt.app/Contents/PkgInfo
+```
+
+The bundle identifier is **`io.github.perpetualbits.rt`** — the same string as
+the Linux desktop file, so rt has one identity on both platforms. `LSMinimumSystemVersion`
+is **11.0**, which is not a guess: `otool -l` on the release binary reports
+`LC_BUILD_VERSION minos 11.0` (rustc's default deployment target for
+`aarch64-apple-darwin`, and also the oldest macOS any Apple-silicon Mac runs).
+
+**`NSHighResolutionCapable` is `true`**, and it is the key that must never go
+missing. Without it macOS hands the app a 1× backing store and scales the result
+up, so every glyph on a Retina display would be a blurred upscale — silently
+undoing rt's entire HiDPI path. It has no effect on `rt` run from a shell; only a
+bundle is ever asked.
+
+Both `CFBundleName` and `CFBundleDisplayName` are `rt`. winit's AppKit backend
+builds the application menu from `NSBundle.mainBundle().name()`, falling back to
+the process name when there is no bundle, so the bold first menu reads **rt**
+either way — bundled or not.
+
+The plist also carries the `NS…UsageDescription` strings (camera, microphone,
+Contacts, Calendars, Reminders, AppleScript, the Desktop/Documents/Downloads
+folders). A terminal needs those even though rt itself touches none of them:
+macOS attributes a privacy request to the *responsible* application, and for
+anything you run in a pane that is `rt.app`. With no usage string the system does
+not prompt — it kills the process outright.
+
+### The icon
+
+macOS has no SVG rasteriser (`sips` cannot read SVG), so a 1024×1024 PNG render
+of `extra/logo/rt.svg` is committed as `extra/macos/rt.png` and the `.icns` is
+generated from it. `bundle.sh` uses whatever is present:
+
+- **on macOS** — `sips` + `iconutil`, both of which every Mac already has. This
+  is the path that was used to build the bundle that ships.
+- **on Linux** — `png2icns` from libicns (`apt install icnsutils`), fed by
+  `rsvg-convert` or ImageMagick.
+
+If neither is available the bundle is still built, without an icon, and says so.
+To refresh `rt.png` after changing the logo:
+
+```sh
+rsvg-convert -w 1024 -h 1024 extra/logo/rt.svg -o extra/macos/rt.png
+```
+
+### Signing, and what Gatekeeper actually does
+
+`bundle.sh` **ad-hoc signs** the bundle (`codesign --force -s -`). There is no
+Apple Developer ID here and none is needed. On Apple silicon the kernel refuses to
+run an *unsigned* Mach-O at all, so a signature is mandatory; but *Gatekeeper* —
+the "unidentified developer" dialog — only fires on files carrying the
+`com.apple.quarantine` extended attribute, which is set by browsers and other
+download agents. An app you built locally, `rsync`'d, or copied from a USB stick
+never has it, so you are never asked.
+
+If you do get an rt bundle out of a `.zip` from a browser, macOS 15 and later
+**removed** the old right-click → Open escape hatch. The two that work now:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/rt.app     # the direct fix
+```
+
+or double-click it, let it be refused, then go to **System Settings → Privacy &
+Security**, scroll to the Security section, and press **"Open Anyway"** next to
+the message about rt. `install.sh` strips the attribute for you, so this only
+comes up if you moved the bundle into place by hand.
+
+### An `rt` on `PATH`
+
+The bundle deliberately does **not** install a command-line `rt`. `cargo install
+--path crates/rt` already puts one in `~/.cargo/bin`, which rustup has on your
+`PATH`; adding a second one would leave two rt binaries of possibly different
+versions with `PATH` order deciding which you get.
+
+If the `.app` is your whole installation, ask for the link explicitly:
+
+```sh
+./extra/macos/install.sh --link-cli     # /usr/local/bin/rt -> the bundled binary
+```
+
+It warns if another `rt` already shadows it, and `--uninstall` removes the
+symlink again (only if it is one it made — it will not delete a real binary).
+
+### Launched from Finder: the working directory
+
+An app started by LaunchServices does not inherit a shell's environment, which
+matters for a program whose whole job is to spawn login shells. Measured on the
+Mac rather than assumed:
+
+- **Working directory is `/`.** Every launchd-started GUI process on the machine
+  has `cwd=/` (`lsof -a -p PID -d cwd`), and `/usr/bin/login -l` — which is how
+  rt starts a pane's shell on macOS — deliberately does *not* change directory.
+  So a double-clicked rt would open every pane sitting in the filesystem root.
+  **rt fixes this**: a binary that finds itself at `…/*.app/Contents/MacOS/…`
+  *and* with a working directory of `/` moves to `$HOME` before the first pane
+  exists. Both conditions are required, so running the bundled binary by hand
+  from a project directory keeps that directory, and an `rt` reached through the
+  `/usr/local/bin` symlink is never touched at all. See `crates/rt/src/app_bundle.rs`.
+- **`PATH`, `SHELL`, `HOME` and `USER` need no fixing.** rt runs each pane
+  through `/usr/bin/login`, so the pane's shell is a *login* shell, and a login
+  shell sources `/etc/zprofile`, which runs `/usr/libexec/path_helper`. Starting
+  from a completely empty environment (`env -i`) that rebuilds the full `PATH`
+  — `/usr/local/bin`, the cryptex paths, and everything in `/etc/paths.d`,
+  including `~/.cargo/bin` — and `login` exports `SHELL`, `HOME`, `USER` and
+  `LOGNAME` from the `passwd` record. A pane in a Finder-launched rt has exactly
+  the environment it would have in Terminal.app.
+
+One consequence worth knowing: rt prints its startup line (which VT engine it
+chose, and any warning) on stderr, and a Finder-launched app has nowhere to put
+that. rt's `crashlog` already redirects stderr to `~/.cache/rt/stderr.log` when
+it is not attached to a terminal, so that is where to look when a bundled rt
+misbehaves.
 
 ---
 

@@ -172,6 +172,10 @@ This installs the [icon](extra/logo/rt.svg) into the hicolor theme and the
 path. rt sets its Wayland `app_id` / X11 `WM_CLASS` to `io.github.perpetualbits.rt`,
 which is what lets the compositor match the window to that icon.
 
+On **macOS** the equivalent is `extra/macos/install.sh`, which builds and installs
+an `rt.app` bundle carrying the same `io.github.perpetualbits.rt` identity. See
+[docs/MACOS.md](docs/MACOS.md#the-rtapp-bundle).
+
 ## Configuration
 
 Settings live in `$XDG_CONFIG_HOME/rt/config.toml` (or `~/.config/rt/config.toml`).

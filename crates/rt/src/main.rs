@@ -10,6 +10,11 @@
 //! becomes an `Action` fed to `Session::apply`; a miss becomes PTY bytes via
 //! `encode_key` fed to `Session::feed_input` (respecting broadcast mode).
 
+// Deliberately NOT cfg'd to macOS, for the same reason as `wgpu_frame` and
+// `vibrancy_policy`: it holds "was this launched from Finder, and where should its
+// panes start?" as a pure decision over paths, so Linux CI runs the tests for a rule
+// only a macOS `.app` bundle can exercise.
+mod app_bundle; // Finder-launch fixups: the cwd a bundled rt hands its panes
 mod backend; // rendering backend abstraction (GL today, XRender in mechanism C)
 #[cfg(not(target_os = "macos"))]
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
@@ -8612,6 +8617,12 @@ fn main() {
     // never come back through the run loop (macOS Cmd+Q) — see its doc. Registered
     // first so it is in place before anything below can decide to exit.
     install_exit_cleanup();
+    // Launched from Finder, a bundled rt gets `/` as its working directory and would
+    // hand it to every pane's shell. Move to `$HOME` first — before any thread exists,
+    // because `chdir` is process-wide. A no-op for a bundle run from a shell, and this
+    // call does not exist on any other platform. See `app_bundle`.
+    #[cfg(target_os = "macos")]
+    app_bundle::normalise_working_directory();
     crashlog::capture_stderr_if_not_a_tty();
     crashlog::install_panic_hook();
     crashlog::selftest_if_asked();
