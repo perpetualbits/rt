@@ -19,8 +19,21 @@ BASE=ci/linux-dep-baseline.txt
 # This makes the check work from any checkout location (main, worktree, CI).
 REPO_ROOT=$(git rev-parse --show-toplevel)
 normalize_paths() {
-  # Replace repo root path with (WORKSPACE) placeholder to make comparison location-independent.
-  sed "s|${REPO_ROOT}|(WORKSPACE)|g"
+  # Two substitutions, both so the baseline compares the SHAPE of the graph and
+  # nothing else:
+  #
+  #  1. the repo root becomes (WORKSPACE), so the check works from any checkout
+  #     or worktree;
+  #  2. a workspace-local crate's own VERSION becomes (WORKSPACE-VERSION).
+  #
+  # (2) matters because every release bumps all nine crates in lockstep, which
+  # rewrote ~40 baseline lines and failed this gate for a graph that had not
+  # changed at all -- exactly once per release, which is how a gate teaches
+  # people to ignore it. Only lines carrying the (WORKSPACE) path are touched,
+  # so a real third-party crate's version still shows, and a dependency added,
+  # removed or REVERSIONED still fails the check.
+  sed -e "s|${REPO_ROOT}|(WORKSPACE)|g" \
+      -e "s| v[0-9][^ ]* ((WORKSPACE)| v(WORKSPACE-VERSION) ((WORKSPACE)|g"
 }
 
 echo "########## macOS graph: must be free of Wayland/X11 ##########"
