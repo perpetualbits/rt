@@ -194,3 +194,19 @@ numbers come from the live session there.
 One more thing the frame log (`age=`) showed on NVIDIA: the driver reports
 buffer age 3 (triple buffering) and rt kept only two frames of damage history,
 so every frame there had silently been full. `HISTORY_DEPTH` is 4 now.
+
+### Postscript (v0.3.22): the instruments do not live inside the bands
+
+Roland's retest on the PowerVR path found "halved jack ports and flickering
+green discs that no longer orbit". The output packets orbit ON the pane
+rectangle's perimeter and the jacks are centred on it, with radii of 7.5–9 px,
+while the partial-frame border bands were 6 px wide and entirely inside the
+pane. So every animation frame cleared and redrew only the inner sliver of
+each disc and never erased the outer half. On v0.3.20 the bands were the same,
+but hardware GL still took full frames, which hid it; on llvmpipe nobody
+looked at the jacks. Now the bands reach `instrument_margin` (the largest rim
+radius + 1) on BOTH sides of each edge, the window-level latency frame — which
+breathes along `content_bounds`, outside any pane — gets its own four bands,
+and everything is clamped to the window. Unit tests assert a disc of the
+instrument radius centred anywhere on the perimeter lies inside the bands.
+Cost: a partial frame on dop561 is still 2.2 ms median.

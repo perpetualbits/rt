@@ -4408,16 +4408,96 @@ mod clip_cull_tests {
     }
 }
 
-fn border_bands(rect: Rect, top_h: i32) -> [crate::damage::PxRect; 4] {
+/// The chrome bands a partial frame must clear and redraw around one pane.
+/// `margin` is how far the pane's rim instruments reach on EITHER side of the
+/// edge: the output packets orbit ON the rectangle's perimeter and the jacks
+/// are centred on it, so half of every disc lies outside the pane. A band that
+/// stopped at the edge (as it did until v0.3.22) repainted only the inner
+/// sliver of each disc and never erased the outer half — "halved jacks" and
+/// packets that flickered in place instead of orbiting. The titlebar strip is
+/// still covered in full when shown.
+fn border_bands(rect: Rect, top_h: i32, margin: i32) -> [crate::damage::PxRect; 4] {
     use crate::damage::PxRect;
     let (x, y, w, h) = (rect.x as i32, rect.y as i32, rect.w as i32, rect.h as i32);
-    let top = BORDER_PX.max(top_h); // cover the full titlebar strip when shown
+    let m = margin.max(0);
+    let inner = BORDER_PX.max(m); // reach inside the pane
+    let top = inner.max(top_h); // cover the full titlebar strip when shown
     [
-        PxRect { x, y, w, h: top },                          // top
-        PxRect { x, y: y + h - BORDER_PX, w, h: BORDER_PX }, // bottom
-        PxRect { x, y, w: BORDER_PX, h },                    // left
-        PxRect { x: x + w - BORDER_PX, y, w: BORDER_PX, h }, // right
+        PxRect { x: x - m, y: y - m, w: w + 2 * m, h: m + top },                  // top
+        PxRect { x: x - m, y: y + h - inner, w: w + 2 * m, h: inner + m },        // bottom
+        PxRect { x: x - m, y: y - m, w: m + inner, h: h + 2 * m },                // left
+        PxRect { x: x + w - inner, y: y - m, w: inner + m, h: h + 2 * m },        // right
     ]
+}
+
+/// How far the rim instruments reach from a pane edge, in physical px, plus
+/// one for anti-aliasing: the larger of the jack backing disc and the packet
+/// glow (both centred on the edge), or the heat border (inside only).
+fn instrument_margin(sc: f32) -> i32 {
+    use chrome_scale::logical as lg;
+    (sc * lg::JACK_R_BACK.max(lg::PACKET_R_GLOW).max(lg::HEAT_BORDER_T)).ceil() as i32 + 1
+}
+
+/// The latency frame runs along the perimeter of the WINDOW's content bounds
+/// (not a pane) and breathes every animation frame, so a partial frame must
+/// cover its four edges too. `t` is its half-thickness plus AA slack.
+fn latency_frame_bands(cb: Rect, t: i32) -> [crate::damage::PxRect; 4] {
+    use crate::damage::PxRect;
+    let (x, y, w, h) = (cb.x as i32, cb.y as i32, cb.w as i32, cb.h as i32);
+    [
+        PxRect { x: x - t, y: y - t, w: w + 2 * t, h: 2 * t },         // top
+        PxRect { x: x - t, y: y + h - t, w: w + 2 * t, h: 2 * t },     // bottom
+        PxRect { x: x - t, y: y - t, w: 2 * t, h: h + 2 * t },         // left
+        PxRect { x: x + w - t, y: y - t, w: 2 * t, h: h + 2 * t },     // right
+    ]
+}
+
+#[cfg(test)]
+mod instrument_band_tests {
+    use super::*;
+    use crate::damage::PxRect;
+
+    fn covers(bands: &[PxRect], x: i32, y: i32) -> bool {
+        bands.iter().any(|b| x >= b.x && x < b.right() && y >= b.y && y < b.bottom())
+    }
+
+    /// A disc of the instrument radius centred on any point of the pane's
+    /// perimeter — a jack, or a packet at any phase — lies inside the bands.
+    #[test]
+    fn bands_contain_rim_discs_on_both_sides_of_the_edge() {
+        let rect = Rect { x: 100.0, y: 50.0, w: 400.0, h: 300.0 };
+        let m = instrument_margin(1.0);
+        assert!(m >= 10, "margin {m} must exceed the 9px packet glow");
+        let bands = border_bands(rect, 24, m);
+        let r = m - 1; // the drawn radius
+        for (cx, cy) in [(100, 200), (500, 150), (500, 250), (300, 50), (300, 350), (100, 50), (500, 350)] {
+            for (dx, dy) in [(-r, 0), (r, 0), (0, -r), (0, r), (-r, -r), (r, r)] {
+                assert!(covers(&bands, cx + dx, cy + dy), "disc at ({cx},{cy}) pokes out at ({},{})", cx + dx, cy + dy);
+            }
+        }
+        // …while the middle of the pane is NOT in any band (bands stay bands).
+        assert!(!covers(&bands, 300, 200));
+    }
+
+    #[test]
+    fn latency_frame_bands_cover_its_thickness_and_leave_the_middle() {
+        let cb = Rect { x: 8.0, y: 8.0, w: 1000.0, h: 600.0 };
+        let bands = latency_frame_bands(cb, 3);
+        for (x, y) in [(8, 300), (1008, 300), (500, 8), (500, 608), (6, 6), (1010, 610)] {
+            assert!(covers(&bands, x, y), "({x},{y}) not covered");
+        }
+        assert!(!covers(&bands, 500, 300));
+    }
+}
+
+/// Intersect `r` with `bounds` (empty if disjoint) — damage rects must stay inside
+/// the window for the EGL damage hints and the scissor.
+fn clamp_rect(r: crate::damage::PxRect, bounds: crate::damage::PxRect) -> crate::damage::PxRect {
+    let x0 = r.x.max(bounds.x);
+    let y0 = r.y.max(bounds.y);
+    let x1 = r.right().min(bounds.right());
+    let y1 = r.bottom().min(bounds.bottom());
+    crate::damage::PxRect { x: x0, y: y0, w: (x1 - x0).max(0), h: (y1 - y0).max(0) }
 }
 
 /// The outcome of the per-frame damage decision: repaint everything, or scissor
@@ -7135,9 +7215,17 @@ impl App {
         // whole point of Route 1: send only the changed cells, like Terminator.
         let x11_present_active = active.backend.x11_present_active();
         if !active.damage.is_full() && !x11_present_active {
+            let margin = instrument_margin(active.chrome_sc);
+            let win = crate::damage::PxRect { x: 0, y: 0, w: size.width as i32, h: size.height as i32 };
             for (_id, (rect, _)) in &snapshots {
-                for band in border_bands(*rect, active.session.titlebar_h() as i32) {
-                    active.damage.add_rect(band);
+                for band in border_bands(*rect, active.session.titlebar_h() as i32, margin) {
+                    active.damage.add_rect(clamp_rect(band, win)); // bands reach past the pane; never past the window
+                }
+            }
+            if active.settings.inst_latency {
+                let t = (active.chrome_sc * chrome_scale::logical::LATENCY_FRAME_T).ceil() as i32 + 1;
+                for band in latency_frame_bands(bounds, t) {
+                    active.damage.add_rect(clamp_rect(band, win));
                 }
             }
         }
