@@ -1,6 +1,6 @@
 [package]
 name = "rt-handoff"
-version = "0.3.21"
+version = "0.3.22"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "rt's frozen cross-process pane-handoff wire format. No dependencies, on purpose: a future rt must be able to vendor an old copy of this crate to check itself against."
