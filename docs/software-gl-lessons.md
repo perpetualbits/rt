@@ -210,3 +210,16 @@ breathes along `content_bounds`, outside any pane — gets its own four bands,
 and everything is clamped to the window. Unit tests assert a disc of the
 instrument radius centred anywhere on the perimeter lies inside the bands.
 Cost: a partial frame on dop561 is still 2.2 ms median.
+
+### Postscript (v0.3.23): the instrument pass was never flushed on partial frames
+
+Retest: "the instrument edge flickers and is only sometimes visible". In
+`redraw_scissored` the pane content was flushed with `end_frame`, then the
+instruments were painted, then the frame was presented — with no second
+`end_frame`, which `redraw_full` has. The instrument geometry sat unflushed
+in the vertex batch and the next `begin_frame` threw it away, so on GL the
+instruments existed only on full frames. This has been so since the partial
+path was born; every GPU took full frames until v0.3.21, and on llvmpipe
+nobody looked at the rim. Reproduced on dop561/NVIDIA with a headless weston
+and `weston-screenshooter` (eight captures: edge absent in all with the old
+build, present in all with the fix). The fallback branch had the same hole.

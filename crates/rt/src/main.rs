@@ -8108,6 +8108,12 @@ impl App {
         // this doesn't reintroduce coupling to keystroke/output frames.
         if active.backend.is_gl() || active.instr_tick {
             Self::paint_overlays_or_instruments(active);
+            // Flush the instrument/overlay geometry batched by that pass — the
+            // same second end_frame redraw_full has. Without it the batch sat
+            // unflushed and the next begin_frame threw it away, so on GL the
+            // instruments existed only on full frames: an edge that flickered in
+            // and out with the frame kind. (No-op on XRender: nothing batched.)
+            active.backend.end_frame();
         }
         active.backend.clear_scissor(); // next frame starts with a clean scissor
         // Present just the damage (X11 Route-1 bbox present, else EGL partial swap).
@@ -8118,6 +8124,7 @@ impl App {
             Self::draw_panes(active, bounds, &snapshots);
             active.backend.end_frame();
             Self::paint_overlays_or_instruments(active);
+            active.backend.end_frame(); // flush the instrument pass (see above)
             active.backend.full_swap();
             return true;
         }
