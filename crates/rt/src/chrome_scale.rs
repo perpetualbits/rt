@@ -157,42 +157,44 @@ pub mod logical {
     /// this module does not exist — and re-exported here.
     pub use crate::touch::PX_PER_LINE;
 
-    // --- overlay panels ----------------------------------------------------
-    /// Vertical padding added to the cell height to make one panel row.
-    pub const PANEL_ROW_PAD: f32 = 4.0;
-    /// Top offset of a row's text inside that row.
-    pub const PANEL_TEXT_TOP: f32 = 2.0;
-    /// Search bar: inner padding all round.
-    pub const SEARCH_PAD: f32 = 6.0;
+    // --- overlay panels: THE SPACING SCALE ---------------------------------
+    // One 4px-grid scale, shared by every chrome panel. See
+    // `crate::chrome::theme` for the system these belong to; a panel that
+    // invents its own padding is the thing this replaced.
+    /// Panel inner padding, across. The measure every panel's text starts at.
+    pub const PANEL_PAD_X: f32 = 14.0;
+    /// Panel inner padding, down — above the first row and below the last.
+    pub const PANEL_PAD_Y: f32 = 8.0;
+    /// Gap between control groups inside a panel (the colour picker's stack).
+    pub const PANEL_GAP: f32 = 8.0;
+    /// Corner radius of every chrome panel.
+    pub const PANEL_RADIUS: f32 = 7.0;
+    /// Standoff of a row highlight from the panel's side edges.
+    pub const PANEL_SEL_INSET: f32 = 5.0;
+    /// Corner radius of that highlight.
+    pub const PANEL_SEL_RADIUS: f32 = 5.0;
+    /// Vertical padding added to the cell height to make one panel row — the
+    /// row rhythm every list in every panel shares.
+    pub const PANEL_ROW_PAD: f32 = 8.0;
+    /// Height of a separator row, with the rule centred in it.
+    pub const PANEL_SEP_H: f32 = 11.0;
     /// Search bar: standoff from the window's top and right edges.
     pub const SEARCH_INSET: f32 = 8.0;
     /// Search bar: caret width.
     pub const SEARCH_CARET_W: f32 = 2.0;
-    /// Preferences: inner padding (used both across and down).
-    pub const PREFS_PAD: f32 = 10.0;
     /// Preferences: gap between palette swatches.
-    pub const PREFS_SWATCH_GAP: f32 = 2.0;
-    /// Preferences: inset of the selected-row highlight.
-    pub const PREFS_SEL_INSET: f32 = 1.0;
-    /// Context menu: inner padding (used both across and down).
-    pub const MENU_PAD: f32 = 8.0;
-    /// Context menu: height of a separator row.
-    pub const MENU_SEP_H: f32 = 7.0;
-    /// Manual overlay: inner padding (defined next to the code that wraps text
-    /// to it, and re-exported here).
-    pub use crate::chrome::manual::PAD as MANUAL_PAD;
-    /// Manual overlay: widest the panel may get.
-    pub const MANUAL_MAX_W: f32 = 900.0;
+    pub const PREFS_SWATCH_GAP: f32 = 3.0;
+    /// Manual overlay: extra leading between wrapped body lines. Monospace set
+    /// solid is a wall; a little air is what lets a long page be read.
+    pub const MANUAL_LEADING: f32 = 4.0;
     /// Manual overlay: scrollbar inset from the panel's right edge.
-    pub const MANUAL_SB_INSET: f32 = 4.0;
+    pub const MANUAL_SB_INSET: f32 = 7.0;
     /// Manual overlay: scrollbar thumb width.
-    pub const MANUAL_SB_W: f32 = 3.0;
+    pub const MANUAL_SB_W: f32 = 4.0;
     /// Manual overlay: shortest that thumb may get.
-    pub const MANUAL_SB_MIN_THUMB: f32 = 12.0;
+    pub const MANUAL_SB_MIN_THUMB: f32 = 28.0;
     /// Manual overlay: total vertical inset of the scrollbar track.
-    pub const MANUAL_SB_TRACK_INSET: f32 = 2.0;
-    /// Clipboard history: inner padding (defined with its panel, re-exported here).
-    pub use crate::chrome::clip_history::PAD as CLIP_PAD;
+    pub const MANUAL_SB_TRACK_INSET: f32 = 16.0;
     /// Clipboard history: anchor fallback when the focused pane has no rect.
     pub const CLIP_ANCHOR_FALLBACK: f32 = 40.0;
     /// Colour picker: floor on the saturation/value square's side.
@@ -259,23 +261,22 @@ pub const REGISTER: &[(&str, f32)] = &[
     ("GHOST_OFFSET", logical::GHOST_OFFSET),
     ("CLICK_SLOP", logical::CLICK_SLOP),
     ("PX_PER_LINE", logical::PX_PER_LINE),
+    ("PANEL_PAD_X", logical::PANEL_PAD_X),
+    ("PANEL_PAD_Y", logical::PANEL_PAD_Y),
+    ("PANEL_GAP", logical::PANEL_GAP),
+    ("PANEL_RADIUS", logical::PANEL_RADIUS),
+    ("PANEL_SEL_INSET", logical::PANEL_SEL_INSET),
+    ("PANEL_SEL_RADIUS", logical::PANEL_SEL_RADIUS),
     ("PANEL_ROW_PAD", logical::PANEL_ROW_PAD),
-    ("PANEL_TEXT_TOP", logical::PANEL_TEXT_TOP),
-    ("SEARCH_PAD", logical::SEARCH_PAD),
+    ("PANEL_SEP_H", logical::PANEL_SEP_H),
     ("SEARCH_INSET", logical::SEARCH_INSET),
     ("SEARCH_CARET_W", logical::SEARCH_CARET_W),
-    ("PREFS_PAD", logical::PREFS_PAD),
     ("PREFS_SWATCH_GAP", logical::PREFS_SWATCH_GAP),
-    ("PREFS_SEL_INSET", logical::PREFS_SEL_INSET),
-    ("MENU_PAD", logical::MENU_PAD),
-    ("MENU_SEP_H", logical::MENU_SEP_H),
-    ("MANUAL_PAD", logical::MANUAL_PAD),
-    ("MANUAL_MAX_W", logical::MANUAL_MAX_W),
+    ("MANUAL_LEADING", logical::MANUAL_LEADING),
     ("MANUAL_SB_INSET", logical::MANUAL_SB_INSET),
     ("MANUAL_SB_W", logical::MANUAL_SB_W),
     ("MANUAL_SB_MIN_THUMB", logical::MANUAL_SB_MIN_THUMB),
     ("MANUAL_SB_TRACK_INSET", logical::MANUAL_SB_TRACK_INSET),
-    ("CLIP_PAD", logical::CLIP_PAD),
     ("CLIP_ANCHOR_FALLBACK", logical::CLIP_ANCHOR_FALLBACK),
     ("PICKER_SV_MIN", logical::PICKER_SV_MIN),
     ("PICKER_HUE_MIN", logical::PICKER_HUE_MIN),
@@ -391,23 +392,22 @@ mod tests {
             ("GHOST_OFFSET", 12.0),
             ("CLICK_SLOP", 5.0),
             ("PX_PER_LINE", 20.0),
-            ("PANEL_ROW_PAD", 4.0),
-            ("PANEL_TEXT_TOP", 2.0),
-            ("SEARCH_PAD", 6.0),
+            ("PANEL_PAD_X", 14.0),
+            ("PANEL_PAD_Y", 8.0),
+            ("PANEL_GAP", 8.0),
+            ("PANEL_RADIUS", 7.0),
+            ("PANEL_SEL_INSET", 5.0),
+            ("PANEL_SEL_RADIUS", 5.0),
+            ("PANEL_ROW_PAD", 8.0),
+            ("PANEL_SEP_H", 11.0),
             ("SEARCH_INSET", 8.0),
             ("SEARCH_CARET_W", 2.0),
-            ("PREFS_PAD", 10.0),
-            ("PREFS_SWATCH_GAP", 2.0),
-            ("PREFS_SEL_INSET", 1.0),
-            ("MENU_PAD", 8.0),
-            ("MENU_SEP_H", 7.0),
-            ("MANUAL_PAD", 12.0),
-            ("MANUAL_MAX_W", 900.0),
-            ("MANUAL_SB_INSET", 4.0),
-            ("MANUAL_SB_W", 3.0),
-            ("MANUAL_SB_MIN_THUMB", 12.0),
-            ("MANUAL_SB_TRACK_INSET", 2.0),
-            ("CLIP_PAD", 6.0),
+            ("PREFS_SWATCH_GAP", 3.0),
+            ("MANUAL_LEADING", 4.0),
+            ("MANUAL_SB_INSET", 7.0),
+            ("MANUAL_SB_W", 4.0),
+            ("MANUAL_SB_MIN_THUMB", 28.0),
+            ("MANUAL_SB_TRACK_INSET", 16.0),
             ("CLIP_ANCHOR_FALLBACK", 40.0),
             ("PICKER_SV_MIN", 140.0),
             ("PICKER_HUE_MIN", 14.0),

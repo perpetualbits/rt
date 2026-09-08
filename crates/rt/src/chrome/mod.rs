@@ -11,6 +11,7 @@ pub mod manual;
 pub mod menu;
 pub mod prefs;
 pub mod search;
+pub mod theme;
 
 /// An axis-aligned layout rectangle in window pixels.
 #[derive(Clone, Copy, Debug)]

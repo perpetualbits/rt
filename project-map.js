@@ -187,6 +187,18 @@ window.PROJECT_MAP = {
       deps: ["rt-session"]
     },
     {
+      id: "chrome-theme", label: "Chrome design system", layer: "chrome", status: "done",
+      tags: ["native chrome", "palette"],
+      desc: "One palette, one spacing scale, one row rhythm and one panel shape for every floating panel rt draws: the context menu, the F1 manual, preferences, the colour picker, the clipboard history and the search bar. Colours are DERIVED from the user's own foreground/background/palette rather than hardcoded (forty literals across chrome/*.rs before this, no two panels agreeing), so the chrome belongs to the terminal it floats over; every text role is held to a stated WCAG contrast floor at every scheme rt ships and at both extremes, asserted by unit test. Panels are rounded rectangles with a hairline edge, built from fill_rect slices so both backends can draw them. A chrome_theme setting (tinted / graphite / contrast) re-derives the whole palette live from the preferences row, so the taste question can be settled side by side rather than one rebuild per guess.",
+      files: ["crates/rt/src/chrome/theme.rs", "crates/rt/src/chrome_scale.rs", "crates/rt-config/src/lib.rs"],
+      specs: [],
+      parts: [
+        { label: "Too-tall panels", status: "done", desc: "A panel taller than the window used to be pinned to the top edge with its tail off-screen and no way to reach it. The context menu now scrolls (wheel, Up/Down arrows with Return to pick, or a click on the ▲/▼ cue); the clipboard history scrolls with its selection; preferences clamps its height and shows a thumb; the colour picker fits itself to the window, the SV square giving way first. One pure `plan` decides which rows are on screen, and both the draw and the hit-test read it." },
+        { label: "Manual typography", status: "done", desc: "Wrapped continuation lines keep their indent and hang under the description column instead of dumping at column zero — the whole manual is two-column key/description material, so that alone was what made it read as ragged prose. The measure is capped in COLUMNS (84) rather than pixels, UPPERCASE section headings are set bold in the accent, and body lines carry leading." }
+      ],
+      deps: ["rt-config"]
+    },
+    {
       id: "chrome-prefs", label: "Preferences", layer: "chrome", status: "done",
       tags: ["native chrome"],
       desc: "A native (not egui) preferences dialog drawn with the same glyph pipeline as the terminal: toggles, steppers, and section headers over font, appearance, behaviour, scrollback, instruments, the arrow-key acceleration controls and the terminal type (which offers only names this machine has terminfo for). Persists through the rt-config store.",
@@ -196,7 +208,7 @@ window.PROJECT_MAP = {
         { label: "XRender chrome slice", href: "docs/superpowers/specs/2026-07-14-slice-2-xrender-chrome-design.md" }
       ],
       parts: [],
-      deps: ["rt-config"]
+      deps: ["rt-config", "chrome-theme"]
     },
     {
       id: "chrome-colour", label: "Colour picker", layer: "chrome", status: "done",
@@ -205,7 +217,7 @@ window.PROJECT_MAP = {
       files: ["crates/rt/src/chrome/colour_picker.rs"],
       specs: [{ label: "Native colour picker design", href: "docs/superpowers/specs/2026-07-19-native-colour-picker-design.md" }],
       parts: [],
-      deps: ["chrome-prefs"]
+      deps: ["chrome-prefs", "chrome-theme"]
     },
     {
       id: "chrome-menu", label: "Menu & manual", layer: "chrome", status: "done",
@@ -216,7 +228,7 @@ window.PROJECT_MAP = {
       parts: [
         { label: "macOS menu bar", status: "active", desc: "A real NSMenu in the system menu bar — Shell / Edit / View / Window / Help, plus Settings… in the application menu winit already installs (⌘Q and ⌘H untouched). Rows, labels and enabled-state come verbatim from menu::rows(), so a click dispatches the same Action a keybinding does via App::apply_action; the pointer-dependent rows (Open Link, Copy Address, Move Pane to …) stay context-menu-only. Chords are shown as real AppKit key equivalents taken from the keymap. Enable/disable is live via -validateMenuItem: against a snapshot the run loop refreshes each turn, which also greys the bar (and kills its key equivalents) while a modal overlay owns the keyboard. The click reaches the loop through winit 0.31's EventLoopProxy::wake_up + proxy_wake_up. The AppKit calls are macOS-only; the STRUCTURE is plain data in menubar_model.rs, unit-tested on Linux like vibrancy_policy.rs. Awaiting on-screen verification." }
       ],
-      deps: ["rt-session"]
+      deps: ["rt-session", "chrome-theme"]
     },
     {
       id: "chrome-search", label: "Scrollback search", layer: "chrome", status: "done",
@@ -225,7 +237,7 @@ window.PROJECT_MAP = {
       files: ["crates/rt/src/chrome/search.rs"],
       specs: [],
       parts: [],
-      deps: ["rt-session"]
+      deps: ["rt-session", "chrome-theme"]
     },
     {
       id: "instruments", label: "Border instruments", layer: "chrome", status: "done",

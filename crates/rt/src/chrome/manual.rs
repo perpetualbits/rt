@@ -1,86 +1,200 @@
 //! Native manual overlay: a centered panel that **word-wraps** `manual::MANUAL`
-//! to the panel width and scrolls by (wrapped) rows. A version line heads the
-//! text. Scroll position lives in `Active.manual_scroll`.
+//! to a comfortable measure and scrolls by wrapped rows. A version line heads
+//! the text. Scroll position lives in `Active.manual_scroll`.
+//!
+//! # What "text does not flow" turned out to mean
+//!
+//! Three separate faults, all of them typographic:
+//!
+//! 1. **Continuation lines lost their indent.** The old wrap split on
+//!    whitespace and emitted every continuation flush at column zero. The manual
+//!    is almost entirely two-column key/description material —
+//!    `  Ctrl+Shift+O    split horizontally` — so a single wrapped description
+//!    threw the whole column structure away and the page dissolved into ragged
+//!    prose. [`wrap_line`] now keeps a line's own indent and hangs continuations
+//!    under the **description column**, found by looking for the first run of two
+//!    or more spaces. That is the fix that most looks like "flow".
+//! 2. **The measure was far too wide.** The panel was 85% of the window capped
+//!    at 900 logical px, which at a small font is 120+ characters per line —
+//!    roughly double the 60–80 that is readable. The measure is now capped in
+//!    COLUMNS ([`MEASURE`]), which is the unit that actually governs reading,
+//!    and the panel is sized from it.
+//! 3. **Headings were invisible.** `MANUAL`'s own doc comment says "UPPERCASE
+//!    lines are section headings", and the overlay drew them in exactly the same
+//!    colour and weight as body text. They are now bold, in the palette's accent
+//!    ([`LineKind::Heading`]).
+//!
+//! Plus leading: monospace set solid is a wall, so body lines get
+//! `MANUAL_LEADING` px of air between them.
 use crate::backend::Backend;
-use crate::chrome_scale::logical;
+use crate::chrome::theme::{self, Palette};
 use crate::chrome::Recti;
+use crate::chrome_scale::logical;
 use crate::manual::manual_lines;
-use crate::render::Color;
+
+/// The widest measure the manual is ever set at, in CHARACTERS.
+///
+/// Capped in columns rather than pixels because the readable measure is a
+/// character count (60–80 is the usual guidance; `MANUAL` itself is authored to
+/// ~76), and a pixel cap turns into a different column count at every font size.
+/// A little over 76 so the authored lines do not wrap at all at this width.
+pub const MEASURE: usize = 84;
+
+/// Fraction of the window the panel may take. Wide enough to feel like a
+/// document, narrow enough to leave the terminal visible around it.
+const PANEL_W_FRAC: f32 = 0.90;
+const PANEL_H_FRAC: f32 = 0.86;
+
+/// What a wrapped line IS, so `draw` can set it appropriately instead of
+/// painting the whole manual as one undifferentiated block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineKind {
+    /// The running version, at the very top.
+    Version,
+    /// An UPPERCASE section heading (see `manual::MANUAL`'s doc comment).
+    Heading,
+    /// Everything else.
+    Body,
+}
 
 /// Manual panel geometry plus the wrapped lines to draw (version header first).
 pub struct Geom {
     pub panel: Recti,
-    pub rows: usize,        // visible wrapped rows in the panel
-    pub lines: Vec<String>, // the whole manual, wrapped to the panel width
-    pub total: usize,       // lines.len()
+    /// Visible wrapped rows in the panel.
+    pub rows: usize,
+    /// The whole manual, wrapped to the panel's measure, each line tagged.
+    pub lines: Vec<(LineKind, String)>,
+    pub total: usize,
+    /// Height of one wrapped line INCLUDING its leading — the manual's own row
+    /// rhythm. `draw` and `rows` both use it, so a scroll position always means
+    /// the same thing on screen.
+    pub line_h: f32,
 }
 
-/// Panel inner padding, in LOGICAL px (registered as
-/// `chrome_scale::logical::MANUAL_PAD`); every use multiplies it by the
-/// display's backing factor.
-pub const PAD: f32 = 12.0;
-
-/// How many character columns fit inside the panel's padded interior.
+/// How many character columns the manual is set at inside a panel of `panel_w`.
 pub fn visible_cols(panel_w: f32, cell_w: f32, sc: f32) -> usize {
-    let inner = panel_w - sc * PAD * 2.0;
+    let inner = panel_w - sc * logical::PANEL_PAD_X * 2.0 - sc * logical::MANUAL_SB_INSET * 2.0;
     if inner <= 0.0 || cell_w <= 0.0 {
         return 0;
     }
-    (inner / cell_w).floor() as usize
+    ((inner / cell_w).floor() as usize).min(MEASURE)
 }
 
-/// Word-wrap the manual to `cols` columns, headed by the running version. Lines
-/// that already fit are emitted unchanged (so the aligned key/description columns
-/// and code examples stay aligned); only longer lines are wrapped, greedily by
-/// word, hard-breaking any single word wider than `cols`.
-pub fn wrapped(cols: usize) -> Vec<String> {
-    let mut out = vec![crate::version_string(), String::new()];
-    if cols == 0 {
-        return out;
-    }
-    let hard_break = |out: &mut Vec<String>, word: &str| -> String {
-        // Split an over-long word into full-width chunks; return the remainder.
-        let mut chars: Vec<char> = word.chars().collect();
-        while chars.len() > cols {
-            out.push(chars[..cols].iter().collect());
-            chars.drain(..cols);
+/// Is this an UPPERCASE section heading?
+fn is_heading(line: &str) -> bool {
+    !line.starts_with(char::is_whitespace)
+        && line.chars().any(char::is_alphabetic)
+        && line.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase())
+}
+
+/// The column a wrapped continuation of `line` should hang at.
+///
+/// For a two-column `KEY   description` line that is the description column, so
+/// a long description stays in its own column instead of running back under the
+/// key. For ordinary prose it is simply the line's own indent, so a paragraph
+/// keeps its block shape. Clamped to half the measure, so a pathologically wide
+/// first column cannot squeeze the text to nothing.
+fn continuation_indent(line: &str, cols: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let lead = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(0);
+    let mut i = lead;
+    while i + 1 < chars.len() {
+        if chars[i] == ' ' && chars[i + 1] == ' ' {
+            let mut j = i;
+            while j < chars.len() && chars[j] == ' ' {
+                j += 1;
+            }
+            if j < chars.len() {
+                return j.min(cols / 2).max(lead.min(cols / 2));
+            }
+            break;
         }
-        chars.into_iter().collect()
-    };
-    for line in manual_lines() {
-        if line.chars().count() <= cols {
-            out.push(line.to_string());
+        i += 1;
+    }
+    lead.min(cols / 2)
+}
+
+/// Greedy word-wrap of one source line to `cols`, appending to `out`.
+///
+/// Keeps the line's own leading indent on the first row and hangs every
+/// continuation at [`continuation_indent`]. A single word wider than the measure
+/// is hard-broken rather than allowed to overhang.
+fn wrap_line(line: &str, cols: usize, kind: LineKind, out: &mut Vec<(LineKind, String)>) {
+    if line.chars().count() <= cols {
+        out.push((kind, line.to_string()));
+        return;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let lead = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(0).min(cols / 2);
+    let cont = continuation_indent(line, cols);
+    let mut cur = " ".repeat(lead);
+    let mut has_word = false;
+    for w in line.split_whitespace() {
+        let wl = w.chars().count();
+        if has_word && cur.chars().count() + 1 + wl > cols {
+            out.push((kind, std::mem::take(&mut cur)));
+            cur = " ".repeat(cont);
+            has_word = false;
+        }
+        if !has_word && cur.chars().count() + wl > cols {
+            // A word wider than the measure: chop it into full rows.
+            let mut rest: Vec<char> = w.chars().collect();
+            loop {
+                let take = cols.saturating_sub(cur.chars().count());
+                if take == 0 || rest.len() <= take {
+                    break;
+                }
+                cur.extend(rest.drain(..take));
+                out.push((kind, std::mem::take(&mut cur)));
+                cur = " ".repeat(cont);
+            }
+            cur.extend(rest);
+            has_word = true;
             continue;
         }
-        let mut cur = String::new();
-        for word in line.split_whitespace() {
-            let wl = word.chars().count();
-            if cur.is_empty() {
-                cur = if wl <= cols { word.to_string() } else { hard_break(&mut out, word) };
-            } else if cur.chars().count() + 1 + wl <= cols {
-                cur.push(' ');
-                cur.push_str(word);
-            } else {
-                out.push(std::mem::take(&mut cur));
-                cur = if wl <= cols { word.to_string() } else { hard_break(&mut out, word) };
-            }
+        if has_word {
+            cur.push(' ');
         }
-        if !cur.is_empty() {
-            out.push(cur);
-        }
+        cur.push_str(w);
+        has_word = true;
+    }
+    if has_word {
+        out.push((kind, cur));
+    }
+}
+
+/// Word-wrap the manual to `cols` columns, headed by the running version.
+pub fn wrapped(cols: usize) -> Vec<(LineKind, String)> {
+    let mut out = Vec::new();
+    if cols == 0 {
+        return vec![(LineKind::Version, crate::version_string())];
+    }
+    // The version line wraps like everything else: at a narrow measure it is one
+    // of the longest lines in the document.
+    wrap_line(&crate::version_string(), cols, LineKind::Version, &mut out);
+    out.push((LineKind::Body, String::new()));
+    for line in manual_lines() {
+        let kind = if is_heading(line) { LineKind::Heading } else { LineKind::Body };
+        wrap_line(line, cols, kind, &mut out);
     }
     out
 }
 
-/// A panel ~85% of the window (a touch wider than before so fewer lines wrap).
+/// A centred panel sized to the manual's measure, never wider than the window.
 pub fn layout(win_w: f32, win_h: f32, cell_w: f32, cell_h: f32, sc: f32) -> Geom {
-    let w = (win_w * 0.85).min(sc * logical::MANUAL_MAX_W);
-    let h = win_h * 0.85;
-    let panel = Recti { x: (win_w - w) / 2.0, y: (win_h - h) / 2.0, w, h };
-    let rows = (((h - sc * PAD * 2.0) / cell_h).floor() as usize).max(1);
+    let pad_x = sc * logical::PANEL_PAD_X;
+    let pad_y = sc * logical::PANEL_PAD_Y;
+    // Width comes from the MEASURE, not from the window: a 4K window must not
+    // hand the reader a 200-character line.
+    let ideal = MEASURE as f32 * cell_w + pad_x * 2.0 + sc * logical::MANUAL_SB_INSET * 2.0;
+    let w = ideal.min(win_w * PANEL_W_FRAC).min(win_w).max(0.0);
+    let h = (win_h * PANEL_H_FRAC).min(win_h).max(0.0);
+    let panel = Recti { x: ((win_w - w) * 0.5).max(0.0), y: ((win_h - h) * 0.5).max(0.0), w, h };
+    let line_h = cell_h + sc * logical::MANUAL_LEADING;
+    let rows = (((h - pad_y * 2.0) / line_h).floor() as usize).max(1);
     let lines = wrapped(visible_cols(w, cell_w, sc));
     let total = lines.len();
-    Geom { panel, rows, lines, total }
+    Geom { panel, rows, lines, total, line_h }
 }
 
 /// Clamp a scroll offset so the last page stays on-screen.
@@ -90,38 +204,31 @@ pub fn clamp_scroll(scroll: usize, g: &Geom) -> usize {
 }
 
 /// Draw the panel, the visible wrapped-line slice, and a scrollbar thumb.
-pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, _cell_w: f32, _cell_h: f32, sc: f32) {
-    let pad = sc * PAD;
-    let hair = sc * logical::HAIRLINE;
-    let bg = Color::rgb(0x18, 0x1a, 0x1f);
-    let border = Color::rgb(0x50, 0x54, 0x60);
-    let fg = Color::rgb(0xd0, 0xd2, 0xda);
-    let dim = Color::rgb(0x80, 0x84, 0x90);
-    let thumb = Color::rgb(0x45, 0x48, 0x54);
+pub fn draw(be: &mut dyn Backend, g: &Geom, scroll: usize, pal: &Palette, _cell_w: f32, cell_h: f32, sc: f32) {
+    let pad_x = sc * logical::PANEL_PAD_X;
+    let pad_y = sc * logical::PANEL_PAD_Y;
     let p = g.panel;
-    be.fill_rect(p.x, p.y, p.w, p.h, bg);
-    be.fill_rect(p.x, p.y, p.w, hair, border);
-    be.fill_rect(p.x, p.y + p.h - hair, p.w, hair, border);
-    be.fill_rect(p.x, p.y, hair, p.h, border);
-    be.fill_rect(p.x + p.w - hair, p.y, hair, p.h, border);
-    let ox = p.x + pad;
-    let oy = p.y + pad;
+    theme::panel(be, p, pal, sc);
+    let ox = p.x + pad_x;
     let scroll = clamp_scroll(scroll, g);
-    for (r, line) in g.lines.iter().skip(scroll).take(g.rows).enumerate() {
-        // The version header (line 0) is dimmed; everything else is body text.
-        let colr = if scroll + r == 0 { dim } else { fg };
-        for (c, ch) in line.chars().enumerate() {
-            be.draw_char(ox, oy, c, r, ch, colr, false, false);
-        }
+    for (r, (kind, line)) in g.lines.iter().skip(scroll).take(g.rows).enumerate() {
+        let (colr, bold) = match kind {
+            LineKind::Version => (pal.dim, false),
+            LineKind::Heading => (pal.accent, true),
+            LineKind::Body => (pal.text, false),
+        };
+        theme::text(be, ox, p.y + pad_y + r as f32 * g.line_h, line, colr, bold);
     }
     // Scrollbar thumb on the right edge, sized to the visible fraction.
     if g.total > g.rows {
         let inset = sc * logical::MANUAL_SB_TRACK_INSET;
-        let track_h = p.h - inset;
-        let th = (track_h * g.rows as f32 / g.total as f32).max(sc * logical::MANUAL_SB_MIN_THUMB);
+        let track_h = (p.h - inset).max(1.0);
+        let tw = sc * logical::MANUAL_SB_W;
+        let th = (track_h * g.rows as f32 / g.total as f32).max(sc * logical::MANUAL_SB_MIN_THUMB).min(track_h);
         let ty = p.y + inset * 0.5 + (track_h - th) * scroll as f32 / (g.total - g.rows) as f32;
-        be.fill_rect(p.x + p.w - sc * logical::MANUAL_SB_INSET, ty, sc * logical::MANUAL_SB_W, th, thumb);
+        theme::rounded(be, p.x + p.w - sc * logical::MANUAL_SB_INSET - tw, ty, tw, th, tw * 0.5, pal.thumb);
     }
+    let _ = cell_h;
 }
 
 #[cfg(test)]
@@ -137,30 +244,134 @@ mod tests {
         assert_eq!(clamp_scroll(0, &g), 0);
     }
 
+    /// The measure is capped in columns, so a huge window does not produce an
+    /// unreadable 200-character line — this is half of "text does not flow".
     #[test]
-    fn visible_cols_fits_inside_the_padded_panel() {
-        // 640px panel, 8px cells, 12px padding each side → (640-24)/8 = 77 cols.
-        assert_eq!(visible_cols(640.0, 8.0, 1.0), 77);
-        assert_eq!(visible_cols(10.0, 8.0, 1.0), 0); // narrower than padding → 0, no underflow
+    fn the_measure_is_comfortable_at_every_window_size() {
+        for &(w, h) in &[(800.0_f32, 600.0_f32), (1920.0, 1080.0), (3840.0, 2160.0), (400.0, 300.0)] {
+            for &cell_w in &[6.0_f32, 8.0, 11.0, 16.0] {
+                let g = layout(w, h, cell_w, cell_w * 2.0, 1.0);
+                let cols = visible_cols(g.panel.w, cell_w, 1.0);
+                assert!(cols <= MEASURE, "{w}x{h} @{cell_w}: {cols} columns is too wide a measure");
+                for (_, l) in &g.lines {
+                    assert!(l.chars().count() <= cols.max(1), "a line ran past the measure: {l:?}");
+                }
+                assert!(g.panel.w <= w + 0.01 && g.panel.h <= h + 0.01, "panel outside the window");
+                assert!(g.panel.x >= -0.01 && g.panel.y >= -0.01);
+            }
+        }
     }
 
+    /// THE flow fix: a wrapped key/description line keeps its description
+    /// column instead of dumping the continuation at column zero.
+    #[test]
+    fn a_wrapped_description_hangs_under_its_own_column() {
+        let mut out = Vec::new();
+        let src = "  Ctrl+Shift+R    rotate the enclosing split 90 degrees counter-clockwise, nested splits included";
+        wrap_line(src, 60, LineKind::Body, &mut out);
+        assert!(out.len() > 1, "this line must wrap at 60 columns");
+        let indent = |s: &str| s.chars().take_while(|c| *c == ' ').count();
+        // The description column: where "rotate" starts on the source line.
+        let want = src.find("rotate").unwrap();
+        for (_, l) in out.iter().skip(1) {
+            assert_eq!(indent(l), want, "continuation must hang under the description column: {l:?}");
+        }
+        // And an ordinary paragraph keeps its own block indent, not a hang.
+        let mut out = Vec::new();
+        wrap_line(
+            "  One rt process serves every window and closing a window just closes it, and rt exits once the last one is gone.",
+            60,
+            LineKind::Body,
+            &mut out,
+        );
+        assert!(out.len() > 1);
+        for (_, l) in &out {
+            assert_eq!(indent(l), 2, "a paragraph keeps its block indent: {l:?}");
+        }
+    }
+
+    /// Nothing ever runs past the measure, at any width — including the
+    /// hard-break path for a word wider than the whole column.
     #[test]
     fn wrapping_keeps_every_line_within_the_width() {
-        // At a deliberately narrow width, NO wrapped line exceeds it — the bug was
-        // long lines running off the panel instead of wrapping.
-        let cols = 50;
-        let lines = wrapped(cols);
-        for l in &lines {
-            assert!(l.chars().count() <= cols, "line wider than {cols}: {l:?}");
+        for cols in [20_usize, 33, 50, 76, 84] {
+            let lines = wrapped(cols);
+            for (_, l) in &lines {
+                assert!(l.chars().count() <= cols, "line wider than {cols}: {l:?}");
+            }
         }
         // And the manual genuinely has lines that needed wrapping.
-        assert!(manual_lines().any(|l| l.chars().count() > cols));
+        assert!(manual_lines().any(|l| l.chars().count() > 50));
+        // A single unbreakable word wider than the measure is chopped, not left
+        // to overhang.
+        let mut out = Vec::new();
+        wrap_line(&"x".repeat(200), 30, LineKind::Body, &mut out);
+        assert!(out.len() >= 7);
+        for (_, l) in &out {
+            assert!(l.chars().count() <= 30, "{l:?}");
+        }
+    }
+
+    /// Headings are distinguishable. They were drawn in body colour and body
+    /// weight, which is why the manual read as one undifferentiated slab.
+    #[test]
+    fn section_headings_are_tagged_as_headings() {
+        let lines = wrapped(84);
+        let heads: Vec<&String> = lines.iter().filter(|(k, _)| *k == LineKind::Heading).map(|(_, l)| l).collect();
+        assert!(heads.len() >= 5, "the manual has several sections, got {}: {heads:?}", heads.len());
+        for h in &heads {
+            assert!(h.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()), "{h:?}");
+            assert!(!h.starts_with(' '), "a heading is flush left: {h:?}");
+        }
+        assert!(heads.iter().any(|h| h.contains("PANES")), "expected a PANES section: {heads:?}");
+        // Indented key rows are NOT headings, even though some are uppercase-ish.
+        assert!(!is_heading("  Ctrl+Shift+O    split horizontally (stacked)"));
+        assert!(!is_heading(""));
+        assert!(is_heading("TABS  &  COLUMNS"));
+    }
+
+    /// Not an assertion — a way to LOOK at the wrapped page without a display,
+    /// which is the only way anyone working on this can check that it flows:
+    /// `cargo test -p rt --bin rt dump_the_wrapped_manual -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints the wrapped manual for eyeballing; asserts nothing"]
+    fn dump_the_wrapped_manual() {
+        for (kind, line) in wrapped(MEASURE) {
+            println!("{kind:?}\t|{line}|");
+        }
     }
 
     #[test]
     fn version_heads_the_manual() {
         let lines = wrapped(80);
-        assert!(lines[0].starts_with("rt "), "first line names the build: {:?}", lines[0]);
-        assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
+        assert_eq!(lines[0].0, LineKind::Version);
+        assert!(lines[0].1.starts_with("rt "), "first line names the build: {:?}", lines[0].1);
+        assert!(lines[0].1.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Body lines get leading, and the row count agrees with it — a scroll of
+    /// one row must move the page by exactly one drawn line.
+    #[test]
+    fn the_line_rhythm_includes_its_leading() {
+        for &sc in &[1.0_f32, 2.0] {
+            let g = layout(1200.0 * sc, 800.0 * sc, 8.0 * sc, 18.0 * sc, sc);
+            assert!(g.line_h > 18.0 * sc, "body lines must have leading at {sc}x");
+            assert_eq!(g.line_h, 18.0 * sc + sc * logical::MANUAL_LEADING);
+            // Every visible row fits inside the panel.
+            let last = g.panel.y + sc * logical::PANEL_PAD_Y + (g.rows as f32 - 1.0) * g.line_h + 18.0 * sc;
+            assert!(last <= g.panel.y + g.panel.h + 0.01, "the last row overflows the panel at {sc}x");
+        }
+    }
+
+    /// A window too small for a page still produces something sane.
+    #[test]
+    fn a_tiny_window_still_lays_out() {
+        for &(w, h) in &[(1.0_f32, 1.0_f32), (60.0, 40.0), (200.0, 90.0)] {
+            let g = layout(w, h, 8.0, 18.0, 1.0);
+            assert!(g.rows >= 1);
+            assert!(g.panel.x >= -0.01 && g.panel.y >= -0.01);
+            assert!(g.panel.x + g.panel.w <= w + 0.01 && g.panel.y + g.panel.h <= h + 0.01);
+            assert_eq!(clamp_scroll(usize::MAX, &g), g.total.saturating_sub(g.rows));
+        }
     }
 }

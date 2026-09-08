@@ -493,6 +493,11 @@ struct Active {
     touch: touch::Touch,                  // fingers on the glass, and the gesture they add up to
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
+    // Scroll offset of the context menu, in rows. Only ever non-zero when the
+    // menu is taller than the window — which used to leave its tail unreachable
+    // under the bottom edge. `chrome::menu::layout` clamps it, so a stale value
+    // from a previous, longer menu can never scroll past the end.
+    menu_scroll: usize,
     // "Move Pane to <window>" targets, snapshotted when the menu opened: every
     // OTHER window at that moment, sorted by `WindowId` for a stable 1-based
     // enumeration. Built together in the same pass (`App::menu_move_targets`)
@@ -1977,6 +1982,7 @@ impl App {
             },
             menu: None,
             menu_hover: None,
+            menu_scroll: 0,
             menu_windows: Vec::new(),
             menu_move_labels: Vec::new(),
             clip_overlay: None,
@@ -2718,7 +2724,20 @@ impl ApplicationHandler for App {
             let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
             let size = active.window.surface_size();
             let (cw, ch) = active.backend.cell_size();
-            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
+            let (win_w, win_h) = (size.width as f32, size.height as f32);
+            let g = chrome::menu::layout(&rows, pos, cw, ch, win_w, win_h, active.menu_scroll, active.chrome_sc);
+            // Scrolling a menu taller than the window. `chrome::menu::layout`
+            // clamps whatever it is given, so this cannot run off either end.
+            let scroll_by = |active: &mut Active, d: isize| {
+                let next = (active.menu_scroll as isize + d).max(0) as usize;
+                active.menu_scroll = next.min(g.max_scroll);
+                active.force_full = true; // the panel moves; it is off the damage-tracked path
+                active.window.request_redraw();
+            };
+            // WHICH row this event asks the menu to run, resolved before anything
+            // acts on it, so the pointer and the keyboard share the one activation
+            // path below rather than growing a second copy of it.
+            let mut activate: Option<usize> = None;
             match &event {
                 WindowEvent::PointerMoved { position, .. } => {
                     active.mouse = (position.x as f32, position.y as f32);
@@ -2726,92 +2745,78 @@ impl ApplicationHandler for App {
                     active.window.request_redraw();
                     return;
                 }
+                WindowEvent::MouseWheel { delta, .. } if g.scrolls() => {
+                    // Positive y = wheel up = toward the top of the menu.
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y as isize,
+                        MouseScrollDelta::PixelDelta(p) => {
+                            (p.y / (active.chrome_sc as f64 * touch::PX_PER_LINE as f64)) as isize
+                        }
+                    };
+                    scroll_by(active, -lines);
+                    return;
+                }
                 WindowEvent::KeyboardInput { event: ke, .. }
                     if ke.state == ElementState::Pressed =>
                 {
-                    // Escape dismisses; every other key is swallowed while open.
-                    if matches!(ke.logical_key, Key::Named(NamedKey::Escape)) {
-                        active.menu = None;
-                        active.menu_hover = None;
-                        active.menu_windows.clear();
-                        active.menu_move_labels.clear();
-                        active.window.request_redraw();
+                    match &ke.logical_key {
+                        // Escape dismisses.
+                        Key::Named(NamedKey::Escape) => {
+                            active.menu = None;
+                            active.menu_hover = None;
+                            active.menu_windows.clear();
+                            active.menu_move_labels.clear();
+                            active.window.request_redraw();
+                        }
+                        // Arrows walk the live rows and drag the scroll with them,
+                        // so a menu taller than the window is reachable with no
+                        // mouse at all.
+                        Key::Named(k @ (NamedKey::ArrowDown | NamedKey::ArrowUp)) => {
+                            let dir = if *k == NamedKey::ArrowDown { 1 } else { -1 };
+                            active.menu_hover = chrome::menu::next_row(&rows, active.menu_hover, dir);
+                            if let Some(i) = active.menu_hover {
+                                active.menu_scroll = chrome::menu::scroll_to_reveal(
+                                    &rows, i, active.menu_scroll, ch, win_h, active.chrome_sc,
+                                );
+                            }
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            activate = active.menu_hover.filter(|i| rows[*i].enabled);
+                        }
+                        _ => {}
                     }
-                    return;
+                    if activate.is_none() {
+                        return; // every other key is swallowed while the menu is open
+                    }
                 }
                 WindowEvent::PointerButton { state, .. }
                     if *state == ElementState::Pressed =>
                 {
                     if g.panel.contains(active.mouse) {
+                        // A click on a scroll cue scrolls rather than picking.
+                        if let Some(d) = chrome::menu::hit_cue(&g, active.mouse) {
+                            scroll_by(active, d as isize);
+                            return;
+                        }
                         // Left-click on an ENABLED row acts + closes; a click on a
                         // disabled row or separator is ignored (menu stays open).
                         if ptr_button == Some(MouseButton::Left) {
-                            if let Some(i) = chrome::menu::hit_row(&g, active.mouse) {
-                                if rows[i].enabled {
-                                    active.menu = None;
-                                    active.menu_hover = None;
-                                    active.window.request_redraw();
-                                    if let Some(a) =
-                                        rows.into_iter().nth(i).and_then(|r| r.action)
-                                    {
-                                        let (cmd, group_echo) = match a.into_pick() {
-                                            menu::MenuPick::Do(act) => {
-                                                Self::apply_action(active, act)
-                                            }
-                                            menu::MenuPick::OpenUrl(u) => {
-                                                Self::open_url(&u);
-                                                (WindowCmd::None, None)
-                                            }
-                                            menu::MenuPick::CopyUrl(u) => {
-                                                if let Some(cb) = &active.clipboard {
-                                                    cb.store(u);
-                                                }
-                                                (WindowCmd::None, None)
-                                            }
-                                            // Index into the snapshot taken when the
-                                            // menu opened — stale-safe: an out-of-
-                                            // range index (shouldn't happen; rows and
-                                            // menu_windows are built from the same
-                                            // pass) is a logged no-op. A target that
-                                            // has since CLOSED still resolves here
-                                            // (its id just sits in the Vec); that case
-                                            // is caught by `move_pane_to_window`.
-                                            menu::MenuPick::MoveToWindow(i) => {
-                                                match active.menu_windows.get(i).copied() {
-                                                    Some(target) => (WindowCmd::MoveToWindow(target), None),
-                                                    None => {
-                                                        log::debug!(
-                                                            "move-to-window: menu index {i} out of range ({} targets)",
-                                                            active.menu_windows.len()
-                                                        );
-                                                        (WindowCmd::None, None)
-                                                    }
-                                                }
-                                            }
-                                        };
-                                        // The menu's snapshot is done with either way.
-                                        active.menu_windows.clear();
-                                        active.menu_move_labels.clear();
-                                        // The `active` borrow ends here; window-
-                                        // level commands re-borrow via &mut self.
-                                        self.run_window_cmd(event_loop, id, cmd);
-                                        if let Some((grp, bytes)) = group_echo {
-                                            self.broadcast_group_paste(id, grp, &bytes);
-                                        }
-                                    }
-                                }
-                            }
+                            activate = chrome::menu::hit_row(&g, active.mouse).filter(|i| rows[*i].enabled);
                         }
-                        // Any press inside the panel is swallowed.
+                        if activate.is_none() {
+                            return; // any other press inside the panel is swallowed
+                        }
+                    } else {
+                        // A press outside the panel dismisses the menu.
+                        active.menu = None;
+                        active.menu_hover = None;
+                        active.menu_windows.clear();
+                        active.menu_move_labels.clear();
+                        active.window.request_redraw();
                         return;
                     }
-                    // A press outside the panel dismisses the menu.
-                    active.menu = None;
-                    active.menu_hover = None;
-                    active.menu_windows.clear();
-                    active.menu_move_labels.clear();
-                    active.window.request_redraw();
-                    return;
                 }
                 // Swallow remaining input (releases, wheel, IME, mods); lifecycle
                 // events fall through to normal handling.
@@ -2821,6 +2826,55 @@ impl ApplicationHandler for App {
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
                 _ => {}
+            }
+            // The one place a menu row runs. Reached from a click and from Enter.
+            if let Some(i) = activate {
+                active.menu = None;
+                active.menu_hover = None;
+                active.window.request_redraw();
+                if let Some(a) = rows.into_iter().nth(i).and_then(|r| r.action) {
+                    let (cmd, group_echo) = match a.into_pick() {
+                        menu::MenuPick::Do(act) => Self::apply_action(active, act),
+                        menu::MenuPick::OpenUrl(u) => {
+                            Self::open_url(&u);
+                            (WindowCmd::None, None)
+                        }
+                        menu::MenuPick::CopyUrl(u) => {
+                            if let Some(cb) = &active.clipboard {
+                                cb.store(u);
+                            }
+                            (WindowCmd::None, None)
+                        }
+                        // Index into the snapshot taken when the menu opened —
+                        // stale-safe: an out-of-range index (shouldn't happen; rows
+                        // and menu_windows are built from the same pass) is a logged
+                        // no-op. A target that has since CLOSED still resolves here
+                        // (its id just sits in the Vec); that case is caught by
+                        // `move_pane_to_window`.
+                        menu::MenuPick::MoveToWindow(i) => {
+                            match active.menu_windows.get(i).copied() {
+                                Some(target) => (WindowCmd::MoveToWindow(target), None),
+                                None => {
+                                    log::debug!(
+                                        "move-to-window: menu index {i} out of range ({} targets)",
+                                        active.menu_windows.len()
+                                    );
+                                    (WindowCmd::None, None)
+                                }
+                            }
+                        }
+                    };
+                    // The menu's snapshot is done with either way.
+                    active.menu_windows.clear();
+                    active.menu_move_labels.clear();
+                    // The `active` borrow ends here; window-level commands re-borrow
+                    // via &mut self.
+                    self.run_window_cmd(event_loop, id, cmd);
+                    if let Some((grp, bytes)) = group_echo {
+                        self.broadcast_group_paste(id, grp, &bytes);
+                    }
+                }
+                return;
             }
         }
 
@@ -2833,7 +2887,7 @@ impl ApplicationHandler for App {
             let anchor = Self::pane_content_rect(active, active.session.focus())
                 .map(|r| (r.x, r.y))
                 .unwrap_or((active.chrome_sc * chrome_scale::logical::CLIP_ANCHOR_FALLBACK, active.chrome_sc * chrome_scale::logical::CLIP_ANCHOR_FALLBACK));
-            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS, active.chrome_sc);
+            let g = chrome::clip_history::layout(n, sel, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS, active.chrome_sc);
             match &event {
                 WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
                     match &ke.logical_key {
@@ -5325,6 +5379,7 @@ impl App {
         let Some(active) = self.windows.get_mut(&id) else { return };
         active.menu = Some(pos);
         active.menu_hover = None; // no row highlighted until the pointer moves
+        active.menu_scroll = 0; // a freshly opened menu always starts at its top
         active.menu_windows = menu_windows;
         active.menu_move_labels = menu_move_labels;
         active.window.request_redraw();
@@ -7891,6 +7946,7 @@ impl App {
             });
             let size = active.window.surface_size();
             let cell = active.backend.cell_size();
+            let pal = Self::chrome_palette(active);
             chrome::dragdrop::draw(
                 &mut *active.backend,
                 chrome::dragdrop::Cues {
@@ -7899,6 +7955,7 @@ impl App {
                     ghost: active.drag_ghost.as_ref().or(active.text_drop_ghost.as_ref()),
                     dim,
                 },
+                &pal,
                 cell,
                 (size.width as f32, size.height as f32),
                 active.chrome_sc,
@@ -7962,18 +8019,21 @@ impl App {
                 .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
             let has_sel = Self::selected_text(active).is_some();
             let rows = menu::rows(&active.keymap, has_sel, url.as_deref(), &active.menu_move_labels);
-            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
+            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32, active.menu_scroll, active.chrome_sc);
             let hover = active.menu_hover;
-            chrome::menu::draw(&mut *active.backend, &g, &rows, hover, cw, ch, active.chrome_sc);
+            let pal = Self::chrome_palette(active);
+            chrome::menu::draw(&mut *active.backend, &g, &rows, hover, &pal, cw, ch, active.chrome_sc);
         } else if active.manual_open {
             let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch, active.chrome_sc);
             let scroll = active.manual_scroll;
-            chrome::manual::draw(&mut *active.backend, &g, scroll, cw, ch, active.chrome_sc);
+            let pal = Self::chrome_palette(active);
+            chrome::manual::draw(&mut *active.backend, &g, scroll, &pal, cw, ch, active.chrome_sc);
         } else if active.search_open {
-            let bar = chrome::search::layout(size.width as f32, cw, ch, active.chrome_sc);
+            let bar = chrome::search::layout(size.width as f32, size.height as f32, cw, ch, active.chrome_sc);
             let count = active.search_matches.len();
             let pos = if count == 0 { 0 } else { active.search_index + 1 };
-            chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, cw, ch, active.chrome_sc);
+            let pal = Self::chrome_palette(active);
+            chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, &pal, cw, ch, active.chrome_sc);
         }
         // Clipboard-history overlay draws on top of everything above (the menu
         // block's early-return means it can't be up at the same time in
@@ -7989,8 +8049,9 @@ impl App {
                 .map(|c| clip_history::preview(c, CLIP_PREVIEW_COLS - 8))
                 .collect();
             let badges: Vec<String> = active.clip_history.iter().map(clip_history::badge).collect();
-            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS, active.chrome_sc);
-            chrome::clip_history::draw(&mut *active.backend, &g, &previews, &badges, Some(sel), sel, cw, ch, active.chrome_sc);
+            let g = chrome::clip_history::layout(n, sel, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS, active.chrome_sc);
+            let pal = Self::chrome_palette(active);
+            chrome::clip_history::draw(&mut *active.backend, &g, &previews, &badges, Some(sel), sel, &pal, cw, ch, active.chrome_sc);
         }
     }
 
@@ -8364,7 +8425,20 @@ impl App {
         let mut sw = vec![Color::rgb(s.foreground[0], s.foreground[1], s.foreground[2])];
         sw.push(Color::rgb(s.background[0], s.background[1], s.background[2]));
         sw.extend(s.palette.iter().map(|c| Color::rgb(c[0], c[1], c[2])));
-        chrome::prefs::draw(&mut *active.backend, &g, &rows, active.prefs_sel, &sw, cw, ch, active.chrome_sc);
+        let pal = Self::chrome_palette(active);
+        chrome::prefs::draw(&mut *active.backend, &g, &rows, active.prefs_sel, &sw, &pal, cw, ch, active.chrome_sc);
+    }
+
+    /// The chrome palette for this window's CURRENT colours.
+    ///
+    /// One call, one palette, every panel — see `chrome::theme`. It reads
+    /// `prefs_pending` when the preferences dialog is mid-edit, so stepping the
+    /// "Chrome theme" row (or any colour) re-derives the panels *live*, under
+    /// the pointer. That is the whole point of the row existing: the choice
+    /// between the three treatments is a matter of taste, and taste needs them
+    /// side by side rather than one rebuild per guess.
+    fn chrome_palette(active: &Active) -> chrome::theme::Palette {
+        chrome::theme::Palette::of(active.prefs_pending.as_ref().unwrap_or(&active.settings))
     }
 
     /// Draw the colour picker over the prefs dialog, from its live H/S/V.
@@ -8373,7 +8447,8 @@ impl App {
         let size = active.window.surface_size();
         let (cw, ch) = active.backend.cell_size();
         let g = chrome::colour_picker::layout(cw, ch, size.width as f32, size.height as f32, active.chrome_sc);
-        chrome::colour_picker::draw(&mut *active.backend, &g, pk.h, pk.s, pk.v, &pk.slot.label(), cw, ch, active.chrome_sc);
+        let pal = Self::chrome_palette(active);
+        chrome::colour_picker::draw(&mut *active.backend, &g, pk.h, pk.s, pk.v, &pk.slot.label(), &pal, cw, ch, active.chrome_sc);
     }
 
     /// Write the picker's current colour into the pending settings' slot and arm

@@ -149,3 +149,75 @@ portable between machines. An unknown name is reported on stderr and falls back 
 the default rather than failing the parse — `Config::load` discards the whole file
 on any parse error, so one mistyped material would otherwise reset every
 preference the user has.
+
+## The in-window chrome — one design system, three themes
+
+rt draws its own panels: the context menu, the built-in manual (F1), the
+preferences dialog, the colour picker, the clipboard history and the search bar.
+They are one **native** draw on both backends (GL and XRender), so Linux and
+macOS see exactly the same chrome.
+
+### The system
+
+`crates/rt/src/chrome/theme.rs` is the whole of it, and it is the only place a
+chrome colour or a chrome measurement comes from.
+
+- **Palette roles, not greys.** `panel`, `edge`, `sep`, `hover`, `sel` /
+  `sel_text`, `text`, `dim`, `off`, `accent`, `thumb`, `field`. A panel reaches
+  for a role; it never writes a colour literal. (Before this, `chrome/*.rs` held
+  forty hardcoded literals and no two panels agreed on any of them.)
+- **Derived from your terminal.** Every role is computed from your configured
+  `foreground`, `background` and palette entry 12, so the chrome belongs to the
+  terminal it floats over rather than clashing with it.
+- **Contrast is guaranteed, not hoped for.** Primary text clears 7:1 against the
+  panel, secondary 4.5:1, headings 4.5:1, text on a selection 4.5:1 — at every
+  colour scheme rt ships and at both extremes (a pure-black and a pure-white
+  terminal). The panel body itself is held ≥1.15:1 against your background so it
+  reads as a separate surface. All of it is asserted by unit test.
+- **A 4 px spacing scale**, registered in `chrome_scale::logical` and multiplied
+  by the display's backing factor at every use: `PANEL_PAD_X` 14 across,
+  `PANEL_PAD_Y` 8 down, `PANEL_GAP` 8 between groups, `PANEL_RADIUS` 7 on every
+  corner, `PANEL_SEL_INSET` 5 for a highlight's standoff.
+- **One row rhythm.** Every list row in every panel is `cell_h + 8` logical px
+  tall with its text vertically centred, and every panel is a rounded rectangle
+  with a hairline edge that follows the curve.
+
+### `chrome_theme`
+
+Whether floating panels should take the terminal's hue or stay a neutral macOS
+graphite is a matter of taste, so it is a setting rather than a decision — the
+same argument that produced `macos_glass_material`. All three derive from your
+own colours and all three meet the same contrast floors; they differ only in how
+much of the terminal's identity the chrome borrows.
+
+| value | what it looks like |
+|---|---|
+| `tinted` (default) | panels take the hue of your background, lifted (dark themes) or settled (light themes) into a legible band, with your bright-blue palette entry as the accent |
+| `graphite` | neutral greys at the weight macOS uses for menus and popovers; only light-vs-dark is taken from your background |
+| `contrast` | tinted, pushed to the ends: fully opaque, stronger border and separator, text held to a 9:1 floor |
+
+Two ways to set it:
+
+- **Preferences → Appearance → "Chrome theme"** — Left/Right steps it and every
+  panel re-derives **live**, so the three can be compared in one sitting.
+- `chrome_theme = "graphite"` in `~/.config/rt/config.toml`.
+
+An unknown name is reported on stderr and falls back to `tinted`, for the same
+reason an unknown glass material does.
+
+### Panels that are taller than the window
+
+A context menu with several "Move Pane to …" rows, or a clipboard history with
+many clips, can be taller than a short rt window. Such a panel used to be pinned
+to the top edge with its tail simply off-screen and no way to reach it. Now:
+
+- The **context menu** scrolls. A `▲` / `▼` cue appears at whichever end has more
+  rows; the wheel, the Up/Down arrows (which also walk the rows, with Return to
+  pick one) or a click on a cue move through it.
+- The **clipboard history** scrolls with its selection — the arrow keys already
+  move that, so there is no second piece of state to keep in step.
+- The **preferences dialog** already scrolled; it now also clamps its own height,
+  and shows a scroll thumb.
+- The **colour picker** fits itself to the window: the saturation/value square is
+  the elastic part and gives way first, then the gaps, so nothing is ever laid
+  out beyond the panel edge.

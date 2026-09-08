@@ -7,8 +7,9 @@
 //! saturation to an edge never loses the hue (the classic picker bug).
 
 use crate::backend::Backend;
-use crate::chrome_scale::logical;
+use crate::chrome::theme::{self, Palette};
 use crate::chrome::Recti;
+use crate::chrome_scale::logical;
 use crate::render::Color;
 
 /// Which colour the picker edits. Swatch index in the prefs row: `0 = Fg`,
@@ -129,31 +130,64 @@ pub struct Geom {
 
 const SV_CELLS: f32 = 8.0; // SV square side, in cell-heights (DPI-aware)
 
-/// Lay the picker out centred and clamped on-screen.
+/// Lay the picker out centred and **fitted** to the window.
+///
+/// The old version clamped only the panel's own height (`.min(win_h)`) while
+/// laying its contents out at full size, so in a short window the SV square, the
+/// hex readout and the Done button ran out through the bottom edge — the same
+/// class of fault as the context menu's. Here the SV square is the elastic part:
+/// every other element has a fixed height, so the square absorbs whatever space
+/// is left, in BOTH axes, and the panel is sized from the result rather than
+/// truncated to fit.
+///
+/// `hit`, `sv_at` and `hue_at` all read the `Geom` this returns, so the click
+/// surface can never fall behind the drawing.
 pub fn layout(cell_w: f32, cell_h: f32, win_w: f32, win_h: f32, sc: f32) -> Geom {
-    // Most of this is cell-derived and already scales with the glyph; `sc` is for
-    // the flat FLOORS (which would otherwise stop being floors on a 2x display)
-    // and the row pads. `hit`, `sv_at` and `hue_at` all read the `Geom` this
-    // returns, so the click surface can never fall behind the drawing.
-    let pad = (cell_w * 1.5).round();
-    let gap = cell_w;
-    let sv_side = (cell_h * SV_CELLS).max(sc * logical::PICKER_SV_MIN);
-    let hue_w = (cell_w * 2.0).max(sc * logical::PICKER_HUE_MIN);
+    // Padding is a fraction of the window before it is anything else: at 3x on a
+    // tiny window the scaled padding alone can exceed the window, and a panel
+    // whose padding does not fit has nowhere to put its contents.
+    let pad_x = (sc * logical::PANEL_PAD_X).min(win_w * 0.2).max(0.0);
+    let pad_y = (sc * logical::PANEL_PAD_Y).min(win_h * 0.15).max(0.0);
+    let inner_w_avail = (win_w - pad_x * 2.0).max(1.0);
+    let hue_w = ((cell_w * 2.0).max(sc * logical::PICKER_HUE_MIN)).min(inner_w_avail * 0.25).max(1.0);
     let title_h = cell_h + sc * logical::PANEL_ROW_PAD;
     let sw_h = cell_h; // preview swatch
     let hex_h = cell_h;
     let close_h = cell_h + sc * logical::PANEL_ROW_PAD;
+    // The stack, squeezed to fit in three stages. The SV square is elastic and
+    // gives way first; then the gaps between the groups close; then, only in a
+    // window too small to show a picker at all, the fixed rows themselves shrink
+    // in proportion. Nothing is ever laid out beyond the panel, which is the
+    // fault this replaced: the old version clamped the panel's height and left
+    // the hex readout and the Done button outside it.
+    let avail = (win_h - pad_y * 2.0).max(1.0);
+    let rows_h = title_h + sw_h + hex_h + close_h;
+    let mut gap = sc * logical::PANEL_GAP;
+    if rows_h + gap * 4.0 + 1.0 > avail {
+        gap = ((avail - rows_h - 1.0) / 4.0).max(0.0);
+    }
+    let squeeze = if rows_h + gap * 4.0 + 1.0 > avail { ((avail - 1.0) / rows_h).max(0.0) } else { 1.0 };
+    let (title_h, sw_h, hex_h, close_h) =
+        (title_h * squeeze, sw_h * squeeze, hex_h * squeeze, close_h * squeeze);
+
+    let want = (cell_h * SV_CELLS).max(sc * logical::PICKER_SV_MIN);
+    let sv_side = want
+        .min(inner_w_avail - gap - hue_w)
+        .min(avail - rows_h * squeeze - gap * 4.0)
+        .max(1.0);
+    let fixed = pad_y * 2.0 + title_h + gap * 4.0 + sw_h + hex_h + close_h;
+
     let inner_w = sv_side + gap + hue_w;
-    let panel_w = (inner_w + pad * 2.0).min(win_w);
-    let panel_h = (pad + title_h + sv_side + gap + sw_h + gap + hex_h + gap + close_h + pad).min(win_h);
+    let panel_w = (inner_w + pad_x * 2.0).min(win_w);
+    let panel_h = (fixed + sv_side).min(win_h);
     let px = ((win_w - panel_w) * 0.5).max(0.0);
     let py = ((win_h - panel_h) * 0.5).max(0.0);
-    let top = py + pad + title_h; // top of the SV square
-    let sv = Recti { x: px + pad, y: top, w: sv_side, h: sv_side };
-    let hue = Recti { x: px + pad + sv_side + gap, y: top, w: hue_w, h: sv_side };
-    let preview = Recti { x: px + pad, y: top + sv_side + gap, w: inner_w, h: sw_h };
-    let hex = (px + pad, top + sv_side + gap + sw_h + gap);
-    let close = Recti { x: px + pad, y: py + panel_h - pad - close_h, w: inner_w, h: close_h };
+    let top = py + pad_y + title_h + gap; // top of the SV square
+    let sv = Recti { x: px + pad_x, y: top, w: sv_side, h: sv_side };
+    let hue = Recti { x: px + pad_x + sv_side + gap, y: top, w: hue_w, h: sv_side };
+    let preview = Recti { x: px + pad_x, y: top + sv_side + gap, w: inner_w, h: sw_h };
+    let hex = (px + pad_x, preview.y + sw_h + gap);
+    let close = Recti { x: px + pad_x, y: hex.1 + hex_h + gap, w: inner_w, h: close_h };
     Geom { panel: Recti { x: px, y: py, w: panel_w, h: panel_h }, sv, hue, preview, hex, close }
 }
 
@@ -194,9 +228,11 @@ pub fn hue_at(g: &Geom, p: (f32, f32)) -> f32 {
 
 // --- drawing --------------------------------------------------------------
 
-const PANEL_BG: Color = Color(0.10, 0.10, 0.12, 0.98);
-const PANEL_EDGE: Color = Color(0.35, 0.35, 0.42, 1.0);
-const TEXT: Color = Color(0.82, 0.82, 0.86, 1.0);
+// The two marker colours are deliberately NOT palette roles. A marker sits on
+// top of an arbitrary user-chosen hue — every colour in the SV square and the
+// hue strip — so it cannot be derived from the chrome palette and stay visible.
+// A black square inside a white one is the standard answer, and it works over
+// anything.
 const BLACK: Color = Color(0.0, 0.0, 0.0, 0.9);
 const WHITE: Color = Color(1.0, 1.0, 1.0, 0.95);
 
@@ -219,20 +255,25 @@ fn outline(be: &mut dyn Backend, x: f32, y: f32, w: f32, h: f32, t: f32, col: Co
 }
 
 /// Paint the picker for state `(h,s,v)`, titled `title`.
-pub fn draw(be: &mut dyn Backend, g: &Geom, h: f32, s: f32, v: f32, title: &str, cell_w: f32, cell_h: f32, sc: f32) {
+pub fn draw(
+    be: &mut dyn Backend,
+    g: &Geom,
+    h: f32,
+    s: f32,
+    v: f32,
+    title: &str,
+    pal: &Palette,
+    cell_w: f32,
+    cell_h: f32,
+    sc: f32,
+) {
     let hair = sc * logical::HAIRLINE;
     let p = g.panel;
-    be.fill_rect(p.x, p.y, p.w, p.h, PANEL_BG);
-    be.fill_rect(p.x, p.y, p.w, hair, PANEL_EDGE);
-    be.fill_rect(p.x, p.y + p.h - hair, p.w, hair, PANEL_EDGE);
-    be.fill_rect(p.x, p.y, hair, p.h, PANEL_EDGE);
-    be.fill_rect(p.x + p.w - hair, p.y, hair, p.h, PANEL_EDGE);
+    theme::panel(be, p, pal, sc);
 
-    // Title, top-left inside the padding.
-    let ty = p.y + sc * logical::PANEL_ROW_PAD;
-    for (i, ch) in title.chars().enumerate() {
-        be.draw_char(p.x + cell_w * 1.5, ty, i, 0, ch, TEXT, true, false);
-    }
+    // Title, top-left inside the padding, on the same measure as the controls.
+    let ty = p.y + sc * logical::PANEL_PAD_Y + ((sc * logical::PANEL_ROW_PAD) * 0.5);
+    theme::text(be, g.sv.x, ty, title, pal.text, true);
 
     // SV square: an N×N grid at the current hue (saturation →x, value →y↑).
     let cw = g.sv.w / SV_GRID as f32;
@@ -269,24 +310,26 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, h: f32, s: f32, v: f32, title: &str,
     // Preview swatch + edge.
     let rgb = hsv_to_rgb(h, s, v);
     be.fill_rect(g.preview.x, g.preview.y, g.preview.w, g.preview.h, c(rgb));
-    outline(be, g.preview.x, g.preview.y, g.preview.w, g.preview.h, hair, PANEL_EDGE);
+    outline(be, g.preview.x, g.preview.y, g.preview.w, g.preview.h, hair, pal.edge);
 
-    // Hex readout.
+    // Hex readout, and the same value again as the panel's quiet caption.
     let hex = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
-    for (i, ch) in hex.chars().enumerate() {
-        be.draw_char(g.hex.0, g.hex.1, i, 0, ch, TEXT, false, false);
-    }
+    theme::text(be, g.hex.0, g.hex.1, &hex, pal.dim, false);
 
-    // Close button: a highlighted bar with centred text.
-    be.fill_rect(g.close.x, g.close.y, g.close.w, g.close.h, Color(0.18, 0.20, 0.28, 1.0));
-    outline(be, g.close.x, g.close.y, g.close.w, g.close.h, hair, PANEL_EDGE);
+    // Done: the panel's default action, so it wears the selection colour the
+    // rest of the chrome uses for "this is what Return does".
+    theme::rounded(
+        be,
+        g.close.x,
+        g.close.y,
+        g.close.w,
+        g.close.h,
+        sc * logical::PANEL_SEL_RADIUS,
+        pal.sel,
+    );
     let label = "Done  (Esc)";
     let lw = label.chars().count() as f32 * cell_w;
-    let lx = g.close.x + (g.close.w - lw) * 0.5;
-    let ly = g.close.y + (g.close.h - cell_h) * 0.5;
-    for (i, ch) in label.chars().enumerate() {
-        be.draw_char(lx, ly, i, 0, ch, TEXT, false, false);
-    }
+    theme::text(be, g.close.x + (g.close.w - lw) * 0.5, theme::text_y(g.close, cell_h), label, pal.sel_text, false);
 }
 
 #[cfg(test)]
@@ -348,6 +391,38 @@ mod tests {
         for r in [g.sv, g.hue, g.preview, g.close] {
             assert!(r.x >= g.panel.x - 0.01 && r.x + r.w <= g.panel.x + g.panel.w + 0.01);
             assert!(r.y >= g.panel.y - 0.01 && r.y + r.h <= g.panel.y + g.panel.h + 0.01);
+        }
+    }
+
+    /// The picker had the same hole the context menu did: in a window shorter
+    /// than the panel's natural height it laid its contents out full size and
+    /// let the hex readout and the Done button run out through the bottom. Every
+    /// control must stay inside the panel, and the panel inside the window, at
+    /// every size and backing factor.
+    #[test]
+    fn every_control_stays_inside_the_window_at_every_size_and_scale() {
+        for &sc in &[1.0_f32, 2.0, 3.0] {
+            for &(w, h) in &[(900.0_f32, 700.0_f32), (400.0, 200.0), (300.0, 120.0), (200.0, 900.0), (60.0, 60.0)] {
+                let g = layout(11.0 * sc, 21.0 * sc, w, h, sc);
+                let ctx = format!("{w}x{h} @{sc}x");
+                assert!(g.panel.x >= -0.01 && g.panel.y >= -0.01, "{ctx}");
+                assert!(g.panel.x + g.panel.w <= w + 0.01, "{ctx}: panel width");
+                assert!(g.panel.y + g.panel.h <= h + 0.01, "{ctx}: panel height");
+                for (name, r) in [("sv", g.sv), ("hue", g.hue), ("preview", g.preview), ("close", g.close)] {
+                    assert!(r.w > 0.0 && r.h > 0.0, "{ctx}: {name} collapsed");
+                    assert!(r.x >= g.panel.x - 0.01, "{ctx}: {name} left of the panel");
+                    assert!(r.x + r.w <= g.panel.x + g.panel.w + 0.01, "{ctx}: {name} right of the panel");
+                    assert!(r.y >= g.panel.y - 0.01, "{ctx}: {name} above the panel");
+                    assert!(r.y + r.h <= g.panel.y + g.panel.h + 0.01, "{ctx}: {name} below the panel");
+                }
+                // The controls stack without overlapping, in the order drawn.
+                assert!(g.sv.y + g.sv.h <= g.preview.y + 0.01, "{ctx}: square over the preview");
+                assert!(g.preview.y + g.preview.h <= g.hex.1 + 0.01, "{ctx}: preview over the hex");
+                assert!(g.hex.1 <= g.close.y + 0.01, "{ctx}: hex over the button");
+                // And the hit-test still resolves each of them.
+                assert_eq!(hit(&g, (g.close.x + 1.0, g.close.y + 1.0)), Hit::Close, "{ctx}");
+                assert_eq!(hit(&g, (g.sv.x + 0.5, g.sv.y + 0.5)), Hit::Sv, "{ctx}");
+            }
         }
     }
 

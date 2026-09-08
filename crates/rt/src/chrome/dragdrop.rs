@@ -56,7 +56,14 @@ pub struct Cues<'a> {
 /// should look like a drop cue whatever is being dropped. The two can never be
 /// live at once (`App::chrome_busy` refuses a foreign drop while rt's own drag
 /// is running), so they share the `ghost` chip rather than stacking two.
-pub fn draw(backend: &mut dyn Backend, cues: Cues<'_>, cell: (f32, f32), win: (f32, f32), sc: f32) {
+pub fn draw(
+    backend: &mut dyn Backend,
+    cues: Cues<'_>,
+    pal: &crate::chrome::theme::Palette,
+    cell: (f32, f32),
+    win: (f32, f32),
+    sc: f32,
+) {
     let Cues { drop: cue, text: text_cue, ghost, dim } = cues;
     if cue.is_none() && text_cue.is_none() && ghost.is_none() && dim.is_none() {
         return;
@@ -113,12 +120,16 @@ pub fn draw(backend: &mut dyn Backend, cues: Cues<'_>, cell: (f32, f32), win: (f
             let off = sc * logical::GHOST_OFFSET;
             let cx = (x + off).min((win.0 - w).max(0.0)).max(0.0);
             let cy = (y + off).min((win.1 - h).max(0.0)).max(0.0);
-            backend.fill_rect(cx, cy, w, h, Color::rgb(0x10, 0x10, 0x14).with_alpha(0.85));
-            backend.fill_rect(cx, cy, w, sc * logical::HAIRLINE, cue_edge);
-            let text = Color::rgb(0xd0, 0xd0, 0xd8);
-            for (i, ch) in label.chars().enumerate() {
-                backend.draw_char(cx + pad, cy + pad, i, 0, ch, text, false, false);
-            }
+            // The chip is a chrome panel like any other, so it wears the shared
+            // palette and the shared rounded shape — a drag ghost that looked
+            // nothing like the menu was one more panel disagreeing with the rest.
+            crate::chrome::theme::panel(
+                backend,
+                crate::chrome::Recti { x: cx, y: cy, w, h },
+                pal,
+                sc,
+            );
+            crate::chrome::theme::text(backend, cx + pad, cy + pad, label, pal.text, false);
         }
     }
 

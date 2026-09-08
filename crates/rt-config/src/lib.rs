@@ -276,6 +276,96 @@ impl<'de> serde::Deserialize<'de> for GlassMaterial {
     }
 }
 
+/// How rt's in-window chrome — the context menu, manual, preferences, colour
+/// picker, clipboard history and search bar — is coloured.
+///
+/// ## Why this is a setting and not a constant
+///
+/// Chrome colour is the one part of this that cannot be settled by reasoning:
+/// whether a floating panel should take the terminal's own hue or stay a
+/// neutral macOS graphite is a matter of taste, and taste needs the two side by
+/// side. This is the same argument that produced [`GlassMaterial`] — a picker
+/// that let the right frosted glass be found in one sitting instead of one
+/// rebuild per guess. Stepping the "Chrome theme" row in Preferences re-derives
+/// the palette live, with no restart.
+///
+/// Every variant derives its palette from the user's OWN foreground, background
+/// and palette colours (see `rt::chrome::theme`), and every variant is held to
+/// the same contrast floors, so none of them is a "worse" choice — they differ
+/// in how much of the terminal's identity the chrome borrows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChromeTheme {
+    /// Panels take the hue of the user's terminal background, lifted (dark
+    /// themes) or settled (light themes) into a legible band, with the user's
+    /// bright-blue palette entry as the accent. Chrome belongs to the terminal
+    /// it floats over. The default.
+    #[default]
+    Tinted,
+    /// Neutral greys in the weight macOS uses for menus and popovers,
+    /// regardless of the terminal's hue: only light-vs-dark is taken from the
+    /// background. Chrome reads as part of the desktop rather than the terminal.
+    Graphite,
+    /// Tinted, but pushed to the extremes: fully opaque panels, a stronger
+    /// border and separator, and text held to a higher contrast floor. For
+    /// bright rooms and for anyone who finds the other two too soft.
+    Contrast,
+}
+
+impl ChromeTheme {
+    /// Every theme, in preferences cycle order (softest to hardest).
+    pub const ALL: &'static [ChromeTheme] =
+        &[ChromeTheme::Tinted, ChromeTheme::Graphite, ChromeTheme::Contrast];
+
+    /// The name this theme carries in `config.toml` and in the Preferences row.
+    pub fn name(self) -> &'static str {
+        match self {
+            ChromeTheme::Tinted => "tinted",
+            ChromeTheme::Graphite => "graphite",
+            ChromeTheme::Contrast => "contrast",
+        }
+    }
+
+    /// Parse a name, case- and separator-insensitively. `None` for anything
+    /// unknown — callers report it and fall back rather than failing, so a typo
+    /// in one cosmetic field never costs the user the whole config file.
+    pub fn from_name(s: &str) -> Option<ChromeTheme> {
+        let want = s.trim().to_ascii_lowercase().replace('_', "-");
+        ChromeTheme::ALL.iter().copied().find(|t| t.name() == want)
+    }
+
+    /// Step `dir` (+1 / -1) places through [`Self::ALL`], wrapping at both ends.
+    pub fn step(self, dir: i32) -> ChromeTheme {
+        let n = ChromeTheme::ALL.len() as i32;
+        let cur = ChromeTheme::ALL.iter().position(|t| *t == self).unwrap_or(0) as i32;
+        ChromeTheme::ALL[(cur + dir).rem_euclid(n) as usize]
+    }
+}
+
+impl serde::Serialize for ChromeTheme {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ChromeTheme {
+    /// Never fails, for the same reason [`GlassMaterial`]'s does not: a derived
+    /// enum `Deserialize` would reject an unknown name, and `Config::load` turns
+    /// ANY parse error into "ignoring malformed config.toml".
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let Ok(raw) = String::deserialize(de) else {
+            eprintln!("rt: config chrome_theme is not a string; using {}", ChromeTheme::default().name());
+            return Ok(ChromeTheme::default());
+        };
+        Ok(ChromeTheme::from_name(&raw).unwrap_or_else(|| {
+            eprintln!(
+                "rt: config chrome_theme {raw:?} is not a known theme; using {}",
+                ChromeTheme::default().name()
+            );
+            ChromeTheme::default()
+        }))
+    }
+}
+
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
 /// spirit). Kept minimal for now; a future preferences panel edits these and a
 /// config file persists them.
@@ -307,6 +397,12 @@ pub struct Settings {
     /// does need a restart, since rt reads the file once at startup;
     /// `RT_GLASS_MATERIAL=<name>` overrides it for one run.
     pub macos_glass_material: GlassMaterial,
+    /// How the in-window chrome (menu, manual, preferences, colour picker,
+    /// clipboard history, search bar) is coloured. See [`ChromeTheme`]: every
+    /// variant derives its palette from the colours below, so this chooses how
+    /// much of the terminal's identity the floating panels borrow. Takes effect
+    /// live — the Preferences "Chrome theme" row steps it.
+    pub chrome_theme: ChromeTheme,
     /// When true, moving the mouse over a pane focuses it (sloppy focus). When
     /// false (default), focus changes only on click. In rt sloppy and strict
     /// pointer-focus coincide, since a pane is always focused (over a gutter the
@@ -569,6 +665,7 @@ impl Default for Settings {
             // NOT AppKit's own default: that is the deprecated `.appearanceBased`,
             // which is what made rt's glass read as an opaque grey-blue haze.
             macos_glass_material: GlassMaterial::UnderWindowBackground,
+            chrome_theme: ChromeTheme::Tinted, // chrome takes the terminal's own hue
             focus_follows_mouse: false,    // click-to-focus by default
             show_titlebar: true,           // Terminator-style per-pane titlebars on by default
             inst_output: true,             // border instruments on by default
@@ -1049,6 +1146,30 @@ mod config_tests {
         assert!(!s.wants_background_blur(), "the user's toggle must be able to turn it OFF");
         s.background_opacity = 1.0;
         assert!(!s.wants_background_blur());
+    }
+
+    /// The chrome theme is the knob that lets the three chrome treatments be
+    /// compared in one sitting, so it has to survive a config round-trip and a
+    /// mistyped name has to cost nothing but a line on stderr.
+    #[test]
+    fn chrome_themes_round_trip_and_a_typo_falls_back() {
+        assert_eq!(Settings::default().chrome_theme, ChromeTheme::Tinted);
+        for t in ChromeTheme::ALL {
+            assert_eq!(ChromeTheme::from_name(t.name()), Some(*t), "{}", t.name());
+            assert_eq!(ChromeTheme::from_name(&t.name().to_ascii_uppercase()), Some(*t));
+        }
+        assert_eq!(ChromeTheme::from_name("graphite"), Some(ChromeTheme::Graphite));
+        assert_eq!(ChromeTheme::from_name("not-a-theme"), None);
+        // Stepping wraps in both directions and visits every theme.
+        let mut seen = Vec::new();
+        let mut t = ChromeTheme::default();
+        for _ in 0..ChromeTheme::ALL.len() {
+            seen.push(t);
+            t = t.step(1);
+        }
+        assert_eq!(t, ChromeTheme::default(), "one full cycle returns to the start");
+        assert_eq!(seen.len(), ChromeTheme::ALL.len());
+        assert_eq!(ChromeTheme::Tinted.step(-1), *ChromeTheme::ALL.last().unwrap());
     }
 
     #[test]

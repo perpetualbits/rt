@@ -59,6 +59,10 @@ pub enum PrefRow {
     // is noise, not a finding.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     GlassMaterial,
+    /// Which chrome palette the floating panels are derived with. Cross-platform
+    /// (unlike `GlassMaterial`): the chrome is the same native draw on both
+    /// backends, so the row exists everywhere.
+    Chrome,
     Preset,
     Ffm,
     Titlebar,
@@ -222,6 +226,9 @@ pub fn step(
         // Cycles rather than toggles: 13 materials, wrapping at both ends, so a
         // user can walk the whole list with one arrow key and watch each one land.
         PrefRow::GlassMaterial => s.macos_glass_material = s.macos_glass_material.step(dir),
+        // The same shape: a cycle, so the three chrome treatments can be walked
+        // with one arrow key and each one seen in place.
+        PrefRow::Chrome => s.chrome_theme = s.chrome_theme.step(dir),
         PrefRow::Blur => s.background_blur = !s.background_blur,
         PrefRow::Ffm => s.focus_follows_mouse = !s.focus_follows_mouse,
         PrefRow::Titlebar => s.show_titlebar = !s.show_titlebar,

@@ -317,7 +317,16 @@ APPEARANCE  &  PREFERENCES   (right-click menu -> Preferences...)
                      config.toml that rt cannot draw keeps its row, with a line
                      under it saying a fallback font is what you are looking at.
   Appearance         background opacity, compositor blur (Wayland
-                     ext-background-effect / KDE; X11 KDE blur-behind)
+                     ext-background-effect / KDE; X11 KDE blur-behind), and
+                     "Chrome theme" — how this manual, the menu, this dialog,
+                     the colour picker, the clipboard history and the search
+                     bar are coloured. All three are derived from YOUR
+                     foreground/background/palette, so the panels belong to
+                     the terminal they float over:
+                       tinted    panels take the terminal's own hue (default)
+                       graphite  neutral macOS greys; only light/dark is taken
+                       contrast  opaque, stronger edges, higher contrast text
+                     Left/Right steps it and the panels change under you.
   Colours            preset schemes (rt default, Solarized Dark, Dracula,
                      Gruvbox Dark, Nord), then tweak foreground, background
                      and the 16 ANSI palette entries with the colour picker

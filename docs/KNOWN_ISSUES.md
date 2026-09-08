@@ -68,6 +68,31 @@ under Input / keyboard.
   reaches `rt-session`/`rt-core` as a plain number, not a window handle.
   Bit-identical at 1.0 — the pixel-identity gate proves it. User-verified on the
   Mac, 2026-09-07.
+- ☑ **The in-window chrome was ugly, and the menu ran off the bottom.** Reported
+  as *"the rt manual and menu system in linux and the in-window manual and menu
+  in the mac is very ugly. Text does not flow, colors are ugly, the bottom of
+  the menu is under the edge so I always have to make the window higher before I
+  can read it."* Three separate faults, all fixed:
+  - **Colour.** Forty hardcoded literals across `chrome/*.rs`, no two panels
+    agreeing, none of them related to the user's own theme. Replaced by one
+    derived palette with named roles (`chrome/theme.rs`), computed from the
+    user's foreground/background/palette and held to stated WCAG contrast floors
+    at every scheme and both extremes. A `chrome_theme` setting (tinted /
+    graphite / contrast) steps live from Preferences so the taste question can be
+    settled side by side.
+  - **The bottom under the edge.** `layout` clamped `anchor.y.min(win_h - h)
+    .max(0.0)`; a panel taller than the window pinned to the top with its tail
+    unreachable. The context menu scrolls now (wheel, arrows + Return, or the
+    ▲/▼ cues), the clipboard history scrolls with its selection, the preferences
+    dialog clamps its height, and the colour picker fits itself to the window.
+  - **Text that does not flow.** The manual's wrap dumped every continuation at
+    column zero, destroying the two-column key/description structure it is
+    almost entirely made of; the measure ran to 120+ characters; UPPERCASE
+    section headings were drawn in body colour and weight. Continuations now
+    hang under the description column, the measure is capped at 84 columns,
+    headings are bold in the accent, and body lines carry leading.
+
+  Awaiting on-screen verification.
 - ☑ **`Ctrl`+click on a URL did nothing.** `App::open_url` spawned `xdg-open`,
   which macOS does not have. Fixed: the program name now comes from
   `opener_command(cfg!(target_os = "macos"))` — `open` on a Mac, `xdg-open`
