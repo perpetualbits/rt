@@ -102,6 +102,20 @@ Where the widget toolkit pays off.
 - **Packaging matrix** (was M6): `.deb` / `.rpm` / arch × x86_64 / aarch64 /
   riscv64. Deferred until the feature set stabilises; egui/glow don't change the
   cross-compile story materially.
+- **wgpu-over-Vulkan backend for GPUs that have a Vulkan driver but no GL
+  driver** — the Milk-V Mars class of board: its PowerVR BXE-4-32 ships a
+  working Vulkan driver (`VK_KHR_wayland_surface`, `VK_KHR_swapchain`) and
+  nothing for GL, so Mesa falls back to llvmpipe, and zink refuses the driver
+  ("no geometry shaders"). rt already has a wgpu backend (macOS/Metal,
+  `crates/rt/src/wgpu_backend.rs` + `wgpu_frame.rs` + `wgpu_text.rs`); the
+  work is to compile it on Linux behind a feature, select it when a Vulkan
+  device exists and GL is software, and give it what the GL path learned in
+  v0.3.20–v0.3.23: partial frames from the swapchain's image age (or a
+  persistent texture), geometry culled to the clip, the instrument bands and
+  their flush. Ordering: after the GL path settles; measure on the Mars with
+  `bench/software-gl/` first (it is 0.3 cores there now on the vendor GLES
+  driver, so the win is portability across GPU-less-GL boards, not milkv
+  itself). See `docs/software-gl-lessons.md`.
 - **Background image**, cell scaling, geometry hinting. (cat. §1, §2)
 - **Window flags** — always-on-top, sticky, hide-from-taskbar, borderless: these
   depend on Wayland/compositor support (`xdg-toplevel`, wlr protocols) and may be

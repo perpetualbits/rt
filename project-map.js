@@ -63,6 +63,19 @@ window.PROJECT_MAP = {
       deps: []
     },
     {
+      id: "render-wgpu-vulkan", label: "wgpu/Vulkan renderer (Linux)", layer: "frontend", status: "planned",
+      tags: ["Vulkan", "PowerVR", "riscv64"],
+      desc: "The wgpu backend compiled on Linux over Vulkan, for boards whose GPU has a Vulkan driver but no GL driver (the Milk-V Mars: PowerVR BXE-4-32 with VK_KHR_wayland_surface; Mesa's zink refuses the vendor driver for lacking geometry shaders, so GL there is either llvmpipe or the vendor GLES). Selection: a Vulkan device present and GL reported as software. Must inherit what the GL path learned in v0.3.20-v0.3.23: partial frames from the swapchain's image age (or a persistent texture), geometry culled to the clip, instrument bands wide enough for the rim discs, and the instrument pass flushed on partial frames. Measure on the Mars with bench/software-gl first.",
+      files: ["crates/rt/src/wgpu_backend.rs", "crates/rt/src/wgpu_frame.rs", "crates/rt/src/wgpu_text.rs", "docs/ROADMAP.md"],
+      specs: [{ label: "Roadmap · cross-cutting", href: "docs/ROADMAP.md" }, { label: "Software GL lessons", href: "docs/software-gl-lessons.md" }],
+      parts: [
+        { label: "Linux build of the wgpu backend", status: "planned", desc: "Feature-gated; the Linux crate graph stays byte-identical when off (ci/check-target-deps.sh)." },
+        { label: "Backend selection", status: "planned", desc: "Prefer Vulkan when a device exists and the GL renderer is software; RT_BACKEND=wgpu to force." },
+        { label: "Partial frames on wgpu", status: "planned", desc: "Swapchain image age or a persistent surface-sized texture; the macOS backend deliberately redraws full frames because Metal makes that cheap — a riscv64 CPU does not." }
+      ],
+      deps: ["render-wgpu", "damage"]
+    },
+    {
       id: "render-gl", label: "GL renderer", layer: "frontend", status: "done",
       tags: ["OpenGL", "glyphs"],
       desc: "The custom OpenGL glyph-atlas renderer used on Wayland and local X11. Rasterises glyphs on the CPU (anti-aliased coverage masks) through a multi-font fallback chain, then blits cells on the GPU. Handles bold/italic/underline, truecolour, and compositor blur. Speaks two GLSL dialects from one shader body, picked at runtime from the live context: desktop GL 3.3 core, or GLES 3.0 for boards whose driver is OpenGL-ES-only (PowerVR/Mali/Adreno).",
