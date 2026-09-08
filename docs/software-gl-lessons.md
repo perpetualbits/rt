@@ -223,3 +223,79 @@ path was born; every GPU took full frames until v0.3.21, and on llvmpipe
 nobody looked at the rim. Reproduced on dop561/NVIDIA with a headless weston
 and `weston-screenshooter` (eight captures: edge absent in all with the old
 build, present in all with the fix). The fallback branch had the same hole.
+
+## Part three: the same lessons against Metal (wgpu, Apple silicon)
+
+The four releases above were driven by a Milk-V Mars. rt's macOS backend
+(`wgpu_backend.rs` / `wgpu_text.rs` / `wgpu_frame.rs`) was written mirroring
+`render.rs` and received none of them, so each was re-examined there. Measured
+on kiku (Apple M5, macOS 26.6.2) with `crates/rt/src/wgpu_offscreen/bench.rs`,
+whose `cpu` column is exactly the vertex build — where glyph hashing lives.
+
+| the GL fix | does it transfer to wgpu? |
+|---|---|
+| MSAA off (§1) | **Nothing to win.** The atlas is `sample_count: 1` and both pipelines take `MultisampleState::default()` (count 1); a wgpu surface texture is single-sampled and rt never creates a resolve target. There was never a multisampled path to turn off. |
+| repaint per damage rect (§2) | **N/A.** `WgpuBackend::buffer_age()` is 0, so `plan_frame` returns `FramePlan::Full` on every macOS frame; `redraw_scissored` is unreachable. |
+| geometry culled to the clip (§2 of part two) | **N/A, same reason** — the culling is driven by `frame_clip`, which only a partial frame sets. |
+| instrument bands reaching the rim (v0.3.22) | **N/A, same reason** — `border_bands` is only consulted on a partial frame. |
+| the flare feeding on itself (§3) | **Already inherited.** The fix is in `main.rs`, not the GL backend: `paint_secs` accumulates around the whole `RedrawRequested` handler and every early exit from it, and `tick_active` subtracts it before judging the overrun. `redraw()` is backend-agnostic, so macOS has had it since v0.3.20. |
+| flush the instrument pass (v0.3.23) | **Same bug, already closed.** `redraw_full` calls `end_frame` twice by design — once after `draw_panes`, once after `paint_overlays_or_instruments` — and `wgpu_frame::end_frame_action` answers `Submit { clear: false }` for the second call whenever vertices are pending. That is the same contract the GL fix restored for the scissored path, and full frames are the only path macOS takes. Not a second hole. |
+| the glyph cache (§3 of part two) | **Half of it, and the other half is a regression here.** See below. |
+
+### The glyph cache: FxHashMap yes, the ASCII table no
+
+`wgpu_text.rs` had the identical `HashMap<(char, bool, bool), Glyph>`. Swapping
+the hasher is a real win on Apple silicon too:
+
+| full-frame vertex build (`cpu`) | std `HashMap` | `FxHashMap` |
+|---|---|---|
+| Retina 3024×1964, 177×61 = 10797 cells | 109.4 us | 100.4 us (−8.2%) |
+| 1x 1920×1080, 213×67 = 14271 cells | 128.0 us | 120.0 us (−6.3%) |
+
+The GL fix's *other* half — a direct-indexed `Vec<Option<Glyph>>` ASCII table,
+`index = (char << 2) | bold << 1 | italic`, which hashes nothing — makes the
+same loop **25–30% slower** here, and was left out:
+
+| full-frame vertex build (`cpu`) | `FxHashMap` | + ASCII table |
+|---|---|---|
+| Retina, 10797 cells | 100.4 us | 126.3 us (+26%) |
+| 1x, 14271 cells | 120.0 us | 157.8 us (+31%) |
+
+It is the table itself, not how it was written. Three variants were built and
+measured against the same baseline and all three landed within noise of each
+other: `Vec<Option<Glyph>>` (36-byte stride, unaligned), `Vec<Glyph>` with a
+`w < 0.0` "uncached" sentinel (32-byte stride, shift-indexed, aligned), and a
+style-major index (`bold << 8 | italic << 7 | char`, so one style's 128 glyphs
+are contiguous). The `glyph`/`rasterise_glyph` split costs nothing — the tree
+with the split and the table disabled measured identical to the tree without
+either. The plausible reason is that a terminal's live repertoire is ~60 entries:
+in an `FxHashMap` that is a couple of KB, hot in L1 and reached by two multiplies;
+in the table it is 60 entries scattered through 16–18 KB. On a U74, SipHash at
+~20 ns dominated that difference; an M5 hashes faster than it chases the table.
+
+**So: the U74 result does not generalise, and neither does this one.** When the
+wgpu-over-Vulkan backend reaches the Mars class, re-measure the ASCII table there
+before assuming either answer.
+
+### How to measure this on a Mac, and how not to
+
+Do not compare two builds by running one after the other. Three back-to-back runs
+of an *identical* workload on kiku climbed 105 → 137 → 153 us purely from machine
+drift — larger than every effect above. Two things that also do not work:
+
+* **One process, two arms, chosen at runtime.** A `TextPipeline` switch that
+  picked the strategy per arm reported the ASCII table 1% *faster*. Compiling
+  both lookup paths into `push_glyph` pessimised both arms by ~33 us, which is
+  more than the difference being measured.
+* **A micro-benchmark of the containers alone.** Timing the three lookups over
+  the same key stream, outside the real loop, said the ASCII table was 20%
+  faster — the opposite of the truth. Isolated, each lookup's latency is exposed;
+  in `push_glyph` it overlaps with the surrounding vertex writes, and the two
+  containers hide differently under that overlap.
+
+What does work: **separate build trees, alternated** (`~/git/rt-base`,
+`~/git/rt-fx`, …), several rounds, each tree differing from the next by one
+change. Alternation cancels the drift the way `REPS` does inside the benchmark,
+and each tree compiles only the code path it is measuring. Every number above
+came out of that, at two or three rounds per variant, with base re-measured in
+every round (it repeated to ±1 us).

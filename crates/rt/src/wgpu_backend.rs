@@ -284,14 +284,18 @@ impl Backend for WgpuBackend {
     }
 
     fn reload_fonts(&mut self, blobs: &FontBlobs, font_px: f32) -> Result<(), String> {
-        self.text = crate::wgpu_text::TextPipeline::new(&self.device, &self.queue, self.config.format, blobs, font_px)?;
+        // In place: the pipelines, atlas, bind group and vertex buffers do not
+        // depend on the font, so only the font chains, the metrics and the three
+        // caches that hold atlas placements are rebuilt. `TextPipeline::
+        // reload_fonts` commits nothing until the new primary has parsed, so a
+        // failure here leaves a readable terminal (main.rs relies on that).
+        self.text.reload_fonts(blobs, font_px)?;
         let (w, h) = self.text.cell_size();
         self.cell_w = w;
         self.cell_h = h;
-        // Rebuilding TextPipeline resets `screen` to its [1.0, 1.0] placeholder
-        // (see `new`'s comment). `Backend::resize` is still a no-op (Task 6), so
-        // without re-seeding here a font-size change leaves text permanently
-        // off-screen: nothing else will ever call `set_screen` again.
+        // Belt and braces: an in-place reload keeps `screen`, but `Backend::
+        // resize` only forwards to `set_screen` and nothing else re-seeds it, so
+        // pin it to the surface configuration here as this path always has.
         self.text.set_screen(self.config.width as f32, self.config.height as f32);
         Ok(())
     }

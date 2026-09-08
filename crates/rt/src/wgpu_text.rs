@@ -19,7 +19,8 @@
 //!   [`vbuf`] by reallocation if `verts.len()` ever exceeds it" needs one to
 //!   create a bigger buffer. `TextPipeline` keeps its own `wgpu::Device` clone
 //!   (a cheap handle, not a second GPU device) for exactly that.
-use std::collections::HashMap;
+use std::collections::HashMap; // shape masks, exactly as render.rs keeps them
+use rustc_hash::FxHashMap; // glyph cache: SipHash on (char, bool, bool) was 24% of a full frame on a U74
 
 use fontdue::Font;
 
@@ -143,17 +144,24 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
 /// Where a rasterised glyph lives in the atlas plus how to place it on the
 /// baseline. Mirrors `render.rs`'s `Glyph`.
-#[derive(Clone, Copy)]
-struct Glyph {
+// `pub(crate)` only so the offscreen harness's cache tests can compare two
+// cached placements field for field; nothing outside this file constructs one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Glyph {
     u0: f32,
     v0: f32,
     u1: f32,
     v1: f32,
-    w: f32,
-    h: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
     bearing_x: f32,
     bearing_y: f32,
 }
+
+/// The cached "there is nothing to draw here" placement: a space, or a glyph a
+/// full atlas refused. Zero width is the sentinel `push_glyph` reads.
+const BLANK_GLYPH: Glyph =
+    Glyph { u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0, w: 0.0, h: 0.0, bearing_x: 0.0, bearing_y: 0.0 };
 
 pub struct TextPipeline {
     device: wgpu::Device, // cheap handle clone; needed to grow `vbuf` in `flush`
@@ -179,7 +187,18 @@ pub struct TextPipeline {
     shelf_y: u32,
     shelf_h: u32,
     /// Cached glyph placements: (char, bold, italic) -> uv rect + pixel offsets.
-    glyphs: HashMap<(char, bool, bool), Glyph>,
+    ///
+    /// `FxHashMap`, not std's. SipHash on this exact key was measured at 24% of
+    /// a full frame on a U74 (`docs/software-gl-lessons.md`); swapping the
+    /// hasher is worth ~8% of the whole vertex build on an M5 too, measured with
+    /// `wgpu_offscreen::bench`.
+    ///
+    /// The GL renderer pairs this with a direct-indexed `Vec<Option<Glyph>>`
+    /// ASCII fast path that hashes nothing. That is deliberately NOT here: on an
+    /// M5 it is a 25% REGRESSION, not a win, and the measurement is in
+    /// `docs/software-gl-lessons.md` along with the three layouts that were
+    /// tried. Re-measure before adding one, on the machine it is meant to help.
+    glyphs: FxHashMap<(char, bool, bool), Glyph>,
     /// Cached instrument coverage masks (disc/ring/bar): mirrors render.rs's
     /// `shape_masks`. Keyed by [`mask_key`] -- see that function's doc comment
     /// for why `f32` geometry is quantised to `u32` rather than hashed via
@@ -439,7 +458,7 @@ impl TextPipeline {
             shelf_x: 2,
             shelf_y: 2,
             shelf_h: 0,
-            glyphs: HashMap::new(),
+            glyphs: FxHashMap::default(),
             shape_masks: HashMap::new(),
             screen: [1.0, 1.0],
             font_px,
@@ -454,6 +473,72 @@ impl TextPipeline {
     }
 
     pub fn cell_size(&self) -> (f32, f32) { (self.cell_w, self.cell_h) }
+
+    /// Reload the font chains and/or pixel size (a preferences font change, or a
+    /// backing-scale change), invalidating everything that was rasterised at the
+    /// old font. Mirrors `render.rs`'s `Renderer::reload_fonts` step for step.
+    ///
+    /// In place rather than rebuilding the whole `TextPipeline`: the pipelines,
+    /// atlas texture, bind group and vertex buffers do not depend on the font at
+    /// all, and rebuilding them also reset `screen` to its placeholder, which
+    /// had to be re-seeded by hand afterwards or the text landed off-window.
+    ///
+    /// What DOES depend on the font is invalidated here, and it is all of it:
+    /// the glyph cache, the shape masks (they share the atlas, so their
+    /// placements are stale once the packing cursor rewinds), and the shelf
+    /// cursor. Old atlas pixels linger harmlessly until overwritten; texel (0,0)
+    /// — the opaque seed solid fills sample — is below the cursor's reset
+    /// position and is never touched.
+    ///
+    /// On failure the old fonts, metrics and caches are left exactly as they
+    /// were: `main.rs` relies on an unusable family in preferences leaving a
+    /// readable terminal rather than a blank one, so parsing happens into locals
+    /// and nothing is committed until it has succeeded.
+    pub fn reload_fonts(&mut self, blobs: &FontBlobs, font_px: f32) -> Result<(), String> {
+        let fonts = parse_chain(&blobs.regular);
+        let regular = fonts.first().ok_or("wgpu_text: no usable regular font")?;
+        let lm = regular
+            .horizontal_line_metrics(font_px)
+            .ok_or("wgpu_text: font has no horizontal line metrics")?;
+        let cell_h = (lm.ascent - lm.descent + lm.line_gap).ceil();
+        let cell_w = regular.metrics('M', font_px).advance_width.ceil();
+        let ascent = lm.ascent;
+        let bold_fonts = parse_chain(&blobs.bold);
+        let italic_fonts = parse_chain(&blobs.italic);
+        let bold_italic_fonts = parse_chain(&blobs.bold_italic);
+
+        // Commit.
+        self.fonts = fonts;
+        self.bold_fonts = bold_fonts;
+        self.italic_fonts = italic_fonts;
+        self.bold_italic_fonts = bold_italic_fonts;
+        self.font_px = font_px;
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        self.ascent = ascent;
+        // Every cache that holds an atlas placement, and the packer itself.
+        self.glyphs.clear();
+        self.shape_masks.clear();
+        self.shelf_x = 2;
+        self.shelf_y = 2;
+        self.shelf_h = 0;
+        Ok(())
+    }
+
+    /// The cached placement for one key, for the offscreen harness's cache
+    /// tests: the invariant they pin is that a key resolves to the SAME glyph
+    /// every time and that a font reload drops it.
+    #[cfg(test)]
+    pub(crate) fn cached_glyph(&self, c: char, bold: bool, italic: bool) -> Option<Glyph> {
+        self.glyphs.get(&(c, bold, italic)).copied()
+    }
+
+    /// `(glyph map entries, shape masks)` — how the cache tests see that a
+    /// reload emptied both and a failed one emptied neither.
+    #[cfg(test)]
+    pub(crate) fn cache_sizes_for_test(&self) -> (usize, usize) {
+        (self.glyphs.len(), self.shape_masks.len())
+    }
 
     /// The regular face's ascent in pixels, matching render.rs's use of
     /// `self.ascent` to place underline/strikeout bars relative to the
@@ -505,45 +590,56 @@ impl TextPipeline {
         Some([x as f32 / s, y as f32 / s, (x + w) as f32 / s, (y + h) as f32 / s])
     }
 
-    pub fn push_glyph(&mut self, queue: &wgpu::Queue, x: f32, y: f32, ch: char, fg: Color, bold: bool, italic: bool) {
-        let key = (ch, bold, italic);
-        let g = match self.glyphs.get(&key) {
+    /// Fetch (rasterising and caching on a miss) the atlas placement for
+    /// `(c, bold, italic)`. A zero-width result means "nothing to draw": a blank
+    /// glyph, or one the atlas had no room for.
+    ///
+    /// Split from [`push_glyph`](Self::push_glyph) the way render.rs splits
+    /// `glyph` from `rasterise_glyph`, so the hot lookup stays inlinable and the
+    /// cold rasterise-and-pack does not.
+    #[inline]
+    fn glyph(&mut self, queue: &wgpu::Queue, c: char, bold: bool, italic: bool) -> Glyph {
+        match self.glyphs.get(&(c, bold, italic)) {
             Some(g) => *g,
-            None => {
-                let font = self.face_for(ch, bold, italic);
-                let (m, cov) = font.rasterize(ch, self.font_px);
-                if m.width == 0 || m.height == 0 {
-                    // Empty glyph (space etc): cache a blank placement so we
-                    // don't retry, and skip drawing -- matches render.rs.
-                    let g = Glyph { u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0, w: 0.0, h: 0.0, bearing_x: 0.0, bearing_y: 0.0 };
-                    self.glyphs.insert(key, g);
-                    return;
-                }
-                // Atlas full: refuse the glyph rather than pack it (an
-                // out-of-bounds write_texture origin would panic mid-frame) --
-                // matches render.rs's `pack_coverage(..)?` early return. Not
-                // cached, so a later frame may retry (harmless: atlas
-                // exhaustion is not expected for a terminal's glyph
-                // repertoire, per ATLAS_SIZE's doc comment).
-                let Some(uv) = self.pack(queue, m.width as u32, m.height as u32, &cov) else {
-                    return;
-                };
-                let g = Glyph {
-                    u0: uv[0],
-                    v0: uv[1],
-                    u1: uv[2],
-                    v1: uv[3],
-                    w: m.width as f32,
-                    h: m.height as f32,
-                    bearing_x: m.xmin as f32,
-                    bearing_y: m.ymin as f32,
-                };
-                self.glyphs.insert(key, g);
-                g
-            }
+            None => self.rasterise_glyph(queue, c, bold, italic).unwrap_or(BLANK_GLYPH),
+        }
+    }
+
+    /// Resolve the face, rasterise, pack into the atlas and cache in
+    /// [`glyphs`](Self::glyphs). `None` for a blank (also cached, so it is not
+    /// retried) or a full atlas (NOT cached here, so a later frame may retry --
+    /// render.rs's `pack_coverage(..)?` early return). Packing has to stay
+    /// optional rather than asserted: an out-of-bounds `write_texture` origin
+    /// panics, and a panic mid-frame takes the process with it.
+    #[cold]
+    #[inline(never)]
+    fn rasterise_glyph(&mut self, queue: &wgpu::Queue, c: char, bold: bool, italic: bool) -> Option<Glyph> {
+        let key = (c, bold, italic);
+        let font = self.face_for(c, bold, italic);
+        let (m, cov) = font.rasterize(c, self.font_px);
+        if m.width == 0 || m.height == 0 {
+            self.glyphs.insert(key, BLANK_GLYPH); // cache the blank so we don't retry
+            return None;
+        }
+        let uv = self.pack(queue, m.width as u32, m.height as u32, &cov)?;
+        let g = Glyph {
+            u0: uv[0],
+            v0: uv[1],
+            u1: uv[2],
+            v1: uv[3],
+            w: m.width as f32,
+            h: m.height as f32,
+            bearing_x: m.xmin as f32,
+            bearing_y: m.ymin as f32,
         };
+        self.glyphs.insert(key, g);
+        Some(g)
+    }
+
+    pub fn push_glyph(&mut self, queue: &wgpu::Queue, x: f32, y: f32, ch: char, fg: Color, bold: bool, italic: bool) {
+        let g = self.glyph(queue, ch, bold, italic);
         if g.w == 0.0 || g.h == 0.0 {
-            return; // blank glyph (space), cached above -- nothing to draw
+            return; // blank, or the atlas had no room -- nothing to draw
         }
         // fontdue's ymin is the offset of the bitmap's BOTTOM from the baseline,
         // and our y grows downward, so the top edge is baseline - (h + ymin).

@@ -325,4 +325,154 @@ mod pixel_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The glyph cache: a wrong glyph is worse than a slow one.
+// ---------------------------------------------------------------------------
+
+/// `TextPipeline`'s glyph cache is keyed `(char, bold, italic)` and is now an
+/// `FxHashMap` rather than a std `HashMap` — SipHash on that key was 24% of a
+/// full frame on a U74, and the swap is worth ~8% of the vertex build on an M5
+/// too (`docs/software-gl-lessons.md`).
+///
+/// Swapping a hasher cannot change which glyph comes back, but the caching
+/// around it can, and a cache that returns the WRONG glyph does not crash — it
+/// silently draws another letter. So these pin the properties that matter: a key
+/// resolves to the same placement every time, blanks and non-ASCII behave, and a
+/// font reload drops everything that was rasterised at the old font. They need a
+/// real atlas and real pixels, which is why they live here.
+#[cfg(test)]
+mod glyph_cache_tests {
+    use super::*;
+
+    const W: u32 = 256;
+    const H: u32 = 64;
+    const BG: Color = Color(0.05, 0.05, 0.07, 1.0);
+    const FG: Color = Color(0.9, 0.9, 0.9, 1.0);
+
+    /// ASCII in several styles, a space (the blank case), and two non-ASCII.
+    const SAMPLE: &str = "Ag1; é⣿";
+
+    fn draw_sample(t: &mut TextPipeline, queue: &wgpu::Queue) {
+        let (cw, _) = t.cell_size();
+        for (i, ch) in SAMPLE.chars().enumerate() {
+            let x = 4.0 + i as f32 * cw;
+            t.push_glyph(queue, x, 4.0, ch, FG, i % 2 == 1, i % 3 == 1);
+        }
+    }
+
+    #[test]
+    fn a_key_resolves_to_the_same_placement_every_time() {
+        // Including across the styles, which share a character but must not share
+        // a cache entry: 'A' bold is a different bitmap from 'A' regular, and a
+        // key that collapsed the style bits would draw one for the other.
+        let h = Harness::new(W, H);
+        let mut t = h.text();
+        let mut first = Vec::new();
+        for ch in ['A', 'g', '1', ';', '~', 'é', '⣿'] {
+            for bold in [false, true] {
+                for italic in [false, true] {
+                    t.push_glyph(&h.queue, 4.0, 4.0, ch, FG, bold, italic);
+                    let g = t.cached_glyph(ch, bold, italic).expect("cached after one draw");
+                    first.push(((ch, bold, italic), g));
+                }
+            }
+        }
+        // Every entry distinct per key, and stable when asked again.
+        for ((ch, bold, italic), want) in first {
+            t.push_glyph(&h.queue, 40.0, 4.0, ch, FG, bold, italic);
+            let got = t.cached_glyph(ch, bold, italic).expect("still cached");
+            assert_eq!(got, want, "{ch:?} bold={bold} italic={italic} moved in the atlas on a second lookup");
+        }
+    }
+
+    #[test]
+    fn a_blank_is_cached_as_blank_rather_than_re_rasterised_forever() {
+        // A space has no bitmap. render.rs caches the blank so it is not retried
+        // every frame; the wgpu path must too, or a screenful of indentation
+        // re-rasterises on every single frame.
+        let h = Harness::new(W, H);
+        let mut t = h.text();
+        assert_eq!(t.cache_sizes_for_test().0, 0);
+        t.push_glyph(&h.queue, 4.0, 4.0, ' ', FG, false, false);
+        let g = t.cached_glyph(' ', false, false).expect("the blank must be cached");
+        assert_eq!(g.w, 0.0, "a space must cache as zero-width, not as a drawable glyph");
+        t.discard_pending();
+        t.push_glyph(&h.queue, 4.0, 4.0, ' ', FG, false, false);
+        assert_eq!(t.pending_vertex_count(), 0, "a blank must push no geometry");
+    }
+
+    #[test]
+    fn the_cached_glyph_draws_the_same_pixels_as_the_first_one_did() {
+        // End to end: the second frame is served entirely from the cache. If a
+        // cached placement ever drifted from what the rasteriser produced, the
+        // text would change between frame one and frame two.
+        let h = Harness::new(W, H);
+        let mut t = h.text();
+        frame(&h, &mut t, BG, None, true, |t| draw_sample(t, &h.queue));
+        let cold = h.read_pixels();
+        frame(&h, &mut t, BG, None, true, |t| draw_sample(t, &h.queue));
+        let warm = h.read_pixels();
+
+        let differing = cold.iter().zip(&warm).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "{differing} pixels differ between the uncached and cached frame");
+        assert!(
+            cold.iter().any(|p| p.0 > 128),
+            "no light pixels: the sample text did not render, so the comparison proved nothing"
+        );
+    }
+
+    #[test]
+    fn a_font_reload_empties_every_cache_and_redraws_at_the_new_size() {
+        // The trap render.rs's comment warns about: leave any cache populated
+        // across a font change and rt silently keeps drawing the old face at the
+        // old size. Both caches hold ATLAS placements, and the reload rewinds the
+        // packing cursor, so a survivor points at pixels that are about to be
+        // overwritten by something else.
+        let h = Harness::new(W, H);
+        let mut t = h.text_at(14.0);
+        draw_sample(&mut t, &h.queue);
+        t.fill_circle(&h.queue, 20.0, 20.0, 6.0, FG); // populate the mask cache too
+        t.discard_pending();
+        let (glyphs, masks) = t.cache_sizes_for_test();
+        assert!(glyphs > 0 && masks > 0, "the sample should have populated both caches");
+
+        let blobs = crate::load_fonts().expect("macOS system fonts");
+        let before = t.cell_size();
+        t.reload_fonts(&blobs, 28.0).expect("reload at a larger size");
+
+        assert_eq!(t.cache_sizes_for_test(), (0, 0), "a font reload must empty both caches");
+        assert!(t.cell_size().0 > before.0, "the cell should have grown with the font");
+
+        // And the next glyph must come back at the NEW size, not the cached old one.
+        t.push_glyph(&h.queue, 4.0, 4.0, 'A', FG, false, false);
+        let reloaded = t.cached_glyph('A', false, false).expect("'A' re-rasterised after the reload");
+        let mut fresh = h.text_at(28.0);
+        fresh.push_glyph(&h.queue, 4.0, 4.0, 'A', FG, false, false);
+        let expected = fresh.cached_glyph('A', false, false).expect("'A' on a pipeline built at 28px");
+        assert_eq!(
+            (reloaded.w, reloaded.h),
+            (expected.w, expected.h),
+            "the reloaded pipeline is still drawing the 14px bitmap"
+        );
+    }
+
+    #[test]
+    fn a_failed_font_reload_leaves_the_old_fonts_and_caches_intact() {
+        // main.rs relies on this: an unusable family in preferences must leave
+        // the terminal readable, not blank it. A half-applied reload -- caches
+        // cleared, fonts not -- would draw nothing until the next change.
+        let h = Harness::new(W, H);
+        let mut t = h.text();
+        draw_sample(&mut t, &h.queue);
+        t.discard_pending();
+        let before_cells = t.cell_size();
+        let before_caches = t.cache_sizes_for_test();
+
+        let empty = crate::render::FontBlobs::default();
+        assert!(t.reload_fonts(&empty, 28.0).is_err(), "an empty regular chain must fail");
+        assert_eq!(t.cell_size(), before_cells, "the failed reload changed the cell metrics");
+        assert_eq!(t.cache_sizes_for_test(), before_caches, "the failed reload emptied the caches anyway");
+    }
+}
+
 pub mod bench;
