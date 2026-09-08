@@ -234,6 +234,69 @@ fn scissored_single_cell_equals_full_redraw() {
     assert_eq!(diffs, 0, "{diffs} bytes differ between full and scissored redraw");
 }
 
+/// Multi-rect partial redraw: two disjoint cells scissored as TWO rects (not
+/// their bounding box) must equal a full redraw, and the untouched pixels
+/// between them must keep the prior frame's content. This is the property the
+/// software-GL path relies on: a keystroke plus the pane's border bands must
+/// clear and draw only those rects, never the whole bounding box.
+#[test]
+#[ignore = "needs a live GL context; run with --ignored on a GL-capable box"]
+fn scissored_multi_rect_equals_full_redraw() {
+    let ctx = match egl_headless::make(W as u32, H as u32) {
+        Ok(c) => c,
+        Err(e) => panic!("could not create a headless GL context: {e}"),
+    };
+    let gl = ctx.glow();
+    let blobs = test_fonts();
+    let mut r = Renderer::new(gl.clone(), &blobs, 16.0).expect("renderer");
+    r.resize(W as f32, H as f32);
+    let bg = Color::rgb(0x10, 0x10, 0x18).with_alpha(1.0);
+    let other = Color::rgb(0x40, 0x20, 0x20).with_alpha(1.0); // a distinct "stale" colour
+    let (cw, ch) = r.cell_size();
+    let (cw, ch) = (cw as i32, ch as i32);
+    let a = PxRect { x: cw, y: ch, w: cw, h: ch };
+    let b = PxRect { x: 6 * cw, y: 3 * ch, w: cw, h: ch };
+    let stripe = |r: &mut Renderer, c: PxRect| r.bell_stripe(c.x as f32, c.y as f32, c.w as f32, c.h as f32);
+
+    // Reference: full redraw over `bg` with both stripes.
+    r.begin_frame(bg);
+    stripe(&mut r, a);
+    stripe(&mut r, b);
+    r.end_frame();
+    let full_px = egl_headless::read_pixels(&gl, W, H);
+
+    // Prior frame: whole buffer bg, nothing at a or b.
+    r.begin_frame(bg);
+    r.end_frame();
+    // Partial: clear + draw ONLY a and b (two scissor rects), same geometry.
+    r.begin_frame_scissored_rects(bg, &[a, b]);
+    stripe(&mut r, a);
+    stripe(&mut r, b);
+    r.end_frame();
+    r.clear_scissor();
+    let partial_px = egl_headless::read_pixels(&gl, W, H);
+    let diffs = full_px.iter().zip(&partial_px).filter(|(x, y)| x != y).count();
+    assert_eq!(diffs, 0, "{diffs} bytes differ between full and multi-rect scissored redraw");
+
+    // Preservation: paint the whole buffer `other`, then a two-rect partial over
+    // it. Pixels outside a and b must still be `other` — i.e. the bbox between the
+    // rects was NOT cleared. (A bbox scissor would clear it to bg.)
+    r.begin_frame(other);
+    r.end_frame();
+    r.begin_frame_scissored_rects(bg, &[a, b]);
+    stripe(&mut r, a);
+    stripe(&mut r, b);
+    r.end_frame();
+    r.clear_scissor();
+    let px = egl_headless::read_pixels(&gl, W, H);
+    // A pixel strictly between the two rects (inside their bounding box).
+    let (mx, my) = (3 * cw + cw / 2, 2 * ch + ch / 2);
+    let gl_row = H - 1 - my; // read_pixels is bottom-up
+    let i = ((gl_row * W + mx) * 4) as usize;
+    let want = [0x40u8, 0x20, 0x20];
+    assert_eq!(&px[i..i + 3], &want, "pixel inside the bbox but outside the rects was clobbered");
+}
+
 /// Build a `FontBlobs` from the first readable common monospace TTF. Only the
 /// regular chain must be non-empty for `Renderer::new` (it measures the cell
 /// from the primary face); `bell_stripe` itself rasterises no glyphs.

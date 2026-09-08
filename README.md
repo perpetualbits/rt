@@ -146,6 +146,24 @@ There's also a text-mode multiplexer that hosts the same panes inside any termin
 cargo install --path crates/rt-mux
 ```
 
+### On a box without a GL driver (llvmpipe)
+
+rt's GL path works on Mesa's software rasteriser and, since v0.3.20, costs about
+0.1 core-seconds per keystroke frame there instead of ~2 (it no longer renders
+into a multisampled buffer, and repaints only the damaged rects, not the pane).
+On a weak board used interactively — a Milk-V Mars, say — the XRender backend
+over Xwayland is still ~20× cheaper, at the price of the Wayland-only features:
+
+```sh
+DISPLAY=:0 rt --backend xrender     # Xwayland's display; unset WAYLAND_DISPLAY if set
+```
+
+To see what a frame costs, `RUST_LOG=rt::frame=debug` logs one line per frame
+(plan, damage rects, vertices, ms, and what asked for it); `RT_FRAME_SYNC=1`
+adds a `glFinish`-timed clear/draw/swap split with per-thread CPU. The whole
+investigation, numbers and the headless harness are in
+[docs/software-gl-lessons.md](docs/software-gl-lessons.md) and `bench/software-gl/`.
+
 ### On macOS
 
 No apt line and no X11 — just Xcode Command Line Tools (`xcode-select --install`)

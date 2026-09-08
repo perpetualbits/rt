@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-09-07"
+    updated: "2026-09-08"
   },
 
   statuses: {
@@ -72,7 +72,8 @@ window.PROJECT_MAP = {
         { label: "Font-fallback chain", status: "done", desc: "Primary + fallbacks (DejaVu, Agave …) so braille/box glyphs aren't tofu." },
         { label: "Background blur", status: "done", desc: "Wayland ext-background-effect-v1 / KDE; X11 _KDE_NET_WM_BLUR." },
         { label: "GLES 3.0 shader path", status: "done", desc: "#version 300 es with highp precision, selected from glow's parsed GL_VERSION; one shared shader body keeps the desktop 3.30 source byte-identical." },
-        { label: "XRender fallback on GL failure", status: "done", desc: "A renderer that will not initialise is no longer fatal: rt drops to XRender on X11 (warn! saying why) and only exits when neither path can draw." }
+        { label: "XRender fallback on GL failure", status: "done", desc: "A renderer that will not initialise is no longer fatal: rt drops to XRender on X11 (warn! saying why) and only exits when neither path can draw." },
+        { label: "Software-GL frame budget", status: "done", desc: "Profiled to the bit on a Milk-V Mars (4x U74, llvmpipe, no GL driver for its PowerVR): rt sat at 2-4 cores while idle. Three causes, all fixed in v0.3.20: the GL config tie-break preferred MORE samples, so llvmpipe's 4x MSAA configs won (every clear/quad shaded 4 samples and each eglSwapBuffers ran a full-window resolve blit, 0.6 core-s); the damage accumulator merged the pane's four touching border bands into their bounding box, so every 'partial' frame scissored the whole pane (and Mesa turns a scissored glClear into a rasterised quad); the latency flare counted rt's own paint time as a stolen frame. Now: never multisample (nothing to gain for pixel-snapped quads), tight damage coalescing + per-rect scissor/clear/draw, own paint time excluded. Same workload: keystrokes 2.5-3.4 -> 0.24 cores, idle tails 1.7-2.4 -> 0.11, output flood 1.5-1.8 -> 0.8. RUST_LOG=rt::frame=debug logs one line per frame (plan, rects, verts, ms, why); RT_FRAME_SYNC=1 adds a glFinish-timed clear/draw/swap split with per-thread CPU ticks. See docs/software-gl-lessons.md and bench/software-gl/." }
       ],
       deps: []
     },

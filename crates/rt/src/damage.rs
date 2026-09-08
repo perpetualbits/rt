@@ -32,6 +32,30 @@ impl PxRect {
             && self.y <= other.bottom()
             && other.y <= self.bottom()
     }
+    pub fn area(&self) -> i64 {
+        if self.is_empty() { 0 } else { self.w as i64 * self.h as i64 }
+    }
+    /// Area shared by the two rectangles (0 when they only touch or are apart).
+    pub fn intersection_area(&self, other: &PxRect) -> i64 {
+        let w = (self.right().min(other.right()) - self.x.max(other.x)).max(0) as i64;
+        let h = (self.bottom().min(other.bottom()) - self.y.max(other.y)).max(0) as i64;
+        w * h
+    }
+    /// Should these two be merged into their union? Only if they overlap or
+    /// touch AND the union adds at most half as many pixels again as the two
+    /// rects cover (waste <= 50% of covered).
+    /// Aligned neighbours (adjacent cells in a row, stacked full-width lines),
+    /// containment and heavy overlap merge; two thin bands meeting at a corner,
+    /// or a cell next to a tall band, stay separate. A merged rect is repainted
+    /// in full, so wasted union area is wasted fragment work.
+    pub fn merges_tightly(&self, other: &PxRect) -> bool {
+        if !self.intersects(other) {
+            return false;
+        }
+        let covered = self.area() + other.area() - self.intersection_area(other);
+        let waste = self.union(other).area() - covered;
+        waste * 2 <= covered
+    }
     /// Smallest rectangle covering both.
     pub fn union(&self, other: &PxRect) -> PxRect {
         let x = self.x.min(other.x);
@@ -146,8 +170,14 @@ impl DamageAccumulator {
     }
 
     /// Coalesce and return this frame's damage. Repeatedly merges any two rects
-    /// that overlap or touch until no more merges are possible, so the renderer
-    /// scissors a handful of regions instead of hundreds of tiny ones.
+    /// that overlap or touch — but only when their union wastes little area
+    /// (see [`PxRect::merges_tightly`]) — until no more merges are possible, so
+    /// the renderer scissors a handful of regions instead of hundreds of tiny
+    /// ones, and a thin L-shape (a pane's border bands) does NOT balloon into
+    /// its bounding box. That distinction is the whole partial-frame budget on
+    /// a software rasteriser: the four 6px bands of a pane touch at the corners,
+    /// and merging them by bounding box made every "partial" frame the whole
+    /// pane, which then swallowed the keystroke's cell too.
     pub fn finish(&self) -> FrameDamage {
         if self.full {
             return FrameDamage::Full;
@@ -157,7 +187,7 @@ impl DamageAccumulator {
             let mut cur = *r;
             let mut i = 0;
             while i < merged.len() {
-                if merged[i].intersects(&cur) {
+                if merged[i].merges_tightly(&cur) {
                     cur = merged[i].union(&cur);
                     merged.swap_remove(i); // re-test cur against the rest
                     i = 0; // reset to re-test grown cur against all remaining elements
@@ -181,6 +211,44 @@ impl Default for DamageAccumulator {
 mod tests {
     use super::*;
     use rt_engine::{CellDamage, Damage};
+
+    /// A pane's four border bands touch at the corners; merging them by bounding
+    /// box would make the "partial" region the whole pane. They must stay four.
+    #[test]
+    fn border_bands_do_not_merge_into_the_pane_bbox() {
+        let mut acc = DamageAccumulator::new();
+        acc.begin_frame();
+        let (x, y, w, h, t) = (8, 8, 1615, 898, 6);
+        acc.add_rect(PxRect { x, y, w, h: 24 }); // titlebar strip
+        acc.add_rect(PxRect { x, y: y + h - t, w, h: t }); // bottom
+        acc.add_rect(PxRect { x, y, w: t, h }); // left
+        acc.add_rect(PxRect { x: x + w - t, y, w: t, h }); // right
+        acc.add_rect(PxRect { x: 400, y: 300, w: 10, h: 19 }); // a keystroke cell in the middle
+        match acc.finish() {
+            FrameDamage::Rects(rs) => {
+                assert_eq!(rs.len(), 5, "{rs:?}");
+                let total: i64 = rs.iter().map(|r| r.area()).sum();
+                assert!(total < 100_000, "damage area ballooned: {total}");
+            }
+            FrameDamage::Full => panic!("expected Rects"),
+        }
+    }
+
+    /// Aligned neighbours still merge: adjacent cells on a row become one span,
+    /// stacked full-width rows become one block, and containment collapses.
+    #[test]
+    fn aligned_neighbours_and_containment_still_merge() {
+        let mut acc = DamageAccumulator::new();
+        acc.begin_frame();
+        acc.add_rect(PxRect { x: 0, y: 0, w: 8, h: 16 });
+        acc.add_rect(PxRect { x: 8, y: 0, w: 8, h: 16 }); // right neighbour
+        acc.add_rect(PxRect { x: 0, y: 16, w: 16, h: 16 }); // row below, same width
+        acc.add_rect(PxRect { x: 2, y: 2, w: 4, h: 4 }); // inside the first
+        match acc.finish() {
+            FrameDamage::Rects(rs) => assert_eq!(rs, vec![PxRect { x: 0, y: 0, w: 16, h: 32 }]),
+            FrameDamage::Full => panic!("expected Rects"),
+        }
+    }
 
     #[test]
     fn cell_span_maps_to_pixels() {
@@ -273,18 +341,19 @@ mod tests {
 
     #[test]
     fn transitive_chain_coalesces_to_one() {
-        // X and C are disjoint from each other, but both intersect Y. Inserting
-        // in the order X, Y, C used to leave X un-merged (scan index not reset
-        // after a merge). All three must collapse into their common bbox.
+        // X and Y are disjoint from each other, but C bridges them (aligned on
+        // one row, so every merge is tight). Inserting in the order X, Y, C used
+        // to leave Y un-merged (scan index not reset after C absorbed X). All
+        // three must collapse into one row span.
         let mut acc = DamageAccumulator::new();
         acc.begin_frame();
-        acc.add_rect(PxRect { x: 0, y: 0, w: 10, h: 10 });   // X: x[0,10] y[0,10]
-        acc.add_rect(PxRect { x: 5, y: 14, w: 10, h: 11 });  // Y: x[5,15] y[14,25]
-        acc.add_rect(PxRect { x: 11, y: 5, w: 10, h: 10 });  // C: x[11,21] y[5,15]
+        acc.add_rect(PxRect { x: 0, y: 0, w: 10, h: 10 });  // X: x[0,10]
+        acc.add_rect(PxRect { x: 20, y: 0, w: 10, h: 10 }); // Y: x[20,30]
+        acc.add_rect(PxRect { x: 10, y: 0, w: 10, h: 10 }); // C: x[10,20], touches both
         match acc.finish() {
             FrameDamage::Rects(rs) => {
                 assert_eq!(rs.len(), 1, "transitive chain must merge to one rect, got {}", rs.len());
-                assert_eq!(rs[0], PxRect { x: 0, y: 0, w: 21, h: 25 });
+                assert_eq!(rs[0], PxRect { x: 0, y: 0, w: 30, h: 10 });
             }
             FrameDamage::Full => panic!("expected Rects"),
         }

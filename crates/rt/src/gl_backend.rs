@@ -26,6 +26,54 @@ pub struct GlBackend {
     context: PossiblyCurrentContext,  // the current GL context
     #[cfg(feature = "x11")]
     x11_present: Option<crate::x11_present::X11Present>, // Route 1: X11 damage-rect present
+    // `RT_FRAME_SYNC=1` diagnostic: glFinish after clear / draw / present and log the
+    // split under the `rt::frame` target. Off (no extra GL calls) unless the env var is set.
+    sync: bool,
+    sync_clear_ms: f64,
+    sync_draw_ms: f64,
+    sync_ticks: [(u64, u64); 4], // (llvmpipe, main) tick deltas: clear, draw, swap, finish
+}
+
+/// `RT_FRAME_SYNC` helper: CPU ticks (utime+stime) consumed so far by this process's
+/// llvmpipe worker threads and by the calling (main) thread. Linux `/proc` only;
+/// returns zeros elsewhere.
+fn proc_ticks() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut lp = 0u64;
+        let mut main = 0u64;
+        let me = unsafe { libc_gettid() };
+        if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
+            for e in rd.flatten() {
+                let Ok(s) = std::fs::read_to_string(e.path().join("stat")) else { continue };
+                // comm is in parens and may hold spaces; split after the closing paren
+                let Some(close) = s.rfind(')') else { continue };
+                let comm = &s[s.find('(').map_or(0, |i| i + 1)..close];
+                let f: Vec<&str> = s[close + 1..].split_whitespace().collect();
+                // fields after ')' : state(0) ppid(1) ... utime(11) stime(12)
+                let t = f.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+                    + f.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                if comm.starts_with("llvmpipe") {
+                    lp += t;
+                } else if e.file_name().to_string_lossy() == me.to_string() {
+                    main = t;
+                }
+            }
+        }
+        (lp, main)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (0, 0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn libc_gettid() -> i64 {
+    extern "C" {
+        fn gettid() -> i32;
+    }
+    gettid() as i64
 }
 
 impl GlBackend {
@@ -42,6 +90,10 @@ impl GlBackend {
             renderer,
             surface,
             context,
+            sync: std::env::var_os("RT_FRAME_SYNC").is_some(),
+            sync_clear_ms: 0.0,
+            sync_draw_ms: 0.0,
+            sync_ticks: [(0, 0); 4],
             #[cfg(feature = "x11")]
             x11_present: crate::x11_present::X11Present::try_new(window),
         }
@@ -119,11 +171,45 @@ impl Backend for GlBackend {
 
     fn begin_frame(&mut self, bg: Color) {
         self.ensure_current(); // frame chokepoint: draw/end_frame/present follow synchronously
-        self.renderer.begin_frame(bg)
+        let t0 = self.sync.then(|| (std::time::Instant::now(), proc_ticks()));
+        self.renderer.begin_frame(bg);
+        if let Some((t0, k0)) = t0 {
+            self.renderer.finish();
+            self.sync_clear_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            self.sync_draw_ms = 0.0;
+            let k1 = proc_ticks();
+            self.sync_ticks = [(k1.0 - k0.0, k1.1 - k0.1), (0, 0), (0, 0), (0, 0)];
+        }
     }
     fn begin_frame_scissored(&mut self, bg: Color, bbox: PxRect) {
         self.ensure_current(); // frame chokepoint (partial path)
-        self.renderer.begin_frame_scissored(bg, bbox)
+        let t0 = self.sync.then(|| (std::time::Instant::now(), proc_ticks()));
+        self.renderer.begin_frame_scissored(bg, bbox);
+        if let Some((t0, k0)) = t0 {
+            self.renderer.finish();
+            self.sync_clear_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            self.sync_draw_ms = 0.0;
+            let k1 = proc_ticks();
+            self.sync_ticks = [(k1.0 - k0.0, k1.1 - k0.1), (0, 0), (0, 0), (0, 0)];
+        }
+    }
+    fn begin_frame_scissored_rects(&mut self, bg: Color, bbox: PxRect, rects: &[PxRect]) {
+        // Too many rects → the bbox: each rect is a scissored clear + a draw call,
+        // and past a point the per-draw overhead beats the fragment savings.
+        const MAX_SCISSOR_RECTS: usize = 24;
+        if rects.is_empty() || rects.len() > MAX_SCISSOR_RECTS {
+            return self.begin_frame_scissored(bg, bbox);
+        }
+        self.ensure_current(); // frame chokepoint (partial path)
+        let t0 = self.sync.then(|| (std::time::Instant::now(), proc_ticks()));
+        self.renderer.begin_frame_scissored_rects(bg, rects);
+        if let Some((t0, k0)) = t0 {
+            self.renderer.finish();
+            self.sync_clear_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            self.sync_draw_ms = 0.0;
+            let k1 = proc_ticks();
+            self.sync_ticks = [(k1.0 - k0.0, k1.1 - k0.1), (0, 0), (0, 0), (0, 0)];
+        }
     }
     fn clear_scissor(&mut self) {
         self.renderer.clear_scissor()
@@ -166,7 +252,24 @@ impl Backend for GlBackend {
         self.renderer.bell_stripe(x, y, w, h)
     }
     fn end_frame(&mut self) {
-        self.renderer.end_frame()
+        let t0 = self.sync.then(|| (std::time::Instant::now(), proc_ticks()));
+        self.renderer.end_frame();
+        if let Some((t0, k0)) = t0 {
+            self.renderer.finish();
+            self.sync_draw_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            let k1 = proc_ticks();
+            self.sync_ticks[1].0 += k1.0 - k0.0;
+            self.sync_ticks[1].1 += k1.1 - k0.1;
+            // RT_FRAME_SYNC=2: is glFinish a real barrier? Sleep and count worker ticks.
+            if std::env::var_os("RT_FRAME_SYNC").is_some_and(|v| v == "2") {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let k2 = proc_ticks();
+                log::debug!(target: "rt::frame", "gl-sync gap-after-draw-finish 400ms [lp{} m{}]", k2.0 - k1.0, k2.1 - k1.1);
+            }
+        }
+    }
+    fn frame_verts(&self) -> Option<usize> {
+        Some(self.renderer.frame_verts())
     }
 
     fn resize_surface(&mut self, w: NonZeroU32, h: NonZeroU32) {
@@ -175,42 +278,29 @@ impl Backend for GlBackend {
     }
 
     fn present(&mut self, window: &dyn Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
-        match damage {
-            // --- full path (was redraw_full's tail), verbatim ---------------
-            None => {
-                #[cfg(feature = "x11")]
-                if let Some(p) = self.x11_present.as_ref() {
-                    let sz = window.surface_size();
-                    let (w, h) = (sz.width as i32, sz.height as i32);
-                    if p.present_rect(self.renderer.gl_ctx(), 0, 0, w, h, h) {
-                        return false; // presented the full window via XPutImage; no swap
-                    }
-                    // present failed → fall through to swap_buffers
-                }
-                if let Err(e) = self.surface.swap_buffers(&self.context) {
-                    log::error!("swap_buffers failed: {e}"); // non-fatal; log and continue
-                }
-                false
-            }
-            // --- scissored path (was redraw_scissored's tail), verbatim -----
-            Some((bbox, hint_rects)) => {
-                #[cfg(not(feature = "x11"))]
-                let _ = bbox; // bbox is only consumed by the (cfg'd-out) Route-1 branch
-                #[cfg(feature = "x11")]
-                if let Some(p) = self.x11_present.as_ref() {
-                    let sh = window.surface_size().height as i32;
-                    if p.present_rect(self.renderer.gl_ctx(), bbox.x, bbox.y, bbox.w, bbox.h, sh) {
-                        return false; // presented the damage rect via XPutImage; no swap, no re-arm
-                    }
-                    // present failed → fall through to the full-redraw fallback
-                }
-                // EGL partial swap; if it isn't available/fails, tell the caller to
-                // run a full redraw + full swap this frame (and force full next).
-                !self.present_with_damage(window, hint_rects)
-            }
+        let t0 = self.sync.then(|| (std::time::Instant::now(), proc_ticks()));
+        let r = self.present_inner(window, damage);
+        if let Some((t0, k0)) = t0 {
+            let swap_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let k1 = proc_ticks();
+            let t1 = std::time::Instant::now();
+            self.renderer.finish();
+            let finish_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let k2 = proc_ticks();
+            self.sync_ticks[2] = (k1.0 - k0.0, k1.1 - k0.1);
+            self.sync_ticks[3] = (k2.0 - k1.0, k2.1 - k1.1);
+            let t = self.sync_ticks;
+            log::debug!(
+                target: "rt::frame",
+                "gl-sync clear={:.1}ms[lp{} m{}] draw={:.1}ms[lp{} m{}] swap={:.1}ms[lp{} m{}] finish={:.1}ms[lp{} m{}]",
+                self.sync_clear_ms, t[0].0, t[0].1,
+                self.sync_draw_ms, t[1].0, t[1].1,
+                swap_ms, t[2].0, t[2].1,
+                finish_ms, t[3].0, t[3].1
+            );
         }
+        r
     }
-
     fn full_swap(&mut self) {
         if let Err(e) = self.surface.swap_buffers(&self.context) {
             log::error!("swap_buffers failed: {e}");
@@ -248,6 +338,47 @@ impl Backend for GlBackend {
         #[cfg(not(feature = "x11"))]
         {
             false
+        }
+    }
+}
+
+impl GlBackend {
+    /// The real `present` (timing wrapper above). Full path: Route-1 X11 present or
+    /// `swap_buffers`; partial: Route-1 bbox present or EGL partial swap.
+    fn present_inner(&mut self, window: &dyn Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
+        match damage {
+            // --- full path (was redraw_full's tail), verbatim ---------------
+            None => {
+                #[cfg(feature = "x11")]
+                if let Some(p) = self.x11_present.as_ref() {
+                    let sz = window.surface_size();
+                    let (w, h) = (sz.width as i32, sz.height as i32);
+                    if p.present_rect(self.renderer.gl_ctx(), 0, 0, w, h, h) {
+                        return false; // presented the full window via XPutImage; no swap
+                    }
+                    // present failed → fall through to swap_buffers
+                }
+                if let Err(e) = self.surface.swap_buffers(&self.context) {
+                    log::error!("swap_buffers failed: {e}"); // non-fatal; log and continue
+                }
+                false
+            }
+            // --- scissored path (was redraw_scissored's tail), verbatim -----
+            Some((bbox, hint_rects)) => {
+                #[cfg(not(feature = "x11"))]
+                let _ = bbox; // bbox is only consumed by the (cfg'd-out) Route-1 branch
+                #[cfg(feature = "x11")]
+                if let Some(p) = self.x11_present.as_ref() {
+                    let sh = window.surface_size().height as i32;
+                    if p.present_rect(self.renderer.gl_ctx(), bbox.x, bbox.y, bbox.w, bbox.h, sh) {
+                        return false; // presented the damage rect via XPutImage; no swap, no re-arm
+                    }
+                    // present failed → fall through to the full-redraw fallback
+                }
+                // EGL partial swap; if it isn't available/fails, tell the caller to
+                // run a full redraw + full swap this frame (and force full next).
+                !self.present_with_damage(window, hint_rects)
+            }
         }
     }
 }

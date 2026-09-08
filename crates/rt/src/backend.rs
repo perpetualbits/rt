@@ -37,6 +37,13 @@ pub trait Backend {
     // --- per-frame drawing (mirrors render.rs exactly) --------------------
     fn begin_frame(&mut self, bg: Color);
     fn begin_frame_scissored(&mut self, bg: Color, bbox: PxRect);
+    /// Partial frame clipped to each of `rects` separately (their union is
+    /// `bbox`). Backends whose partial cost is per-pixel (GL) override this;
+    /// the default keeps the bbox behaviour (XRender trims its own requests).
+    fn begin_frame_scissored_rects(&mut self, bg: Color, bbox: PxRect, rects: &[PxRect]) {
+        let _ = rects;
+        self.begin_frame_scissored(bg, bbox)
+    }
     fn clear_scissor(&mut self);
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color);
     fn fill_cell(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color);
@@ -48,6 +55,11 @@ pub trait Backend {
     fn cursor_beam(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color);
     fn bell_stripe(&mut self, x: f32, y: f32, w: f32, h: f32);
     fn end_frame(&mut self);
+    /// Vertices drawn this frame, if the backend batches geometry (GL). For the
+    /// `rt::frame` debug log only.
+    fn frame_verts(&self) -> Option<usize> {
+        None
+    }
 
     // --- anti-aliased chrome primitives (native XRender chrome, Slice 2) ---
     // Default no-ops: the GL backend never draws native chrome (it uses egui),

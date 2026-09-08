@@ -383,6 +383,8 @@ pub struct Renderer {
     shelf_y: i32,                      // top y of the current shelf
     shelf_h: i32,                      // height of the current shelf
     verts: Vec<f32>,                   // per-frame vertex scratch (cleared each frame)
+    frame_verts: usize,                // vertices drawn since the last begin_frame* (frame log)
+    scissor_rects: Vec<crate::damage::PxRect>, // >1 entries: end_frame draws once per rect (partial frames)
     screen: (f32, f32),                // current viewport size in pixels
     software: bool,                    // GL renderer is software (llvmpipe/swrast) → repaints are CPU-expensive
 }
@@ -393,6 +395,17 @@ impl Renderer {
     /// throttles animated chrome. Detected once from `GL_RENDERER`.
     pub fn is_software(&self) -> bool {
         self.software
+    }
+
+    /// Block until every queued GL command has executed (`glFinish`). Only the
+    /// `RT_FRAME_SYNC` diagnostic uses it, to attribute frame time per phase.
+    pub fn finish(&self) {
+        unsafe { self.gl.finish() }
+    }
+
+    /// Vertices drawn since the last `begin_frame*` (for the `rt::frame` debug log).
+    pub fn frame_verts(&self) -> usize {
+        self.frame_verts
     }
 
     /// Borrow the GL context (for the X11 readback present path).
@@ -522,6 +535,8 @@ impl Renderer {
                 shelf_h: 0,
                 verts: Vec::new(),
                 screen: (0.0, 0.0),
+                frame_verts: 0,
+                scissor_rects: Vec::new(),
             })
         }
     }
@@ -622,6 +637,7 @@ impl Renderer {
     /// Start a frame: clear the framebuffer to `bg` and reset the vertex buffer.
     pub fn begin_frame(&mut self, bg: Color) {
         self.verts.clear(); // drop last frame's geometry
+        self.frame_verts = 0;
         // Clear to a PREMULTIPLIED background so the alpha channel carries the
         // window's opacity: bg.3 < 1 makes the empty areas translucent, and the
         // rgb is pre-scaled by that alpha to match the premultiplied blend mode.
@@ -646,17 +662,40 @@ impl Renderer {
     /// frame's pixels (the present layer guarantees the back buffer is
     /// preserved). The following `end_frame()` draw is clipped to `bbox` too.
     pub fn begin_frame_scissored(&mut self, bg: Color, bbox: crate::damage::PxRect) {
+        self.begin_frame_scissored_rects(bg, &[bbox])
+    }
+
+    /// Begin a partial frame that clears and redraws ONLY `rects` (each is
+    /// scissored separately), not their bounding box. Everything outside every
+    /// rect keeps the previous frame's pixels. `end_frame` then issues the
+    /// frame's single vertex batch once per rect, so fragment work — and, on a
+    /// software rasteriser, the clear, which Mesa's state tracker turns into a
+    /// drawn quad whenever the scissor test is on — is proportional to the
+    /// damaged AREA. With the pane's thin border bands folded into every
+    /// partial frame, the bounding box was the whole pane; the rects are ~5%
+    /// of it. An empty `rects` clears and draws nothing (zero-area scissor).
+    pub fn begin_frame_scissored_rects(&mut self, bg: Color, rects: &[crate::damage::PxRect]) {
         self.verts.clear(); // drop last frame's geometry
+        self.frame_verts = 0;
+        self.scissor_rects.clear();
+        self.scissor_rects.extend(rects.iter().copied().filter(|r| !r.is_empty()));
         let a = bg.3; // premultiplied clear, matching begin_frame
-        let (sx, sy, sw, sh) = scissor_box(bbox, self.screen.1 as i32);
+        let screen_h = self.screen.1 as i32;
         unsafe {
-            self.gl.viewport(0, 0, self.screen.0 as i32, self.screen.1 as i32);
-            self.gl.enable(glow::SCISSOR_TEST); // clip clears AND draws to bbox
-            self.gl.scissor(sx, sy, sw, sh);
+            self.gl.viewport(0, 0, self.screen.0 as i32, screen_h);
+            self.gl.enable(glow::SCISSOR_TEST); // clip clears AND draws to the rects
             self.gl.enable(glow::BLEND);
             self.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
             self.gl.clear_color(bg.0 * a, bg.1 * a, bg.2 * a, a);
-            self.gl.clear(glow::COLOR_BUFFER_BIT); // scissor confines this to bbox
+            if self.scissor_rects.is_empty() {
+                self.gl.scissor(0, 0, 0, 0); // nothing to repaint: clip every draw away
+            }
+            for r in &self.scissor_rects {
+                let (sx, sy, sw, sh) = scissor_box(*r, screen_h);
+                self.gl.scissor(sx, sy, sw, sh);
+                self.gl.clear(glow::COLOR_BUFFER_BIT); // scissor confines this to the rect
+            }
+            // Leave the scissor on the last rect; end_frame re-sets it per rect.
         }
     }
 
@@ -664,6 +703,7 @@ impl Renderer {
     /// frame so egui and the next `begin_frame`/`begin_frame_scissored` start
     /// from a known-clean state.
     pub fn clear_scissor(&mut self) {
+        self.scissor_rects.clear();
         unsafe {
             self.gl.disable(glow::SCISSOR_TEST);
             self.gl.scissor(0, 0, self.screen.0 as i32, self.screen.1 as i32);
@@ -1000,6 +1040,7 @@ impl Renderer {
             return; // nothing to draw this frame
         }
         let vertex_count = (self.verts.len() / FLOATS_PER_VERTEX) as i32; // #vertices
+        self.frame_verts += vertex_count as usize;
         unsafe {
             self.gl.use_program(Some(self.program)); // select our shader
             // Set the viewport-size uniform so the vertex shader maps pixels.
@@ -1015,8 +1056,19 @@ impl Renderer {
                 self.verts.len() * 4, // 4 bytes per f32
             );
             self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
-            // One draw call for the whole frame's quads.
-            self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
+            if self.scissor_rects.len() > 1 {
+                // Multi-rect partial frame: the same batch once per rect, each
+                // scissored to that rect (vertex work is trivial; fragments are not).
+                let screen_h = self.screen.1 as i32;
+                for r in &self.scissor_rects {
+                    let (sx, sy, sw, sh) = scissor_box(*r, screen_h);
+                    self.gl.scissor(sx, sy, sw, sh);
+                    self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
+                }
+            } else {
+                // One draw call for the whole frame's quads.
+                self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
+            }
         }
         // Clear the batch so end_frame is idempotent: a caller may flush again
         // after the content pass (to emit native chrome batched during the

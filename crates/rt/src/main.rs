@@ -531,7 +531,9 @@ struct Active {
     heat_last: Instant,                   // wall-clock of the last heat sample
     lat_phase: f32,                       // phase of the latency frame's undulation
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
+    frame_why: u16,                       // `rt::frame` debug log: what asked for the pending repaint (FRAME_WHY_*)
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
+    paint_secs: f32,                      // rt's OWN time (paints + the previous tick) since the last tick; excluded from the stall measure
     // RT_XDIAG loop-side diagnostic: is the event loop iterating fast (input
     // delivery is the bottleneck) or stalling (a blocking op per iteration)?
     ld_on: bool,
@@ -1452,10 +1454,20 @@ impl App {
                 if at != bt {
                     return if bt { b } else { a }; // the transparency-capable one wins
                 }
-                // Tie on transparency: prefer more alpha, then more samples.
+                // Tie on transparency: prefer more alpha, then FEWER samples.
+                //
+                // Never multisample. rt draws axis-aligned, pixel-snapped textured
+                // quads (glyphs, cell backgrounds, hairlines), which MSAA cannot
+                // improve — it only anti-aliases triangle edges, and ours sit on
+                // pixel boundaries. What it does cost is real on every platform:
+                // N sample planes to clear and shade, and a full-window resolve
+                // blit through the fragment pipeline on every swap. On a software
+                // renderer that resolve alone was ~0.6 core-seconds per frame on a
+                // riscv64 board (llvmpipe's 4x configs sort AFTER the plain ones,
+                // so the old "prefer more samples" tie-break picked them).
                 let better_alpha = b.alpha_size() > a.alpha_size();
-                let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
-                if better_alpha || same_more_samples { b } else { a }
+                let same_fewer_samples = b.alpha_size() == a.alpha_size() && b.num_samples() < a.num_samples();
+                if better_alpha || same_fewer_samples { b } else { a }
             });
             let gl_config = match gl_config {
                 Some(c) => c,
@@ -1464,6 +1476,13 @@ impl App {
                     return self.fail_build(event_loop);
                 }
             };
+            log::info!(
+                "GL config: alpha={} samples={} depth={} transparency={:?}",
+                gl_config.alpha_size(),
+                gl_config.num_samples(),
+                gl_config.depth_size(),
+                gl_config.supports_transparency()
+            );
             (gl_display, gl_config)
         };
 
@@ -1983,7 +2002,9 @@ impl App {
             heat_last: Instant::now(),
             lat_phase: 0.0,
             stall: 0.0,
+            frame_why: 0,
             last_wake: Instant::now(),
+            paint_secs: 0.0,
             ld_on: std::env::var_os("RT_XDIAG").is_some(),
             ld_last: Instant::now(),
             ld_prev: Instant::now(),
@@ -3988,9 +4009,14 @@ impl App {
         // fixed 16ms — otherwise an intentional idle wake (100ms apart) would be
         // misread as a stolen frame and flare the latency instrument forever,
         // which would in turn force repaints and defeat the throttle.
+        // Our own paint time is not a stolen frame: on a software renderer a
+        // frame can take longer than the poll budget by itself, and counting it
+        // would flare the instrument, which requests a repaint, which overruns…
+        let own_paint = std::mem::take(&mut active.paint_secs);
         let budget = active.poll_ms as f32 / 1000.0;
-        let overrun = wake_dt - budget;
+        let overrun = wake_dt - budget - own_paint;
         if active.poll_ms <= 16 && overrun > 0.010 {
+            log::debug!(target: "rt::frame", "stall: wake_dt={:.1}ms budget={:.0}ms own_paint={:.1}ms overrun={:.1}ms", wake_dt * 1000.0, budget * 1000.0, own_paint * 1000.0, overrun * 1000.0);
             active.stall = active.stall.max((overrun / 0.05).clamp(0.0, 1.0)); // keep the worst recent hitch
         }
         active.lat_phase = (active.lat_phase + 0.12 * wake_dt).fract(); // calm breath
@@ -4038,6 +4064,7 @@ impl App {
                             // flow instrument, keep the fast poll, and schedule a redraw.
                             active.meters.entry(id).or_default().wakeups += 1;
                             active.active_until = now + ACTIVE_TAIL;
+                            active.frame_why |= FRAME_WHY_OUTPUT;
                             dirty = true;
                         }
                     }
@@ -4224,12 +4251,15 @@ impl App {
             }
             if heat_live {
                 anim = true; // a warm pane's heat border stays live
+                active.frame_why |= FRAME_WHY_HEAT;
             }
             if active.meters.values().any(|m| m.rate > 0.5) {
                 anim = true; // output-flow easing to a stop
+                active.frame_why |= FRAME_WHY_METER;
             }
             if active.stall > 0.02 {
                 anim = true; // latency flare fading out
+                active.frame_why |= FRAME_WHY_STALL;
             }
         }
         // The focused cursor soft-blinks for a bounded window after typing — but a
@@ -4239,6 +4269,7 @@ impl App {
             && active.last_input.elapsed() < Duration::from_secs_f32(CURSOR_BLINK_PERIOD * CURSOR_BLINK_CYCLES);
         if blinking {
             anim = true;
+            active.frame_why |= FRAME_WHY_BLINK;
         }
         // Let animation drive a repaint, but throttle it to ~2 fps on a software
         // renderer (llvmpipe — a weak or remote box) so the bling can't peg the
@@ -4249,6 +4280,7 @@ impl App {
         let anim_min = if active.low_power { Duration::from_millis(500) } else { Duration::ZERO };
         if anim && active.backend.is_gl() && now.duration_since(active.last_anim) >= anim_min {
             active.last_anim = now;
+            active.frame_why |= FRAME_WHY_ANIM;
             dirty = true;
         }
         // Native (XRender) path: the instrument LAYER redraws on its own fixed
@@ -4307,6 +4339,9 @@ impl App {
             IDLE_POLL
         };
         active.poll_ms = interval.as_millis() as u64;
+        // This tick's own duration is not a stolen frame either (sampling heat via
+        // /proc, draining panes and pumping wires cost real ms on a slow core).
+        active.paint_secs += now.elapsed().as_secs_f32();
         (false, interval, drag_payload_died)
     }
 }
@@ -4319,6 +4354,19 @@ impl App {
 /// on the partial path. `top_h` widens the top band to cover the titlebar strip
 /// (focus tint + title text) when the titlebar is shown; 0 leaves it at `BORDER_PX`.
 const BORDER_PX: i32 = 6;
+
+// `rt::frame` debug-log reason bits (see `Active::frame_why`).
+const FRAME_WHY_OUTPUT: u16 = 1;
+const FRAME_WHY_ANIM: u16 = 2;
+const FRAME_WHY_HEAT: u16 = 4;
+const FRAME_WHY_METER: u16 = 8;
+const FRAME_WHY_STALL: u16 = 16;
+const FRAME_WHY_BLINK: u16 = 32;
+fn frame_why_str(why: u16) -> String {
+    let names = [(FRAME_WHY_OUTPUT, "output"), (FRAME_WHY_ANIM, "anim"), (FRAME_WHY_HEAT, "heat"), (FRAME_WHY_METER, "meter"), (FRAME_WHY_STALL, "stall"), (FRAME_WHY_BLINK, "blink")];
+    let s: Vec<&str> = names.iter().filter(|(b, _)| why & b != 0).map(|(_, n)| *n).collect();
+    if s.is_empty() { "other".to_string() } else { s.join("+") }
+}
 fn border_bands(rect: Rect, top_h: i32) -> [crate::damage::PxRect; 4] {
     use crate::damage::PxRect;
     let (x, y, w, h) = (rect.x as i32, rect.y as i32, rect.w as i32, rect.h as i32);
@@ -6910,12 +6958,14 @@ impl App {
     /// Repaint one window: fill each pane's background, draw its visible
     /// grid, then outline the focused pane. Finally swap buffers.
     fn redraw(&mut self, id: WindowId) {
+        let paint_t0 = Instant::now(); // whole handler: snapshots, buffer-age query, draw, present
         let Some(active) = self.windows.get_mut(&id) else { return };
         // A window resize is in flight: the backend surface is still the old size
         // and every frame drawn now is discarded by the settle frame. Painting
         // here is what produced the 5-12 visible intermediate steps; skip it and
         // let the settle repaint once, at the resting size (see Resized).
         if active.surface_pending.is_some() {
+            active.paint_secs += paint_t0.elapsed().as_secs_f32();
             return;
         }
         // Multi-window: target THIS window's GL context before any backend work
@@ -7017,6 +7067,7 @@ impl App {
         if Self::redraw_scroll_blit(active, bg, bounds, &snapshots, chrome_moved, overlay_open, cw, ch) {
             active.force_full = false; // a clean scroll frame; overlay_open was false to get here
             active.last_focus = active.session.focus();
+            active.paint_secs += paint_t0.elapsed().as_secs_f32();
             return;
         }
         // Chrome egui blends every frame (focus outline, border instruments)
@@ -7067,6 +7118,17 @@ impl App {
         // Fold in recent frames' damage per the back-buffer age, and decide.
         let plan = Self::plan_frame(active, frame_damage);
 
+        // `rt::frame` debug log (RUST_LOG=rt::frame=debug): one line per presented
+        // frame — plan, scissor box, rect count, vertices, wall time, and what asked
+        // for it. Free when the target is off.
+        let frame_log = log::log_enabled!(target: "rt::frame", log::Level::Debug);
+        let t0 = frame_log.then(Instant::now);
+        let (plan_desc, px) = match &plan {
+            FramePlan::Full => ("full".to_string(), (size.width * size.height) as i64),
+            FramePlan::Partial(b, rs) => {
+                (format!("partial {}x{}@{},{} rects={}", b.w, b.h, b.x, b.y, rs.len()), (b.w as i64) * (b.h as i64))
+            }
+        };
         let force_next = match plan {
             FramePlan::Full => {
                 self.redraw_full(id, bg, bounds, snapshots); // today's exact path
@@ -7076,6 +7138,23 @@ impl App {
                 self.redraw_scissored(id, bg, bounds, snapshots, bbox, &hint_rects)
             }
         };
+        if let Some(active) = self.windows.get_mut(&id) {
+            active.paint_secs += paint_t0.elapsed().as_secs_f32();
+        }
+        if let Some(t0) = t0 {
+            if let Some(active) = self.windows.get_mut(&id) {
+                let why = std::mem::take(&mut active.frame_why);
+                log::debug!(
+                    target: "rt::frame",
+                    "{plan_desc} px={px} verts={} ms={:.1} why={} win={}x{}",
+                    active.backend.frame_verts().unwrap_or(0),
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    frame_why_str(why),
+                    size.width,
+                    size.height
+                );
+            }
+        }
         // Clear the per-frame force flag. An overlay visible this frame (its
         // pixels must be cleared when it closes) or a failed partial swap arms a
         // full redraw next frame; specific handlers also re-arm it.
@@ -7850,7 +7929,7 @@ impl App {
         hint_rects: &[crate::damage::PxRect],
     ) -> bool {
         let Some(active) = self.windows.get_mut(&id) else { return false };
-        active.backend.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
+        active.backend.begin_frame_scissored_rects(bg, bbox, hint_rects); // clear + draw each damage rect, not the bbox
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame();
         // GL blends its egui instruments into the scissored region every frame.
