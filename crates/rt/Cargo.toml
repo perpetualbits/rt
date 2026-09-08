@@ -44,6 +44,7 @@ x11 = ["winit/x11", "glutin/glx", "glutin/x11", "dep:arboard", "dep:x11rb"]
 
 [dependencies]
 rt-core = { path = "../rt-core" }
+rustc-hash = "1.1"                  # glyph-cache key hashing: SipHash was 24% of a frame on a slow core
 rt-config = { path = "../rt-config" }
 rt-engine = { path = "../rt-engine" }
 rt-session = { path = "../rt-session" }

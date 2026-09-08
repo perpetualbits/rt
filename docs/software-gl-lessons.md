@@ -139,3 +139,58 @@ this board's memcpy speed), about 0.1 core-s, down from ~1.9.
 * Startup still JIT-compiles llvmpipe's shader variants for the config in
   use (once per Mesa version; `~/.cache/mesa_shader_cache_db`). The first
   run after this change pays it again because the non-MSAA variants are new.
+
+## Part two: hardware GL on a slow CPU (v0.3.21)
+
+The day after v0.3.20 the same board rebooted with its PowerVR GLES driver
+active (the `xfce-wayland-pvr` session sets `__EGL_VENDOR_LIBRARY_FILENAMES`
+to the PVR vendor file and `GBM_BACKENDS_PATH=/usr/lib/pvr-gbm`). No llvmpipe
+threads any more — and rt still burned ~0.9 cores with btop in a pane, this
+time entirely on its own main thread. Symbolized profile (addr2line over
+`perf script`, since riscv `$x` mapping symbols hide names in `perf report`):
+
+| function | share |
+|---|---|
+| `GlBackend::draw_char` | 27% |
+| `App::draw_panes` | 24% |
+| `Renderer::push_quad` | 21% |
+| SipHash of the glyph-cache key `(char, bool, bool)` | 24% |
+
+Three policies, all sized for x86, made a CPU-bound repaint loop here:
+
+1. **Hardware GL always took the full-frame path.** "Repaints are cheap on a
+   GPU" is true of rasterising; it is not true of building 7000 glyph quads on
+   the CPU 25 times a second. Now EGL buffer age decides on every GL backend
+   (a driver that does not report it gets age 0 → full frame, as before). The
+   focused cursor cell is added to the damage each frame so its blink pulse
+   (which changes no cell) still repaints.
+2. **The scissor clipped fragments, but the CPU still visited every cell.**
+   `draw_panes` now builds geometry only for cells within one cell of the
+   applied clip (the margin keeps overhanging glyphs repainted with their
+   neighbour). The backend reports the clip it actually applied (the rects on
+   GL, the bbox elsewhere) so the culling can never be tighter than the clear.
+3. **The glyph cache hashed with SipHash**, a quarter of every frame on a U74.
+   ASCII (nearly every cell) is a direct table lookup now; the rest use
+   `rustc-hash`. Instrument animation on hardware GL runs at ~30 fps instead
+   of on every 16 ms wake.
+
+The same loop cost ~0.2 cores on dop561 (x86, real GPU) with a streaming pane,
+so this is not a milkv-only win.
+
+Measured first on dop561 (NVIDIA RTX A500, Wayland, headless weston with the GL
+renderer — the same harness, `RT_BENCH_HOME` pointed at a scratch dir), because a
+PowerVR client presenting to a compositor that itself runs on llvmpipe segfaults
+inside the vendor driver on the Mars, shipped v0.3.20 included; the PowerVR
+numbers come from the live session there.
+
+| phase (dop561, NVIDIA) | v0.3.20 (cores) | v0.3.21 (cores) |
+|---|---|---|
+| start-up + blink | 0.17 | 0.06 |
+| 1 keystroke / s | 0.08 | 0.03 |
+| easing after the flood | 0.63 | 0.01 |
+| hot child, no output | 0.02 | 0.01 |
+| median frame (wall) | 24 ms, every frame full | 2.3 ms, 5 rects |
+
+One more thing the frame log (`age=`) showed on NVIDIA: the driver reports
+buffer age 3 (triple buffering) and rt kept only two frames of damage history,
+so every frame there had silently been full. `HISTORY_DEPTH` is 4 now.

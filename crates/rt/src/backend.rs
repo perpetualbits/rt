@@ -40,9 +40,12 @@ pub trait Backend {
     /// Partial frame clipped to each of `rects` separately (their union is
     /// `bbox`). Backends whose partial cost is per-pixel (GL) override this;
     /// the default keeps the bbox behaviour (XRender trims its own requests).
-    fn begin_frame_scissored_rects(&mut self, bg: Color, bbox: PxRect, rects: &[PxRect]) {
+    /// Returns the clip the backend actually applied (the rects, or `[bbox]`),
+    /// so the caller can skip building geometry that lands outside it.
+    fn begin_frame_scissored_rects(&mut self, bg: Color, bbox: PxRect, rects: &[PxRect]) -> Vec<PxRect> {
         let _ = rects;
-        self.begin_frame_scissored(bg, bbox)
+        self.begin_frame_scissored(bg, bbox);
+        vec![bbox]
     }
     fn clear_scissor(&mut self);
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color);

@@ -193,12 +193,13 @@ impl Backend for GlBackend {
             self.sync_ticks = [(k1.0 - k0.0, k1.1 - k0.1), (0, 0), (0, 0), (0, 0)];
         }
     }
-    fn begin_frame_scissored_rects(&mut self, bg: Color, bbox: PxRect, rects: &[PxRect]) {
+    fn begin_frame_scissored_rects(&mut self, bg: Color, bbox: PxRect, rects: &[PxRect]) -> Vec<PxRect> {
         // Too many rects → the bbox: each rect is a scissored clear + a draw call,
         // and past a point the per-draw overhead beats the fragment savings.
         const MAX_SCISSOR_RECTS: usize = 24;
         if rects.is_empty() || rects.len() > MAX_SCISSOR_RECTS {
-            return self.begin_frame_scissored(bg, bbox);
+            self.begin_frame_scissored(bg, bbox);
+            return vec![bbox];
         }
         self.ensure_current(); // frame chokepoint (partial path)
         let t0 = self.sync.then(|| (std::time::Instant::now(), proc_ticks()));
@@ -210,6 +211,7 @@ impl Backend for GlBackend {
             let k1 = proc_ticks();
             self.sync_ticks = [(k1.0 - k0.0, k1.1 - k0.1), (0, 0), (0, 0), (0, 0)];
         }
+        rects.to_vec()
     }
     fn clear_scissor(&mut self) {
         self.renderer.clear_scissor()

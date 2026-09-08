@@ -297,6 +297,55 @@ fn scissored_multi_rect_equals_full_redraw() {
     assert_eq!(&px[i..i + 3], &want, "pixel inside the bbox but outside the rects was clobbered");
 }
 
+/// Real glyphs through both cache paths (ASCII table and the non-ASCII map):
+/// a per-cell partial redraw of "Hé" + bold H must equal the full redraw, and
+/// repeating the draw (now cache hits) must produce the same pixels.
+#[test]
+#[ignore = "needs a live GL context; run with --ignored on a GL-capable box"]
+fn glyphs_via_both_cache_paths_are_pixel_identical() {
+    let ctx = match egl_headless::make(W as u32, H as u32) {
+        Ok(c) => c,
+        Err(e) => panic!("could not create a headless GL context: {e}"),
+    };
+    let gl = ctx.glow();
+    let blobs = test_fonts();
+    let mut r = Renderer::new(gl.clone(), &blobs, 16.0).expect("renderer");
+    r.resize(W as f32, H as f32);
+    let bg = Color::rgb(0x10, 0x10, 0x18).with_alpha(1.0);
+    let fg = Color::rgb(0xe0, 0xe0, 0xe0).with_alpha(1.0);
+    let (cw, ch) = r.cell_size();
+    let (cwi, chi) = (cw as i32, ch as i32);
+    let text = |r: &mut Renderer| {
+        r.draw_char(0.0, 0.0, 2, 1, 'H', fg, false, false); // ASCII path
+        r.draw_char(0.0, 0.0, 3, 1, 'é', fg, false, false); // map path
+        r.draw_char(0.0, 0.0, 4, 1, 'H', fg, true, false); // ASCII, bold slot
+    };
+    r.begin_frame(bg);
+    text(&mut r);
+    r.end_frame();
+    let first = egl_headless::read_pixels(&gl, W, H);
+    r.begin_frame(bg);
+    text(&mut r); // all cache hits now
+    r.end_frame();
+    let second = egl_headless::read_pixels(&gl, W, H);
+    assert_eq!(first, second, "cache hits drew different pixels than the first rasterisation");
+    r.begin_frame(bg);
+    r.end_frame();
+    let bg_only = egl_headless::read_pixels(&gl, W, H);
+    assert!(first.iter().zip(&bg_only).any(|(a, b)| a != b), "no glyph pixels were drawn");
+    // Partial: prior frame bg, then only the three cells as three rects.
+    r.begin_frame(bg);
+    r.end_frame();
+    let cells: Vec<PxRect> = (2..5).map(|c| PxRect { x: c * cwi, y: chi, w: cwi, h: chi }).collect();
+    r.begin_frame_scissored_rects(bg, &cells);
+    text(&mut r);
+    r.end_frame();
+    r.clear_scissor();
+    let partial = egl_headless::read_pixels(&gl, W, H);
+    let diffs = first.iter().zip(&partial).filter(|(a, b)| a != b).count();
+    assert_eq!(diffs, 0, "{diffs} bytes differ between full and per-cell scissored glyph redraw");
+}
+
 /// Build a `FontBlobs` from the first readable common monospace TTF. Only the
 /// regular chain must be non-empty for `Renderer::new` (it measures the cell
 /// from the primary face); `bell_stripe` itself rasterises no glyphs.

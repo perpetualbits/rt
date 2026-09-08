@@ -534,6 +534,8 @@ struct Active {
     frame_why: u16,                       // `rt::frame` debug log: what asked for the pending repaint (FRAME_WHY_*)
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
     paint_secs: f32,                      // rt's OWN time (paints + the previous tick) since the last tick; excluded from the stall measure
+    frame_clip: Option<Vec<crate::damage::PxRect>>, // the partial frame's applied clip: draw_panes builds geometry only near it
+    frame_age: u32,                       // EGL buffer age seen by the last plan_frame (0 = driver reports none → full frames); frame log
     // RT_XDIAG loop-side diagnostic: is the event loop iterating fast (input
     // delivery is the bottleneck) or stalling (a blocking op per iteration)?
     ld_on: bool,
@@ -2005,6 +2007,8 @@ impl App {
             frame_why: 0,
             last_wake: Instant::now(),
             paint_secs: 0.0,
+            frame_clip: None,
+            frame_age: 0,
             ld_on: std::env::var_os("RT_XDIAG").is_some(),
             ld_last: Instant::now(),
             ld_prev: Instant::now(),
@@ -4277,7 +4281,7 @@ impl App {
         // GL path: a throttled full-frame repaint drives egui's inline instrument
         // animation (target "A"). Software GL caps this at ~2fps so the bling can't
         // peg the CPU; on a real GPU it repaints every frame.
-        let anim_min = if active.low_power { Duration::from_millis(500) } else { Duration::ZERO };
+        let anim_min = if active.low_power { Duration::from_millis(500) } else { ANIM_MIN_HW };
         if anim && active.backend.is_gl() && now.duration_since(active.last_anim) >= anim_min {
             active.last_anim = now;
             active.frame_why |= FRAME_WHY_ANIM;
@@ -4367,6 +4371,43 @@ fn frame_why_str(why: u16) -> String {
     let s: Vec<&str> = names.iter().filter(|(b, _)| why & b != 0).map(|(_, n)| *n).collect();
     if s.is_empty() { "other".to_string() } else { s.join("+") }
 }
+/// The horizontal extents of the clip rects that overlap the band `y0..y1`
+/// (window px). Empty means nothing in that band needs geometry.
+fn clip_row_spans(clip: &[crate::damage::PxRect], y0: f32, y1: f32) -> Vec<(f32, f32)> {
+    clip.iter()
+        .filter(|r| (r.y as f32) < y1 && (r.bottom() as f32) > y0)
+        .map(|r| (r.x as f32, r.right() as f32))
+        .collect()
+}
+
+/// Does any span overlap `x0..x1`?
+fn clip_span_hit(spans: &[(f32, f32)], x0: f32, x1: f32) -> bool {
+    spans.iter().any(|&(a, b)| a < x1 && b > x0)
+}
+
+#[cfg(test)]
+mod clip_cull_tests {
+    use super::*;
+    use crate::damage::PxRect;
+
+    #[test]
+    fn rows_outside_every_rect_get_no_spans() {
+        let clip = [PxRect { x: 100, y: 200, w: 50, h: 20 }];
+        assert!(clip_row_spans(&clip, 0.0, 100.0).is_empty());
+        assert!(clip_row_spans(&clip, 220.0, 240.0).is_empty()); // touching the bottom edge: out
+        assert_eq!(clip_row_spans(&clip, 190.0, 210.0), vec![(100.0, 150.0)]);
+    }
+
+    #[test]
+    fn cells_are_culled_by_horizontal_overlap() {
+        let spans = [(100.0, 150.0), (400.0, 410.0)];
+        assert!(!clip_span_hit(&spans, 0.0, 100.0)); // ends where the span starts
+        assert!(clip_span_hit(&spans, 90.0, 101.0));
+        assert!(clip_span_hit(&spans, 405.0, 415.0));
+        assert!(!clip_span_hit(&spans, 200.0, 399.0));
+    }
+}
+
 fn border_bands(rect: Rect, top_h: i32) -> [crate::damage::PxRect; 4] {
     use crate::damage::PxRect;
     let (x, y, w, h) = (rect.x as i32, rect.y as i32, rect.w as i32, rect.h as i32);
@@ -4387,7 +4428,10 @@ enum FramePlan {
 }
 
 /// How many past frames' damage we retain to satisfy an EGL buffer age > 1.
-const HISTORY_DEPTH: u32 = 2;
+/// Compositors and drivers commonly triple-buffer (NVIDIA's Wayland EGL reports
+/// age 3 steadily); at 2 every frame there was silently full. Four covers
+/// triple and quadruple buffering; each entry is a handful of rects.
+const HISTORY_DEPTH: u32 = 4;
 
 /// What an action needs the App (window-owner) level to do afterwards.
 /// Active-level code can't create or close OS windows — it has no event loop.
@@ -7021,11 +7065,15 @@ impl App {
         // output flood is most frames, and that would put instrument geometry back
         // on content frames — the exact coupling `instrument_ticks_decoupled_from_output`
         // guards against.
+        // Hardware GL used to force a full frame here ("repaints are cheap on a
+        // GPU"). They are cheap to RASTERISE; building 7000 glyph quads on the
+        // CPU every frame is not — a hot pane (btop) held a riscv64 core at 25
+        // frames per second doing exactly that. EGL buffer age decides instead:
+        // a driver that does not report it gets age 0 → full, via plan_frame.
         let chrome_moved = active.force_full || active.session.focus() != active.last_focus;
         if chrome_moved
             || overlay_open
             || !active.bell_flash.is_empty() // bell stripes span the pane top+bottom, not the output's cell-damage → full (and the expired entry, still present here until draw_panes retains it, gives one full frame to clear the stripe)
-            || !active.backend.is_software()
             || (active.backend.is_gl() && !active.wires.is_empty())
             || !active.backend.partial_present_available()
         {
@@ -7056,6 +7104,11 @@ impl App {
                     active.damage.mark_full(); // newspaper columns: cell→px mapping ambiguous
                 } else {
                     active.damage.add_cells(&snap.damage, content.x as i32, content.y as i32, cw, ch);
+                    // The cursor cell: its blink alpha changes with no cell damage
+                    // (a move damages old+new cells in the engine; the pulse does not).
+                    if let Some(c) = &snap.cursor {
+                        active.damage.add_cell_span(c.line, c.col, c.col, content.x as i32, content.y as i32, cw, ch);
+                    }
                 }
             }
             snapshots.push((id, (rect, snap)));
@@ -7146,10 +7199,11 @@ impl App {
                 let why = std::mem::take(&mut active.frame_why);
                 log::debug!(
                     target: "rt::frame",
-                    "{plan_desc} px={px} verts={} ms={:.1} why={} win={}x{}",
+                    "{plan_desc} px={px} verts={} ms={:.1} why={} age={} win={}x{}",
                     active.backend.frame_verts().unwrap_or(0),
                     t0.elapsed().as_secs_f64() * 1000.0,
                     frame_why_str(why),
+                    active.frame_age,
                     size.width,
                     size.height
                 );
@@ -7296,6 +7350,14 @@ impl App {
                 // Draw each cell: an opaque background quad only when the cell's
                 // background differs from the default (so ordinary text keeps the
                 // translucent window background), then the glyph in its colour.
+                //
+                // Partial frame: only cells within a cell of the applied clip get
+                // geometry at all. The scissor would discard the rest anyway, but
+                // on the CPU side "the rest" is the whole grid — walking 7000
+                // cells and hashing every glyph per frame is what pinned a slow
+                // core with nothing on screen changing. The one-cell margin keeps
+                // a glyph that overhangs its neighbour repainted with it.
+                let clip = active.frame_clip.clone();
                 for (r, row) in snap.rows.iter().enumerate() {
                     if n > 1 && r / per_col >= geom.count as usize {
                         break; // guard against a transient over-tall snapshot mid-resize
@@ -7304,9 +7366,20 @@ impl App {
                     if sub >= clamp_rows {
                         continue; // stale row past the current (smaller) height
                     }
+                    let row_y = rect.y + sub as f32 * cell_h;
+                    let spans = clip.as_deref().map(|c| clip_row_spans(c, row_y - cell_h, row_y + 2.0 * cell_h));
+                    if spans.as_ref().is_some_and(|s| s.is_empty()) {
+                        continue; // no clip rect near this row: nothing to build
+                    }
                     for (col_idx, cell) in row.iter().enumerate() {
                         if col_idx >= clamp_cols {
                             break; // stale col past the current width (kept clear of the scrollbar)
+                        }
+                        if let Some(s) = &spans {
+                            let x0 = ox + col_idx as f32 * cell_w;
+                            if !clip_span_hit(s, x0 - cell_w, x0 + 2.0 * cell_w) {
+                                continue; // cell (plus a cell of margin) cannot touch the clip
+                            }
                         }
                         // Selection highlight wins over the cell's own background;
                         // otherwise draw an explicit (non-default) background.
@@ -7851,6 +7924,7 @@ impl App {
                 active.backend.buffer_age()
             }
         };
+        active.frame_age = age;
         let full_now = matches!(this, FrameDamage::Full);
         // Record this frame's damage for future frames (the back buffer we draw
         // into next may be several swaps old).
@@ -7929,8 +8003,10 @@ impl App {
         hint_rects: &[crate::damage::PxRect],
     ) -> bool {
         let Some(active) = self.windows.get_mut(&id) else { return false };
-        active.backend.begin_frame_scissored_rects(bg, bbox, hint_rects); // clear + draw each damage rect, not the bbox
+        let applied = active.backend.begin_frame_scissored_rects(bg, bbox, hint_rects); // clear + draw each damage rect, not the bbox
+        active.frame_clip = Some(applied); // draw_panes skips cells that cannot touch the clip
         Self::draw_panes(active, bounds, &snapshots);
+        active.frame_clip = None;
         active.backend.end_frame();
         // GL blends its egui instruments into the scissored region every frame.
         // The native (XRender) path draws its instrument layer separately from
@@ -8583,6 +8659,11 @@ fn dim(c: Color, k: f32) -> Color {
     Color(c.0 * k, c.1 * k, c.2 * k, c.3)
 }
 
+/// Instrument animation cadence on hardware GL: ~30fps, not every 16 ms wake.
+/// An animation frame is a partial frame of the border bands, but it still costs
+/// a present (and, on a slow CPU, tens of buffer ioctls); half the wakes is plenty
+/// for a heat glow and a flow meter.
+const ANIM_MIN_HW: Duration = Duration::from_millis(33);
 /// Fast wake interval while animating or interacting (~60fps).
 const ACTIVE_POLL: Duration = Duration::from_millis(16);
 /// Remote instrument layer redraw cadence: 6fps, decoupled from content frames.

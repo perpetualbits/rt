@@ -16,7 +16,8 @@
 //! uploads it once; this is plenty fast for a terminal's glyph counts and keeps
 //! the GL code tiny and auditable.
 
-use std::collections::HashMap; // char -> packed glyph location
+use std::collections::HashMap; // shape masks
+use rustc_hash::FxHashMap; // glyph cache: SipHash on (char, bool, bool) was 24% of a full frame on a U74
 
 use fontdue::Font; // CPU glyph rasteriser
 use glow::HasContext; // brings the raw GL methods into scope
@@ -375,7 +376,8 @@ pub struct Renderer {
     cell_w: f32,                       // monospace cell width in pixels
     cell_h: f32,                       // cell height (line advance) in pixels
     ascent: f32,                       // baseline offset from the cell top
-    glyphs: HashMap<(char, bool, bool), Glyph>, // glyph cache, keyed by (char, bold, italic)
+    glyphs: FxHashMap<(char, bool, bool), Glyph>, // glyph cache (non-ASCII), keyed by (char, bold, italic)
+    ascii_glyphs: Vec<Option<Glyph>>,           // ASCII fast path: index = (char << 2) | bold << 1 | italic; no hashing at all
     // AA coverage masks for the instrument primitives, keyed by (kind, r*4, w*4):
     // kind 0 = disc, 1 = ring, 2 = line bar. Packed into the same atlas as glyphs.
     shape_masks: HashMap<(u8, u32, u32), Glyph>,
@@ -528,7 +530,8 @@ impl Renderer {
                 cell_w,
                 cell_h,
                 ascent,
-                glyphs: HashMap::new(),
+                glyphs: FxHashMap::default(),
+                ascii_glyphs: vec![None; 128 * 4],
                 shape_masks: HashMap::new(),
                 shelf_x: 2,  // leave column 0/1 near the opaque seed texel
                 shelf_y: 2,  // first shelf sits below the seed row
@@ -577,6 +580,7 @@ impl Renderer {
         // The shape masks share the atlas, so their placements are stale too —
         // drop them so they re-pack against the reset cursor.
         self.glyphs.clear();
+        self.ascii_glyphs.iter_mut().for_each(|g| *g = None);
         self.shape_masks.clear();
         self.shelf_x = 2;
         self.shelf_y = 2;
@@ -714,10 +718,26 @@ impl Renderer {
     /// Returns `None` for glyphs that don't fit the atlas or have no bitmap
     /// (e.g. space), so callers simply skip drawing them.
     fn glyph(&mut self, c: char, bold: bool, italic: bool) -> Option<Glyph> {
-        // Fast path: already cached for this (char, bold, italic) combination.
-        if let Some(g) = self.glyphs.get(&(c, bold, italic)) {
+        // ASCII (the overwhelming majority of cells): a direct table lookup.
+        let ascii_idx = if (c as u32) < 128 { Some(((c as usize) << 2) | ((bold as usize) << 1) | italic as usize) } else { None };
+        if let Some(i) = ascii_idx {
+            if let Some(g) = self.ascii_glyphs[i] {
+                return if g.w > 0.0 { Some(g) } else { None }; // a cached blank draws nothing
+            }
+        } else if let Some(g) = self.glyphs.get(&(c, bold, italic)) {
             return Some(*g);
         }
+        let g = self.rasterise_glyph(c, bold, italic);
+        if let Some(i) = ascii_idx {
+            self.ascii_glyphs[i] = Some(g.unwrap_or(Glyph { u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0, w: 0.0, h: 0.0, left: 0.0, top: 0.0 }));
+        }
+        g
+    }
+
+    /// Resolve the face for `(c, bold, italic)` through the preference chains,
+    /// rasterise, pack into the atlas and cache in the non-ASCII map. `None`
+    /// for a blank (also cached, so it is not retried) or a full atlas.
+    fn rasterise_glyph(&mut self, c: char, bold: bool, italic: bool) -> Option<Glyph> {
         // Preference-ordered chains for this style. Exact style first, then
         // progressively looser matches, ending at the regular chain (widest
         // coverage + braille/etc. fallbacks). Within each chain we take the first
