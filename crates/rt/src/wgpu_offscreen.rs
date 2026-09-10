@@ -3,7 +3,13 @@
 //! target that can be read back pixel for pixel — with no window, no drawable
 //! and nothing on anybody's screen.
 //!
-//! It exists for two jobs that cannot be done any other way:
+//! It exists for three jobs that cannot be done any other way:
+//!
+//!  * **the alpha-convention gate** in [`alpha_convention_tests`]. A non-opaque
+//!    `CAMetalLayer` is composited premultiplied; rt's wgpu path used to write
+//!    straight colour, so a translucent background reached the screen `1/alpha`
+//!    too bright. Nothing but read-back pixels can tell the two conventions
+//!    apart, and only for content whose alpha is strictly between 0 and 1.
 //!
 //!  * **the scissored-clear pixel gate** below, the macOS counterpart of Linux's
 //!    `tests/damage_pixel_identity.rs`. `wgpu_frame`'s unit tests prove rt asks
@@ -184,7 +190,7 @@ pub fn frame(
     owns_background: bool,
     draw: impl FnOnce(&mut TextPipeline),
 ) {
-    use crate::wgpu_frame::{background_op, scissor_rect, BackgroundOp};
+    use crate::wgpu_frame::{background_op, premultiplied, scissor_rect, BackgroundOp};
     draw(text);
     let op = background_op(owns_background, scissor.is_some());
     let mut enc = h.device.create_command_encoder(&Default::default());
@@ -197,12 +203,18 @@ pub fn frame(
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: match op {
-                        BackgroundOp::ClearAll => wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg.0 as f64,
-                            g: bg.1 as f64,
-                            b: bg.2 as f64,
-                            a: bg.3 as f64,
-                        }),
+                        // Premultiplied, exactly as `WgpuBackend::end_frame` does
+                        // it -- this harness exists to test the real path, and
+                        // the clear colour's convention IS part of it.
+                        BackgroundOp::ClearAll => {
+                            let c = premultiplied(bg);
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: c.0 as f64,
+                                g: c.1 as f64,
+                                b: c.2 as f64,
+                                a: c.3 as f64,
+                            })
+                        }
                         BackgroundOp::LoadAndPaint | BackgroundOp::LoadOnly => wgpu::LoadOp::Load,
                     },
                     store: wgpu::StoreOp::Store,
@@ -281,8 +293,11 @@ mod pixel_tests {
         frame(&h, &mut text, BG, Some(damage), true, |_| {});
 
         let px = h.read_pixels();
-        // 0.25 -> 64, 0.5 -> 128, 0.75 -> 191 (Bgra8Unorm rounds to nearest).
-        let want = (0u8, 64u8, 128u8, 191u8);
+        // BG premultiplied: rgb is scaled by 0.75 before it lands, so
+        // 0.25*0.75 -> 48, 0.5*0.75 -> 96, and the alpha 0.75 -> 191
+        // (Bgra8Unorm rounds to nearest). See
+        // `the_background_quad_lands_premultiplied_like_the_gl_path`.
+        let want = (0u8, 48u8, 96u8, 191u8);
         for &(x, y) in &[(32u32, 16u32), (50, 25), (71, 35)] {
             let got = h.px(&px, x, y);
             assert!(
@@ -322,6 +337,173 @@ mod pixel_tests {
         let px = h.read_pixels();
         assert_eq!(h.px(&px, 0, 0).0, 0, "the on-screen part of the rect was painted");
         assert_eq!(h.px(&px, 45, 10), (255, 0, 0, 255), "and nothing beyond its clamped right edge was");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The alpha convention: what the drawable actually holds.
+// ---------------------------------------------------------------------------
+
+/// The gate for rt's straight-vs-premultiplied bug on macOS.
+///
+/// A non-opaque `CAMetalLayer` is composited by CoreAnimation as
+/// **premultiplied** — that is the only thing CoreAnimation does, and
+/// `CompositeAlphaMode::PostMultiplied` does not change it (wgpu-hal's Metal
+/// backend implements that mode as `layer.setOpaque(false)` and nothing else).
+/// So every stage of the wgpu path has to leave premultiplied RGBA in the
+/// drawable, which is the convention the GL path has always used
+/// (`render.rs`: `frag = vec4(v_color.rgb * a, a)` with `(ONE,
+/// ONE_MINUS_SRC_ALPHA)`).
+///
+/// It did not. Three stages disagreed: the fragment shader emitted straight
+/// colour, the `LoadOp::Clear` and the unblended background quad wrote straight
+/// colour, and only the alpha-blended pipeline happened to land on the right
+/// answer. rt's translucent background therefore reached the screen `1/alpha`
+/// too bright.
+///
+/// **Every colour in here has an alpha strictly between 0 and 1.** At `a == 1.0`
+/// the two conventions are the same number, which is exactly why the bug was
+/// invisible on glyphs, chrome and pane titlebars and survived to a user report.
+#[cfg(test)]
+mod alpha_convention_tests {
+    use super::*;
+    use crate::damage::PxRect;
+
+    const W: u32 = 64;
+    const H: u32 = 32;
+
+    /// "What was on the drawable before" — opaque, so it cannot itself smuggle a
+    /// convention error into the expected value.
+    const OLD: Color = Color(0.0, 0.0, 0.0, 1.0);
+
+    /// The maximally-diverging translucent colour: white at half alpha. Straight
+    /// it stores 255; premultiplied it stores 128. Nothing about a rounding
+    /// tolerance can confuse those.
+    const HALF_WHITE: Color = Color(1.0, 1.0, 1.0, 0.5);
+
+    /// Roland's reported configuration: `background = [0, 0, 14]` at
+    /// `background_opacity = 0.65`.
+    const REPORTED_BG: Color = Color(0.0, 0.0, 14.0 / 255.0, 0.65);
+
+    fn u8_of(v: f32) -> u8 {
+        (v * 255.0).round().clamp(0.0, 255.0) as u8
+    }
+
+    fn near(got: (u8, u8, u8, u8), want: (u8, u8, u8, u8), what: &str) {
+        let d = |a: u8, b: u8| (a as i32 - b as i32).abs();
+        assert!(
+            d(got.0, want.0) <= 1 && d(got.1, want.1) <= 1 && d(got.2, want.2) <= 1 && d(got.3, want.3) <= 1,
+            "{what}: drawable holds {got:?}, want ~{want:?}"
+        );
+    }
+
+    /// What `render.rs`'s GL path leaves in ITS framebuffer for the same draw:
+    /// a premultiplied source-over. `gl.blend_func(ONE, ONE_MINUS_SRC_ALPHA)`
+    /// over `frag = vec4(rgb * a, a)` is
+    /// `dst = src.rgb*src.a + dst.rgb*(1-src.a)`, `dst.a = src.a + dst.a*(1-src.a)`.
+    ///
+    /// This is the reference the wgpu path is held against: not "what wgpu
+    /// happens to do", but the arithmetic rt's colours are authored for.
+    fn gl_over(src: Color, dst: Color) -> Color {
+        let a = src.3;
+        Color(
+            src.0 * a + dst.0 * (1.0 - a),
+            src.1 * a + dst.1 * (1.0 - a),
+            src.2 * a + dst.2 * (1.0 - a),
+            a + dst.3 * (1.0 - a),
+        )
+    }
+
+    fn as_px(c: Color) -> (u8, u8, u8, u8) {
+        (u8_of(c.0), u8_of(c.1), u8_of(c.2), u8_of(c.3))
+    }
+
+    #[test]
+    fn the_frame_clear_lands_premultiplied_like_the_gl_path() {
+        // The path EVERY macOS frame takes today (unscissored -> LoadOp::Clear).
+        // Straight, this came back (255,255,255,128) and CoreAnimation composited
+        // a half-transparent window as if its background were full-strength white.
+        let h = Harness::new(W, H);
+        let mut text = h.text();
+        h.prefill(OLD);
+        frame(&h, &mut text, HALF_WHITE, None, true, |_| {});
+        let px = h.read_pixels();
+        near(h.px(&px, W / 2, H / 2), (128, 128, 128, 128), "the frame clear");
+    }
+
+    #[test]
+    fn the_background_quad_lands_premultiplied_like_the_gl_path() {
+        // The scissored path: the same background, painted as an unblended quad
+        // instead of a load op. Blending being OFF says the fragment does not
+        // COMBINE with what is under it; it does not exempt the fragment from
+        // meaning premultiplied RGBA.
+        let h = Harness::new(W, H);
+        let mut text = h.text();
+        h.prefill(OLD);
+        let damage = PxRect { x: 8, y: 4, w: 32, h: 16 };
+        frame(&h, &mut text, HALF_WHITE, Some(damage), true, |_| {});
+        let px = h.read_pixels();
+        near(h.px(&px, 20, 10), (128, 128, 128, 128), "the background quad");
+    }
+
+    #[test]
+    fn the_two_background_paths_land_the_same_rgba() {
+        // The clear and the quad are meant to be interchangeable -- that is the
+        // whole premise of the scissored redraw. They can only be if they speak
+        // the same convention, and before the fix a divergence in either one
+        // alone would have gone unnoticed here.
+        let h = Harness::new(W, H);
+        let mut text = h.text();
+
+        h.prefill(OLD);
+        frame(&h, &mut text, REPORTED_BG, None, true, |_| {});
+        let cleared = h.px(&h.read_pixels(), 20, 10);
+
+        h.prefill(OLD);
+        frame(&h, &mut text, REPORTED_BG, Some(PxRect { x: 8, y: 4, w: 32, h: 16 }), true, |_| {});
+        let painted = h.px(&h.read_pixels(), 20, 10);
+
+        assert_eq!(cleared, painted, "the load-op clear and the background quad disagree");
+        // And both are the premultiplied answer: blue 14/255 * 0.65 = 9/255.
+        near(cleared, (0, 0, 9, 166), "the reported background");
+    }
+
+    #[test]
+    fn a_translucent_quad_over_the_background_matches_the_gl_arithmetic() {
+        // The composite as a whole, held against `gl_over` -- so this fails if
+        // ANY stage (clear, shader, blend state) drifts from the GL path's
+        // convention, not just the background.
+        let h = Harness::new(W, H);
+        let mut text = h.text();
+        h.prefill(OLD);
+
+        let overlay = Color(0.8, 0.2, 0.4, 0.5); // translucent chrome
+        frame(&h, &mut text, REPORTED_BG, None, true, |t| {
+            t.push_quad(8.0, 4.0, 32.0, 16.0, overlay);
+        });
+
+        let px = h.read_pixels();
+        // GL: clear to premultiplied REPORTED_BG, then source-over the overlay.
+        let base = crate::wgpu_frame::premultiplied(REPORTED_BG);
+        near(h.px(&px, 20, 10), as_px(gl_over(overlay, base)), "translucent quad over the background");
+        // And outside the quad, the background alone.
+        near(h.px(&px, 55, 28), as_px(base), "background outside the quad");
+    }
+
+    #[test]
+    fn opaque_content_is_untouched_by_the_convention_change() {
+        // Why the bug was invisible, pinned so the fix cannot have moved
+        // anything rt draws at full alpha -- glyphs, chrome, pane titlebars,
+        // cell backgrounds. At a == 1.0 premultiplying is the identity.
+        let h = Harness::new(W, H);
+        let mut text = h.text();
+        h.prefill(OLD);
+        let solid = Color(0.25, 0.5, 0.75, 1.0);
+        frame(&h, &mut text, Color(0.0, 0.0, 0.0, 1.0), None, true, |t| {
+            t.push_quad(8.0, 4.0, 32.0, 16.0, solid);
+        });
+        let px = h.read_pixels();
+        near(h.px(&px, 20, 10), as_px(solid), "an opaque quad");
     }
 }
 

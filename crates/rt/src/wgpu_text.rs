@@ -136,9 +136,26 @@ fn vs(@location(0) pos: vec2<f32>,
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  // R8 coverage modulates alpha, exactly as render.rs's GL shader does.
+  // Line for line what render.rs's GL fragment shader emits: R8 coverage
+  // modulates alpha, and the output is PREMULTIPLIED (rgb scaled by the
+  // effective alpha).
+  //
+  // The premultiply is not cosmetic and it is not optional. A non-opaque
+  // CAMetalLayer is composited by CoreAnimation as premultiplied -- there is no
+  // straight-alpha mode in CoreAnimation, and `CompositeAlphaMode::PostMultiplied`
+  // does not add one (on Metal wgpu-hal implements it as `layer.setOpaque(false)`
+  // and nothing else). So whatever lands in the drawable is read as premultiplied
+  // whether it was written that way or not.
+  //
+  // Paired with `BlendState::PREMULTIPLIED_ALPHA_BLENDING` below, this is
+  // arithmetically identical to the straight `vec4(rgb, a*cov)` +
+  // `ALPHA_BLENDING` it replaces -- both compute `src.rgb*src.a + dst*(1-src.a)`
+  // -- but only this pair leaves a premultiplied value in the attachment when
+  // blending is OFF, which is how `paint_background` and the frame's
+  // `LoadOp::Clear` put rt's translucent background down.
   let cov = textureSample(atlas, samp, in.uv).r;
-  return vec4<f32>(in.color.rgb, in.color.a * cov);
+  let a = in.color.a * cov;
+  return vec4<f32>(in.color.rgb * a, a);
 }
 "#;
 
@@ -432,7 +449,13 @@ impl TextPipeline {
                 cache: None,
             })
         };
-        let pipeline = make_pipeline("rt text pipeline", Some(wgpu::BlendState::ALPHA_BLENDING));
+        // PREMULTIPLIED, not `ALPHA_BLENDING`: `(ONE, ONE_MINUS_SRC_ALPHA)` on
+        // both colour and alpha, which is exactly `render.rs`'s
+        // `gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA)` over a shader
+        // that already scaled rgb by alpha. See the fragment shader above for
+        // why the whole path has to speak one convention.
+        let pipeline =
+            make_pipeline("rt text pipeline", Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING));
         let bg_pipeline = make_pipeline("rt background pipeline", None);
 
         let bgbuf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -798,14 +821,22 @@ impl TextPipeline {
     /// Two details make it equivalent to a clear rather than merely similar:
     ///
     ///  * it draws through `bg_pipeline`, whose blend is `None`, so the
-    ///    fragment's RGBA is written straight to the attachment. rt's background
-    ///    is translucent on purpose — that is what the macOS vibrancy layer
-    ///    shows through — and alpha-blending it over the previous frame would
+    ///    fragment's RGBA lands on the attachment untouched. rt's background is
+    ///    translucent on purpose — that is what the macOS vibrancy layer shows
+    ///    through — and alpha-blending it over the previous frame would
     ///    composite with it, darkening the damage rect a little more each time
     ///    it was repainted.
     ///  * the quad's UV is texel (0,0) of the atlas, which `new` seeds to full
     ///    coverage, so the shader's `color.a * cov` passes the alpha through
     ///    unchanged.
+    ///
+    /// `c` is handed in **straight**, exactly as it is handed to the
+    /// `LoadOp::Clear` this stands in for; the fragment shader premultiplies it,
+    /// so what reaches the attachment is `(rgb * a, a)` — the same premultiplied
+    /// RGBA the clear path writes via `wgpu_frame::premultiplied`, and the only
+    /// thing CoreAnimation can composite correctly. Blending being off does NOT
+    /// exempt this quad from the convention: it decides *whether* the fragment
+    /// combines with what is under it, not what the fragment means.
     ///
     /// It must be called INSIDE the pass and BEFORE [`flush`](Self::flush), the
     /// same place in the order a load op would have run.

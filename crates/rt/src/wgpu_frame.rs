@@ -15,6 +15,8 @@
 // resulting dead_code warning is noise, not a finding.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use crate::render::Color;
+
 /// What `WgpuBackend::end_frame` must do this call.
 ///
 /// The three inputs are: whether `begin_frame` managed to acquire a drawable
@@ -157,10 +159,80 @@ pub fn scissor_rect(r: crate::damage::PxRect, surface_w: u32, surface_h: u32) ->
     (x, y, w, h)
 }
 
+/// Turn one of rt's **straight** colours into the **premultiplied** RGBA a
+/// compositor actually reads back.
+///
+/// rt authors every colour straight: `Color(r, g, b, a)` means "this rgb, `a` of
+/// the way opaque". Every surface rt hands to a compositor is read the other way
+/// — as premultiplied, where the stored rgb has *already* been scaled by the
+/// alpha, so the compositor's job is only `dst = src.rgb + backdrop * (1 - src.a)`.
+/// That is true of a Wayland surface on Linux and it is true of a non-opaque
+/// `CAMetalLayer` on macOS: CoreAnimation has no straight-alpha compositing mode
+/// at all, and wgpu's `CompositeAlphaMode::PostMultiplied` does not add one — on
+/// Metal wgpu-hal implements it as nothing but `layer.setOpaque(false)`.
+///
+/// The GL path converts in its fragment shader (`render.rs`: `frag = vec4(rgb *
+/// a, a)`), so every fragment it writes is already premultiplied. The wgpu path
+/// does the same in its own shader — but a `LoadOp::Clear` is not a fragment and
+/// runs no shader, so the one clear colour rt hands wgpu has to be converted
+/// here instead.
+///
+/// Getting this wrong is invisible on opaque content (`a == 1.0` is a no-op) and
+/// wrong by a factor of `1/a` on translucent content, which is why it survived:
+/// it shows up only as a translucent background compositing brighter than it
+/// should — worst at high `rgb` with low alpha, where a straight-written white
+/// at `a = 0.5` reaches the screen as full-strength white instead of half.
+pub fn premultiplied(c: Color) -> Color {
+    let a = c.3.clamp(0.0, 1.0);
+    Color(c.0 * a, c.1 * a, c.2 * a, a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::damage::PxRect;
+
+    /// Floats out of a GPU are never bit-exact; 1/255 is half a colour step.
+    fn close(a: Color, b: Color) -> bool {
+        (a.0 - b.0).abs() < 1.0 / 512.0
+            && (a.1 - b.1).abs() < 1.0 / 512.0
+            && (a.2 - b.2).abs() < 1.0 / 512.0
+            && (a.3 - b.3).abs() < 1.0 / 512.0
+    }
+
+    #[test]
+    fn premultiplying_an_opaque_colour_changes_nothing() {
+        // Why the wrong convention shipped and stayed: on everything rt draws at
+        // full alpha -- glyphs, chrome, pane titlebars, cell backgrounds -- the
+        // two conventions are the SAME NUMBER. Only the translucent background
+        // can tell them apart.
+        let c = Color(0.2, 0.5, 0.9, 1.0);
+        assert!(close(premultiplied(c), c));
+    }
+
+    #[test]
+    fn premultiplying_scales_rgb_by_alpha() {
+        assert!(close(premultiplied(Color(1.0, 1.0, 1.0, 0.5)), Color(0.5, 0.5, 0.5, 0.5)));
+        // Roland's reported configuration: background = [0, 0, 14] at
+        // background_opacity = 0.65. Straight, the blue channel reaches the
+        // compositor at 14/255; premultiplied it is 9/255 -- the window's colour
+        // cast is 1/0.65 = 1.54x too strong until this runs.
+        let bg = Color(0.0, 0.0, 14.0 / 255.0, 0.65);
+        assert!(close(premultiplied(bg), Color(0.0, 0.0, 14.0 / 255.0 * 0.65, 0.65)));
+    }
+
+    #[test]
+    fn premultiplying_a_fully_transparent_colour_erases_it() {
+        assert!(close(premultiplied(Color(1.0, 0.3, 0.7, 0.0)), Color(0.0, 0.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn a_nonsense_alpha_cannot_push_a_channel_out_of_range() {
+        // Nothing should hand this an alpha outside 0..=1, but a clamp here is
+        // cheaper than a saturated drawable if something ever does.
+        assert!(close(premultiplied(Color(1.0, 1.0, 1.0, 2.0)), Color(1.0, 1.0, 1.0, 1.0)));
+        assert!(close(premultiplied(Color(1.0, 1.0, 1.0, -1.0)), Color(0.0, 0.0, 0.0, 0.0)));
+    }
 
     #[test]
     fn a_frame_that_never_acquired_a_drawable_drops_its_geometry() {

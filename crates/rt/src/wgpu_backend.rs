@@ -163,9 +163,21 @@ impl WgpuBackend {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            // PostMultiplied is what lets the NSVisualEffectView installed in
-            // Task 8 show through. With Opaque you get a black window and the
-            // frosted glass never appears.
+            // PostMultiplied is what lets the frosted glass installed in Task 8
+            // show through. With Opaque you get a black window and it never
+            // appears.
+            //
+            // Its NAME is a trap and cost a bug. It does not ask the window
+            // server to post-multiply anything: wgpu-hal's Metal backend
+            // implements the whole of it as `render_layer.setOpaque(false)`
+            // (wgpu-hal `src/metal/surface.rs`), and Opaque/PostMultiplied are
+            // the only two modes Metal advertises. CoreAnimation then composites
+            // the drawable the only way CoreAnimation composites anything --
+            // PREMULTIPLIED. So the drawable's contents must be premultiplied,
+            // which is what `wgpu_text`'s fragment shader and
+            // `wgpu_frame::premultiplied` are for. Reading the name as "the
+            // window server will multiply by alpha for you" is what left rt's
+            // translucent background 1/alpha too bright on screen.
             alpha_mode: if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
                 wgpu::CompositeAlphaMode::PostMultiplied
             } else {
@@ -429,7 +441,10 @@ impl Backend for WgpuBackend {
     // underneath everything painted since ("menu under panes, disks under
     // titlebars"), double-blending through rt's translucent background.
     fn end_frame(&mut self) {
-        use crate::wgpu_frame::{background_op, end_frame_action, scissor_rect, BackgroundOp, EndFrameAction};
+        use crate::wgpu_frame::{
+            background_op, end_frame_action, premultiplied, scissor_rect, BackgroundOp,
+            EndFrameAction,
+        };
         let action =
             end_frame_action(self.frame.is_some(), self.needs_clear, self.text.pending_vertex_count());
         let clear = match action {
@@ -462,15 +477,25 @@ impl Backend for WgpuBackend {
                     ops: wgpu::Operations {
                         load: match bg {
                             // render.rs's Color is already normalised 0..1 AND carries
-                            // alpha, so this is a straight widen. The alpha matters:
-                            // it is what lets the vibrancy show through, and at 1.0 the
-                            // frosted glass is invisible.
-                            BackgroundOp::ClearAll => wgpu::LoadOp::Clear(wgpu::Color {
-                                r: self.clear.0 as f64,
-                                g: self.clear.1 as f64,
-                                b: self.clear.2 as f64,
-                                a: self.clear.3 as f64,
-                            }),
+                            // alpha. The alpha matters: it is what lets the vibrancy
+                            // show through, and at 1.0 the frosted glass is invisible.
+                            //
+                            // It is PREMULTIPLIED on the way in. A clear runs no
+                            // shader, so it is the one place in this backend where the
+                            // conversion the fragment shader does for every other
+                            // fragment has to be done by hand -- and this is the arm
+                            // every unscissored macOS frame takes, i.e. all of them
+                            // today. Written straight, rt's translucent background
+                            // reached CoreAnimation 1/alpha too bright.
+                            BackgroundOp::ClearAll => {
+                                let c = premultiplied(self.clear);
+                                wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: c.0 as f64,
+                                    g: c.1 as f64,
+                                    b: c.2 as f64,
+                                    a: c.3 as f64,
+                                })
+                            }
                             // Later passes of the same frame: the background and the
                             // earlier pass's geometry are already on the texture, and
                             // clearing again would erase them. A scissored FIRST pass
