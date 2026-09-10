@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-09-08"
+    updated: "2026-09-10"
   },
 
   statuses: {
@@ -189,7 +189,7 @@ window.PROJECT_MAP = {
     {
       id: "chrome-theme", label: "Chrome design system", layer: "chrome", status: "done",
       tags: ["native chrome", "palette"],
-      desc: "One palette, one spacing scale, one row rhythm and one panel shape for every floating panel rt draws: the context menu, the F1 manual, preferences, the colour picker, the clipboard history and the search bar. Colours are DERIVED from the user's own foreground/background/palette rather than hardcoded (forty literals across chrome/*.rs before this, no two panels agreeing), so the chrome belongs to the terminal it floats over; every text role is held to a stated WCAG contrast floor at every scheme rt ships and at both extremes, asserted by unit test. Panels are rounded rectangles with a hairline edge, built from fill_rect slices so both backends can draw them. A chrome_theme setting (tinted / graphite / contrast) re-derives the whole palette live from the preferences row, so the taste question can be settled side by side rather than one rebuild per guess.",
+      desc: "One palette, one spacing scale, one row rhythm and one panel shape for every floating panel rt draws: the context menu, the F1 manual, preferences, the colour picker, the clipboard history and the search bar. Colours are DERIVED from the user's own foreground/background/palette rather than hardcoded (forty literals across chrome/*.rs before this, no two panels agreeing), so the chrome belongs to the terminal it floats over; every text role is held to a stated WCAG contrast floor at every scheme rt ships and at both extremes, asserted by unit test. The palette reasons about what is ON SCREEN rather than what is configured: it takes background_opacity, derives the effective background the panel really floats over, and holds every floor against the panel AS COMPOSITED — so a see-through window (0.05 on a Mac with glass behind it) gets a nearly solid panel and a stronger border instead of guarantees stated about a colour that is 95% not there. Panels are rounded rectangles with a hairline edge, built from fill_rect slices so both backends can draw them. A chrome_theme setting (tinted / graphite / contrast) re-derives the whole palette live from the preferences row, so the taste question can be settled side by side rather than one rebuild per guess.",
       files: ["crates/rt/src/chrome/theme.rs", "crates/rt/src/chrome_scale.rs", "crates/rt-config/src/lib.rs"],
       specs: [],
       parts: [
