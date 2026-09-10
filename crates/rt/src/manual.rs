@@ -408,17 +408,24 @@ macOS — THE FROSTED GLASS
   Turn "Background blur" off in Preferences (or slide Background opacity
   back to 1.00) and the glass goes away, live. Turn it back on and it
   returns; there is no restart in either direction.
-  "Glass material" in Preferences picks which frosted look the glass is:
-  Left/Right steps through 13 of them and the window changes as you step.
-  The row is dimmed while blur is off or the background is opaque —
-  there is no glass on screen to shape.
-  under-window-background is the default: the lightest of them, and the
-  one AppKit means for a view sitting under a window's content.
-  Prefer the config file? macos_glass_material = "hud-window" in
-  ~/.config/rt/config.toml (read at startup), or RT_GLASS_MATERIAL=hud-window
-  for one run. system-default is AppKit's own (deprecated, dense) material,
-  kept only for comparison — switching TO it is the one change needing a
-  restart.
+  "Glass material" in Preferences picks HOW the window blurs. Left/Right
+  steps it and the window changes as you step. The row is dimmed while
+  blur is off or the background is opaque — there is nothing to shape.
+  window-blur is the default, and the only untinted one: no material at
+  all, just a plain blur of whatever is behind the window, so the colour
+  you see is your own background at your own opacity and nothing else.
+  It is what Terminal.app does.
+  "Blur radius (px)" is that blur's strength — Terminal.app's Blur
+  slider. 1 to 100; the default is 24. Live only for window-blur: the
+  other entries are AppKit NSVisualEffectMaterials, and a material's
+  radius is AppKit's to choose, not yours. Each also carries its own
+  tint, which shifts your background colour — that is the price of the
+  vibrancy and light/dark adaptation they bring.
+  Prefer the config file? macos_glass_material = "hud-window" and
+  macos_blur_radius = 12 in ~/.config/rt/config.toml (read at startup),
+  or RT_GLASS_MATERIAL=hud-window / RT_BLUR_RADIUS=12 for one run.
+  system-default is AppKit's own (deprecated, dense) material, kept only
+  for comparison — switching TO it is the one change needing a restart.
 "#;
 
 /// Empty off macOS: there is no appendix to show.

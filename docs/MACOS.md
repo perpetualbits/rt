@@ -329,16 +329,29 @@ platform. Use `⌥⌘←` / `⌥⌘→`.
 macOS is the one platform where rt gets real blur-behind for free. On Wayland a
 client is forbidden from touching the pixels behind its own window, so blur is
 the compositor's business and most compositors do not offer it. On macOS the
-window server blurs behind a transparent window through `NSVisualEffectView`,
-and rt asks it to.
+window server blurs behind a transparent window, and rt asks it to.
 
-Three settings control it, all in **Preferences → Appearance**:
+There are **two mechanisms**, and rt can use either — but never both at once:
+
+1. **A plain window blur** — the window server blurs what is behind the window
+   at a radius rt chooses, and adds nothing else. **Untinted**, so the only
+   colour on screen is your `background` at your `background_opacity`. This is
+   what Terminal.app's Profiles → Window "Blur" slider drives, and it is rt's
+   default.
+2. **An `NSVisualEffectView`** with a named `NSVisualEffectMaterial` — public
+   AppKit, and it adapts to light/dark and the desktop tint on its own. But
+   every material carries **its own tint**, which composites under your
+   background colour and shifts it, and none of them lets you set the blur
+   radius.
+
+Four settings control it, all in **Preferences → Appearance**:
 
 | Setting | What it does |
 | --- | --- |
 | `background_opacity` | how see-through the window's background is, `0.05`–`1.0` (default `1.0`, fully opaque) |
 | `background_blur` | whether rt asks for the frosted glass at all (default `true`) |
-| `macos_glass_material` | which frosted look the glass has (default `under-window-background`) |
+| `macos_glass_material` | which of the two mechanisms, and which material (default `window-blur`) |
+| `macos_blur_radius` | the plain blur's radius in pixels, `1`–`100` (default `24`); `window-blur` only |
 
 **There is no glass until the background is translucent.** Blur behind an opaque
 window is invisible work, so rt installs the effect view only while
@@ -351,27 +364,32 @@ and an environment variable for a one-off, `RT_OPACITY=0.8 rt`.
 
 ### `macos_glass_material`
 
-AppKit's `NSVisualEffectView` has a `material` property, and its documented
-default (`NSVisualEffectMaterialAppearanceBased`) has been deprecated since
-10.14 and is far denser than anything Terminal.app shows — it reads as an
-almost-opaque grey-blue haze with your own background colour faintly on top of
-it. rt therefore picks a material explicitly.
+The values, in the order Preferences steps through them — the plain blur first,
+then the materials roughly lightest to heaviest:
 
-The values, in the order Preferences steps through them, roughly lightest to
-heaviest:
+`window-blur`, `under-window-background`, `under-page-background`,
+`content-background`, `window-background`, `sidebar`, `header-view`, `titlebar`,
+`menu`, `popover`, `sheet`, `full-screen-ui`, `hud-window`, `system-default`
 
-`under-window-background`, `under-page-background`, `content-background`,
-`window-background`, `sidebar`, `header-view`, `titlebar`, `menu`, `popover`,
-`sheet`, `full-screen-ui`, `hud-window`, `system-default`
-
-- **`under-window-background` is the default.** AppKit documents
+- **`window-blur` is the default, and it is not a material at all.** No
+  `NSVisualEffectView` is installed; rt sets the window's own backdrop blur
+  radius instead. That is the Terminal.app mechanism, and the two things it buys
+  you are the two things no material can offer: **no tint** (your colour scheme
+  is the colour you chose, at the opacity you chose — nothing sits under it) and
+  **an adjustable radius** (see `macos_blur_radius` below). What it gives up is
+  vibrancy and automatic light/dark adaptation, which a terminal with a fixed
+  colour scheme was never using anyway.
+- Everything else names an `NSVisualEffectMaterial`. They adapt to light/dark
+  and to the desktop tint, and each carries its own tint while doing so.
+  **`under-window-background` is the pick of them**: AppKit documents
   `.underWindowBackground` as "the material used under window backgrounds",
   which is literally where rt puts its effect view, and it is the lightest of
-  the behind-window materials — the one that leaves the desktop behind the
-  window legible rather than merely present.
-- **`system-default` means "never set a material"** — i.e. AppKit's deprecated
-  default. It is kept only so the old look can be compared against the new one.
-  It is not a recommended value.
+  the behind-window materials.
+- **`system-default` means "never set a material"** — i.e. AppKit's
+  `NSVisualEffectMaterialAppearanceBased`, deprecated since 10.14 and far denser
+  than anything Terminal.app shows: an almost-opaque grey-blue haze with your
+  own background faintly on top. Kept only for comparison; not a recommended
+  value.
 
 Three ways to set it:
 
@@ -397,10 +415,37 @@ already carries a material cannot be talked back into AppKit's implicit default,
 so that one takes a restart. Every other material applies the moment you step
 onto it.
 
-An unrecognised name is reported on stderr and the default is used — a typo
-here never costs you the rest of `config.toml`. The setting is macOS-only in
-effect but cross-platform in type: a Linux rt parses it, keeps it, and writes it
-back unchanged, so one config file stays portable.
+### `macos_blur_radius`
+
+How strong the plain window blur is, in pixels: `1`–`100`, default `24`. This is
+Terminal.app's Blur slider, and it is the setting `NSVisualEffectView` has no
+equivalent of — AppKit picks a radius per material and that is the end of it. So
+the row is live only while `macos_glass_material` is `window-blur`, and dimmed
+otherwise.
+
+For reference, winit's own `Window::set_blur(true)` — which rt still uses as a
+last-resort fallback when it cannot reach the AppKit window at all — hardcodes
+`80`, with no way to change it. That is a milky wash rather than frosted glass,
+and being unable to dial it back is why rt makes the call itself.
+
+```
+Preferences → Appearance → "Blur radius (px)"   ← Left/Right steps by 4, live
+```
+
+```toml
+[settings]
+macos_blur_radius = 12
+```
+
+```sh
+RT_BLUR_RADIUS=12 rt                 # one run; beats the config file
+```
+
+An unrecognised material name is reported on stderr and the default is used, and
+an out-of-range radius is clamped and reported — a typo in either never costs you
+the rest of `config.toml`. Both settings are macOS-only in effect but
+cross-platform in type: a Linux rt parses them, keeps them, and writes them back
+unchanged, so one config file stays portable.
 
 The design rationale, and the Wayland/X11 side of the same story, is in
 [`docs/APPEARANCE.md`](APPEARANCE.md).

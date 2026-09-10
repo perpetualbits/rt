@@ -1343,6 +1343,23 @@ impl App {
                 ),
             }
         }
+        // The backdrop blur radius, likewise for one run. Only the `window-blur`
+        // material reads it (NSVisualEffectView has no radius); parsed on every
+        // platform for the same portability reason as the material above.
+        if let Ok(v) = std::env::var("RT_BLUR_RADIUS") {
+            match v.trim().parse::<u32>() {
+                Ok(r) => {
+                    settings.macos_blur_radius = r.clamp(
+                        rt_config::Settings::MIN_BLUR_RADIUS,
+                        rt_config::Settings::MAX_BLUR_RADIUS,
+                    )
+                }
+                Err(_) => eprintln!(
+                    "rt: RT_BLUR_RADIUS={v:?} is not a number; keeping {}",
+                    settings.macos_blur_radius
+                ),
+            }
+        }
         // CLI overrides win over the persisted config (and over the env knobs
         // above), so a benchmark harness can pin the font without editing config.
         if let Some(family) = &self.cli.font {
@@ -1636,26 +1653,34 @@ impl App {
         // installed just below.
         #[cfg(not(target_os = "macos"))]
         blur::try_enable_kwin_blur(window.as_ref());
-        // macOS frosted glass, as a fallback chain:
-        //   1. a public NSVisualEffectView under the content view (vibrancy,
-        //      material, light/dark adaptation — the look Apple ships);
-        //   2. winit's set_blur(), i.e. the PRIVATE CGSSetWindowBackgroundBlurRadius
-        //      at a hardcoded radius 80: a plain gaussian backdrop blur, no
-        //      vibrancy and no adaptation, but better than nothing;
-        //   3. plain transparency, which already works and needs no call.
-        // Only one of 1/2 is applied, so what the user sees identifies which
-        // path ran (the log line says so too). Gated on `want_blur` — the SAME
-        // predicate the Wayland and X11 paths below use — so `background_blur =
-        // false` turns the glass off on macOS exactly as it does on Linux. It
-        // was once unconditional, on the theory that the glass is invisible
-        // while the background is opaque; at 0.05 opacity it is anything but,
-        // and the preference had no effect at all. `apply_blur` re-runs this
-        // whole decision on every opacity step and settings commit.
+        // macOS frosted glass. `vibrancy::set_enabled` owns the whole decision —
+        // it applies EITHER an NSVisualEffectView with a named material OR the
+        // window's own untinted, variable-radius backdrop blur (the Terminal.app
+        // mechanism, and rt's default), from one `glass_plan`. See `vibrancy.rs`
+        // for why the untinted one wins by default.
+        //
+        // The fallback below is for when that module cannot reach AppKit at all
+        // (no window handle, or off the main thread): winit's own `set_blur()`,
+        // the same private call at a hardcoded radius 80. Then plain
+        // transparency, which already works and needs no call.
+        //
+        // Gated on `want_blur` — the SAME predicate the Wayland and X11 paths
+        // below use — so `background_blur = false` turns the glass off on macOS
+        // exactly as it does on Linux. It was once unconditional, on the theory
+        // that the glass is invisible while the background is opaque; at 0.05
+        // opacity it is anything but, and the preference had no effect at all.
+        // `apply_blur` re-runs this whole decision on every opacity step and
+        // settings commit.
         #[cfg(target_os = "macos")]
         {
             let want = want_blur(&settings);
-            if !vibrancy::set_enabled(window.as_ref(), want, settings.macos_glass_material) {
-                log::info!("NSVisualEffectView unavailable; falling back to winit's window blur");
+            if !vibrancy::set_enabled(
+                window.as_ref(),
+                want,
+                settings.macos_glass_material,
+                settings.macos_blur_radius,
+            ) {
+                log::info!("AppKit window unreachable; falling back to winit's window blur");
                 window.set_blur(want);
             }
         }
@@ -8370,7 +8395,10 @@ impl App {
         // "Glass material" row change the look under the user rather than at the
         // next launch. Inert on Linux, where the field is carried but unused.
         let blur_changed = want_blur(&new) != want_blur(&active.settings)
-            || new.macos_glass_material != active.settings.macos_glass_material;
+            || new.macos_glass_material != active.settings.macos_glass_material
+            // The radius rides the same re-apply, so the Preferences "Blur
+            // radius" row moves the window server's backdrop under the user.
+            || new.macos_blur_radius != active.settings.macos_blur_radius;
         active.settings = new; // commit
         Self::persist(&active.settings);
         // Scrollback: newly spawned panes read this live cell.
@@ -8953,10 +8981,11 @@ fn apply_blur(active: &mut Active) {
     {
         let want = want_blur(&active.settings);
         let material = active.settings.macos_glass_material;
-        // Same fallback chain as at window creation: when NSVisualEffectView is
+        let radius = active.settings.macos_blur_radius;
+        // Same fallback chain as at window creation: when the AppKit window is
         // unreachable, drive winit's private-API blur with the same decision so
         // the toggle still works on that path.
-        if !vibrancy::set_enabled(active.window.as_ref(), want, material) {
+        if !vibrancy::set_enabled(active.window.as_ref(), want, material, radius) {
             active.window.set_blur(want);
         }
     }

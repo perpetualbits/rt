@@ -170,6 +170,18 @@ pub fn rows(s: &Settings, mem_total: u64, cols: usize, family: FamilyStatus) -> 
         pref: Some(PrefRow::GlassMaterial),
         enabled: enabled(s, PrefRow::GlassMaterial),
     });
+    // The Terminal.app "Blur" slider, and the reason `window-blur` is the default
+    // glass: it is the ONE blur radius on macOS a user can actually choose.
+    // Dimmed while a named material is selected, because `NSVisualEffectView`
+    // has no radius to set — see `prefs_model::enabled`.
+    #[cfg(target_os = "macos")]
+    v.push(Row {
+        kind: RowKind::Step,
+        label: "Blur radius (px)".into(),
+        value: s.macos_blur_radius.to_string(),
+        pref: Some(PrefRow::BlurRadius),
+        enabled: enabled(s, PrefRow::BlurRadius),
+    });
     // Cross-platform, unlike the glass above: the chrome palette is derived the
     // same way on both backends. It is here so the three treatments can be
     // compared side by side in one session rather than one rebuild per guess —
@@ -525,6 +537,8 @@ mod tests {
             // frozen order differs by target rather than pretending it doesn't.
             #[cfg(target_os = "macos")]
             PrefRow::GlassMaterial,
+            #[cfg(target_os = "macos")]
+            PrefRow::BlurRadius,
             PrefRow::Chrome,
             PrefRow::Preset, PrefRow::Ffm, PrefRow::Titlebar, PrefRow::Scrollback,
             PrefRow::ArrowAccel, PrefRow::ArrowAccelMax, PrefRow::Term,

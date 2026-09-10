@@ -119,13 +119,32 @@ pub enum Action {
     MoveTabRight,
 }
 
-/// Which `NSVisualEffectMaterial` the macOS frosted glass is made of.
+/// How the macOS window blurs what is behind it: [`GlassMaterial::WindowBlur`]
+/// (a plain, untinted backdrop blur — what Terminal.app does), or one of
+/// AppKit's named `NSVisualEffectMaterial`s.
 ///
 /// **macOS-only in EFFECT, cross-platform in TYPE.** It lives here, unguarded by
 /// any `cfg`, so that one `config.toml` is portable: a Linux rt reading
 /// `macos_glass_material = "hud-window"` parses it, keeps it, writes it back
 /// unchanged on the next save, and ignores it. Nothing outside
 /// `rt/src/vibrancy.rs` reads it, and that file is `cfg(target_os = "macos")`.
+///
+/// ## Two mechanisms, not one
+///
+/// [`Self::WindowBlur`] is not a material at all — it is the *absence* of one.
+/// Every other variant installs an `NSVisualEffectView`, and every
+/// `NSVisualEffectMaterial` carries **its own tint**, which sits under the
+/// configured background colour and shifts it: the user's report of `hud-window`
+/// was "too blurry and it is blue coloured, which messes up the colors I want to
+/// choose". That tint is not adjustable and neither is the blur radius —
+/// `NSVisualEffectView` offers no radius at all.
+///
+/// Terminal.app does not use `NSVisualEffectView`. Profiles → Window gives it a
+/// background colour with its own opacity plus a separate **Blur slider**: a
+/// variable-radius, *untinted* blur behind an otherwise plain window. That is
+/// `CGSSetWindowBackgroundBlurRadius`, and [`Self::WindowBlur`] is rt asking for
+/// exactly it at [`Settings::macos_blur_radius`]. With it, the only colour on
+/// screen is `background` at `background_opacity` — nothing tints it.
 ///
 /// ## Why this exists at all
 ///
@@ -139,18 +158,30 @@ pub enum Action {
 ///
 /// ## Ordering
 ///
-/// [`GlassMaterial::ALL`] is the cycle order used by the preferences row, run
-/// roughly lightest-to-heaviest so stepping right adds density. [`Self::SystemDefault`]
-/// is deliberately LAST: it is the only entry that is not a deliberate choice
-/// (it means "never call `setMaterial:`"), kept solely so the old look can be
-/// compared against the new one without rebuilding.
+/// [`GlassMaterial::ALL`] is the cycle order used by the preferences row:
+/// [`Self::WindowBlur`] first because it is the default and the untinted one,
+/// then the named materials roughly lightest-to-heaviest so stepping right adds
+/// density. [`Self::SystemDefault`] is deliberately LAST: it is the only entry
+/// that is not a deliberate choice (it means "never call `setMaterial:`"), kept
+/// solely so the old look can be compared against the new one without
+/// rebuilding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GlassMaterial {
+    /// **No material at all** — no `NSVisualEffectView` is installed. Instead the
+    /// window itself is given a plain gaussian backdrop blur of
+    /// [`Settings::macos_blur_radius`] pixels, which is what Terminal.app's
+    /// Profiles → Window "Blur" slider drives.
+    ///
+    /// The default, and the only variant that adds **no tint of its own**: the
+    /// colour on screen is purely `background` at `background_opacity`, so a
+    /// chosen colour scheme survives intact. It is also the only one whose blur
+    /// radius is adjustable — see [`Settings::macos_blur_radius`].
+    #[default]
+    WindowBlur,
     /// `.underWindowBackground` — "the material used under window backgrounds".
     /// rt's effect view IS under the window's content view, so this is the one
     /// material whose documented purpose is literally rt's placement. The
-    /// default.
-    #[default]
+    /// lightest of the named materials, and the former default.
     UnderWindowBackground,
     /// `.underPageBackground` — the material behind document pages.
     UnderPageBackground,
@@ -183,6 +214,7 @@ pub enum GlassMaterial {
 impl GlassMaterial {
     /// Every material, in preferences cycle order (see the type docs).
     pub const ALL: &'static [GlassMaterial] = &[
+        GlassMaterial::WindowBlur,
         GlassMaterial::UnderWindowBackground,
         GlassMaterial::UnderPageBackground,
         GlassMaterial::ContentBackground,
@@ -202,6 +234,7 @@ impl GlassMaterial {
     /// and in the preferences row. Kebab-case, matching the AppKit constant.
     pub fn name(self) -> &'static str {
         match self {
+            GlassMaterial::WindowBlur => "window-blur",
             GlassMaterial::UnderWindowBackground => "under-window-background",
             GlassMaterial::UnderPageBackground => "under-page-background",
             GlassMaterial::ContentBackground => "content-background",
@@ -231,7 +264,24 @@ impl GlassMaterial {
         if want == "default" {
             return Some(GlassMaterial::SystemDefault);
         }
+        // The plain-blur mode is the one entry that is not an AppKit material
+        // name, so it is also the one whose name is not guessable. Accept the
+        // three things a user actually types for "the Terminal.app look" /
+        // "no material at all".
+        if matches!(want.as_str(), "none" | "terminal" | "terminal-app") {
+            return Some(GlassMaterial::WindowBlur);
+        }
         GlassMaterial::ALL.iter().copied().find(|m| m.name() == want)
+    }
+
+    /// Does this variant install an `NSVisualEffectView`?
+    ///
+    /// False for exactly [`Self::WindowBlur`], which asks the window server for a
+    /// plain backdrop blur instead and installs no view at all. The whole
+    /// install / remove / retarget decision in `rt::vibrancy_policy` turns on
+    /// this, so it lives with the enum rather than being re-derived at each site.
+    pub fn is_effect_view(self) -> bool {
+        !matches!(self, GlassMaterial::WindowBlur)
     }
 
     /// Step `dir` (+1 / -1) places through [`Self::ALL`], wrapping at both ends.
@@ -397,6 +447,24 @@ pub struct Settings {
     /// does need a restart, since rt reads the file once at startup;
     /// `RT_GLASS_MATERIAL=<name>` overrides it for one run.
     pub macos_glass_material: GlassMaterial,
+    /// **macOS only.** The radius, in pixels, of the plain backdrop blur behind
+    /// the window — the one thing Terminal.app's Profiles → Window "Blur" slider
+    /// controls. `1..=`[`Self::MAX_BLUR_RADIUS`].
+    ///
+    /// Consulted ONLY while [`Self::wants_background_blur`] is true AND
+    /// `macos_glass_material` is [`GlassMaterial::WindowBlur`]. The named
+    /// `NSVisualEffectMaterial`s ignore it, because `NSVisualEffectView` exposes
+    /// no radius: AppKit picks one per material and that is the end of it. That
+    /// asymmetry is the point — it is why `window-blur` is the default.
+    ///
+    /// The default of [`Self::DEFAULT_BLUR_RADIUS`] is deliberately well under
+    /// winit's hardcoded 80 (`WindowDelegate::set_blur` passes 80 and offers no
+    /// way to change it), which reads as a milky wash rather than frosted glass.
+    ///
+    /// Ignored but preserved off macOS, exactly like `macos_glass_material`, so
+    /// one `config.toml` stays portable. Takes effect live from the Preferences
+    /// "Blur radius (px)" row; `RT_BLUR_RADIUS=<n>` overrides it for one run.
+    pub macos_blur_radius: u32,
     /// How the in-window chrome (menu, manual, preferences, colour picker,
     /// clipboard history, search bar) is coloured. See [`ChromeTheme`]: every
     /// variant derives its palette from the colours below, so this chooses how
@@ -664,7 +732,8 @@ impl Default for Settings {
             // what "frosted glass you can still see the rocks through" needs.
             // NOT AppKit's own default: that is the deprecated `.appearanceBased`,
             // which is what made rt's glass read as an opaque grey-blue haze.
-            macos_glass_material: GlassMaterial::UnderWindowBackground,
+            macos_glass_material: GlassMaterial::WindowBlur,
+            macos_blur_radius: Settings::DEFAULT_BLUR_RADIUS,
             chrome_theme: ChromeTheme::Tinted, // chrome takes the terminal's own hue
             focus_follows_mouse: false,    // click-to-focus by default
             show_titlebar: true,           // Terminator-style per-pane titlebars on by default
@@ -704,6 +773,23 @@ impl Settings {
     /// Upper bound for the arrow-acceleration slider: the most cursor moves sent per held
     /// key-repeat. Effective top speed is this times the OS keyboard repeat rate.
     pub const MAX_ARROW_ACCEL: u32 = 30;
+
+    /// The smallest [`Self::macos_blur_radius`] worth asking for. Zero would be
+    /// "no blur", which is what `background_blur = false` already says, so the
+    /// radius row can never become a second, confusing off switch.
+    pub const MIN_BLUR_RADIUS: u32 = 1;
+    /// Upper bound for [`Self::macos_blur_radius`]. Past roughly this the
+    /// backdrop stops being frosted glass and becomes a flat wash of the average
+    /// colour behind the window; winit's own hardcoded 80 is already in that
+    /// territory. Kept as a guardrail rather than a taste judgement — every
+    /// value up to it is reachable from the Preferences row.
+    pub const MAX_BLUR_RADIUS: u32 = 100;
+    /// The out-of-the-box backdrop blur radius. Chosen to sit well below winit's
+    /// hardcoded 80 (see the field docs): enough to make what is behind the
+    /// window unreadable without making it a featureless wash.
+    pub const DEFAULT_BLUR_RADIUS: u32 = 24;
+    /// One step of the Preferences "Blur radius (px)" row.
+    pub const BLUR_RADIUS_STEP: u32 = 4;
 
     /// Does this settings state want background blur / frosted glass right now?
     ///
@@ -754,6 +840,18 @@ impl Settings {
                 self.scrollback, Self::MAX_SCROLLBACK
             );
             self.scrollback = Self::MAX_SCROLLBACK;
+        }
+        if self.macos_blur_radius < Self::MIN_BLUR_RADIUS
+            || self.macos_blur_radius > Self::MAX_BLUR_RADIUS
+        {
+            let c = self.macos_blur_radius.clamp(Self::MIN_BLUR_RADIUS, Self::MAX_BLUR_RADIUS);
+            eprintln!(
+                "rt: config macos_blur_radius {} out of range [{}, {}]; clamped to {c}",
+                self.macos_blur_radius,
+                Self::MIN_BLUR_RADIUS,
+                Self::MAX_BLUR_RADIUS
+            );
+            self.macos_blur_radius = c;
         }
         if self.arrow_accel_max < 1 || self.arrow_accel_max > Self::MAX_ARROW_ACCEL {
             let c = self.arrow_accel_max.clamp(1, Self::MAX_ARROW_ACCEL);
@@ -1172,11 +1270,65 @@ mod config_tests {
         assert_eq!(ChromeTheme::Tinted.step(-1), *ChromeTheme::ALL.last().unwrap());
     }
 
+    /// The default is the UNTINTED mode, not a material. Every
+    /// `NSVisualEffectMaterial` carries its own tint on top of the configured
+    /// background — which is what the user hit ("it is blue coloured, which
+    /// messes up the colors I want to choose") — and offers no radius. The
+    /// Terminal.app look is a plain, adjustable backdrop blur and no material.
     #[test]
-    fn glass_material_defaults_to_under_window_background() {
-        // NOT AppKit's own default (.appearanceBased, deprecated and dense).
-        assert_eq!(Settings::default().macos_glass_material, GlassMaterial::UnderWindowBackground);
-        assert_eq!(GlassMaterial::default(), GlassMaterial::UnderWindowBackground);
+    fn glass_defaults_to_the_untinted_plain_window_blur() {
+        assert_eq!(Settings::default().macos_glass_material, GlassMaterial::WindowBlur);
+        assert_eq!(GlassMaterial::default(), GlassMaterial::WindowBlur);
+        assert!(!GlassMaterial::WindowBlur.is_effect_view(), "no NSVisualEffectView is installed");
+        // ...and every other variant IS one, including the deprecated control case.
+        for m in GlassMaterial::ALL.iter().filter(|m| **m != GlassMaterial::WindowBlur) {
+            assert!(m.is_effect_view(), "{} names a real NSVisualEffectMaterial", m.name());
+        }
+        // It is first in the cycle, so stepping right from the default walks the
+        // materials rather than wrapping straight off the end.
+        assert_eq!(GlassMaterial::ALL[0], GlassMaterial::WindowBlur);
+    }
+
+    #[test]
+    fn the_blur_radius_defaults_well_below_winits_hardcoded_eighty() {
+        let s = Settings::default();
+        assert_eq!(s.macos_blur_radius, Settings::DEFAULT_BLUR_RADIUS);
+        assert!(
+            s.macos_blur_radius < 80,
+            "winit's set_blur() passes 80 with no way to change it; that is the 'too blurry'"
+        );
+        assert!(s.macos_blur_radius >= Settings::MIN_BLUR_RADIUS);
+        assert!(s.macos_blur_radius <= Settings::MAX_BLUR_RADIUS);
+    }
+
+    #[test]
+    fn normalize_clamps_the_blur_radius_into_range() {
+        // Zero is not an off switch — `background_blur = false` is.
+        let mut s = Settings { macos_blur_radius: 0, ..Settings::default() };
+        s.normalize();
+        assert_eq!(s.macos_blur_radius, Settings::MIN_BLUR_RADIUS);
+        let mut s = Settings { macos_blur_radius: 100_000, ..Settings::default() };
+        s.normalize();
+        assert_eq!(s.macos_blur_radius, Settings::MAX_BLUR_RADIUS);
+        // An in-range value is left exactly alone.
+        let mut s = Settings { macos_blur_radius: 30, ..Settings::default() };
+        s.normalize();
+        assert_eq!(s.macos_blur_radius, 30);
+    }
+
+    /// The radius travels with the material in one portable `config.toml`, and a
+    /// missing field falls back rather than failing the load.
+    #[test]
+    fn a_config_naming_a_blur_radius_loads_and_round_trips_on_any_platform() {
+        let cfg: Config = toml::from_str("[settings]\nmacos_blur_radius = 12\n")
+            .expect("a blur radius must parse on Linux too");
+        assert_eq!(cfg.settings.macos_blur_radius, 12);
+        let text = toml::to_string_pretty(&cfg).expect("serialisable");
+        assert!(text.contains("macos_blur_radius = 12"), "{text}");
+        // Absent -> the default, with every other setting intact.
+        let cfg: Config = toml::from_str("[settings]\nfont_size = 21.0\n").expect("loads");
+        assert_eq!(cfg.settings.macos_blur_radius, Settings::DEFAULT_BLUR_RADIUS);
+        assert_eq!(cfg.settings.font_size, 21.0);
     }
 
     #[test]
@@ -1196,6 +1348,11 @@ mod config_tests {
         assert_eq!(GlassMaterial::from_name(" Sidebar "), Some(GlassMaterial::Sidebar));
         assert_eq!(GlassMaterial::from_name("default"), Some(GlassMaterial::SystemDefault));
         assert_eq!(GlassMaterial::from_name("frosted"), None);
+        // "window-blur" is the only name that is not an AppKit constant, so the
+        // things a user would actually type for it are accepted too.
+        for want in ["window-blur", "WINDOW_BLUR", "none", "terminal", "Terminal-App"] {
+            assert_eq!(GlassMaterial::from_name(want), Some(GlassMaterial::WindowBlur), "{want}");
+        }
     }
 
     #[test]

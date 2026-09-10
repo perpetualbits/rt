@@ -59,6 +59,12 @@ pub enum PrefRow {
     // is noise, not a finding.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     GlassMaterial,
+    /// The radius of the macOS window's own backdrop blur, in pixels — the
+    /// Terminal.app "Blur" slider. Live only while `macos_glass_material` is
+    /// `window-blur`: an `NSVisualEffectView` has no radius to set. Same
+    /// macOS-only-in-UI / cross-platform-in-rule split as `GlassMaterial`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    BlurRadius,
     /// Which chrome palette the floating panels are derived with. Cross-platform
     /// (unlike `GlassMaterial`): the chrome is the same native draw on both
     /// backends, so the row exists everywhere.
@@ -106,6 +112,13 @@ pub fn enabled(s: &Settings, row: PrefRow) -> bool {
         PrefRow::ArrowAccelMax => s.arrow_accel, // the cap is moot when acceleration is off
         // The one predicate every blur/glass backend shares; never a second copy.
         PrefRow::GlassMaterial => s.wants_background_blur(),
+        // The radius is the same trap one level down: it is real only for the
+        // `window-blur` mode, because `NSVisualEffectView` exposes no radius at
+        // all. Stepping it while a material is chosen would change a number and
+        // nothing on screen.
+        PrefRow::BlurRadius => {
+            s.wants_background_blur() && !s.macos_glass_material.is_effect_view()
+        }
         _ => true,
     }
 }
@@ -223,9 +236,18 @@ pub fn step(
             s.background = c.background;
             s.palette = c.palette;
         }
-        // Cycles rather than toggles: 13 materials, wrapping at both ends, so a
-        // user can walk the whole list with one arrow key and watch each one land.
+        // Cycles rather than toggles: the plain window blur plus 13 materials,
+        // wrapping at both ends, so a user can walk the whole list with one arrow
+        // key and watch each one land.
         PrefRow::GlassMaterial => s.macos_glass_material = s.macos_glass_material.step(dir),
+        // Clamps, not wraps: this is a magnitude, and wrapping from 1px to 100px
+        // on one keypress would be a jump-scare, not a setting.
+        PrefRow::BlurRadius => {
+            let step = Settings::BLUR_RADIUS_STEP as i32 * dir;
+            s.macos_blur_radius = (s.macos_blur_radius as i32 + step)
+                .clamp(Settings::MIN_BLUR_RADIUS as i32, Settings::MAX_BLUR_RADIUS as i32)
+                as u32;
+        }
         // The same shape: a cycle, so the three chrome treatments can be walked
         // with one arrow key and each one seen in place.
         PrefRow::Chrome => s.chrome_theme = s.chrome_theme.step(dir),
@@ -653,6 +675,52 @@ mod tests {
         let before = s.macos_glass_material;
         step(&mut s, PrefRow::GlassMaterial, 1, &fams(), &terms());
         assert_eq!(s.macos_glass_material, before);
+    }
+
+    /// The radius clamps at both ends rather than wrapping — it is a magnitude,
+    /// and one keypress must never take 1px to 100px.
+    #[test]
+    fn blur_radius_steps_and_clamps_at_both_ends() {
+        let mut s = Settings::default();
+        s.background_opacity = 0.5; // the row is live only while there IS blur
+        let start = s.macos_blur_radius;
+        step(&mut s, PrefRow::BlurRadius, 1, &fams(), &terms());
+        assert_eq!(s.macos_blur_radius, start + Settings::BLUR_RADIUS_STEP);
+        step(&mut s, PrefRow::BlurRadius, -1, &fams(), &terms());
+        assert_eq!(s.macos_blur_radius, start, "a step and back is identity");
+        // All the way down: it stops at the floor, it does not wrap to the top.
+        for _ in 0..100 {
+            step(&mut s, PrefRow::BlurRadius, -1, &fams(), &terms());
+        }
+        assert_eq!(s.macos_blur_radius, Settings::MIN_BLUR_RADIUS);
+        // And all the way up.
+        for _ in 0..100 {
+            step(&mut s, PrefRow::BlurRadius, 1, &fams(), &terms());
+        }
+        assert_eq!(s.macos_blur_radius, Settings::MAX_BLUR_RADIUS);
+    }
+
+    /// A named material has no radius — `NSVisualEffectView` exposes none — so
+    /// the row must dim rather than edit a number nothing reads.
+    #[test]
+    fn blur_radius_is_live_only_for_the_plain_window_blur_mode() {
+        let mut s = Settings::default();
+        s.background_opacity = 0.5;
+        assert_eq!(s.macos_glass_material, rt_config::GlassMaterial::WindowBlur);
+        assert!(enabled(&s, PrefRow::BlurRadius), "the default mode owns a radius");
+        s.macos_glass_material = rt_config::GlassMaterial::HudWindow;
+        assert!(!enabled(&s, PrefRow::BlurRadius), "a material's radius is AppKit's, not ours");
+        // ...and a disabled row refuses to step.
+        let before = s.macos_blur_radius;
+        step(&mut s, PrefRow::BlurRadius, 1, &fams(), &terms());
+        assert_eq!(s.macos_blur_radius, before);
+        // Turning blur off dims it too, even in the plain mode.
+        s.macos_glass_material = rt_config::GlassMaterial::WindowBlur;
+        s.background_blur = false;
+        assert!(!enabled(&s, PrefRow::BlurRadius));
+        s.background_blur = true;
+        s.background_opacity = 1.0;
+        assert!(!enabled(&s, PrefRow::BlurRadius), "opaque -> nothing to blur");
     }
 
     #[test]

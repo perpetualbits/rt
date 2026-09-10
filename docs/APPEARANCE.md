@@ -89,11 +89,10 @@ so our setup roundtrip buffers rather than steals winit's events.
 ## macOS: the frosted glass and its material
 
 macOS is the one platform where rt gets real blur-behind for free: the window
-server blurs behind a transparent window through `NSVisualEffectView`
-(`crates/rt/src/vibrancy.rs`), which is the AppKit sibling of `blur.rs` and
-`bg_effect.rs`. Two things about it were wrong in the first cut and are worth
-recording, because both were reported from a real screen rather than reasoned
-about.
+server blurs behind a transparent window (`crates/rt/src/vibrancy.rs`), which is
+the AppKit sibling of `blur.rs` and `bg_effect.rs`. Three things about it were
+wrong in the first cuts and are worth recording, because all three were reported
+from a real screen rather than reasoned about.
 
 **It is gated, like every other blur path.** The effect view used to be installed
 unconditionally, on the theory that glass behind an opaque background is
@@ -106,7 +105,9 @@ the preference and the slider both take effect live. `vibrancy::set_enabled` is
 idempotent: it finds its own view by an `identifier` tag rather than remembering
 a handle, so the hierarchy is the only source of truth and a repeated call can
 never stack a second pane of glass. The decision itself is
-`vibrancy_policy::glass_action`, deliberately not `cfg`'d so Linux CI tests it.
+`vibrancy_policy::glass_plan`, deliberately not `cfg`'d so Linux CI tests it —
+and it decides BOTH mechanisms at once, so switching between them takes the old
+one down in the same pass it brings the new one up.
 
 **The material is chosen, not defaulted.** AppKit's `material` property "Defaults
 to `NSVisualEffectMaterialAppearanceBased`" — deprecated since 10.14, and much
@@ -114,18 +115,46 @@ denser than what Terminal.app shows. Leaving it unset is what made rt's glass
 read as an almost-opaque grey-blue haze with the user's own background colour
 faintly on top of it.
 
-`macos_glass_material` in `config.toml` names it. The default is
+`macos_glass_material` in `config.toml` names it. Among the materials the pick is
 `under-window-background`: AppKit documents `.underWindowBackground` as "the
 material used under window backgrounds", which is literally where rt puts the
 effect view (below the content view, as a sibling one level up), and it is the
-lightest of the behind-window materials — the one that leaves the desktop behind
-the window legible rather than merely present.
+lightest of the behind-window materials.
 
-The full list, in Preferences cycle order (roughly lightest to heaviest):
+**And a material was still the wrong default.** Judged on a real screen against
+Terminal.app, every one of them lost, for two reasons that no amount of picking a
+better material can fix:
 
-`under-window-background`, `under-page-background`, `content-background`,
-`window-background`, `sidebar`, `header-view`, `titlebar`, `menu`, `popover`,
-`sheet`, `full-screen-ui`, `hud-window`, `system-default`.
+- **Every `NSVisualEffectMaterial` carries its own tint.** It composites *under*
+  the terminal's background colour, so at a low `background_opacity` the tint is
+  most of what is on screen and the chosen colour scheme is no longer the colour
+  that was chosen. The user's words: `hud-window` "is blue coloured, which messes
+  up the colors I want to choose".
+- **`NSVisualEffectView` exposes no blur radius.** AppKit picks one per material.
+  "Too blurry" has no answer.
+
+Terminal.app does not use `NSVisualEffectView` at all. Profiles → Window is a
+background colour with its own opacity plus a separate **Blur slider**: a
+variable-radius, *untinted* blur behind an otherwise plain window. That is the
+private `CGSSetWindowBackgroundBlurRadius`, and it is now rt's default, as
+`macos_glass_material = "window-blur"` — no effect view is installed, and the
+only colour on screen is `background` at `background_opacity`.
+
+rt makes that private call itself rather than through winit's `Window::set_blur`,
+for exactly one reason: winit's `set_blur` hardcodes the radius at 80 ("in
+general we want to specify the blur radius, but the choice of 80 should be a
+reasonable default" — its own comment), and 80 *is* the "too blurry". The radius
+is `macos_blur_radius`, `1`–`100`, default `24`, with a Preferences row of its
+own that is live only in `window-blur` mode. Being private SPI, the call fails
+soft: a non-zero `CGError` is logged and the window is merely translucent.
+`Window::set_blur` remains the fallback for when AppKit cannot be reached at all.
+
+The full list, in Preferences cycle order (the plain blur first, then the
+materials roughly lightest to heaviest):
+
+`window-blur`, `under-window-background`, `under-page-background`,
+`content-background`, `window-background`, `sidebar`, `header-view`, `titlebar`,
+`menu`, `popover`, `sheet`, `full-screen-ui`, `hud-window`, `system-default`.
 
 `system-default` means "never call `setMaterial:`" — the deprecated AppKit
 default, kept only as the control case to compare against.
