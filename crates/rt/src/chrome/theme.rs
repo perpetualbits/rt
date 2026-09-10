@@ -31,6 +31,25 @@
 //! *contrast*: see [`Palette::derive`]'s floors and
 //! [`tests::every_theme_is_legible_over_every_scheme`].
 //!
+//! **Reasoned about what is on screen, not what is configured.** A window with
+//! `background_opacity = 0.05` is not showing the user's background colour; it
+//! is showing 5% of it over a desktop rt cannot see. [`Palette::derive`]
+//! therefore takes the opacity and works from [`surround`] — the composite that
+//! actually reaches the eye — and holds every text floor against the panel *as
+//! composited*, not against the panel's own RGB. Two consequences fall out of
+//! that one input: a sheer window gets a nearly solid panel (there is no point
+//! blending in a colour nobody can predict — see `panel_alpha`), and it gets a
+//! stronger border ([`FLOOR_EDGE_SHEER`]), because when the surroundings are
+//! unknowable the border is the only thing that reliably says where the panel
+//! ends.
+//!
+//! **Three text colours, used the same way everywhere.** `text` is reading
+//! matter, `dim` is metadata, and `accent` marks *the thing you press* — key
+//! names in the manual's left column, accelerators in the menu — with bold
+//! `accent` reserved for section headings. The manual's key column is coloured,
+//! so [`FLOOR_ROLE_SPLIT`] makes `accent` being distinguishable from `text` a
+//! guarantee rather than a coincidence of the user's scheme.
+//!
 //! **Spacing scale.** A 4 px logical grid, registered in
 //! [`crate::chrome_scale::logical`] and multiplied by the display's backing
 //! factor at every use: `PANEL_PAD_X` (14) across, `PANEL_PAD_Y` (8) down,
@@ -147,27 +166,66 @@ fn ensure_contrast(c: [f32; 3], bg: [f32; 3], ratio: f32) -> [f32; 3] {
     mix(c, toward, hi)
 }
 
-/// `body`, moved away from `bg` until it clears `floor` — the panel's own
-/// separation from the terminal behind it.
+/// `body`, moved away from `around` until the panel **as composited at `alpha`**
+/// clears `floor` against it — the panel's own separation from the terminal.
 ///
-/// Monotone, hence bisectable: a dark panel only ever moves toward white and a
-/// light one only ever toward black, and the background is by construction on
-/// the far side of that move.
-fn ensure_separation(body: [f32; 3], bg: [f32; 3], floor: f32, dark: bool) -> [f32; 3] {
-    if contrast(body, bg) >= floor {
+/// Two things changed here when the theme started reasoning about the effective
+/// background:
+///
+/// * The test is on `mix(around, body, alpha)`, not on `body`. A panel that is
+///   96% opaque is 4% of whatever it sits on, which pulls it back *toward* the
+///   thing it is trying to stand off from; solving on the raw body overshoots
+///   into a panel that misses the floor by exactly that 4%. A white terminal is
+///   the case that catches it.
+/// * The direction comes from the two *luminances*, not from the theme's
+///   light/dark flag. That is what keeps this monotone — and hence bisectable —
+///   now that `around` is the effective background and may sit on either side of
+///   a dark panel. The flag was a safe proxy only while `around` was the user's
+///   own background, which a dark panel is always lighter than; `dark` now only
+///   breaks the exact tie.
+fn ensure_separation(body: [f32; 3], around: [f32; 3], floor: f32, alpha: f32, dark: bool) -> [f32; 3] {
+    let composited = |b: [f32; 3]| mix(around, b, alpha);
+    if contrast(composited(body), around) >= floor {
         return body;
     }
-    let toward = if dark { WHITE } else { BLACK };
-    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
-    for _ in 0..24 {
-        let m = 0.5 * (lo + hi);
-        if contrast(mix(body, toward, m), bg) >= floor {
-            hi = m;
-        } else {
-            lo = m;
+    // Preferred direction: straight away from `around`, which is the smallest
+    // move and the one that preserves what the panel band already decided. It is
+    // not always *reachable*, though — a near-white terminal at high opacity puts
+    // `around` above a light panel with less than the floor's worth of room left
+    // above it — so the opposite pole is tried second.
+    let preferred = match lum(composited(body)).partial_cmp(&lum(around)) {
+        Some(std::cmp::Ordering::Greater) => WHITE,
+        Some(std::cmp::Ordering::Less) => BLACK,
+        _ => {
+            if dark {
+                WHITE
+            } else {
+                BLACK
+            }
+        }
+    };
+    let other = if preferred == WHITE { BLACK } else { WHITE };
+    // A forward scan, not a bisection: crossing `around` on the way to the far
+    // pole makes contrast dip to 1.0 and rise again, so the predicate is not
+    // monotone in `t` and bisection can settle on the wrong side of the dip.
+    // The first `t` that clears the floor is the least the panel has to move.
+    const STEPS: usize = 256;
+    let mut best = (contrast(composited(body), around), body);
+    for toward in [preferred, other] {
+        for i in 1..=STEPS {
+            let c = mix(body, toward, i as f32 / STEPS as f32);
+            let got = contrast(composited(c), around);
+            if got >= floor {
+                return c;
+            }
+            if got > best.0 {
+                best = (got, c);
+            }
         }
     }
-    mix(body, toward, hi)
+    // Nothing reaches the floor (a panel wedged against a backdrop it cannot
+    // escape): take the most separated colour there was.
+    best.1
 }
 
 fn to_f(rgb: [u8; 3]) -> [f32; 3] {
@@ -241,16 +299,116 @@ pub const FLOOR_OFF: f32 = 2.4;
 pub const FLOOR_ACCENT: f32 = 4.5;
 /// Text on a selected row.
 pub const FLOOR_SEL_TEXT: f32 = 4.5;
-/// A panel's border against its own body — enough to see the edge, not enough
-/// to draw the eye.
+/// A panel's border against its own body, over an **opaque** window — enough to
+/// find the edge, not enough to draw the eye. The body's own difference from a
+/// known terminal colour is doing most of the separating here.
 pub const FLOOR_EDGE: f32 = 1.25;
-/// A panel body against the terminal background it floats over.
+/// The same floor over a **fully see-through** window. When the terminal is not
+/// really there, the colour behind the panel is the user's desktop, which rt
+/// cannot know — so body-versus-terminal contrast guarantees nothing and the
+/// border becomes the only thing that reliably says where the panel ends. It has
+/// to be *seen* rather than merely found, so the floor roughly doubles.
+pub const FLOOR_EDGE_SHEER: f32 = 3.2;
+/// A panel body against the terminal background it floats over — measured
+/// against the EFFECTIVE background (see [`surround`]), which is what is
+/// actually on screen, not against the configured colour.
 pub const FLOOR_PANEL: f32 = 1.15;
 /// The alpha floor for a panel body. The contrast floors above are computed
 /// against the panel's own RGB as if it were opaque; at 0.95 and above the
 /// worst case a composite can shift the effective luminance by is 5%, which is
 /// well inside the margin every floor is met with.
 pub const PANEL_ALPHA_MIN: f32 = 0.95;
+/// A recessed field (the search bar's query area) against the panel it is sunk
+/// into. *"[the search bar] background grey also too light, so it does not
+/// contrast enough"* — the well was a fixed mix off the panel and nothing
+/// checked that the mix actually produced a visible recess.
+/// It is deliberately shallow: on a near-white panel the whole range left
+/// between the panel and paper white is 1.16, and deepening the well the *other*
+/// way would sink it toward the text colour — a recess that costs legibility,
+/// which is the trade this well must never make.
+pub const FLOOR_FIELD: f32 = 1.12;
+/// Accent text against primary text. The manual sets a two-column reference in
+/// two colours — key names in [`Palette::accent`], their descriptions in
+/// [`Palette::text`] — so the *difference* between those two roles carries
+/// meaning. A scheme whose accent happens to land on top of its foreground
+/// would silently turn that back into one undifferentiated slab.
+pub const FLOOR_ROLE_SPLIT: f32 = 1.25;
+
+/// The luminance rt assumes for whatever is behind its window.
+///
+/// A see-through window shows the desktop — or, on macOS, a frosted-glass
+/// version of it. rt cannot sample either, so it has to assume. Mid grey is the
+/// honest assumption on two counts: it is roughly where arbitrary screen content
+/// averages out (the photographer's 18% card), and it is the luminance from
+/// which the maximum contrast reachable in *either* direction is lowest — so
+/// assuming it is also the conservative choice.
+const BACKDROP_L: f32 = 0.20;
+
+/// The largest fraction of a chrome pixel that may be unknown backdrop.
+///
+/// A translucent panel is only safe while what shows through it is *known* to be
+/// close to the panel's own colour — which is true of a terminal painted in the
+/// user's background colour, and false of an arbitrary desktop. See
+/// [`panel_alpha`].
+const UNKNOWN_MAX: f32 = 0.01;
+
+/// The neutral mid-grey rt assumes is behind the window.
+fn backdrop() -> [f32; 3] {
+    with_lum(WHITE, BACKDROP_L)
+}
+
+/// **What the terminal area actually looks like on screen**: the user's
+/// background colour composited at `opacity` over the assumed [`backdrop`].
+///
+/// This is the colour a floating panel really sits next to, and it is the thing
+/// the theme reasons about now. The difference is not academic: at
+/// `background_opacity = 0.05` — a perfectly ordinary setting on a Mac with
+/// glass behind it — a near-black configured background of luminance 0.0008
+/// reaches the eye at luminance 0.18. Every guarantee stated against the
+/// configured colour was being stated about something that is 95% not there.
+pub fn surround(bg: [f32; 3], opacity: f32) -> [f32; 3] {
+    mix(backdrop(), bg, opacity.clamp(0.0, 1.0))
+}
+
+/// How opaque a panel has to be, given how see-through the window is.
+///
+/// A chrome pixel is `alpha` of the panel plus `1 - alpha` of the terminal
+/// behind it, and that terminal is itself only `opacity` of the user's
+/// background plus `1 - opacity` of unknown desktop. So the unknown fraction of
+/// a chrome pixel is `(1 - alpha) * (1 - opacity)`, and holding it under
+/// [`UNKNOWN_MAX`] is what keeps "the floors are computed against the panel's own
+/// RGB as if it were opaque" a true statement rather than a hopeful one.
+///
+/// On an opaque window this asks for nothing and the theme's own alpha stands
+/// (rt's Linux default at `opacity = 0.9` still gets its 0.96 panel). As the
+/// window goes sheer the panel closes up to nearly solid, because the only
+/// alternative is blending in a colour nobody can predict.
+fn panel_alpha(theme_alpha: f32, opacity: f32) -> f32 {
+    let unknown = (1.0 - opacity.clamp(0.0, 1.0)).max(1e-6);
+    let need = 1.0 - UNKNOWN_MAX / unknown;
+    theme_alpha.max(PANEL_ALPHA_MIN).max(need).clamp(0.0, 1.0)
+}
+
+/// The border floor for a window of this opacity — [`FLOOR_EDGE`] when the
+/// window is opaque, rising to [`FLOOR_EDGE_SHEER`] as it goes see-through.
+fn edge_floor(opacity: f32) -> f32 {
+    FLOOR_EDGE + (FLOOR_EDGE_SHEER - FLOOR_EDGE) * (1.0 - opacity.clamp(0.0, 1.0))
+}
+
+/// What a chrome pixel of colour `body` at `alpha` actually looks like on
+/// screen, over a terminal of this background and opacity. Every text floor is
+/// held against THIS, not against `body`.
+fn seen(body: [f32; 3], alpha: f32, bg: [f32; 3], opacity: f32) -> [f32; 3] {
+    mix(surround(bg, opacity), body, alpha.clamp(0.0, 1.0))
+}
+
+/// The luminance that hits exactly `ratio` against a background of luminance
+/// `bg_l`, on the side a `dark` panel's text lives on (brighter for a dark
+/// panel, darker for a light one). Straight from the WCAG definition.
+fn floor_lum(bg_l: f32, ratio: f32, dark: bool) -> f32 {
+    let l = if dark { ratio * (bg_l + 0.05) - 0.05 } else { (bg_l + 0.05) / ratio - 0.05 };
+    l.clamp(0.0, 1.0)
+}
 
 impl Palette {
     /// Derive the whole palette from the user's colours.
@@ -259,16 +417,33 @@ impl Palette {
     /// user's own bright-blue palette entry, so a selection bar is in the
     /// family of colours the terminal already uses.
     ///
+    /// `opacity` is `Settings::background_opacity` — how much of the window is
+    /// really the user's background and how much is desktop showing through.
+    /// Everything the palette claims about *separation* is claimed against
+    /// [`surround`], the colour that composite actually produces, and every text
+    /// floor is held against [`seen`], the panel colour that composite actually
+    /// produces. Passing the configured background alone (which is what this
+    /// used to do) states those guarantees about a colour that, on a sheer
+    /// window, is almost entirely not on screen.
+    ///
     /// The shape of it: decide dark vs light from the background's luminance;
     /// pin the panel body into the legible band for that side (keeping the
     /// background's hue, except under [`ChromeTheme::Graphite`], which
     /// deliberately drops it); then derive every other role from the panel and
     /// hold each to its floor with [`ensure_contrast`].
-    pub fn derive(fg: [u8; 3], bg: [u8; 3], accent: [u8; 3], theme: ChromeTheme) -> Palette {
+    pub fn derive(fg: [u8; 3], bg: [u8; 3], accent: [u8; 3], theme: ChromeTheme, opacity: f32) -> Palette {
         let bg = to_f(bg);
         let fg = to_f(fg);
         let accent = to_f(accent);
+        let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
+        // Light-vs-dark stays the USER's decision, taken from the colour they
+        // configured. It deliberately does NOT follow `surround`: an assumed
+        // backdrop is a guess, and a guess must not be allowed to hand somebody
+        // who chose a light terminal a black menu. The guess only ever informs
+        // how far apart things have to be, never which side they are on.
         let dark = lum(bg) < 0.5;
+        // What the panel will really be sitting next to.
+        let around = surround(bg, opacity);
 
         // 1. The panel body.
         let (body, alpha, floor_text): ([f32; 3], f32, f32) = match theme {
@@ -293,13 +468,20 @@ impl Palette {
                 (with_lum(bg, l), 1.0, 9.0)
             }
         };
+        // How solid the panel has to be for the floors below to mean anything.
+        let alpha = panel_alpha(alpha, opacity);
         // The panel must be visibly a different surface from the terminal behind
         // it. A pure-white terminal is the case that forces this: the light-mode
         // band alone lands the panel within 1.06:1 of the background, which is
-        // no edge at all. Push it further from the background — away from the
-        // pole it already sits near, which is the direction that also RAISES the
-        // text contrast, so nothing below is spent to pay for it.
-        let body = ensure_separation(body, bg, FLOOR_PANEL, dark);
+        // no edge at all. Push it further from what is ACTUALLY behind it — the
+        // composited `around`, not the configured colour.
+        let body = ensure_separation(body, around, FLOOR_PANEL, alpha, dark);
+        // From here on, floors are held against the colour the panel resolves to
+        // on screen. With `alpha` set as above the two are within 1% of each
+        // other, so this is a small correction — but it is the correction that
+        // makes "text clears 7:1 on the panel" a statement about the panel the
+        // user is looking at.
+        let panel_seen = seen(body, alpha, bg, opacity);
         // Against the pole the panel is not: the direction every contrast-
         // increasing nudge below travels in.
         let away = if dark { WHITE } else { BLACK };
@@ -312,19 +494,51 @@ impl Palette {
             ChromeTheme::Contrast => 0.45,
             _ => 0.26,
         };
-        let edge = ensure_contrast(mix(body, away, edge_mix), body, FLOOR_EDGE);
-        let sep = ensure_contrast(mix(body, away, edge_mix * 0.6), body, 1.18);
+        let edge = ensure_contrast(mix(body, away, edge_mix), panel_seen, edge_floor(opacity));
+        let sep = ensure_contrast(mix(body, away, edge_mix * 0.6), panel_seen, 1.18);
         let hover = mix(body, away, if dark { 0.13 } else { 0.10 });
         let thumb = mix(body, away, 0.34);
         // A well is recessed: darker than the panel in a dark theme, brighter
         // (toward paper white) in a light one.
-        let field = mix(body, if dark { BLACK } else { WHITE }, if dark { 0.45 } else { 0.55 });
+        let recess = if dark { BLACK } else { WHITE };
+        let field = mix(body, recess, if dark { 0.45 } else { 0.55 });
+        // …and it has to be a recess you can SEE, not just a different number.
+        // Deepened only ever AWAY from the text: `ensure_separation` would be
+        // free to pick the other pole when this one runs out of room, and on a
+        // near-white panel that means a well DARKER than the panel — which is a
+        // visible recess bought with the legibility of the text sitting in it.
+        let field = {
+            const STEPS: usize = 64;
+            let mut deepened = mix(field, recess, 1.0);
+            for i in 0..=STEPS {
+                let c = mix(field, recess, i as f32 / STEPS as f32);
+                if contrast(c, panel_seen) >= FLOOR_FIELD {
+                    deepened = c;
+                    break;
+                }
+            }
+            deepened
+        };
 
         // 3. Text, each held to its floor, each starting from the user's own colour.
-        let text = ensure_contrast(fg, body, floor_text);
-        let dim = ensure_contrast(mix(text, body, 0.40), body, FLOOR_DIM);
-        let off = ensure_contrast(mix(text, body, 0.62), body, FLOOR_OFF);
-        let accent_text = ensure_contrast(accent, body, FLOOR_ACCENT);
+        let text = ensure_contrast(fg, panel_seen, floor_text);
+        let dim = ensure_contrast(mix(text, panel_seen, 0.40), panel_seen, FLOOR_DIM);
+        let off = ensure_contrast(mix(text, panel_seen, 0.62), panel_seen, FLOOR_OFF);
+        let accent_text = ensure_contrast(accent, panel_seen, FLOOR_ACCENT);
+        // The manual sets its key column in `accent` and the descriptions beside
+        // it in `text`, so those two roles have to be TELLABLE APART or the
+        // colour coding says nothing. A scheme whose accent already sits on top
+        // of its foreground gets its accent restated at exactly the dimmest
+        // luminance FLOOR_ACCENT allows. That is guaranteed to be a clear step
+        // below `text`, because `text` is held to a strictly higher floor
+        // against the same panel — the gap is at least FLOOR_TEXT/FLOOR_ACCENT,
+        // which is 1.56, comfortably past FLOOR_ROLE_SPLIT.
+        let accent_text = if contrast(accent_text, text) >= FLOOR_ROLE_SPLIT {
+            accent_text
+        } else {
+            let at_floor = floor_lum(lum(panel_seen), FLOOR_ACCENT, dark);
+            ensure_contrast(with_lum(accent_text, at_floor), panel_seen, FLOOR_ACCENT)
+        };
 
         // 4. The selection bar. A saturated accent at a fixed dark luminance in
         // BOTH modes — that is what a macOS menu highlight is, and it is the one
@@ -337,10 +551,10 @@ impl Palette {
         );
 
         Palette {
-            // The floors below are computed against the panel's own RGB as if it
-            // were opaque, so the alpha is held at or above the level that makes
-            // that approximation safe.
-            panel: col(body, alpha.max(PANEL_ALPHA_MIN)),
+            // `alpha` came out of `panel_alpha`, which is what keeps the floors
+            // above — all computed against `panel_seen` — true of the pixels
+            // that actually reach the screen.
+            panel: col(body, alpha),
             edge: col(edge, 1.0),
             sep: col(sep, 1.0),
             hover: col(hover, 1.0),
@@ -359,7 +573,7 @@ impl Palette {
     pub fn of(s: &rt_config::Settings) -> Palette {
         // Palette entry 12 is bright blue in every scheme rt ships — the nearest
         // thing a terminal palette has to a system accent colour.
-        Palette::derive(s.foreground, s.background, s.palette[12], s.chrome_theme)
+        Palette::derive(s.foreground, s.background, s.palette[12], s.chrome_theme, s.background_opacity)
     }
 }
 
@@ -529,18 +743,50 @@ mod tests {
     fn every_theme_is_legible_over_every_scheme() {
         for theme in rt_config::ChromeTheme::ALL {
             for (fg, bg, accent) in schemes() {
-                let p = Palette::derive(fg, bg, accent, *theme);
+                // Every opacity a user can dial in, not just the opaque default:
+                // 0.05 is what a Mac with glass behind it actually runs at, and
+                // it is the setting under which the old derivation was reasoning
+                // about a background colour that was 95% not on screen.
+                for &op in &[1.0_f32, 0.9, 0.5, 0.2, 0.05, 0.0] {
+                    let p = Palette::derive(fg, bg, accent, *theme, op);
+                    // The floors are claims about the SCREEN, so they are tested
+                    // against what the composite really produces.
+                    let body = seen(rgb(p.panel), p.panel.3, to_f(bg), op);
+                    let around = surround(to_f(bg), op);
+                    let name = theme.name();
+                    let ctx = format!("{name} over bg {bg:?} at opacity {op}");
+                    assert!(p.panel.3 >= PANEL_ALPHA_MIN, "{ctx}: panel alpha {}", p.panel.3);
+                    // A chrome pixel is almost entirely a colour rt chose, never
+                    // mostly a desktop rt cannot see.
+                    let unknown = (1.0 - p.panel.3) * (1.0 - op);
+                    assert!(unknown <= UNKNOWN_MAX + 1e-6, "{ctx}: {unknown} of the panel is unknown backdrop");
+                    assert!(contrast(rgb(p.text), body) >= FLOOR_TEXT - 0.01, "{ctx}: text");
+                    assert!(contrast(rgb(p.dim), body) >= FLOOR_DIM - 0.01, "{ctx}: dim");
+                    assert!(contrast(rgb(p.off), body) >= FLOOR_OFF - 0.01, "{ctx}: off");
+                    assert!(contrast(rgb(p.accent), body) >= FLOOR_ACCENT - 0.01, "{ctx}: accent");
+                    assert!(contrast(rgb(p.sel_text), rgb(p.sel)) >= FLOOR_SEL_TEXT - 0.01, "{ctx}: sel text");
+                    // The border carries more of the separation the sheerer the
+                    // window gets, because nothing else can be relied on.
+                    assert!(
+                        contrast(rgb(p.edge), body) >= edge_floor(op) - 0.01,
+                        "{ctx}: edge {} < {}",
+                        contrast(rgb(p.edge), body),
+                        edge_floor(op)
+                    );
+                    // The panel stands off the terminal AS SEEN, not as configured.
+                    assert!(contrast(body, around) >= FLOOR_PANEL - 0.01, "{ctx}: panel vs terminal");
+                    // Key names and their descriptions are two different colours
+                    // in the manual; they have to look it.
+                    assert!(
+                        contrast(rgb(p.accent), rgb(p.text)) >= FLOOR_ROLE_SPLIT - 0.01,
+                        "{ctx}: accent is indistinguishable from text ({})",
+                        contrast(rgb(p.accent), rgb(p.text))
+                    );
+                }
+                let p = Palette::derive(fg, bg, accent, *theme, 1.0);
                 let body = rgb(p.panel);
                 let name = theme.name();
                 let ctx = format!("{name} over bg {bg:?}");
-                assert!(p.panel.3 >= PANEL_ALPHA_MIN, "{ctx}: panel alpha {}", p.panel.3);
-                assert!(contrast(rgb(p.text), body) >= FLOOR_TEXT - 0.01, "{ctx}: text");
-                assert!(contrast(rgb(p.dim), body) >= FLOOR_DIM - 0.01, "{ctx}: dim");
-                assert!(contrast(rgb(p.off), body) >= FLOOR_OFF - 0.01, "{ctx}: off");
-                assert!(contrast(rgb(p.accent), body) >= FLOOR_ACCENT - 0.01, "{ctx}: accent");
-                assert!(contrast(rgb(p.sel_text), rgb(p.sel)) >= FLOOR_SEL_TEXT - 0.01, "{ctx}: sel text");
-                assert!(contrast(rgb(p.edge), body) >= FLOOR_EDGE - 0.01, "{ctx}: edge");
-                assert!(contrast(body, to_f(bg)) >= FLOOR_PANEL - 0.01, "{ctx}: panel vs terminal");
                 // Dimmed text really is dimmer than primary, and disabled dimmer
                 // still — the ordering is what makes the hierarchy readable.
                 assert!(
@@ -583,8 +829,8 @@ mod tests {
         };
         // A strongly blue-purple background.
         let bg = [0x18, 0x10, 0x30];
-        let t = Palette::derive([0xd0, 0xd0, 0xd8], bg, [0x8b, 0x7c, 0xff], ChromeTheme::Tinted);
-        let g = Palette::derive([0xd0, 0xd0, 0xd8], bg, [0x8b, 0x7c, 0xff], ChromeTheme::Graphite);
+        let t = Palette::derive([0xd0, 0xd0, 0xd8], bg, [0x8b, 0x7c, 0xff], ChromeTheme::Tinted, 1.0);
+        let g = Palette::derive([0xd0, 0xd0, 0xd8], bg, [0x8b, 0x7c, 0xff], ChromeTheme::Graphite, 1.0);
         assert!(hue_spread(t.panel) > 0.02, "tinted must carry the terminal's hue: {:?}", t.panel);
         assert!(hue_spread(g.panel) < 0.005, "graphite must be neutral: {:?}", g.panel);
         // And the blue channel leads in the tinted panel, as it does in the bg.
@@ -595,8 +841,8 @@ mod tests {
     /// chrome: a white terminal must not be handed a black menu.
     #[test]
     fn a_light_terminal_gets_light_chrome() {
-        let dark = Palette::derive([0xd0; 3], [0x10, 0x10, 0x14], [0x5c, 0x5c, 0xff], ChromeTheme::Tinted);
-        let light = Palette::derive([0x20; 3], [0xfd, 0xf6, 0xe3], [0x26, 0x8b, 0xd2], ChromeTheme::Tinted);
+        let dark = Palette::derive([0xd0; 3], [0x10, 0x10, 0x14], [0x5c, 0x5c, 0xff], ChromeTheme::Tinted, 1.0);
+        let light = Palette::derive([0x20; 3], [0xfd, 0xf6, 0xe3], [0x26, 0x8b, 0xd2], ChromeTheme::Tinted, 1.0);
         assert!(lum(rgb(dark.panel)) < 0.1, "dark chrome stays dark");
         assert!(lum(rgb(light.panel)) > 0.6, "light chrome stays light");
         // Text flips with it.
@@ -610,15 +856,70 @@ mod tests {
     #[test]
     fn the_three_themes_are_actually_different() {
         let (fg, bg, ac) = ([0xd0, 0xd0, 0xd8], [0x14, 0x10, 0x22], [0x8b, 0x7c, 0xff]);
-        let t = Palette::derive(fg, bg, ac, ChromeTheme::Tinted);
-        let g = Palette::derive(fg, bg, ac, ChromeTheme::Graphite);
-        let c = Palette::derive(fg, bg, ac, ChromeTheme::Contrast);
+        let t = Palette::derive(fg, bg, ac, ChromeTheme::Tinted, 1.0);
+        let g = Palette::derive(fg, bg, ac, ChromeTheme::Graphite, 1.0);
+        let c = Palette::derive(fg, bg, ac, ChromeTheme::Contrast, 1.0);
         assert_eq!(c.panel.3, 1.0, "contrast mode is fully opaque");
         assert!(t.panel.3 < 1.0 && g.panel.3 < 1.0, "the softer themes let the terminal through");
         assert!(contrast(rgb(c.text), rgb(c.panel)) > contrast(rgb(t.text), rgb(t.panel)));
         assert!(contrast(rgb(c.edge), rgb(c.panel)) > contrast(rgb(t.edge), rgb(t.panel)));
         // All three are distinguishable panels.
         assert!(contrast(rgb(t.panel), rgb(g.panel)) > 1.05, "tinted vs graphite");
+    }
+
+    /// THE opacity defect. *"The grey in the preferences and the manual is ugly
+    /// compared to the rest in the OSX GUI. On Linux it is not ugly."* Same code,
+    /// same panel colour — the difference between the two machines is that one
+    /// runs at `background_opacity = 0.90` and the other at `0.05`, and
+    /// `derive` used to take no opacity at all.
+    ///
+    /// At 0.05 a near-black background reaches the eye at roughly the luminance
+    /// of the desktop behind it. Every "the panel stands off the terminal"
+    /// guarantee was being made about a colour that is 95% not on screen.
+    #[test]
+    fn the_theme_reasons_about_what_is_on_screen_not_what_is_configured() {
+        // Roland's two machines, verbatim from their config.toml files.
+        let linux = ([248, 194, 0], [13, 0, 28], 0.90_f32);
+        let macos = ([5, 255, 12], [2, 2, 9], 0.05_f32);
+        for (fg, bg, op) in [linux, macos] {
+            let cfg = to_f(bg);
+            let on_screen = surround(cfg, op);
+            let p = Palette::derive(fg, bg, [0x5c, 0x5c, 0xff], ChromeTheme::Tinted, op);
+            let body = seen(rgb(p.panel), p.panel.3, cfg, op);
+            assert!(contrast(body, on_screen) >= FLOOR_PANEL - 0.01, "panel must stand off what is THERE");
+            assert!(contrast(rgb(p.text), body) >= FLOOR_TEXT - 0.01, "text on the panel as composited");
+        }
+        // The two are not the same situation, which is the whole point: the
+        // configured backgrounds are both near-black and within a hair of each
+        // other in luminance, but what reaches the eye is an order of magnitude
+        // apart. A derivation blind to opacity cannot tell them apart at all.
+        let l_seen = lum(surround(to_f(linux.1), linux.2));
+        let m_seen = lum(surround(to_f(macos.1), macos.2));
+        assert!((lum(to_f(linux.1)) - lum(to_f(macos.1))).abs() < 0.002, "configured: indistinguishable");
+        assert!(m_seen > l_seen * 10.0, "on screen: {m_seen} vs {l_seen} — not remotely the same surface");
+    }
+
+    /// A panel may only be see-through while what shows through it is a colour
+    /// rt chose. The sheerer the window, the more of that is unknowable desktop,
+    /// so the panel closes up — and the border, which is then the only reliable
+    /// separator, is held to a higher floor.
+    #[test]
+    fn a_sheer_window_gets_a_solid_panel_and_a_stronger_border() {
+        let (fg, bg, ac) = ([0xd0, 0xd0, 0xd8], [0x14, 0x10, 0x22], [0x8b, 0x7c, 0xff]);
+        let opaque = Palette::derive(fg, bg, ac, ChromeTheme::Tinted, 1.0);
+        let linuxish = Palette::derive(fg, bg, ac, ChromeTheme::Tinted, 0.9);
+        let sheer = Palette::derive(fg, bg, ac, ChromeTheme::Tinted, 0.05);
+        // rt's own Linux default is opaque enough that the theme's soft 0.96
+        // stands: this change must not quietly solidify chrome that was fine.
+        assert_eq!(opaque.panel.3, linuxish.panel.3, "0.9 is opaque enough to leave alone");
+        assert!(sheer.panel.3 > linuxish.panel.3, "a sheer window gets a more solid panel");
+        assert!(sheer.panel.3 > 0.98, "…and nearly solid at that: {}", sheer.panel.3);
+        let edge_c = |p: &Palette| contrast(rgb(p.edge), rgb(p.panel));
+        assert!(edge_c(&sheer) >= edge_floor(0.05) - 0.01, "sheer edge {} < floor", edge_c(&sheer));
+        assert!(edge_c(&sheer) > edge_c(&linuxish) * 1.25, "a sheer window needs a border you can see");
+        assert!(edge_floor(1.0) < edge_floor(0.0), "the border floor rises as the window goes sheer");
+        // Nothing about the panel's own colour is thrown away to get there.
+        assert!(contrast(rgb(sheer.text), rgb(sheer.panel)) >= FLOOR_TEXT - 0.01);
     }
 
     /// `with_lum` hits the luminance it is asked for and keeps the hue's sign.
@@ -640,3 +941,4 @@ mod tests {
         assert!(contrast(WHITE, BLACK) == contrast(BLACK, WHITE), "order-independent");
     }
 }
+

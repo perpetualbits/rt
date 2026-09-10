@@ -281,34 +281,48 @@ pub fn draw(
         if hot {
             theme::row_highlight(be, *rect, pal.sel, sc);
         }
-        let colr = if hot {
-            pal.sel_text
-        } else if !row.enabled {
-            pal.off
-        } else if row.action.is_none() {
-            pal.dim // an info row (the version footer)
-        } else {
-            pal.text
-        };
+        let (colr, acol) = roles(row, hot, pal);
         let oy = theme::text_y(*rect, cell_h);
         theme::text(be, rect.x + pad_x, oy, &row.label, colr, false);
-        // Accelerator, right-aligned and one step quieter than its label.
         if let Some(acc) = &row.accel {
-            let acol = if hot {
-                pal.sel_text
-            } else if row.enabled {
-                pal.dim
-            } else {
-                pal.off
-            };
             theme::text_right(be, rect.x + rect.w - pad_x, oy, acc, cell_w, acol, false);
         }
     }
-    // "More this way" cues, centred.
+    // "More this way" cues, centred — in the accent, because they are the one
+    // thing in the panel you can click that is not a row.
     for (cue, glyph) in [(g.up_cue, '▲'), (g.down_cue, '▼')] {
         let Some(r) = cue else { continue };
-        theme::text(be, r.x + (r.w - cell_w) * 0.5, theme::text_y(r, cell_h), &glyph.to_string(), pal.dim, false);
+        theme::text(be, r.x + (r.w - cell_w) * 0.5, theme::text_y(r, cell_h), &glyph.to_string(), pal.accent, false);
     }
+}
+
+/// The (label, accelerator) colours for one row. Pure, so what the menu is
+/// *saying* with colour can be asserted rather than eyeballed.
+///
+/// Three ideas, and they are the same three the manual uses:
+///
+/// * `text` is the thing you are reading — a live command's name.
+/// * `accent` is the thing you press. In the manual that is the key column; here
+///   it is the accelerator. A menu whose labels and shortcuts were both grey (the
+///   accelerator was merely `dim`) had no colour in it at all, which is what
+///   *"there is also not use of color in the manual nor menu"* was about.
+/// * `dim` is metadata — a row with no action, like the version footer.
+///
+/// A disabled row drops to `off` **wholesale**, accelerator included: "you
+/// cannot press this" has to beat "this is what you would press".
+fn roles(row: &Row, hot: bool, pal: &Palette) -> (crate::render::Color, crate::render::Color) {
+    if hot {
+        // On the selection bar there is exactly one legible colour, and the
+        // palette guarantees it against the bar rather than against the panel.
+        return (pal.sel_text, pal.sel_text);
+    }
+    if !row.enabled {
+        return (pal.off, pal.off);
+    }
+    if row.action.is_none() {
+        return (pal.dim, pal.dim); // an info row (the version footer)
+    }
+    (pal.text, pal.accent)
 }
 
 #[cfg(test)]
@@ -322,7 +336,50 @@ mod tests {
     }
 
     fn pal() -> Palette {
-        Palette::derive([0xd0, 0xd0, 0xd8], [0x10, 0x10, 0x14], [0x5c, 0x5c, 0xff], ChromeTheme::Tinted)
+        Palette::derive([0xd0, 0xd0, 0xd8], [0x10, 0x10, 0x14], [0x5c, 0x5c, 0xff], ChromeTheme::Tinted, 1.0)
+    }
+
+    /// *"There is also not use of color in the manual nor menu."* A label, its
+    /// accelerator, a disabled row and an info row must be four visibly
+    /// different things — and the accelerator must be the accent, matching the
+    /// manual's key column, so "accent means the thing you press" is one rule
+    /// across both panels rather than two local decisions.
+    #[test]
+    fn a_menu_row_says_four_different_things_in_colour() {
+        let p = pal();
+        let rgb = |c: crate::render::Color| [c.0, c.1, c.2];
+        let mk = |enabled: bool, action: bool| Row {
+            label: "Split Horizontally".into(),
+            accel: Some("Ctrl+Shift+O".into()),
+            action: action.then_some(menu::RowAction::Do(rt_config::Action::SplitHoriz)),
+            enabled,
+        };
+        let (label, accel) = roles(&mk(true, true), false, &p);
+        assert_eq!(rgb(accel), rgb(p.accent), "an accelerator is the thing you press");
+        assert_eq!(rgb(label), rgb(p.text), "a label is what you read");
+        assert!(
+            theme::contrast(rgb(label), rgb(accel)) >= theme::FLOOR_ROLE_SPLIT - 0.01,
+            "label and accelerator must be tellable apart"
+        );
+        // Disabled beats "pressable": the whole row goes quiet, accelerator too.
+        let (dl, da) = roles(&mk(false, true), false, &p);
+        assert_eq!(rgb(dl), rgb(p.off));
+        assert_eq!(rgb(da), rgb(p.off), "a shortcut you cannot use must not still shout");
+        // An info row is metadata, not a command.
+        assert_eq!(rgb(roles(&mk(true, false), false, &p).0), rgb(p.dim));
+        // On the selection bar there is one colour, held against the bar.
+        let (hl, ha) = roles(&mk(true, true), true, &p);
+        assert_eq!(rgb(hl), rgb(p.sel_text));
+        assert_eq!(rgb(ha), rgb(p.sel_text));
+        // The four are a HIERARCHY, not just four colours: a live label reads
+        // louder than a shortcut, and a disabled row quieter than either. (That
+        // each one clears its own contrast floor is asserted where the floors
+        // live — `theme::tests::every_theme_is_legible_over_every_scheme` — and
+        // against the panel AS COMPOSITED, which is the only panel there is.)
+        let body = rgb(p.panel);
+        let loudness = |c| theme::contrast(rgb(c), body);
+        assert!(loudness(p.text) > loudness(p.off), "a live label beats a disabled one");
+        assert!(loudness(p.dim) > loudness(p.off), "an info row beats a disabled one");
     }
 
     #[test]
