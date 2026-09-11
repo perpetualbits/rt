@@ -80,7 +80,13 @@ mod menubar; // the native macOS menu bar (NSMenu), built from menubar_model
 // NOT cfg'd to macOS on purpose: the shape of the menu bar is plain data, and
 // this is the only coverage Linux CI can give it. See the module's own doc.
 mod menubar_model; // which row goes in which menu-bar menu, and what it advertises
+// NOT cfg'd, and for the same reason as `cpu_heat` below it: what a titlebar says
+// — the fallback label for a pane no program has titled, and which end of an
+// over-long title survives — is plain string logic, and only the two leaf queries
+// it needs (a process's cwd and name, in `proc_info`) are per-platform.
+mod pane_title; // the pane titlebar's label: derived fallback + the truncation rule
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
+mod proc_info; // a process's cwd and program name (the derived title's inputs)
 mod proc_liveness; // portable "is this pid still alive?" for the patch-bay sweep
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
 mod render; // the GL glyph-atlas renderer
@@ -534,6 +540,13 @@ struct Active {
     heat: std::collections::HashMap<rt_core::PaneId, f32>, // per-pane CPU load (heat instrument)
     heat_ns: std::collections::HashMap<rt_core::PaneId, u64>,    // last session CPU nanoseconds per pane
     heat_last: Instant,                   // wall-clock of the last heat sample
+    // Cache behind the DERIVED pane title (the fallback for a pane no program has
+    // titled — every pane on macOS, where nothing emits OSC 0/2). Holds the two
+    // facts a kernel query costs, NOT the formatted string: the grid size in the
+    // title changes with every resize, so the string is composed at draw time from
+    // these + the cols/rows the titlebar already computed.
+    derived_facts: std::collections::HashMap<rt_core::PaneId, pane_title::ProcFacts>,
+    derived_last: Instant,                // wall-clock of the last derived-title refresh
     lat_phase: f32,                       // phase of the latency frame's undulation
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
     frame_why: u16,                       // `rt::frame` debug log: what asked for the pending repaint (FRAME_WHY_*)
@@ -2037,6 +2050,12 @@ impl App {
             heat: std::collections::HashMap::new(),
             heat_ns: std::collections::HashMap::new(),
             heat_last: Instant::now(),
+            derived_facts: std::collections::HashMap::new(),
+            // Backdated so the first draw refreshes immediately rather than
+            // leaving a pane unlabelled for the first half second of its life.
+            // `checked_sub` because `Instant` is the monotonic clock and rt may be
+            // started within a minute of boot, where the subtraction underflows.
+            derived_last: Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now),
             lat_phase: 0.0,
             stall: 0.0,
             frame_why: 0,
@@ -4213,6 +4232,7 @@ impl App {
             active.meters.remove(&id); // forget the closed pane's instrument state
             active.heat.remove(&id);
             active.heat_ns.remove(&id);
+            active.derived_facts.remove(&id); // and its cached title facts
             active.jacks.borrow_mut().remove(&id); // Drop -> remove its fifos
             active.wires.retain(|w| w.src != id && w.dst != id); // unplug its wires
             active.force_full = true; // clear removed-wire ghosts (relayout usually rescues, but be explicit)
@@ -4330,6 +4350,17 @@ impl App {
         // unless `inst_animate` opts in; the local GL backend always animates.
         let pumped = Self::pump_wires(active);
         let heat_live = Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02);
+        // The derived pane title (the fallback for a pane no program has titled)
+        // follows a cwd, and a `cd` at an otherwise idle prompt draws ONE frame —
+        // the new prompt — and then nothing. Sampling here as well as in the draw
+        // path means the change is picked up within the refresh interval even when
+        // the pane has gone quiet, and it asks for a repaint only when the label
+        // actually moved. Both callers share one 2 Hz throttle, so this is not a
+        // second sampler.
+        if active.session.titlebar_h() > 0.0 && Self::refresh_derived_facts(active) {
+            active.frame_why |= FRAME_WHY_TITLE;
+            dirty = true;
+        }
         let animate_instruments = active.backend.is_gl()
             || (active.settings.inst_remote && active.settings.inst_animate);
         if animate_instruments {
@@ -4449,8 +4480,9 @@ const FRAME_WHY_HEAT: u16 = 4;
 const FRAME_WHY_METER: u16 = 8;
 const FRAME_WHY_STALL: u16 = 16;
 const FRAME_WHY_BLINK: u16 = 32;
+const FRAME_WHY_TITLE: u16 = 64;
 fn frame_why_str(why: u16) -> String {
-    let names = [(FRAME_WHY_OUTPUT, "output"), (FRAME_WHY_ANIM, "anim"), (FRAME_WHY_HEAT, "heat"), (FRAME_WHY_METER, "meter"), (FRAME_WHY_STALL, "stall"), (FRAME_WHY_BLINK, "blink")];
+    let names = [(FRAME_WHY_OUTPUT, "output"), (FRAME_WHY_ANIM, "anim"), (FRAME_WHY_HEAT, "heat"), (FRAME_WHY_METER, "meter"), (FRAME_WHY_STALL, "stall"), (FRAME_WHY_BLINK, "blink"), (FRAME_WHY_TITLE, "title")];
     let s: Vec<&str> = names.iter().filter(|(b, _)| why & b != 0).map(|(_, n)| *n).collect();
     if s.is_empty() { "other".to_string() } else { s.join("+") }
 }
@@ -7415,6 +7447,13 @@ impl App {
         // history), so a stale rect from a previous frame must not survive the
         // pane unfocusing or the history emptying.
         active.clip_affordance = None;
+        // Refresh the facts behind the derived title of any pane that has none of
+        // its own (self-throttled to 2 Hz; see the function). Here rather than in
+        // the tick loop because the titlebar is the only thing that reads it — and
+        // when titlebars are off, nothing does.
+        if active.session.titlebar_h() > 0.0 {
+            Self::refresh_derived_facts(active);
+        }
         // Once per call (i.e. once per window paint), decide whether this frame
         // logs the cursor-presence diagnostic below — cheap to check even when
         // debug logging is off, so it costs nothing at default log levels.
@@ -7859,12 +7898,48 @@ impl App {
                     let scol = Color::rgb(0x6a, 0xa9, 0xff); // the focus-accent blue
                     // Cap to the same room the title gets, so a long status ("◉
                     // selecting · 12345 lines") never runs into the meter/size.
-                    for (i, ch) in status.chars().take(avail).enumerate() {
+                    // KEEP THE HEAD here, unlike the title below: this string is
+                    // composed by rt and reads left to right, and its first cells
+                    // ("◉ selecting") are the mode — the thing the status exists to
+                    // say. A count with no mode marker in front of it would be
+                    // indistinguishable from a pane title.
+                    let shown = pane_title::fit(&status, avail, pane_title::Keep::Head);
+                    for (i, ch) in shown.chars().enumerate() {
                         active.backend.draw_char(left_x, text_top, i, 0, ch, scol, false, false);
                     }
                 } else {
-                    let title = active.session.title_of(id).filter(|t| !t.is_empty()).unwrap_or("Terminal");
-                    for (i, ch) in title.chars().take(avail).enumerate() {
+                    // The label, in priority order:
+                    //
+                    // 1. what the PROGRAM set (OSC 0/2) — an explicit title always
+                    //    wins, because it says something rt cannot know (a bash
+                    //    `PROMPT_COMMAND` puts `user@host: cwd` here, ssh sessions
+                    //    name the remote host, and a long-running job can announce
+                    //    its progress);
+                    // 2. failing that, a title DERIVED from the pane's own process
+                    //    — Terminal.app's shape, `<dir> — <program> — <cols>x<rows>`.
+                    //    Without this a macOS pane says the literal "Terminal"
+                    //    forever, because Apple's `/etc/zshrc` emits no title escape
+                    //    for a terminal it does not recognise, and rt sets no
+                    //    `TERM_PROGRAM` (see `pane_title`'s module doc). The
+                    //    same fallback runs on Linux, where a bare `sh`, a shell
+                    //    without the distro `PROMPT_COMMAND`, or a full-screen app
+                    //    that reset the title lands in exactly the same hole;
+                    // 3. and if even the process is unreadable, the old literal.
+                    //
+                    // Titles are untrusted (`sanitize`), and truncation KEEPS THE
+                    // TAIL: a title is usually a path, every pane on a machine
+                    // shares its head (`roland@dop561: ~/`), and the tail is the
+                    // part that says which pane this is.
+                    let app_title = active.session.title_of(id).filter(|t| !t.is_empty());
+                    let shown = match app_title {
+                        Some(t) => pane_title::fit(&pane_title::sanitize(t), avail, pane_title::Keep::Tail),
+                        None => active
+                            .derived_facts
+                            .get(&id)
+                            .and_then(|f| pane_title::derived(f, cols, rows, avail))
+                            .unwrap_or_else(|| pane_title::fit("Terminal", avail, pane_title::Keep::Head)),
+                    };
+                    for (i, ch) in shown.chars().enumerate() {
                         active.backend.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
                     }
                 }
@@ -7928,15 +8003,20 @@ impl App {
                 // Truncate to what fits in the segment (leaving room for the
                 // number prefix and padding).
                 let max_chars = ((r.w - 2.0 * sc * chrome_scale::logical::TAB_LABEL_INSET) / cell_w).floor().max(1.0) as usize;
-                let label = match active.session.title_of(tab.first_pane) {
+                // The tab number is a keeper (it is how the tab is switched to, and
+                // it is one cell); the title is cut with the SAME rule as the pane
+                // titlebar — tail-keeping, because the head of a title is the part
+                // every tab shares. This used to cut the head, which turned
+                // "1: roland@dop561: ~/git/rt/src" into "1: roland@dop561: ~/g…".
+                let label = match active.session.title_of(tab.first_pane).filter(|t| !t.is_empty()) {
                     Some(title) => {
-                        let prefixed = format!("{}: {}", tab.number, title); // "1: user@host …"
-                        if prefixed.chars().count() > max_chars {
-                            // Truncate with an ellipsis.
-                            let keep = max_chars.saturating_sub(1);
-                            format!("{}…", prefixed.chars().take(keep).collect::<String>())
-                        } else {
-                            prefixed
+                        let prefix = format!("{}: ", tab.number); // "1: user@host …"
+                        match max_chars.saturating_sub(prefix.chars().count()) {
+                            0 => tab.number.to_string(), // no room for any of the title
+                            room => format!(
+                                "{prefix}{}",
+                                pane_title::fit(&pane_title::sanitize(title), room, pane_title::Keep::Tail)
+                            ),
                         }
                     }
                     None => tab.number.to_string(), // untitled → just the number
@@ -8680,6 +8760,76 @@ impl App {
             *e = *e * 0.5 + load * 0.5; // smooth
         }
         true
+    }
+
+    /// Refresh the cached facts behind the DERIVED pane title — the fallback
+    /// label for a pane no program has titled.
+    ///
+    /// Returns whether any pane's facts actually CHANGED, which is the tick's cue
+    /// to repaint: a `cd` at an otherwise idle prompt produces one frame (the new
+    /// prompt) and then silence, so without this the titlebar could sit on the old
+    /// directory until the next keystroke.
+    ///
+    /// # Why this is cached at all
+    ///
+    /// The titlebar is redrawn on every frame of every pane, and the answer costs
+    /// a `readlink` in `/proc` (Linux) or a 2 KB struct copy out of the kernel
+    /// (macOS) *per pane*, plus the walk that decides which process to ask. None of
+    /// that belongs in a repaint. So it is sampled on a timer and the draw path
+    /// reads a `HashMap`.
+    ///
+    /// # The interval, and what it costs
+    ///
+    /// 500 ms. The thing being tracked is a `cd`, and half a second is below
+    /// noticing for a label — you look at the titlebar after you have finished
+    /// typing, not during. The cost per refresh per untitled pane is: one
+    /// `child_pids` call per level of an unambiguous process chain (one for a
+    /// shell at a prompt, two under `vim`), one cwd query and one name query — so
+    /// ~3 kernel calls, twice a second, for panes that have no title of their own.
+    /// That is the same order as the heat instrument's subtree walk, which already
+    /// runs at ~2 Hz per pane and is not noticeable.
+    ///
+    /// # What it skips
+    ///
+    /// Panes whose program DID set a title: theirs wins (an explicit title is the
+    /// program telling you something this cannot know) so its facts would never be
+    /// read. A macOS pane is the common case here precisely because Apple's
+    /// `/etc/zshrc` sets no title for a terminal it does not recognise; a Linux
+    /// `bash` with the distro `PROMPT_COMMAND` sets one on every prompt and is
+    /// skipped from the second prompt onward.
+    /// Returns whether any pane's facts actually CHANGED, which is the tick's cue
+    /// to repaint: a `cd` at an otherwise idle prompt produces one frame (the new
+    /// prompt) and then silence, so without this the titlebar could sit on the old
+    /// directory until the next keystroke.
+    fn refresh_derived_facts(active: &mut Active) -> bool {
+        const REFRESH: Duration = Duration::from_millis(500);
+        let now = Instant::now();
+        if now.duration_since(active.derived_last) < REFRESH {
+            return false;
+        }
+        active.derived_last = now;
+        let mut changed = false;
+        for id in active.session.tree().all_panes() {
+            // A title the program set wins; don't pay for facts nothing will read.
+            if active.session.title_of(id).is_some_and(|t| !t.is_empty()) {
+                changed |= active.derived_facts.remove(&id).is_some();
+                continue;
+            }
+            let Some(shell) = active.session.pane(id).and_then(|p| p.pid()) else { continue };
+            // Reuse the heat instrument's per-platform children query rather than
+            // writing a second process walk (see `pane_title::describing_pid` for
+            // which process this lands on, and why).
+            let pid = pane_title::describing_pid(shell, cpu_heat::child_pids);
+            let facts =
+                pane_title::ProcFacts { cwd: proc_info::cwd_of(pid), name: proc_info::name_of(pid) };
+            // A process that exited mid-refresh answers nothing; keep the last
+            // good facts rather than blanking the titlebar for one interval.
+            if facts != pane_title::ProcFacts::default() && active.derived_facts.get(&id) != Some(&facts) {
+                active.derived_facts.insert(id, facts);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Optionally advance the instrument animation by wall-clock time (see
