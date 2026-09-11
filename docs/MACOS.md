@@ -25,6 +25,16 @@ no Wayland or X11 libraries at all (CI asserts this in `ci/check-target-deps.sh`
 
 1. **Xcode Command Line Tools** — for the linker and the system headers.
 
+   > If you were *handed* a built `rt.app` rather than building it yourself, you
+   > may still meet macOS's "The … command requires the command line developer
+   > tools" dialog at some point. Two things worth knowing: installing them is
+   > harmless and useful, and **a system dialog can end up behind a full-screen
+   > window** — rt uses AppKit's real full-screen (its own Space), so a prompt
+   > raised by a system agent may sit on another Space and look frozen because
+   > your clicks never reach it. Leave full screen (`Ctrl`+`Cmd`+`F`) and the
+   > dialog is reachable again. This is macOS Spaces behaviour, not rt's: any
+   > full-screen app behaves the same way.
+
    ```sh
    xcode-select --install     # skip if `xcode-select -p` already prints a path
    ```
