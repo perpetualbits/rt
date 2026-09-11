@@ -37,6 +37,21 @@ no Wayland or X11 libraries at all (CI asserts this in `ci/check-target-deps.sh`
 
    ```sh
    xcode-select --install     # skip if `xcode-select -p` already prints a path
+
+   > **If the link step fails with `unknown architecture arm64e.x1`**, the
+   > Command Line Tools have shipped an SDK newer than their own linker can
+   > read. Seen 2026-09-11: default SDK `MacOSX27.0.sdk`, `ld-1267` built
+   > 2026-06-08, and every build that relinks fails. It is an Apple packaging
+   > mismatch, not an rt problem. Point the build at the previous SDK, which the
+   > same install still carries:
+   >
+   > ```sh
+   > ls /Library/Developer/CommandLineTools/SDKs/          # see what is there
+   > export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk
+   > ```
+   >
+   > Or install full Xcode, whose toolchain is self-consistent, or wait for the
+   > Command Line Tools update that ships a matching linker.
    ```
 
 2. **A stable Rust toolchain**, from <https://rustup.rs>.
