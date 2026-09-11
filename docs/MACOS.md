@@ -654,6 +654,43 @@ Terminal-type list on its own.
 
 ---
 
+## Pane titles: what a pane is called when nothing names it
+
+A pane's titlebar shows whatever the program running in it set with the OSC 0/2
+escape — on Debian/Ubuntu, `bash`'s stock `PROMPT_COMMAND` emits one on every
+prompt, which is where `roland@dop561: ~/git/rt` comes from.
+
+**On macOS nothing emits it.** Apple's `/etc/zshrc` sets a title only for
+terminals it recognises, and it recognises them by `TERM_PROGRAM=Apple_Terminal`
+— an identity rt does not claim (it exports `TERM` and `COLORTERM`, and see the
+previous section for why borrowing an identity is a trap). So a Mac pane has no
+title of its own, and rt derives one:
+
+```
+roland — zsh — 120x30       # ~ , a login shell, a 120x30 grid
+rt — vim — 100x40           # ~/git/rt , with vim in the foreground
+```
+
+That is Terminal.app's shape: **the last component of the working directory, the
+program, and the grid size**. Two differences from Terminal.app, both deliberate:
+it says `zsh`, not `-zsh` (the leading dash is a login shell's `argv[0]`, not a
+program name), and in a narrow pane it drops the size and then the program name
+rather than eliding characters — the directory is the part worth keeping, and rt
+already prints the grid size at the other end of the same titlebar.
+
+The directory is read from the pane's foreground program (so `cd`-ing inside
+`vim` or a `python` REPL is reflected), refreshed twice a second, and **a title
+the program sets always wins** — set one from `.zshrc` and rt shows yours:
+
+```sh
+precmd() { print -Pn "\e]0;%n@%m: %~\a" }   # the bash PROMPT_COMMAND shape
+```
+
+This is not macOS-only: the same fallback labels a Linux pane running a bare
+`sh`, or one whose full-screen application reset the title on exit.
+
+---
+
 ## Known issues on macOS
 
 Status: ☐ open · ◐ in progress · ☑ fixed. The same list, kept alongside rt's
