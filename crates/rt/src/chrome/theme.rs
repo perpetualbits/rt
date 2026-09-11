@@ -402,6 +402,90 @@ fn seen(body: [f32; 3], alpha: f32, bg: [f32; 3], opacity: f32) -> [f32; 3] {
     mix(surround(bg, opacity), body, alpha.clamp(0.0, 1.0))
 }
 
+// --- the pane titlebar strip ------------------------------------------------
+//
+// Not a floating panel, so not a `Palette` role — the per-pane titlebar is part
+// of the pane, and the whole point of what follows is that it stays part of it.
+// It lives here anyway because it is the same defect `surround`/`seen` exist
+// for, one level down: the strip's colour was derived from the CONFIGURED
+// background and then painted at alpha 1.0, so on a see-through window it was an
+// opaque slab of a colour that is mostly not on screen — a different material
+// sitting on top of the pane instead of the pane's own surface, lifted.
+
+/// How far the pane titlebar strip is lifted from the pane's background toward
+/// its foreground. A focused pane takes more tint, an unfocused one a whisper.
+/// Interpolating between two real colours can never clip, so even a
+/// black-on-white scheme yields a valid, scheme-native tint.
+pub const BAR_LIFT_FOCUSED: f32 = 0.20;
+/// See [`BAR_LIFT_FOCUSED`].
+pub const BAR_LIFT_UNFOCUSED: f32 = 0.10;
+/// The hairline under the strip: lifted further still, so the boundary between
+/// the strip and the terminal body reads as an edge.
+pub const BAR_LIFT_SEP: f32 = 0.40;
+/// The vertical rule between newspaper columns — the fg/bg midpoint: visible,
+/// but not text-weight. The same defect and the same fix as the titlebar, one
+/// hairline further in: it is `mix(bg, fg, ..)` drawn straight onto the pane
+/// body, so at alpha 1.0 it was an opaque rule in a colour the window is only
+/// partly showing.
+pub const COLUMN_RULE_LIFT: f32 = 0.5;
+
+/// The alpha to paint the pane's **foreground** at, over a surface already
+/// lifted `from` of the way from background toward foreground, so that the
+/// result reads as that surface lifted to `to` — in a window of this `opacity`.
+///
+/// # Why paint the foreground rather than the mixed colour
+///
+/// The strip should be the pane body's own material, lifted — not a second
+/// material laid over it. Composited over an unknown desktop `D`, the body is
+/// `opacity * bg + (1 - opacity) * D`, so the strip *wants* to be
+/// `opacity * mix(bg, fg, to) + (1 - opacity) * D`: the same `1 - opacity` of
+/// desktop showing through.
+///
+/// Source-over cannot hit that exactly — every pass over the body *reduces* the
+/// desktop's share, by exactly the alpha painted. So the rule is to spend as
+/// little alpha as possible: painting pure `fg` reaches the tint `to` at alpha
+/// `opacity * (to - from) / (1 - from)`, where painting the already-mixed colour
+/// would need alpha `opacity` — five times more at the tints rt uses, and five
+/// times more of the backdrop closed off. The residual error works out to
+/// `to * opacity * (1 - opacity) * (bg - D)`, which is at most
+/// `0.05 * (bg - D)` at [`BAR_LIFT_FOCUSED`] and vanishes at both ends of the
+/// opacity range. [`tests::the_pane_titlebar_is_the_body_lifted_at_the_bodys_own_alpha`]
+/// pins it.
+///
+/// At `opacity == 1.0` this is exactly the old opaque behaviour, to the bit:
+/// `lift_alpha(0, t, 1) == t`, and `mix(bg, fg, t)` is what a fill of `fg` at
+/// alpha `t` over `bg` produces. An opaque window sees no change at all.
+pub fn lift_alpha(from: f32, to: f32, opacity: f32) -> f32 {
+    let from = from.clamp(0.0, 1.0);
+    let to = to.clamp(0.0, 1.0);
+    if to <= from {
+        return 0.0; // nothing to add (and the `1 - from` divisor cannot be zero below)
+    }
+    (opacity.clamp(0.0, 1.0) * (to - from) / (1.0 - from)).clamp(0.0, 1.0)
+}
+
+/// The fill for one band of the pane titlebar: the strip itself (`from = 0.0`,
+/// `to` = one of [`BAR_LIFT_FOCUSED`]/[`BAR_LIFT_UNFOCUSED`]) or the hairline
+/// drawn on top of it (`from` = the strip's lift, `to` = [`BAR_LIFT_SEP`]).
+///
+/// `blends` is [`crate::backend::Backend::is_gl`] — whether this backend's
+/// `fill_rect` composites with what is already in the frame. The GL and wgpu
+/// backends do. The XRender backend does **not**: its content fills are
+/// `PictOp::SRC`, a replace rather than a composite, with a straight (not
+/// premultiplied) colour. Handing it a translucent foreground would paint a
+/// full-strength `fg` slab, which is worse than what it has today — so it keeps
+/// exactly what it has today, the pre-mixed colour at alpha 1.0. That is the
+/// honest answer for a backend that cannot composite, and it costs nothing:
+/// XRender is the `ssh -X` path, where there is no blur to show through anyway.
+pub fn lift_fill(bg: [u8; 3], fg: [u8; 3], from: f32, to: f32, opacity: f32, blends: bool) -> Color {
+    let (bgf, fgf) = (to_f(bg), to_f(fg));
+    if blends {
+        col(fgf, lift_alpha(from, to, opacity))
+    } else {
+        col(mix(bgf, fgf, to), 1.0)
+    }
+}
+
 /// The luminance that hits exactly `ratio` against a background of luminance
 /// `bg_l`, on the side a `dark` panel's text lives on (brighter for a dark
 /// panel, darker for a light one). Straight from the WCAG definition.
@@ -733,6 +817,144 @@ mod tests {
 
     fn rgb(c: Color) -> [f32; 3] {
         [c.0, c.1, c.2]
+    }
+
+    /// Straight-alpha source over, the one operation both blending backends
+    /// perform: GL's shader premultiplies and blends `ONE, ONE_MINUS_SRC_ALPHA`,
+    /// wgpu's does the same (`wgpu_frame::premultiplied`). Returns the RGB the
+    /// eye sees and the alpha the *window* now carries at that pixel, which is
+    /// what the compositor uses to let the desktop through.
+    fn over(src: [f32; 3], a: f32, dst: [f32; 3], dst_a: f32) -> ([f32; 3], f32) {
+        (mix(dst, src, a), a + dst_a * (1.0 - a))
+    }
+
+    /// **The pane titlebar guarantee.** The strip is the pane body's own
+    /// material lifted toward the foreground, carrying the body's own alpha —
+    /// not an opaque slab of a colour that, on a see-through window, is mostly
+    /// not on screen. Pinned against the exact composite the backends perform.
+    #[test]
+    fn the_pane_titlebar_is_the_body_lifted_at_the_bodys_own_alpha() {
+        // The residual of painting `fg` instead of the mixed colour, derived in
+        // `lift_alpha`: `to * opacity * (1 - opacity) * (bg - D)`, maximised at
+        // `opacity = 0.5` where `opacity * (1 - opacity) = 0.25`, and with
+        // `|bg - D| <= 1`.
+        let bound = BAR_LIFT_SEP * 0.25 + 1e-6;
+        // How much MORE opaque than the pane body each band leaves the window.
+        // One pass costs `to * opacity * (1 - opacity) <= to / 4`. The hairline
+        // is a second pass on top of the strip, so it compounds a little past
+        // that: solving `d/dp [a2 (1 - A1) + a1 (1 - p)] = 0` puts its true
+        // maximum at 0.1064 (opacity 0.485, focused), rounded up here.
+        let strip_alpha_bound = BAR_LIFT_FOCUSED * 0.25 + 1e-6;
+        let hair_alpha_bound = 0.11;
+        for (fg, bg, _) in schemes() {
+            let (fgf, bgf) = (to_f(fg), to_f(bg));
+            for desktop_l in [0.0_f32, 0.5, 1.0] {
+                let desktop = [desktop_l; 3];
+                for opacity in [0.0_f32, 0.25, 0.5, 0.65, 0.9, 1.0] {
+                    for lift in [BAR_LIFT_FOCUSED, BAR_LIFT_UNFOCUSED] {
+                        // The pane body as it reaches the eye, and the window
+                        // alpha it carries.
+                        let body = mix(desktop, bgf, opacity);
+
+                        // The strip, painted the way `lift_fill` says to.
+                        let c = lift_fill(bg, fg, 0.0, lift, opacity, true);
+                        let (strip, strip_a) = over(rgb(c), c.3, body, opacity);
+
+                        // What it is *supposed* to look like: the body's colour
+                        // lifted toward fg, composited at the body's opacity.
+                        let ideal = mix(desktop, mix(bgf, fgf, lift), opacity);
+                        for i in 0..3 {
+                            assert!(
+                                (strip[i] - ideal[i]).abs() <= bound,
+                                "strip {strip:?} vs ideal {ideal:?} at opacity {opacity} lift {lift}"
+                            );
+                        }
+                        // And it lets the backdrop through like the body does,
+                        // instead of sealing it off the way an opaque slab did.
+                        assert!(
+                            strip_a - opacity <= strip_alpha_bound,
+                            "strip alpha {strip_a} is not in the body's world ({opacity})"
+                        );
+                        assert!(strip_a >= opacity - 1e-6, "a strip never makes the window MORE sheer");
+
+                        // The hairline, drawn on top of the strip, lands in the
+                        // same place relative to the body.
+                        let h = lift_fill(bg, fg, lift, BAR_LIFT_SEP, opacity, true);
+                        let (hair, hair_a) = over(rgb(h), h.3, strip, strip_a);
+                        let hair_ideal = mix(desktop, mix(bgf, fgf, BAR_LIFT_SEP), opacity);
+                        for i in 0..3 {
+                            assert!(
+                                (hair[i] - hair_ideal[i]).abs() <= bound,
+                                "hairline {hair:?} vs ideal {hair_ideal:?} at opacity {opacity}"
+                            );
+                        }
+                        assert!(
+                            hair_a - opacity <= hair_alpha_bound,
+                            "hairline alpha {hair_a} is not in the body's world ({opacity})"
+                        );
+                        assert!(hair_a >= strip_a - 1e-6, "a hairline never makes the strip MORE sheer");
+                    }
+                }
+            }
+        }
+    }
+
+    /// An OPAQUE window must be bit-identical to the slab rt drew before this
+    /// change — that is what makes the Linux delta a function of opacity alone,
+    /// and it is the only reason this is safe to ship to both platforms at once.
+    #[test]
+    fn an_opaque_window_gets_exactly_the_colours_it_always_did() {
+        for (fg, bg, _) in schemes() {
+            let (fgf, bgf) = (to_f(fg), to_f(bg));
+            for lift in [BAR_LIFT_FOCUSED, BAR_LIFT_UNFOCUSED] {
+                let c = lift_fill(bg, fg, 0.0, lift, 1.0, true);
+                assert_eq!(c.3, lift, "opaque: the alpha IS the lift");
+                let (strip, strip_a) = over(rgb(c), c.3, bgf, 1.0);
+                assert_eq!(strip_a, 1.0, "an opaque window stays opaque");
+                for i in 0..3 {
+                    assert!((strip[i] - mix(bgf, fgf, lift)[i]).abs() < 1e-6, "the old mix(bg, fg, t)");
+                }
+                // The hairline compounds correctly on top of it: lifted from the
+                // strip's tint to BAR_LIFT_SEP lands on mix(bg, fg, BAR_LIFT_SEP).
+                let h = lift_fill(bg, fg, lift, BAR_LIFT_SEP, 1.0, true);
+                let (hair, _) = over(rgb(h), h.3, strip, 1.0);
+                for i in 0..3 {
+                    assert!((hair[i] - mix(bgf, fgf, BAR_LIFT_SEP)[i]).abs() < 1e-6);
+                }
+            }
+        }
+    }
+
+    /// A backend that cannot composite gets what it has today rather than a
+    /// full-strength foreground slab. XRender's content fills are `PictOp::SRC`
+    /// — a replace, not a blend — so alpha there is not a tint, it is a hole.
+    #[test]
+    fn a_non_blending_backend_keeps_the_opaque_premixed_colour() {
+        for (fg, bg, _) in schemes() {
+            for opacity in [0.0_f32, 0.65, 1.0] {
+                for lift in [BAR_LIFT_FOCUSED, BAR_LIFT_UNFOCUSED, BAR_LIFT_SEP] {
+                    let c = lift_fill(bg, fg, 0.0, lift, opacity, false);
+                    assert_eq!(c.3, 1.0, "no alpha ever reaches a SRC fill");
+                    let want = mix(to_f(bg), to_f(fg), lift);
+                    for i in 0..3 {
+                        assert!((rgb(c)[i] - want[i]).abs() < 1e-6, "exactly the pre-change colour");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A fully transparent window contributes no chrome either — which is the
+    /// point of allowing `background_opacity = 0` with blur on: at that setting
+    /// rt adds nothing to the frosted backdrop but its text.
+    #[test]
+    fn a_fully_transparent_window_paints_no_titlebar_slab() {
+        assert_eq!(lift_alpha(0.0, BAR_LIFT_FOCUSED, 0.0), 0.0);
+        assert_eq!(lift_alpha(BAR_LIFT_FOCUSED, BAR_LIFT_SEP, 0.0), 0.0);
+        // And the degenerate lifts are inert rather than a division by zero.
+        assert_eq!(lift_alpha(BAR_LIFT_SEP, BAR_LIFT_SEP, 1.0), 0.0, "no lift asked for");
+        assert_eq!(lift_alpha(BAR_LIFT_SEP, BAR_LIFT_FOCUSED, 1.0), 0.0, "a downward lift is not a fill");
+        assert_eq!(lift_alpha(1.0, 1.0, 1.0), 0.0, "from == 1.0 must not divide by zero");
     }
 
     /// THE guarantee. Whatever the user's colours, and whichever chrome theme is

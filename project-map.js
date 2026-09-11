@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-09-10"
+    updated: "2026-09-11"
   },
 
   statuses: {
@@ -194,7 +194,9 @@ window.PROJECT_MAP = {
       specs: [],
       parts: [
         { label: "Too-tall panels", status: "done", desc: "A panel taller than the window used to be pinned to the top edge with its tail off-screen and no way to reach it. The context menu now scrolls (wheel, Up/Down arrows with Return to pick, or a click on the ▲/▼ cue); the clipboard history scrolls with its selection; preferences clamps its height and shows a thumb; the colour picker fits itself to the window, the SV square giving way first. One pure `plan` decides which rows are on screen, and both the draw and the hit-test read it." },
-        { label: "Manual typography", status: "done", desc: "Wrapped continuation lines keep their indent and hang under the description column instead of dumping at column zero — the whole manual is two-column key/description material, so that alone was what made it read as ragged prose. The measure is capped in COLUMNS (84) rather than pixels, UPPERCASE section headings are set bold in the accent, and body lines carry leading." }
+        { label: "Manual typography", status: "done", desc: "Wrapped continuation lines keep their indent and hang under the description column instead of dumping at column zero — the whole manual is two-column key/description material, so that alone was what made it read as ragged prose. The measure is capped in COLUMNS (84) rather than pixels, UPPERCASE section headings are set bold in the accent, and body lines carry leading." },
+        { label: "Predictable pane colours", status: "done", desc: "The same defect as the palette's, one level in: the per-pane titlebar strip, its hairline and the newspaper-column rule all derived their tint from the CONFIGURED background and then painted it at alpha 1.0 — opaque slabs of a colour a see-through window is only partly showing, which is why pane titles read as a different material on macOS at 0.65 and looked right on Linux at 0.90. theme::lift_fill now paints the pane's FOREGROUND at opacity*(to-from)/(1-from) instead, so each band is the pane body's own surface lifted rather than something laid on top of it, carrying the body's alpha to within to/4. Painting fg rather than the pre-mixed colour is what makes that possible: it reaches the same tint at a fifth of the alpha, so a fifth as much of the backdrop is sealed off. At background_opacity = 1.0 it is bit-identical to the old mix(bg, fg, t), and a backend that cannot composite (XRender, PictOp::SRC) keeps the opaque pre-mix rather than being handed an alpha it would draw as a full-strength slab." },
+        { label: "Opacity floor follows blur", status: "done", desc: "background_opacity = 0 is reachable while background_blur is on and floored at MIN_OPACITY (0.05) while it is off. A fully transparent BLURRED window is not invisible — the compositor's frosted backdrop is the surface, exactly what Terminal.app shows — and it is the one setting where the colour rt derives chrome from and the colour on screen agree, because rt contributes none. The floor reads the SETTING, not whether blur is really happening: blur is fire-and-forget on X11 and via org_kde_kwin_blur, so that is undecidable on Linux, and a floor that varied with it would differ between the config file, the Preferences row and the key binding. The corner is closed by Settings::enforce_opacity_floor — turning blur off at 0 carries the opacity back up to 0.05 rather than leaving nothing on screen — and the floor only ever lifts. normalize() applies the same rule, so a hand-edited config cannot produce an invisible window either." }
       ],
       deps: ["rt-config"]
     },

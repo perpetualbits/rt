@@ -251,7 +251,15 @@ pub fn step(
         // The same shape: a cycle, so the three chrome treatments can be walked
         // with one arrow key and each one seen in place.
         PrefRow::Chrome => s.chrome_theme = s.chrome_theme.step(dir),
-        PrefRow::Blur => s.background_blur = !s.background_blur,
+        // Turning blur OFF raises the opacity floor under a value that was legal
+        // a moment ago (zero is allowed only while there is a blurred backdrop
+        // to see — `Settings::min_opacity`), so the toggle carries the opacity
+        // back up with it rather than leaving an invisible window behind. The
+        // rule lives in `Settings`; this is the only UI that can reach it.
+        PrefRow::Blur => {
+            s.background_blur = !s.background_blur;
+            s.enforce_opacity_floor();
+        }
         PrefRow::Ffm => s.focus_follows_mouse = !s.focus_follows_mouse,
         PrefRow::Titlebar => s.show_titlebar = !s.show_titlebar,
         PrefRow::InstOutput => s.inst_output = !s.inst_output,
@@ -439,15 +447,61 @@ mod tests {
 
     #[test]
     fn opacity_clamps_via_the_existing_settings_rule() {
-        let mut s = Settings::default();
+        let mut s = Settings { background_blur: false, ..Settings::default() };
         s.background_opacity = 1.0;
         step(&mut s, PrefRow::Opacity, 1, &fams(), &terms());
         assert_eq!(s.background_opacity, 1.0, "must not exceed 1.0");
-        // Down to the floor: MIN_OPACITY, never 0 (the window would vanish).
+        // Down to the floor. With blur OFF that is MIN_OPACITY, never 0 — an
+        // unblurred window at 0 would be nothing but floating glyphs.
         for _ in 0..100 {
             step(&mut s, PrefRow::Opacity, -1, &fams(), &terms());
         }
         assert_eq!(s.background_opacity, Settings::MIN_OPACITY);
+    }
+
+    /// The stepper must obey the floor that is in force *at the time*, not a
+    /// constant — and `OPACITY_STEP` has to be able to land ON both floors, or
+    /// the bottom of the range would be unreachable by keyboard.
+    #[test]
+    fn the_opacity_row_steps_to_zero_only_while_blur_is_on() {
+        let mut s = Settings { background_blur: true, ..Settings::default() };
+        for _ in 0..100 {
+            step(&mut s, PrefRow::Opacity, -1, &fams(), &terms());
+        }
+        assert_eq!(s.background_opacity, 0.0, "blurred: the row reaches fully transparent");
+        // One more step does not go negative, and Right still comes back up.
+        step(&mut s, PrefRow::Opacity, -1, &fams(), &terms());
+        assert_eq!(s.background_opacity, 0.0);
+        step(&mut s, PrefRow::Opacity, 1, &fams(), &terms());
+        assert_eq!(s.background_opacity, OPACITY_STEP);
+        // Both floors are whole multiples of the step, so each is landed on
+        // exactly rather than clamped to from some value in between.
+        assert_eq!(Settings::MIN_OPACITY % OPACITY_STEP, 0.0);
+        assert_eq!(Settings::MIN_OPACITY_BLURRED % OPACITY_STEP, 0.0);
+    }
+
+    /// The corner the conditional floor creates, at the one place a user can
+    /// actually create it: the Preferences Blur toggle. Flipping blur off while
+    /// the window is fully transparent must not leave an invisible window.
+    #[test]
+    fn toggling_blur_off_at_zero_opacity_lifts_the_window_back_into_view() {
+        let mut s = Settings { background_blur: true, background_opacity: 0.0, ..Settings::default() };
+        step(&mut s, PrefRow::Blur, 1, &fams(), &terms());
+        assert!(!s.background_blur, "the toggle still flips");
+        assert_eq!(
+            s.background_opacity,
+            Settings::MIN_OPACITY,
+            "and carries the opacity up with it rather than leaving nothing on screen"
+        );
+        // Turning it back on leaves the opacity where it is: the floor lifts, it
+        // never drops a window back to invisible behind the user's back.
+        step(&mut s, PrefRow::Blur, 1, &fams(), &terms());
+        assert!(s.background_blur);
+        assert_eq!(s.background_opacity, Settings::MIN_OPACITY);
+        // A translucent-but-not-zero window is untouched by the same toggle.
+        let mut s = Settings { background_blur: true, background_opacity: 0.65, ..Settings::default() };
+        step(&mut s, PrefRow::Blur, 1, &fams(), &terms());
+        assert_eq!(s.background_opacity, 0.65);
     }
 
     #[test]

@@ -759,8 +759,22 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// The smallest opacity we allow, so the window never vanishes entirely.
+    /// The smallest opacity we allow **with blur off**, so the window never
+    /// vanishes entirely. Without a blurred backdrop, zero leaves nothing on
+    /// screen but floating glyphs over whatever happens to be behind rt.
     pub const MIN_OPACITY: f32 = 0.05;
+    /// The smallest opacity we allow **with blur on**: none at all.
+    ///
+    /// The old unconditional 0.05 floor reasoned about an unblurred window and
+    /// was right about that one. A fully transparent *blurred* window is not
+    /// invisible: the compositor's frosted backdrop IS the window's surface,
+    /// which is exactly what Terminal.app shows. It is also the one setting
+    /// where the colour rt computes its chrome from and the colour actually on
+    /// screen agree — at any other opacity rt is deriving titlebars, panels and
+    /// contrast floors from a background that is only partly on screen, which
+    /// is the whole reason chrome colours drift from the configured scheme.
+    /// Zero removes rt's contribution entirely, so nothing can drift.
+    pub const MIN_OPACITY_BLURRED: f32 = 0.0;
     /// Upper bound for the scrollback slider. 5M lines still suits listing/searching a
     /// large tree, but a *full* buffer is heavy — very roughly ~1.5 GB per million
     /// 80-column lines — so the titlebar shows a used/max meter to watch it. On the
@@ -808,11 +822,62 @@ impl Settings {
         self.background_blur && self.background_opacity < 1.0
     }
 
-    /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
-    /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.
+    /// The opacity floor in force **right now** — [`Self::MIN_OPACITY_BLURRED`]
+    /// while blur is on, [`Self::MIN_OPACITY`] while it is off.
+    ///
+    /// # Why this reads the SETTING and not "blur is actually happening"
+    ///
+    /// Those are different questions, and rt can only answer the first one.
+    /// Blur is a request, not a result: [`crate`]'s consumers ask for it through
+    /// `org_kde_kwin_blur` (fire and forget), the X11
+    /// `_KDE_NET_WM_BLUR_BEHIND_REGION` property (a compositor that does not
+    /// implement it simply ignores it, and says nothing), or
+    /// `ext-background-effect-v1` (which *does* advertise a capability — but its
+    /// absence does not mean "no blur", because KWin-X11 and picom blur through
+    /// the other two paths). Only the macOS `NSVisualEffectView` reports back.
+    /// So "is blur actually happening" is undecidable on Linux, and a floor that
+    /// depended on it would be undecidable too — and would silently differ
+    /// between the config file, the Preferences row and the key binding, only
+    /// one of which has a live window to ask.
+    ///
+    /// The residual risk is a user on a compositor with no blur support who
+    /// leaves the toggle on and steps to zero. That is recoverable rather than
+    /// fatal, by construction: chrome panels close to fully opaque as the window
+    /// goes sheer (`rt::chrome::theme::panel_alpha`), so Preferences is still
+    /// solid and legible at zero, the `OpacityUp` key still works, and turning
+    /// blur off carries the window straight back up to [`Self::MIN_OPACITY`]
+    /// (see [`Self::enforce_opacity_floor`]).
+    pub fn min_opacity(&self) -> f32 {
+        if self.background_blur { Self::MIN_OPACITY_BLURRED } else { Self::MIN_OPACITY }
+    }
+
+    /// Re-clamp `background_opacity` into the floor its *current*
+    /// `background_blur` allows, returning whether anything moved.
+    ///
+    /// The one invariant behind the conditional floor: **opacity is never below
+    /// [`Self::min_opacity`]**. Call it after anything that changes
+    /// `background_blur`, because lowering the blur toggle raises the floor
+    /// under a value that was legal a moment ago. The floor only ever lifts —
+    /// turning blur back on does not restore a zero the user was pushed off,
+    /// since dropping a window back to invisible on a toggle would be a worse
+    /// surprise than one step down.
+    pub fn enforce_opacity_floor(&mut self) -> bool {
+        let floor = self.min_opacity();
+        if self.background_opacity < floor {
+            self.background_opacity = floor;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Nudge the opacity by `delta`, clamped to `[min_opacity(), 1.0]`. Returns
+    /// the new value. Used by the `OpacityUp`/`OpacityDown` actions and by the
+    /// Preferences opacity row, so both obey the same live floor.
     pub fn adjust_opacity(&mut self, delta: f32) -> f32 {
-        // Clamp so we stay in a usable, always-visible range.
-        self.background_opacity = (self.background_opacity + delta).clamp(Self::MIN_OPACITY, 1.0);
+        // Clamp so we stay in a usable, always-visible range. The floor is
+        // conditional on blur — see `min_opacity`.
+        self.background_opacity = (self.background_opacity + delta).clamp(self.min_opacity(), 1.0);
         self.background_opacity
     }
 
@@ -832,7 +897,13 @@ impl Settings {
                 *v = c;
             }
         }
-        clamp_f32(&mut self.background_opacity, Self::MIN_OPACITY, 1.0, 1.0, "background_opacity");
+        // The opacity floor is conditional on blur (see `min_opacity`), so a
+        // hand-edited `background_opacity = 0.0` is accepted with
+        // `background_blur = true` and lifted to MIN_OPACITY without it. This is
+        // the only guard on the file path: `toml::from_str` bypasses every UI
+        // clamp, so the invisible-window state has to be unreachable here too.
+        let opacity_floor = self.min_opacity();
+        clamp_f32(&mut self.background_opacity, opacity_floor, 1.0, 1.0, "background_opacity");
         clamp_f32(&mut self.font_size, 4.0, 200.0, 18.0, "font_size");
         if self.scrollback > Self::MAX_SCROLLBACK {
             eprintln!(
@@ -1224,11 +1295,18 @@ mod config_tests {
         assert_eq!(s.font_size, 200.0, "huge font size clamped to the max");
         assert_eq!(s.scrollback, Settings::MAX_SCROLLBACK, "scrollback clamped to policy max");
 
-        // A negative opacity clamps up to the minimum; valid values pass through untouched.
+        // A negative opacity clamps up to the minimum *in force* — and the
+        // default settings have blur on, where that minimum is zero. See
+        // `the_opacity_floor_is_zero_only_while_blur_is_on`.
         let mut s2 = Settings { background_opacity: -5.0, font_size: 14.0, ..Settings::default() };
+        assert!(s2.background_blur, "the default this case relies on");
         s2.normalize();
-        assert_eq!(s2.background_opacity, Settings::MIN_OPACITY);
+        assert_eq!(s2.background_opacity, Settings::MIN_OPACITY_BLURRED);
         assert_eq!(s2.font_size, 14.0, "an in-range value is left alone");
+        // With blur off the old floor is the one that applies.
+        let mut s3 = Settings { background_opacity: -5.0, background_blur: false, ..Settings::default() };
+        s3.normalize();
+        assert_eq!(s3.background_opacity, Settings::MIN_OPACITY);
     }
 
     #[test]
@@ -1244,6 +1322,85 @@ mod config_tests {
         assert!(!s.wants_background_blur(), "the user's toggle must be able to turn it OFF");
         s.background_opacity = 1.0;
         assert!(!s.wants_background_blur());
+    }
+
+    /// The opacity floor is CONDITIONAL on blur, and that is the whole point:
+    /// a fully transparent *blurred* window is the one setting where the colour
+    /// rt computes chrome from and the colour actually on screen agree, because
+    /// rt contributes no colour at all. With blur off the same value is a window
+    /// that is nothing but floating glyphs, so the old floor still stands there.
+    #[test]
+    fn the_opacity_floor_is_zero_only_while_blur_is_on() {
+        let mut s = Settings::default();
+        s.background_blur = true;
+        assert_eq!(s.min_opacity(), 0.0, "blurred: fully transparent is a legitimate look");
+        s.background_blur = false;
+        assert_eq!(s.min_opacity(), Settings::MIN_OPACITY, "unblurred: the old floor stands");
+    }
+
+    /// Stepping down cannot go below the floor *in force at the time* — the
+    /// same clamp the `OpacityUp`/`OpacityDown` keys and the Preferences row
+    /// both go through, so there is only ever one rule.
+    #[test]
+    fn the_stepper_cannot_step_below_the_live_floor() {
+        let mut s = Settings { background_blur: true, ..Settings::default() };
+        s.adjust_opacity(-5.0);
+        assert_eq!(s.background_opacity, 0.0, "blur on: reachable all the way to zero");
+        assert_eq!(s.adjust_opacity(-0.05), 0.0, "and it stops there rather than going negative");
+
+        let mut s = Settings { background_blur: false, ..Settings::default() };
+        s.adjust_opacity(-5.0);
+        assert_eq!(s.background_opacity, Settings::MIN_OPACITY, "blur off: floored at 0.05");
+        assert_eq!(s.adjust_opacity(-0.05), Settings::MIN_OPACITY);
+
+        // The floor is a floor, not a target: going up still works from it.
+        s.adjust_opacity(5.0);
+        assert_eq!(s.background_opacity, 1.0);
+    }
+
+    /// The corner the conditional floor creates: sitting at 0 with blur on, and
+    /// then turning blur off. The window must not be left invisible, so the
+    /// toggle carries the opacity back up to the unblurred floor with it. That
+    /// is a rule about `Settings`, not about the Preferences panel, so it lives
+    /// here and every caller that flips the toggle goes through it.
+    #[test]
+    fn turning_blur_off_at_zero_lifts_the_window_back_into_view() {
+        let mut s = Settings { background_blur: true, background_opacity: 0.0, ..Settings::default() };
+        assert!(!s.enforce_opacity_floor(), "blur on: zero is already legal, nothing moves");
+        assert_eq!(s.background_opacity, 0.0);
+
+        s.background_blur = false;
+        assert!(s.enforce_opacity_floor(), "blur off: zero is not, so it is raised");
+        assert_eq!(s.background_opacity, Settings::MIN_OPACITY);
+
+        // Turning blur back ON does NOT restore the zero: the floor only ever
+        // lifts. Silently dropping a window back to invisible on a toggle would
+        // be a worse surprise than making the user step back down.
+        s.background_blur = true;
+        assert!(!s.enforce_opacity_floor());
+        assert_eq!(s.background_opacity, Settings::MIN_OPACITY);
+    }
+
+    /// `toml::from_str` bypasses every UI clamp, so the invisible-window state
+    /// has to be unreachable from a hand-edited file too.
+    #[test]
+    fn a_hand_edited_config_cannot_produce_an_invisible_window() {
+        // The bad pair: fully transparent AND no blur to make it visible.
+        let mut s = Settings { background_opacity: 0.0, background_blur: false, ..Settings::default() };
+        s.normalize();
+        assert_eq!(s.background_opacity, Settings::MIN_OPACITY);
+
+        // The same pair WITH blur is legal and must survive untouched — this is
+        // the setting the whole change exists to make reachable.
+        let mut s = Settings { background_opacity: 0.0, background_blur: true, ..Settings::default() };
+        s.normalize();
+        assert_eq!(s.background_opacity, 0.0, "a blurred window at zero is a supported look");
+
+        // And it survives a real round-trip through the file format.
+        let s: Settings = toml::from_str("background_opacity = 0.0\nbackground_blur = true\n").unwrap();
+        let mut s = s;
+        s.normalize();
+        assert_eq!(s.background_opacity, 0.0);
     }
 
     /// The chrome theme is the knob that lets the three chrome treatments be

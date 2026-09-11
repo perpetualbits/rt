@@ -1324,7 +1324,11 @@ impl App {
         let mut settings = rt_config::Config::load().settings;
         if let Ok(v) = std::env::var("RT_OPACITY") {
             if let Ok(o) = v.parse::<f32>() {
-                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0);
+                // The floor is conditional on blur (`Settings::min_opacity`), so
+                // read it off the settings we just loaded rather than the
+                // blur-off constant — otherwise `RT_OPACITY=0` would be the one
+                // path that could not reach the fully transparent blurred look.
+                settings.background_opacity = o.clamp(settings.min_opacity(), 1.0);
             }
         }
         if let Ok(v) = std::env::var("RT_FOCUS") {
@@ -7398,7 +7402,14 @@ impl App {
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, cell_h) = active.backend.cell_size(); // px per cell
         let sc = active.chrome_sc; // display backing factor for the flat chrome constants
-        let sep = column_separator(active.settings.foreground, cfg_bg); // fg/bg midpoint: visible but not text-weight
+        // fg/bg midpoint: visible but not text-weight — translucent, so it sits
+        // in the pane body rather than on top of it (see `column_separator`).
+        let sep = column_separator(
+            active.settings.foreground,
+            cfg_bg,
+            active.settings.background_opacity,
+            active.backend.is_gl(), // XRender's content fills are PictOp::SRC, not a blend
+        );
         // Reset the clip-history titlebar affordance's hit-rect before the
         // per-pane pass: it is set at most once below (focused pane, non-empty
         // history), so a stale rect from a previous frame must not survive the
@@ -7715,14 +7726,36 @@ impl App {
                 // a valid, scheme-native tint, distinct from the terminal body,
                 // with readable text. Focused panes get more tint + full-strength
                 // text; unfocused ones a whisper of tint + dimmed text.
+                //
+                // The strip and its hairline are painted TRANSLUCENT, carrying
+                // the pane body's own alpha, so they are the body's surface
+                // lifted rather than an opaque slab laid on top of it. That
+                // matters because the tint is derived from the CONFIGURED
+                // background, and on a see-through window the configured
+                // background is mostly not what is on screen — an opaque slab of
+                // it is a colour from a different world, which is exactly what
+                // made pane titles look wrong at the low opacities the macOS
+                // glass wants. `theme::lift_fill` owns the whole rule (including
+                // what a non-blending backend gets instead); at
+                // `background_opacity = 1.0` it reproduces the old opaque
+                // `mix(bg, fg, t)` to the bit.
                 let bg = active.settings.background; // [u8; 3], Copy
                 let fg = active.settings.foreground;
                 let mix = |a: [u8; 3], b: [u8; 3], t: f32| {
                     let c = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round().clamp(0.0, 255.0) as u8;
                     Color::rgb(c(0), c(1), c(2))
                 };
-                let bar_bg = mix(bg, fg, if focused { 0.20 } else { 0.10 });
-                let sep = mix(bg, fg, 0.40); // hairline: a touch more toward fg → a visible edge
+                let opacity = active.settings.background_opacity;
+                let blends = active.backend.is_gl(); // XRender's content fills are PictOp::SRC
+                let lift = if focused {
+                    chrome::theme::BAR_LIFT_FOCUSED
+                } else {
+                    chrome::theme::BAR_LIFT_UNFOCUSED
+                };
+                let bar_bg = chrome::theme::lift_fill(bg, fg, 0.0, lift, opacity, blends);
+                // Hairline: lifted on from the strip it is drawn over, so it
+                // lands at BAR_LIFT_SEP against the pane body either way.
+                let sep = chrome::theme::lift_fill(bg, fg, lift, chrome::theme::BAR_LIFT_SEP, opacity, blends);
                 active.backend.fill_rect(full.x, full.y, full.w, bar_h, bar_bg);
                 let hair = sc * chrome_scale::logical::HAIRLINE;
                 active.backend.fill_rect(full.x, full.y + bar_h - hair, full.w, hair, sep);
@@ -9162,9 +9195,12 @@ pub fn version_string() -> String {
     }
 }
 
-fn column_separator(fg: [u8; 3], bg: [u8; 3]) -> Color {
-    let mid = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
-    Color::rgb(mid(fg[0], bg[0]), mid(fg[1], bg[1]), mid(fg[2], bg[2]))
+fn column_separator(fg: [u8; 3], bg: [u8; 3], opacity: f32, blends: bool) -> Color {
+    // Same rule as the pane titlebar (`chrome::theme::lift_fill`): the pane
+    // body's own surface lifted toward the foreground, carrying the body's
+    // alpha, rather than an opaque rule in a colour a see-through window is only
+    // partly showing. At `opacity == 1.0` it is the fg/bg midpoint it always was.
+    chrome::theme::lift_fill(bg, fg, 0.0, chrome::theme::COLUMN_RULE_LIFT, opacity, blends)
 }
 
 /// Write `rgb` into the colour slot the picker edits (foreground, background, or
@@ -9465,12 +9501,31 @@ mod sep_tests {
 
     #[test]
     fn column_separator_is_the_fg_bg_midpoint() {
+        let close = |c: Color, want: Color| {
+            (c.0 - want.0).abs() < 1e-5 && (c.1 - want.1).abs() < 1e-5 && (c.2 - want.2).abs() < 1e-5
+        };
+        // On a backend that cannot blend (XRender, `PictOp::SRC`) the rule is
+        // the opaque midpoint it has always been, whatever the opacity.
         // A light-on-dark scheme: each channel is the mean of fg and bg.
-        let c = column_separator([210, 210, 210], [30, 30, 30]);
-        assert_eq!(c, Color::rgb(120, 120, 120));
+        let c = column_separator([210, 210, 210], [30, 30, 30], 0.65, false);
+        assert_eq!(c.3, 1.0);
+        assert!(close(c, Color::rgb(120, 120, 120)));
         // Per channel, not a single grey: colours mix independently.
-        let c2 = column_separator([200, 100, 0], [0, 0, 40]);
-        assert_eq!(c2, Color::rgb(100, 50, 20));
+        let c2 = column_separator([200, 100, 0], [0, 0, 40], 0.65, false);
+        assert!(close(c2, Color::rgb(100, 50, 20)));
+
+        // On a blending backend it is the foreground at the lift, which over an
+        // OPAQUE pane body composites to exactly that same midpoint — the rule
+        // only changes where the body is see-through.
+        let c3 = column_separator([210, 210, 210], [30, 30, 30], 1.0, true);
+        assert_eq!(c3.3, chrome::theme::COLUMN_RULE_LIFT);
+        let over = |src: f32, a: f32, dst: f32| dst + (src - dst) * a;
+        assert!((over(c3.0, c3.3, 30.0 / 255.0) - 120.0 / 255.0).abs() < 1e-5);
+        // ...and on a see-through body it lets the backdrop through instead of
+        // sealing it off: half the pane's own transparency survives the rule.
+        let c4 = column_separator([210, 210, 210], [30, 30, 30], 0.65, true);
+        assert!(c4.3 < 1.0, "a translucent pane gets a translucent rule");
+        assert_eq!(c4.3, chrome::theme::COLUMN_RULE_LIFT * 0.65);
     }
 
     #[test]

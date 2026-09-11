@@ -61,11 +61,17 @@ fn appearance_settings_clamp() {
     use rt_config::Settings;
     let mut s = Settings::default();
     assert_eq!(s.background_opacity, 1.0); // opaque by default
-    // Opacity clamps to [MIN_OPACITY, 1.0].
+    // Opacity clamps to [min_opacity(), 1.0] — a floor that depends on blur.
+    // Blur is on by default, where fully transparent is a supported look.
+    assert!(s.background_blur);
     s.adjust_opacity(-5.0);
-    assert_eq!(s.background_opacity, Settings::MIN_OPACITY); // floored, not negative
+    assert_eq!(s.background_opacity, Settings::MIN_OPACITY_BLURRED); // floored, not negative
     s.adjust_opacity(5.0);
     assert_eq!(s.background_opacity, 1.0); // capped at fully opaque
+    // With blur off, the window must still be visible at the bottom of the range.
+    let mut s = Settings { background_blur: false, ..Settings::default() };
+    s.adjust_opacity(-5.0);
+    assert_eq!(s.background_opacity, Settings::MIN_OPACITY);
 }
 
 #[test]
