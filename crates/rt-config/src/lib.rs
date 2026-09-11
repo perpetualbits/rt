@@ -569,6 +569,63 @@ pub struct Settings {
     /// Values that are empty or contain anything outside `[A-Za-z0-9._+-]` are
     /// rejected by [`Settings::normalize`] and fall back to [`DEFAULT_TERM`].
     pub term: String,
+    /// **The colours the user made themselves**, remembered so that trying a
+    /// built-in preset can never destroy them.
+    ///
+    /// *"I had custom colors set, but when I tried one of the presets, my custom
+    /// scheme is gone… mac users have zero tolerance for that."* Stepping the
+    /// Preferences "Colour preset" row used to assign `foreground`/`background`/
+    /// `palette` straight out of [`SCHEMES`] with nothing holding what was
+    /// there, and `commit_settings` persists — so one keypress took the colours
+    /// out of `config.toml` too.
+    ///
+    /// The invariant, and it is the only thing to remember about this field:
+    /// **it holds the last colours that matched no built-in preset.**
+    /// [`Settings::remember_custom`] is what maintains it, called wherever
+    /// colours are written — the preset row, the colour picker's slot write, and
+    /// [`Settings::normalize`] on load, which is how a `config.toml` written by
+    /// an older rt (or by hand) arrives with its custom colours already in the
+    /// cycle. [`scheme_candidates`] then puts them in the list next to the
+    /// built-ins, exactly the way [`term_candidates`] guarantees the configured
+    /// `TERM` is always one of the choices.
+    ///
+    /// `None` for a user who has never had colours of their own — in which case
+    /// no "custom" entry appears in the cycle, because there is nothing to go
+    /// back to. Declared LAST because `Some` serialises as a TOML *table*, and
+    /// TOML requires every plain value in a table to be emitted before any
+    /// sub-table.
+    #[serde(default, deserialize_with = "de_custom_scheme")]
+    pub custom_scheme: Option<CustomScheme>,
+}
+
+/// The user's own foreground, background and palette — see
+/// [`Settings::custom_scheme`], which is the only place this is stored.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CustomScheme {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub palette: [[u8; 3]; 16],
+}
+
+/// Never fails, for the same reason [`GlassMaterial`]'s and [`ChromeTheme`]'s
+/// `Deserialize` do not: [`Config::load`] turns ANY parse error into "ignoring
+/// malformed config.toml", so a derived `Deserialize` here would let one
+/// mistyped colour — in the very block that exists to stop colours being lost —
+/// cost the user the whole file. A bad shape is reported and dropped; every
+/// other setting loads.
+fn de_custom_scheme<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<CustomScheme>, D::Error> {
+    use serde::Deserialize;
+    let Ok(v) = toml::Value::deserialize(de) else {
+        eprintln!("rt: config custom_scheme is not a table; ignoring it");
+        return Ok(None);
+    };
+    match v.try_into::<CustomScheme>() {
+        Ok(c) => Ok(Some(c)),
+        Err(e) => {
+            eprintln!("rt: config custom_scheme is not a usable colour scheme ({e}); ignoring it");
+            Ok(None)
+        }
+    }
 }
 
 /// The `TERM` rt exports into a pane's shell unless told otherwise.
@@ -754,6 +811,7 @@ impl Default for Settings {
             arrow_accel: true,             // hold-to-accelerate arrows on by default
             arrow_accel_max: 10,           // up to 10 cursor moves per held repeat
             term: DEFAULT_TERM.to_string(), // the borrowed-but-universally-installed identity
+            custom_scheme: None,           // nothing of the user's own to go back to yet
         }
     }
 }
@@ -881,6 +939,58 @@ impl Settings {
         self.background_opacity
     }
 
+    /// The user's own colours: the live ones when they match no built-in
+    /// preset, otherwise the remembered [`Self::custom_scheme`]. `None` when
+    /// the user has never had any.
+    ///
+    /// The live colours come first because they are the truth: while the user
+    /// is *on* their own scheme, that scheme is whatever is on screen, and a
+    /// stale remembered copy must never win over it.
+    pub fn own_colours(&self) -> Option<CustomScheme> {
+        if matching_scheme(self.foreground, self.background, &self.palette).is_none() {
+            return Some(CustomScheme {
+                foreground: self.foreground,
+                background: self.background,
+                palette: self.palette,
+            });
+        }
+        self.custom_scheme
+    }
+
+    /// Maintain [`Self::custom_scheme`]'s invariant — *it holds the last
+    /// colours that matched no built-in preset* — after any write to
+    /// `foreground`, `background` or `palette`.
+    ///
+    /// Call it from **every** such write. That is what makes the colour picker
+    /// agree with the preset row rather than being a second way to lose
+    /// colours: editing one swatch while sitting on "Dracula" makes colours
+    /// that are nobody's preset, so they become the custom scheme there and
+    /// then, and the next preset step cannot take them away. It does replace an
+    /// older custom scheme — "the colours you last made yourself" is the only
+    /// rule a user can predict, and the alternative (a stack of every scheme
+    /// ever held) is a history nothing in the UI could show.
+    ///
+    /// Stepping onto a *preset* is exactly the case this leaves alone: those
+    /// colours match a built-in, so nothing is remembered and nothing is lost.
+    pub fn remember_custom(&mut self) {
+        if matching_scheme(self.foreground, self.background, &self.palette).is_none() {
+            self.custom_scheme = Some(CustomScheme {
+                foreground: self.foreground,
+                background: self.background,
+                palette: self.palette,
+            });
+        }
+    }
+
+    /// Take `fg`/`bg`/`palette` from one entry of [`scheme_candidates`],
+    /// keeping [`Self::custom_scheme`] true afterwards.
+    pub fn apply_scheme(&mut self, c: &ColorScheme) {
+        self.foreground = c.foreground;
+        self.background = c.background;
+        self.palette = c.palette;
+        self.remember_custom();
+    }
+
     /// Clamp deserialized values into their supported ranges. `toml::from_str` bypasses the
     /// bounds the Preferences UI enforces, so a hand-edited or corrupt file could otherwise
     /// inject a non-finite/absurd float or an out-of-policy scrollback that later drives
@@ -946,11 +1056,17 @@ impl Settings {
         } else if trimmed.len() != self.term.len() {
             self.term = trimmed.to_string(); // stray whitespace, otherwise fine
         }
+        // A config written by an rt that predates `custom_scheme` — or edited by
+        // hand, which is how most people set colours — arrives with colours of
+        // the user's own and no memory of them. Seed it here, on the load path,
+        // so the very first preset step already has somewhere to step back to.
+        self.remember_custom();
     }
 }
 
 /// A named colour scheme (foreground + background + 16 ANSI palette), for the
 /// preferences dialog's preset picker (rt's port of Terminator's `_Colors` menu).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorScheme {
     pub name: &'static str,
     pub foreground: [u8; 3],
@@ -999,6 +1115,46 @@ pub const SCHEMES: &[ColorScheme] = &[
         ],
     },
 ];
+
+/// What the Preferences "Colour preset" row calls the user's own colours.
+pub const CUSTOM_SCHEME: &str = "custom";
+
+/// **Every colour scheme the preset row can cycle to**: the built-in
+/// [`SCHEMES`], plus the user's own colours when they have any.
+///
+/// The same shape, and the same guarantee, as [`term_candidates`]: the value
+/// the settings actually carry is always one of the choices, so stepping is a
+/// walk around a ring the current position is on rather than a jump out of it.
+/// That is the whole of the fix for *"I tried one of the presets and my custom
+/// scheme is gone"* — with "custom" a real entry holding real colours, stepping
+/// off it and back on restores them.
+///
+/// The custom entry is the live colours when they match no built-in (the user
+/// is *on* their own scheme right now), and [`Settings::custom_scheme`] when
+/// they do (the user has stepped onto a preset, and this is what going back
+/// means). A user who has never had colours of their own gets no custom entry —
+/// there is nothing to go back to, and an empty slot in a picker is a lie.
+pub fn scheme_candidates(s: &Settings) -> Vec<ColorScheme> {
+    let mut out: Vec<ColorScheme> = SCHEMES.to_vec();
+    if let Some(c) = s.own_colours() {
+        out.push(ColorScheme {
+            name: CUSTOM_SCHEME,
+            foreground: c.foreground,
+            background: c.background,
+            palette: c.palette,
+        });
+    }
+    out
+}
+
+/// The name of the built-in scheme `fg`/`bg`/`palette` match, or `None` for
+/// colours of the user's own. The one place the match is defined.
+pub fn matching_scheme(fg: [u8; 3], bg: [u8; 3], palette: &[[u8; 3]; 16]) -> Option<&'static str> {
+    SCHEMES
+        .iter()
+        .find(|c| c.foreground == fg && c.background == bg && c.palette == *palette)
+        .map(|c| c.name)
+}
 
 /// The persisted rt configuration (`~/.config/rt/config.toml`). Currently just
 /// wraps [`Settings`]; keybinding overrides and colour schemes will join it as
@@ -1475,6 +1631,110 @@ mod config_tests {
 
     /// The radius travels with the material in one portable `config.toml`, and a
     /// missing field falls back rather than failing the load.
+    /// A `config.toml` written by an rt that predates `custom_scheme` — which is
+    /// every config on disk today, and every one written by hand — must arrive
+    /// with its colours already in the preset cycle. That is the load-path half
+    /// of "trying a preset cannot destroy your colours": without it the first
+    /// step of the Preset row after an upgrade would still have nowhere to go
+    /// back to.
+    #[test]
+    fn an_older_config_gets_its_own_colours_into_the_cycle_on_load() {
+        let cfg: Config = toml::from_str(
+            "[settings]\nforeground = [255, 207, 5]\nbackground = [0, 0, 14]\n",
+        )
+        .expect("a config with no custom_scheme key must still load");
+        let mut s = cfg.settings;
+        assert_eq!(s.custom_scheme, None, "nothing was stored, because nothing wrote it");
+        s.normalize(); // what Config::load does
+        let mine = s.custom_scheme.expect("normalize seeds it from the colours on file");
+        assert_eq!(mine.foreground, [255, 207, 5]);
+        assert_eq!(mine.background, [0, 0, 14]);
+        assert_eq!(mine.palette, DEFAULT_PALETTE);
+        assert_eq!(scheme_candidates(&s).len(), SCHEMES.len() + 1);
+
+        // Colours that ARE a built-in stay nobody's custom scheme.
+        let mut s = Settings::default();
+        s.normalize();
+        assert_eq!(s.custom_scheme, None);
+        assert_eq!(scheme_candidates(&s).len(), SCHEMES.len());
+    }
+
+    /// The custom colours survive a restart, and a file carrying them is still
+    /// readable by an rt that has never heard of the key — `Settings` is
+    /// `#[serde(default)]` with no `deny_unknown_fields`, so an older build
+    /// ignores it and keeps the rest of the file rather than falling back to
+    /// defaults.
+    #[test]
+    fn a_custom_scheme_round_trips_through_the_config_file() {
+        let mut cfg = Config::default();
+        cfg.settings.foreground = [255, 207, 5];
+        cfg.settings.background = [0, 0, 14];
+        cfg.settings.palette[2] = [1, 2, 3];
+        cfg.settings.remember_custom();
+        // Now step onto a preset, the way the Preferences row does.
+        cfg.settings.apply_scheme(&SCHEMES[1]);
+        let text = toml::to_string_pretty(&cfg).expect("serialisable");
+        assert!(text.contains("[settings.custom_scheme]"), "{text}");
+
+        let back: Config = toml::from_str(&text).expect("round trips");
+        let mine = back.settings.custom_scheme.expect("the user's colours came back");
+        assert_eq!(mine.foreground, [255, 207, 5]);
+        assert_eq!(mine.background, [0, 0, 14]);
+        assert_eq!(mine.palette[2], [1, 2, 3]);
+        assert_eq!(back.settings.foreground, SCHEMES[1].foreground, "still on the preset");
+        // An unknown key from a NEWER rt is ignored, not fatal — the same
+        // tolerance that lets an older rt read this file.
+        let fwd: Config = toml::from_str("[settings]\nfont_size = 21.0\nsomething_new = 3\n")
+            .expect("an unknown key must not cost the whole file");
+        assert_eq!(fwd.settings.font_size, 21.0);
+    }
+
+    /// A mistyped `custom_scheme` must cost the user that block and nothing
+    /// else. `Config::load` turns any parse error into "ignoring malformed
+    /// config.toml" — so a derived `Deserialize` on the block that exists to
+    /// stop colours being lost would be able to lose every setting in the file.
+    #[test]
+    fn a_broken_custom_scheme_block_does_not_cost_the_whole_config() {
+        // Wrong type altogether.
+        let cfg: Config = toml::from_str("[settings]\nfont_size = 21.0\ncustom_scheme = 5\n")
+            .expect("a bad custom_scheme must not fail the load");
+        assert_eq!(cfg.settings.custom_scheme, None);
+        assert_eq!(cfg.settings.font_size, 21.0, "every other setting survived");
+        // A table, but not a colour scheme.
+        let cfg: Config = toml::from_str(
+            "[settings]\nfont_size = 21.0\n\n[settings.custom_scheme]\nforeground = \"green\"\n",
+        )
+        .expect("a half-written custom_scheme must not fail the load");
+        assert_eq!(cfg.settings.custom_scheme, None);
+        assert_eq!(cfg.settings.font_size, 21.0);
+    }
+
+    /// [`scheme_candidates`] keeps the same promise [`term_candidates`] does:
+    /// the value the settings actually carry is always one of the choices.
+    #[test]
+    fn the_scheme_cycle_always_contains_the_colours_in_force() {
+        let mut s = Settings::default();
+        s.foreground = [9, 9, 9]; // the user's own
+        let list = scheme_candidates(&s);
+        let cur = list.iter().find(|c| c.name == CUSTOM_SCHEME).expect("custom is listed");
+        assert_eq!(cur.foreground, [9, 9, 9], "and it is the LIVE colours, not a stale copy");
+        // Even with a stale remembered scheme, the live colours win.
+        s.custom_scheme = Some(CustomScheme {
+            foreground: [1, 1, 1],
+            background: [2, 2, 2],
+            palette: DEFAULT_PALETTE,
+        });
+        let list = scheme_candidates(&s);
+        let cur = list.iter().find(|c| c.name == CUSTOM_SCHEME).unwrap();
+        assert_eq!(cur.foreground, [9, 9, 9]);
+        // ...but once the settings sit on a built-in, the remembered one is it.
+        s.apply_scheme(&SCHEMES[0]);
+        let list = scheme_candidates(&s);
+        let cur = list.iter().find(|c| c.name == CUSTOM_SCHEME).unwrap();
+        assert_eq!(cur.foreground, [1, 1, 1]);
+        assert_eq!(matching_scheme(s.foreground, s.background, &s.palette), Some(SCHEMES[0].name));
+    }
+
     #[test]
     fn a_config_naming_a_blur_radius_loads_and_round_trips_on_any_platform() {
         let cfg: Config = toml::from_str("[settings]\nmacos_blur_radius = 12\n")

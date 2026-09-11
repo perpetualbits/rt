@@ -126,13 +126,12 @@ pub fn enabled(s: &Settings, row: PrefRow) -> bool {
 /// The name of the scheme whose colours `s` currently carries, or `"custom"`.
 ///
 /// Colours are edited in `config.toml`, so "custom" is the normal state for
-/// anyone who has done that — it is a readout, not a warning.
+/// anyone who has done that — it is a readout, not a warning. It is also a real
+/// entry in the cycle whenever the user has colours of their own; see
+/// [`rt_config::scheme_candidates`].
 pub fn preset_name(s: &Settings) -> &'static str {
-    rt_config::SCHEMES
-        .iter()
-        .find(|c| c.foreground == s.foreground && c.background == s.background && c.palette == s.palette)
-        .map(|c| c.name)
-        .unwrap_or("custom")
+    rt_config::matching_scheme(s.foreground, s.background, &s.palette)
+        .unwrap_or(rt_config::CUSTOM_SCHEME)
 }
 
 /// Apply ONE step of `dir` (+1 = Right, -1 = Left) to `row`'s setting.
@@ -221,20 +220,26 @@ pub fn step(
             let next = if dir > 0 { s.scrollback.saturating_mul(2) } else { s.scrollback / 2 };
             s.scrollback = next.clamp(SCROLLBACK_MIN, Settings::MAX_SCROLLBACK);
         }
+        // The same cycle as Family and Term, over the schemes this settings
+        // object can actually reach: the built-ins plus the user's own colours,
+        // which `scheme_candidates` puts in the list exactly the way
+        // `term_candidates` keeps the configured TERM in its list. That is what
+        // makes trying a preset non-destructive — "custom" is a position on the
+        // ring, so stepping off it and back on restores the colours rather than
+        // finding them gone.
         PrefRow::Preset => {
-            let n = rt_config::SCHEMES.len();
-            // Start from the scheme we currently match. When the colours match
-            // no scheme ("custom"), land on the natural end for the direction
-            // rather than 0-then-step: a first Right must hit SCHEMES[0], not
-            // skip it to SCHEMES[1], and a first Left must hit the last scheme.
-            let next = match rt_config::SCHEMES.iter().position(|c| c.name == preset_name(s)) {
+            let list = rt_config::scheme_candidates(s);
+            let n = list.len();
+            // Start from the scheme we currently match. The `None` arm is
+            // unreachable while the user's own colours are in the list (they
+            // always are, when there are any), and survives as the same
+            // 0-then-step guard `term_candidates`' caller keeps: a first Right
+            // must hit list[0], not skip it to list[1].
+            let next = match list.iter().position(|c| c.name == preset_name(s)) {
                 Some(cur) => (cur as i32 + dir).rem_euclid(n as i32) as usize,
                 None => if dir > 0 { 0 } else { n - 1 },
             };
-            let c = &rt_config::SCHEMES[next];
-            s.foreground = c.foreground;
-            s.background = c.background;
-            s.palette = c.palette;
+            s.apply_scheme(&list[next]);
         }
         // Cycles rather than toggles: the plain window blur plus 13 materials,
         // wrapping at both ends, so a user can walk the whole list with one arrow
@@ -561,6 +566,93 @@ mod tests {
         assert_eq!(s.background, want.background);
         assert_eq!(s.palette, want.palette, "a preset sets fg, bg AND the palette");
         assert_eq!(preset_name(&s), want.name);
+    }
+
+    /// The user's own colours, the way `config.toml` delivers them: hand-edited
+    /// values that match no built-in, normalised the way `Config::load` does.
+    fn with_custom_colours() -> Settings {
+        let mut s = Settings::default();
+        s.foreground = [255, 207, 5]; // bright gold
+        s.background = [0, 0, 14]; // near-black
+        s.palette[4] = [9, 9, 99];
+        s.normalize(); // the load path, which is where the custom slot is seeded
+        s
+    }
+
+    /// **The reported defect.** *"I had custom colors set, but when I tried one
+    /// of the presets, my custom scheme is gone."* Trying a preset must be
+    /// something you can undo with the other arrow key — walk the whole ring in
+    /// both directions and the user's own colours have to come back intact,
+    /// every time.
+    #[test]
+    fn trying_a_preset_never_destroys_the_users_own_colours() {
+        let mine = with_custom_colours();
+        assert_eq!(preset_name(&mine), rt_config::CUSTOM_SCHEME);
+        let ring = rt_config::scheme_candidates(&mine).len();
+        assert_eq!(ring, rt_config::SCHEMES.len() + 1, "custom is a position on the ring");
+
+        for dir in [1, -1] {
+            let mut s = mine.clone();
+            // All the way round, one step at a time.
+            for _ in 0..ring {
+                step(&mut s, PrefRow::Preset, dir, &fams(), &terms());
+            }
+            assert_eq!(s.foreground, mine.foreground, "dir {dir}: foreground came back");
+            assert_eq!(s.background, mine.background, "dir {dir}: background came back");
+            assert_eq!(s.palette, mine.palette, "dir {dir}: the whole palette came back");
+            assert_eq!(preset_name(&s), rt_config::CUSTOM_SCHEME);
+        }
+
+        // And the shortest version of the same thing: one step away, one back.
+        let mut s = mine.clone();
+        step(&mut s, PrefRow::Preset, 1, &fams(), &terms());
+        assert_ne!(s.foreground, mine.foreground, "the preset really was applied");
+        step(&mut s, PrefRow::Preset, -1, &fams(), &terms());
+        assert_eq!((s.foreground, s.background, s.palette), (mine.foreground, mine.background, mine.palette));
+    }
+
+    /// The colour picker writes one swatch at a time, and it must agree with the
+    /// preset row rather than being a second way to lose colours: a colour
+    /// edited while sitting on a preset IS the user's own scheme from that
+    /// moment, so the next preset step cannot take it away.
+    #[test]
+    fn editing_one_colour_on_a_preset_becomes_the_new_custom_scheme() {
+        let mut s = Settings::default();
+        step(&mut s, PrefRow::Preset, 1, &fams(), &terms()); // sit on a preset
+        let on_preset = preset_name(&s);
+        assert_ne!(on_preset, rt_config::CUSTOM_SCHEME);
+        assert!(s.custom_scheme.is_none(), "a preset alone is nobody's custom scheme");
+
+        // What `main::set_slot` does for one swatch.
+        s.palette[3] = [7, 8, 9];
+        s.remember_custom();
+        assert_eq!(preset_name(&s), rt_config::CUSTOM_SCHEME);
+        let mine = (s.foreground, s.background, s.palette);
+
+        // Step away and back: the edit survives.
+        step(&mut s, PrefRow::Preset, 1, &fams(), &terms());
+        step(&mut s, PrefRow::Preset, -1, &fams(), &terms());
+        assert_eq!((s.foreground, s.background, s.palette), mine);
+    }
+
+    /// A user who has never had colours of their own gets no "custom" entry —
+    /// an empty slot in a picker is a lie, and there would be nothing to step
+    /// back to. The same rule `term_candidates` follows: the list holds the
+    /// values that exist, plus the configured one, and nothing else.
+    #[test]
+    fn custom_is_absent_until_the_user_has_colours_of_their_own() {
+        let mut s = Settings::default();
+        assert_eq!(rt_config::scheme_candidates(&s).len(), rt_config::SCHEMES.len());
+        // Walking every preset must not conjure one either.
+        for _ in 0..rt_config::SCHEMES.len() * 2 {
+            step(&mut s, PrefRow::Preset, 1, &fams(), &terms());
+            assert_eq!(
+                rt_config::scheme_candidates(&s).len(),
+                rt_config::SCHEMES.len(),
+                "a preset is not a custom scheme"
+            );
+            assert!(s.custom_scheme.is_none());
+        }
     }
 
     #[test]

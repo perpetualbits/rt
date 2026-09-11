@@ -9355,6 +9355,13 @@ fn column_separator(fg: [u8; 3], bg: [u8; 3], opacity: f32, blends: bool) -> Col
 
 /// Write `rgb` into the colour slot the picker edits (foreground, background, or
 /// a palette entry). Out-of-range palette indices are ignored.
+///
+/// Every write ends in `remember_custom`, which is what keeps the picker and the
+/// preset row telling the same story: a colour edited here is by definition
+/// nobody's preset any more, so it becomes the user's own scheme immediately and
+/// the next step of the Preset row can no longer take it away. Without that this
+/// function would be a second route to the very loss `Settings::custom_scheme`
+/// exists to stop.
 fn set_slot(s: &mut rt_config::Settings, slot: chrome::colour_picker::Slot, rgb: [u8; 3]) {
     use chrome::colour_picker::Slot;
     match slot {
@@ -9366,6 +9373,7 @@ fn set_slot(s: &mut rt_config::Settings, slot: chrome::colour_picker::Slot, rgb:
             }
         }
     }
+    s.remember_custom();
 }
 
 /// Y positions (physical px) for scrollback-search hit markers on a pane's
@@ -9671,11 +9679,19 @@ mod sep_tests {
         assert_eq!(c3.3, chrome::theme::COLUMN_RULE_LIFT);
         let over = |src: f32, a: f32, dst: f32| dst + (src - dst) * a;
         assert!((over(c3.0, c3.3, 30.0 / 255.0) - 120.0 / 255.0).abs() < 1e-5);
-        // ...and on a see-through body it lets the backdrop through instead of
-        // sealing it off: half the pane's own transparency survives the rule.
+        // A nearly-opaque pane is still exactly that: the rule the pane body
+        // can carry, at the pane body's own alpha.
+        let c35 = column_separator([210, 210, 210], [30, 30, 30], 0.9, true);
+        assert_eq!(c35.3, chrome::theme::COLUMN_RULE_LIFT * 0.9);
+        // ...and on a SEE-THROUGH body the rule follows the pane titlebar's,
+        // for the reason written out at `chrome::theme::bar_target`: a colour
+        // measured in the user's own scheme cannot be painted as a lift over a
+        // composite that is mostly desktop without becoming a wash. It gets
+        // denser instead, and stays translucent — never a slab.
         let c4 = column_separator([210, 210, 210], [30, 30, 30], 0.65, true);
         assert!(c4.3 < 1.0, "a translucent pane gets a translucent rule");
-        assert_eq!(c4.3, chrome::theme::COLUMN_RULE_LIFT * 0.65);
+        assert!(c4.3 <= 0.65 + 1e-6, "never denser than twice the pane body itself");
+        assert!(c4.3 > chrome::theme::COLUMN_RULE_LIFT * 0.65, "and denser than the old lift");
     }
 
     #[test]

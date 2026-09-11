@@ -464,9 +464,165 @@ pub fn lift_alpha(from: f32, to: f32, opacity: f32) -> f32 {
     (opacity.clamp(0.0, 1.0) * (to - from) / (1.0 - from)).clamp(0.0, 1.0)
 }
 
+/// The largest share of a pane-titlebar pixel that may be unknown backdrop
+/// before *"the pane body, lifted toward the text colour"* stops being a
+/// statement about the user's own colours.
+///
+/// This is [`UNKNOWN_MAX`]'s argument one level down, and one order looser
+/// because the strip is pane furniture rather than chrome that has to carry a
+/// 7:1 text floor. The number is not a taste call: at `opacity = 1 - 0.10`,
+/// [`surround`] is still within [`FLOOR_EDGE`] of the configured background for
+/// **every** scheme — that is, the composited body is not even *findable* as a
+/// different surface from the colour the user configured, so lifting it by a
+/// fraction of the configured `bg → fg` span still lands where the user asked.
+/// [`tests::at_the_bar_density_knee_the_composite_is_still_the_users_background`]
+/// pins exactly that, and it is what makes the Linux look at
+/// `background_opacity = 0.90` bit-identical to what it has always been.
+const BAR_UNKNOWN_MAX: f32 = 0.10;
+
+/// How much of the strip's colour is the titlebar colour **itself** rather than
+/// whatever the composite left behind, lifted.
+///
+/// `0` while at most [`BAR_UNKNOWN_MAX`] of the pane is unknown backdrop —
+/// the region where the old rule is exactly right and is therefore kept, to the
+/// bit. It ramps to `1` by twice that, where the body is mostly not the user's
+/// colour at all and a lift calibrated in the user's colours over-delivers: on a
+/// near-black terminal at `opacity = 0.65` the old rule put a bright gold wash
+/// over a mid-grey composite, which is the defect this exists for
+/// (*"the background color in the title bar in OSX is still too bright"*).
+fn bar_density(opacity: f32) -> f32 {
+    let unknown = 1.0 - opacity.clamp(0.0, 1.0);
+    // Float slack, and it has to be here: `1.0 - 0.9f32` is 0.100000024, so
+    // without it the knee's own opacity lands a 2e-7 density on the wrong side
+    // of the branch and the "bit-identical at 0.90" guarantee becomes a
+    // last-ulp lie. A density this small is four orders under one 8-bit step.
+    const SLACK: f32 = 1e-4;
+    if unknown <= BAR_UNKNOWN_MAX + SLACK {
+        return 0.0;
+    }
+    ((unknown - BAR_UNKNOWN_MAX) / BAR_UNKNOWN_MAX).clamp(0.0, 1.0)
+}
+
+/// What is on screen *underneath* a titlebar band whose surface sits at lift
+/// `from`: the composited pane body for the strip (`from == 0`), and the strip
+/// as it actually came out for the hairline drawn on top of it.
+fn bar_under(bg: [f32; 3], fg: [f32; 3], from: f32, opacity: f32) -> [f32; 3] {
+    let around = surround(bg, opacity);
+    if from <= 0.0 {
+        return around;
+    }
+    let (c, a) = bar_paint(bg, fg, 0.0, from, opacity);
+    mix(around, c, a)
+}
+
+/// The colour one titlebar band should have **on screen** — the whole rule.
+///
+/// Two regimes, crossfaded by [`bar_density`] so dragging the opacity slider
+/// never steps:
+///
+/// * **The body is still the user's background** (at most [`BAR_UNKNOWN_MAX`]
+///   unknown): the band is that body lifted toward `fg`, exactly as before.
+/// * **The body is mostly backdrop**: the band is `mix(bg, fg, to)` — the
+///   titlebar colour the user's own scheme defines, the one an opaque window
+///   shows — pulled toward the pane's own background by however much that
+///   colour falls short of the separation *it has on an opaque window*, with
+///   the shortfall measured against [`surround`] rather than against a colour
+///   that is, at `opacity = 0.65`, 35% absent.
+///
+/// Two consequences, and they are the reported defect's inverse. The strip
+/// stops climbing with the backdrop: it is a fixed colour of the user's own,
+/// not a fixed step up from wherever the composite happened to land, so a
+/// bright desktop behind sheer glass no longer turns a 20% gold lift into a
+/// gold wash. And it still cannot vanish, because the shortfall is measured
+/// against what is really behind it — which is exactly the case Roland's scheme
+/// hits at 0.65, where the composited body and the titlebar colour land within
+/// 1.01:1 of each other.
+///
+/// The floor is the scheme's own opaque separation rather than a constant
+/// because a constant cannot be both reachable and honest: an unfocused strip
+/// on a near-black scheme clears only 1.15:1 on an opaque window, and any floor
+/// tight enough to matter would have quietly redesigned the look the user
+/// already has.
+fn bar_target(bg: [f32; 3], fg: [f32; 3], around: [f32; 3], from: f32, to: f32, opacity: f32) -> [f32; 3] {
+    // The old rule, in seen space: the composite lifted toward the text colour.
+    let lifted = mix(around, fg, lift_alpha(from, to, opacity));
+    let w = bar_density(opacity);
+    if w <= 0.0 {
+        return lifted;
+    }
+    let solid = mix(bg, fg, to); // the titlebar colour an opaque window shows
+    let floor = contrast(solid, mix(bg, fg, from)); // the separation it has there
+    // The one direction a titlebar may separate itself in when the body is
+    // mostly backdrop: toward the pane's OWN background — denser glass, less of
+    // the desktop. It works on both sides of the scheme (a dark terminal gets
+    // darker, a light one whiter) and it can never be the brighter wash this
+    // rule exists to stop; a pull toward the foreground would be exactly that
+    // wash again.
+    //
+    // A forward scan rather than a solve, for the same reason
+    // `ensure_separation` uses one: the path from `solid` to `bg` may cross the
+    // composite's own luminance, so contrast dips to 1.0 and rises again and
+    // the predicate is not monotone. The FIRST `t` that clears the floor is the
+    // least density that does the job; when nothing on the path clears it —
+    // a body sitting between the titlebar colour and the background, which is
+    // what a *nearly* opaque window looks like — the answer is all the way to
+    // `bg`, the far end, never a stop in the dip.
+    const STEPS: usize = 128;
+    let mut pull = 1.0;
+    for i in 1..=STEPS {
+        let t = i as f32 / STEPS as f32;
+        if contrast(mix(solid, bg, t), around) >= floor {
+            pull = t;
+            break;
+        }
+    }
+    let dense = if contrast(solid, around) >= floor { solid } else { mix(solid, bg, pull) };
+    mix(lifted, dense, w)
+}
+
+/// The `(colour, alpha)` to paint so the band lands on [`bar_target`].
+///
+/// Minimal ink, as before — the alpha is the smallest that can reach the target
+/// over what is behind it, because every unit of alpha is backdrop the strip
+/// seals off. Two bounds sit on it: it is never *less* than [`lift_alpha`] (so
+/// the untouched regime returns the old fill bit-for-bit), and never more than
+/// `opacity` — the strip may be denser than the pane body, but never more than
+/// twice as much of the user's colour as the body itself has, which is what
+/// keeps a fully see-through window free of a titlebar slab.
+fn bar_paint(bg: [f32; 3], fg: [f32; 3], from: f32, to: f32, opacity: f32) -> ([f32; 3], f32) {
+    let want = lift_alpha(from, to, opacity);
+    if bar_density(opacity) <= 0.0 {
+        return (fg, want); // the old rule, to the bit
+    }
+    // Computed once and handed on: `bar_under` walks the band below this one,
+    // and asking for it twice would double the work at every level.
+    let around = bar_under(bg, fg, from, opacity);
+    let target = bar_target(bg, fg, around, from, to, opacity);
+    let mut a = want;
+    for i in 0..3 {
+        let d = target[i] - around[i];
+        // How far this channel can be pushed by a full-strength fill.
+        let room = if d >= 0.0 { 1.0 - around[i] } else { around[i] };
+        a = a.max(if room > 1e-6 {
+            (d.abs() / room).min(1.0)
+        } else if d.abs() > 1e-6 {
+            1.0 // wedged against the end of the range: spend everything
+        } else {
+            0.0
+        });
+    }
+    let a = a.min(opacity.clamp(0.0, 1.0));
+    if a <= 1e-6 {
+        return (fg, 0.0); // a fully see-through window gets no strip at all
+    }
+    let c = [0usize, 1, 2].map(|i| (around[i] + (target[i] - around[i]) / a).clamp(0.0, 1.0));
+    (c, a)
+}
+
 /// The fill for one band of the pane titlebar: the strip itself (`from = 0.0`,
 /// `to` = one of [`BAR_LIFT_FOCUSED`]/[`BAR_LIFT_UNFOCUSED`]) or the hairline
 /// drawn on top of it (`from` = the strip's lift, `to` = [`BAR_LIFT_SEP`]).
+/// See [`bar_target`] for the rule and [`bar_paint`] for how it is spent.
 ///
 /// `blends` is [`crate::backend::Backend::is_gl`] — whether this backend's
 /// `fill_rect` composites with what is already in the frame. The GL and wgpu
@@ -480,7 +636,8 @@ pub fn lift_alpha(from: f32, to: f32, opacity: f32) -> f32 {
 pub fn lift_fill(bg: [u8; 3], fg: [u8; 3], from: f32, to: f32, opacity: f32, blends: bool) -> Color {
     let (bgf, fgf) = (to_f(bg), to_f(fg));
     if blends {
-        col(fgf, lift_alpha(from, to, opacity))
+        let (c, a) = bar_paint(bgf, fgf, from, to, opacity);
+        col(c, a)
     } else {
         col(mix(bgf, fgf, to), 1.0)
     }
@@ -828,12 +985,13 @@ mod tests {
         (mix(dst, src, a), a + dst_a * (1.0 - a))
     }
 
-    /// **The pane titlebar guarantee.** The strip is the pane body's own
-    /// material lifted toward the foreground, carrying the body's own alpha —
-    /// not an opaque slab of a colour that, on a see-through window, is mostly
-    /// not on screen. Pinned against the exact composite the backends perform.
+    /// **The pane titlebar guarantee, part one: nothing moves where the body is
+    /// still the user's background.** At or above the [`BAR_UNKNOWN_MAX`] knee
+    /// the strip is the pane body's own material lifted toward the foreground,
+    /// carrying the body's own alpha, exactly as it always was — pinned against
+    /// the composite the backends really perform.
     #[test]
-    fn the_pane_titlebar_is_the_body_lifted_at_the_bodys_own_alpha() {
+    fn a_nearly_opaque_titlebar_is_the_body_lifted_at_the_bodys_own_alpha() {
         // The residual of painting `fg` instead of the mixed colour, derived in
         // `lift_alpha`: `to * opacity * (1 - opacity) * (bg - D)`, maximised at
         // `opacity = 0.5` where `opacity * (1 - opacity) = 0.25`, and with
@@ -842,15 +1000,15 @@ mod tests {
         // How much MORE opaque than the pane body each band leaves the window.
         // One pass costs `to * opacity * (1 - opacity) <= to / 4`. The hairline
         // is a second pass on top of the strip, so it compounds a little past
-        // that: solving `d/dp [a2 (1 - A1) + a1 (1 - p)] = 0` puts its true
-        // maximum at 0.1064 (opacity 0.485, focused), rounded up here.
+        // that.
         let strip_alpha_bound = BAR_LIFT_FOCUSED * 0.25 + 1e-6;
         let hair_alpha_bound = 0.11;
         for (fg, bg, _) in schemes() {
             let (fgf, bgf) = (to_f(fg), to_f(bg));
             for desktop_l in [0.0_f32, 0.5, 1.0] {
                 let desktop = [desktop_l; 3];
-                for opacity in [0.0_f32, 0.25, 0.5, 0.65, 0.9, 1.0] {
+                // Only the untouched regime: 1 - BAR_UNKNOWN_MAX and above.
+                for opacity in [0.90_f32, 0.95, 1.0] {
                     for lift in [BAR_LIFT_FOCUSED, BAR_LIFT_UNFOCUSED] {
                         // The pane body as it reaches the eye, and the window
                         // alpha it carries.
@@ -897,6 +1055,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The knee is not a taste call. [`BAR_UNKNOWN_MAX`] is the share of unknown
+    /// backdrop up to which [`surround`] is still within [`FLOOR_EDGE`] of the
+    /// configured background — i.e. the composited body is not even *findable*
+    /// as a different surface from the colour the user configured, so a lift
+    /// measured in that colour's span still lands where the user asked. Below
+    /// the knee that stops being true and the rule changes.
+    #[test]
+    fn at_the_bar_density_knee_the_composite_is_still_the_users_background() {
+        let knee = 1.0 - BAR_UNKNOWN_MAX;
+        assert_eq!(bar_density(knee), 0.0, "the knee itself is inside the untouched regime");
+        for (_, bg, _) in schemes() {
+            let bgf = to_f(bg);
+            let drift = contrast(surround(bgf, knee), bgf);
+            assert!(drift < FLOOR_EDGE, "at {knee} opacity the body has drifted {drift} from {bg:?}");
+        }
+        // ...and the ramp is monotone, so dragging the opacity slider never
+        // steps: 0 at the knee, 1 by twice the unknown share, continuous between.
+        assert_eq!(bar_density(1.0), 0.0);
+        assert!((bar_density(1.0 - 2.0 * BAR_UNKNOWN_MAX) - 1.0).abs() < 1e-6);
+        assert_eq!(bar_density(0.65), 1.0);
+        let mut prev = 0.0;
+        for i in 0..=100 {
+            let d = bar_density(1.0 - i as f32 / 100.0);
+            assert!(d >= prev - 1e-6, "bar_density must not fall as the window goes sheer");
+            prev = d;
+        }
+    }
+
+    /// **The pane titlebar guarantee, part two: a sheer window gets the
+    /// titlebar colour, not a wash of foreground over the desktop.**
+    ///
+    /// *"the background color in the title bar in OSX is still too bright …
+    /// on OSX that pane character background is too bright."* Below the knee the
+    /// band is `mix(bg, fg, to)` pulled toward the pane's own background, and
+    /// the defect's inverse is what that buys: **whatever the scheme and
+    /// whatever the opacity, the strip reads closer to the pane's own
+    /// background than the old lift-toward-the-foreground rule did.** That is
+    /// the one statement that means "not a wash" on a dark terminal and a light
+    /// one at the same time — and it still has to be *seen*.
+    #[test]
+    fn a_sheer_titlebar_reads_as_the_pane_not_as_a_wash() {
+        for (fg, bg, _) in schemes() {
+            let (fgf, bgf) = (to_f(fg), to_f(bg));
+            for opacity in [0.05_f32, 0.25, 0.5, 0.6, 0.65, 0.7, 0.8] {
+                let around = surround(bgf, opacity);
+                for lift in [BAR_LIFT_FOCUSED, BAR_LIFT_UNFOCUSED] {
+                    let c = lift_fill(bg, fg, 0.0, lift, opacity, true);
+                    let strip = mix(around, rgb(c), c.3);
+                    // What rt drew before: the composite lifted toward fg — and
+                    // on a sheer window that lift rides ON TOP of the backdrop's
+                    // own, which is how a 20% tint became a wash.
+                    let was = mix(around, fgf, lift_alpha(0.0, lift, opacity));
+                    let solid = mix(bgf, fgf, lift);
+                    // Never worse than the old rule, at any opacity at all.
+                    assert!(
+                        (lum(strip) - lum(bgf)).abs() <= (lum(was) - lum(bgf)).abs() + 1e-4,
+                        "strip {strip:?} is further from the pane's own background than the \
+                         old {was:?} at opacity {opacity} scheme {bg:?}/{fg:?}"
+                    );
+                    // And the strip is the titlebar colour the scheme itself
+                    // defines — no further from the pane's background than that
+                    // — up to what the fill alpha's cap at the pane's own
+                    // opacity leaves unreachable. That residual is `1 - opacity`
+                    // of the composite's own drift: the share of the pixel that
+                    // is backdrop rt is not allowed to paint over, which is also
+                    // why a fully see-through window keeps its glass. A scheme
+                    // whose foreground IS its background has no titlebar to draw
+                    // and nothing to assert about.
+                    if contrast(fgf, bgf) > 1.05 {
+                        let unreachable = (1.0 - opacity) * (lum(around) - lum(bgf)).abs();
+                        assert!(
+                            (lum(strip) - lum(bgf)).abs() <= (lum(solid) - lum(bgf)).abs() + unreachable + 1e-4,
+                            "strip {strip:?} sits further from the pane's own background than the \
+                             titlebar colour the scheme defines ({solid:?}); rt used to draw \
+                             {was:?} here. opacity {opacity} scheme {bg:?}/{fg:?}"
+                        );
+                    }
+                    // And it is still SEEN: the alpha the window can afford is
+                    // capped at `opacity`, so on a very sheer window this is a
+                    // best effort — but it never comes out flat. (A scheme whose
+                    // foreground IS its background has no titlebar to draw.)
+                    if opacity >= 0.25 && contrast(fgf, bgf) > 1.05 {
+                        assert!(
+                            contrast(strip, around) > 1.0 + 1e-4,
+                            "strip vanished into the body at opacity {opacity} scheme {bg:?}/{fg:?}"
+                        );
+                    }
+                    // The strip never seals the window off completely either.
+                    let strip_a = c.3 + opacity * (1.0 - c.3);
+                    assert!(strip_a <= 1.0 - (1.0 - opacity).powi(2) + 1e-6, "denser than twice the body");
+                }
+            }
+        }
+    }
+
+    /// **Roland's own settings, pinned.** `background_opacity = 0.90` on Linux
+    /// is the look he has asked twice to keep, so it is bit-identical to what rt
+    /// drew before this change; the same colours at the macOS glass setting of
+    /// `0.65` are the fix, and they are visibly DARKER, not a gold wash.
+    #[test]
+    fn the_reported_scheme_is_unchanged_at_0_90_and_darker_at_0_65() {
+        let fg = [255u8, 207, 5]; // bright gold
+        let bg = [0u8, 0, 14]; // near-black
+        let seen = |opacity: f32, lift: f32| {
+            let c = lift_fill(bg, fg, 0.0, lift, opacity, true);
+            let strip = mix(surround(to_f(bg), opacity), rgb(c), c.3);
+            (c, strip, lum(strip))
+        };
+
+        // --- 0.90: EXACTLY what rt drew before, to the bit. -----------------
+        for lift in [BAR_LIFT_FOCUSED, BAR_LIFT_UNFOCUSED] {
+            let c = lift_fill(bg, fg, 0.0, lift, 0.90, true);
+            assert_eq!(rgb(c), to_f(fg), "0.90 still paints the foreground itself");
+            assert_eq!(c.3, lift_alpha(0.0, lift, 0.90), "0.90 still paints it at the body's lift");
+            let h = lift_fill(bg, fg, lift, BAR_LIFT_SEP, 0.90, true);
+            assert_eq!(rgb(h), to_f(fg));
+            assert_eq!(h.3, lift_alpha(lift, BAR_LIFT_SEP, 0.90));
+        }
+        let (_, strip90, lum90) = seen(0.90, BAR_LIFT_FOCUSED);
+
+        // --- 0.65: the fix. -------------------------------------------------
+        let (_, strip65, lum65) = seen(0.65, BAR_LIFT_FOCUSED);
+        assert!(
+            lum65 < lum90 * 0.5,
+            "0.65 must come out substantially darker: {lum65} vs {lum90} ({strip65:?} vs {strip90:?})"
+        );
+        // It is no brighter than the titlebar colour his opaque window shows.
+        let solid = mix(to_f(bg), to_f(fg), BAR_LIFT_FOCUSED);
+        assert!(lum65 <= lum(solid) + 1e-4, "{lum65} vs the opaque titlebar's {}", lum(solid));
+        // And it is still a titlebar: separated from the body behind it — by
+        // slightly MORE than the wash was, not less.
+        let around65 = surround(to_f(bg), 0.65);
+        let was65 = mix(around65, to_f(fg), lift_alpha(0.0, BAR_LIFT_FOCUSED, 0.65));
+        assert!(contrast(strip65, around65) >= contrast(was65, around65), "{}", contrast(strip65, around65));
+
+        // The numbers, on the record, so a future change to any of this has to
+        // say out loud that it moved them: over the assumed backdrop the strip
+        // is [56, 47, 21] at 0.90 — exactly what it always was — and [15, 15,
+        // 18] at 0.65, where the old rule gave [71, 65, 46] over a [43, 43, 52]
+        // pane body. A tenth of the luminance at 1.368:1 instead of 1.365:1.
+        let px = |c: [f32; 3]| [0usize, 1, 2].map(|i| (c[i] * 255.0).round() as u8);
+        assert_eq!(px(strip90), [56, 47, 21], "0.90 is the look Roland asked twice to keep");
+        assert_eq!(px(strip65), [15, 15, 18], "0.65 is the fix");
+        assert_eq!(px(was65), [71, 65, 46], "what 0.65 used to draw");
+        assert_eq!(px(around65), [43, 43, 52], "the pane body it sits in");
     }
 
     /// An OPAQUE window must be bit-identical to the slab rt drew before this
@@ -955,6 +1260,13 @@ mod tests {
         assert_eq!(lift_alpha(BAR_LIFT_SEP, BAR_LIFT_SEP, 1.0), 0.0, "no lift asked for");
         assert_eq!(lift_alpha(BAR_LIFT_SEP, BAR_LIFT_FOCUSED, 1.0), 0.0, "a downward lift is not a fill");
         assert_eq!(lift_alpha(1.0, 1.0, 1.0), 0.0, "from == 1.0 must not divide by zero");
+        // The densifying regime must not undo that: the fill's alpha is capped
+        // at the pane's own opacity, so at zero there is nothing to paint with.
+        for (fg, bg, _) in schemes() {
+            for lift in [BAR_LIFT_FOCUSED, BAR_LIFT_UNFOCUSED, BAR_LIFT_SEP] {
+                assert_eq!(lift_fill(bg, fg, 0.0, lift, 0.0, true).3, 0.0, "{bg:?}/{fg:?}");
+            }
+        }
     }
 
     /// THE guarantee. Whatever the user's colours, and whichever chrome theme is
