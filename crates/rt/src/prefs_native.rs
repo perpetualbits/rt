@@ -528,8 +528,18 @@ mod tests {
         assert!(chrome.contains(&"graphite".to_string()));
         let glass = choices(&s, PrefRow::GlassMaterial, &[], &[]);
         assert_eq!(glass.len(), rt_config::GlassMaterial::ALL.len(), "all fourteen materials");
-        let t = choices(&s, PrefRow::Term, &[], &terms());
-        assert_eq!(t.len(), rt_config::term_candidates(&s.term).len());
+        // The TERM ring is whatever the caller supplies, plus the configured
+        // value if it is not already in it -- the promise `term_candidates`
+        // keeps. Asserted against the SUPPLIED list, not against
+        // `term_candidates(&s.term)`: that probes this machine's installed
+        // terminfo, so the old form passed on Linux (two candidates) and failed
+        // on macOS (one), which is a property of the host and not of the code.
+        let supplied = terms();
+        let t = choices(&s, PrefRow::Term, &[], &supplied);
+        assert_eq!(t.len(), supplied.len(), "the ring is the supplied list: {t:?}");
+        for name in &supplied {
+            assert!(t.contains(name), "{name} missing from the ring: {t:?}");
+        }
     }
 
     /// The greyed case: the glass popup still lists every material while the
