@@ -7852,12 +7852,7 @@ impl App {
         let sc = active.chrome_sc; // display backing factor for the flat chrome constants
         // fg/bg midpoint: visible but not text-weight — translucent, so it sits
         // in the pane body rather than on top of it (see `column_separator`).
-        let sep = column_separator(
-            active.settings.foreground,
-            cfg_bg,
-            active.settings.background_opacity,
-            active.backend.is_gl(), // XRender's content fills are PictOp::SRC, not a blend
-        );
+        let sep = column_separator(active.settings.foreground, cfg_bg);
         // Reset the clip-history titlebar affordance's hit-rect before the
         // per-pane pass: it is set at most once below (focused pane, non-empty
         // history), so a stale rect from a previous frame must not survive the
@@ -9815,12 +9810,25 @@ pub fn version_string() -> String {
     }
 }
 
-fn column_separator(fg: [u8; 3], bg: [u8; 3], opacity: f32, blends: bool) -> Color {
-    // Same rule as the pane titlebar (`chrome::theme::lift_fill`): the pane
-    // body's own surface lifted toward the foreground, carrying the body's
-    // alpha, rather than an opaque rule in a colour a see-through window is only
-    // partly showing. At `opacity == 1.0` it is the fg/bg midpoint it always was.
-    chrome::theme::lift_fill(bg, fg, 0.0, chrome::theme::COLUMN_RULE_LIFT, opacity, blends)
+fn column_separator(fg: [u8; 3], bg: [u8; 3]) -> Color {
+    // The fg/bg midpoint, OPAQUE — a structural rule, drawn like the pane
+    // divider a few lines up (`divider_col`).
+    //
+    // It is NOT lifted from the pane body the way the titlebar strip is: the
+    // strip fills a region that sits over the body, but this rule is a hairline
+    // in the inter-column gap, where default-background cells are left unfilled
+    // — so it sits over the translucent clear, not over the body. Painting it
+    // translucent (which it briefly was, when the titlebar work reached it by
+    // mistake) makes a see-through window's rule vanish over its own frosted
+    // glass on macOS: a 30-50% line of the scheme's fg over a bright blurred
+    // desktop has no contrast. Opaque, it is visible at every opacity, on both
+    // backends, exactly as it was before.
+    let c = |i: usize| {
+        (bg[i] as f32 + (fg[i] as f32 - bg[i] as f32) * chrome::theme::COLUMN_RULE_LIFT)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::rgb(c(0), c(1), c(2))
 }
 
 /// Write `rgb` into the colour slot the picker edits (foreground, background, or
@@ -10141,41 +10149,29 @@ mod selection_tests {
 mod sep_tests {
     use super::*;
 
+    /// The inter-column rule is the opaque fg/bg midpoint, on both backends and
+    /// at every opacity — a structural line that must not vanish over a
+    /// see-through pane's frosted glass. It is deliberately NOT the titlebar's
+    /// translucent lift: unlike the strip, this hairline sits over the gap's
+    /// translucent clear, not over the pane body. See `column_separator`.
     #[test]
-    fn column_separator_is_the_fg_bg_midpoint() {
+    fn column_separator_is_the_opaque_fg_bg_midpoint() {
         let close = |c: Color, want: Color| {
             (c.0 - want.0).abs() < 1e-5 && (c.1 - want.1).abs() < 1e-5 && (c.2 - want.2).abs() < 1e-5
         };
-        // On a backend that cannot blend (XRender, `PictOp::SRC`) the rule is
-        // the opaque midpoint it has always been, whatever the opacity.
-        // A light-on-dark scheme: each channel is the mean of fg and bg.
-        let c = column_separator([210, 210, 210], [30, 30, 30], 0.65, false);
-        assert_eq!(c.3, 1.0);
+        // Light-on-dark: each channel is the mean of fg and bg, and fully opaque.
+        let c = column_separator([210, 210, 210], [30, 30, 30]);
+        assert_eq!(c.3, 1.0, "a structural rule is opaque");
         assert!(close(c, Color::rgb(120, 120, 120)));
         // Per channel, not a single grey: colours mix independently.
-        let c2 = column_separator([200, 100, 0], [0, 0, 40], 0.65, false);
+        let c2 = column_separator([200, 100, 0], [0, 0, 40]);
         assert!(close(c2, Color::rgb(100, 50, 20)));
-
-        // On a blending backend it is the foreground at the lift, which over an
-        // OPAQUE pane body composites to exactly that same midpoint — the rule
-        // only changes where the body is see-through.
-        let c3 = column_separator([210, 210, 210], [30, 30, 30], 1.0, true);
-        assert_eq!(c3.3, chrome::theme::COLUMN_RULE_LIFT);
-        let over = |src: f32, a: f32, dst: f32| dst + (src - dst) * a;
-        assert!((over(c3.0, c3.3, 30.0 / 255.0) - 120.0 / 255.0).abs() < 1e-5);
-        // A nearly-opaque pane is still exactly that: the rule the pane body
-        // can carry, at the pane body's own alpha.
-        let c35 = column_separator([210, 210, 210], [30, 30, 30], 0.9, true);
-        assert_eq!(c35.3, chrome::theme::COLUMN_RULE_LIFT * 0.9);
-        // ...and on a SEE-THROUGH body the rule follows the pane titlebar's,
-        // for the reason written out at `chrome::theme::bar_target`: a colour
-        // measured in the user's own scheme cannot be painted as a lift over a
-        // composite that is mostly desktop without becoming a wash. It gets
-        // denser instead, and stays translucent — never a slab.
-        let c4 = column_separator([210, 210, 210], [30, 30, 30], 0.65, true);
-        assert!(c4.3 < 1.0, "a translucent pane gets a translucent rule");
-        assert!(c4.3 <= 0.65 + 1e-6, "never denser than twice the pane body itself");
-        assert!(c4.3 > chrome::theme::COLUMN_RULE_LIFT * 0.65, "and denser than the old lift");
+        // The value does not depend on opacity or backend any more — there are
+        // no such parameters. A dark scheme's rule is the same solid line
+        // whether the window is opaque or pure glass, which is the whole fix.
+        let dark = column_separator([255, 207, 5], [0, 0, 14]);
+        assert_eq!(dark.3, 1.0);
+        assert!(close(dark, Color::rgb(128, 104, 10)));
     }
 
     #[test]
