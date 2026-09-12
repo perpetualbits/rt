@@ -154,7 +154,16 @@ objc2 = "0.6"
 # Both are already in the graph via winit-appkit, whose window delegate is a
 # dragging destination for FILE drops -- naming them here says rt is one too,
 # for text.
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics", "NSUserInterfaceItemIdentification", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSDragging", "NSPasteboard"] }
+# The native Settings window (settings_window.rs) is the second batch here: `NSControl` and
+# `NSCell` carry `setTarget:`/`setAction:`/`tag`, which is how every control
+# reaches rt; `NSSwitch`, `NSSlider`, `NSStepper`, `NSPopUpButton`,
+# `NSTextField` and `NSColorWell` are the controls each preferences row maps to
+# (see prefs_native.rs); `NSColorPanel` is what a colour well opens and
+# `NSColorSpace` is what converts what it returns into rt's 8-bit sRGB;
+# `NSScrollView` scrolls the pane and `NSFont` sizes its labels. All of them are
+# already in the graph via winit-appkit; naming them here just says rt uses them
+# too.
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSVisualEffectView", "NSResponder", "NSColor", "NSGraphics", "NSUserInterfaceItemIdentification", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSDragging", "NSPasteboard", "NSControl", "NSCell", "NSSwitch", "NSSlider", "NSStepper", "NSPopUpButton", "NSTextField", "NSColorWell", "NSColorPanel", "NSColorSpace", "NSScrollView", "NSFont", "NSButton", "NSClipView", "NSLayoutManager", "NSTextStorage", "NSStringDrawing", "NSParagraphStyle"] }
 objc2-foundation = "0.3"
 pollster = "0.4"   # block_on for wgpu's async adapter/device request
 bytemuck = { version = "1", features = ["derive"] }  # Pod/Zeroable for TextPipeline's Vertex
