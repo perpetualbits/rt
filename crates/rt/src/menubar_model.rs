@@ -34,11 +34,19 @@
 //!   in). They are meaningless in a menu bar that has no pointer position, so
 //!   they never reach it; `RowAction::action` returns `None` for exactly those
 //!   three variants and this module only ever asks for actions.
-//! * **Menu-bar-only rows** ([`Entry::Extra`]) — the handful of standard Mac
-//!   menu entries a right-click menu has no reason to carry (Enter Full Screen,
-//!   the zoom triple, tab cycling, Close Window, Clipboard History). Each names
-//!   an [`Action`] rt already implements and a binding rt already has; nothing
-//!   here invents a keystroke.
+//! * **Menu-bar-only rows** ([`Entry::Extra`]) — every [`Action`] rt has that
+//!   rt's own right-click menu does not offer. Some are the standard Mac
+//!   entries a context menu has no reason to carry (Enter Full Screen, the zoom
+//!   triple, tab cycling, Close Window, Clipboard History); the rest are
+//!   actions that until now were reachable ONLY by keystroke — moving the focus
+//!   between panes, moving a divider, the background-translucency pair and the
+//!   whole patch bay. Each names an [`Action`] rt already implements and a
+//!   binding rt already has; nothing here invents a keystroke.
+//!
+//! Which of the two a given action is, is not a judgement call that can be
+//! forgotten: `every_action_reaches_the_menu_bar_or_is_excluded_with_a_reason`
+//! walks [`Action::ALL`] — generated from the list that DECLARES the enum — so a
+//! new variant fails the build until it is filed or excluded by name.
 //!
 //! ## Why the model is rebuilt rather than mutated
 //!
@@ -174,6 +182,18 @@ fn categories() -> &'static [(&'static str, &'static [Entry])] {
                 Entry::Ctx(Action::BroadcastGroup),
                 Entry::Ctx(Action::GroupCycle),
                 Entry::Sep,
+                // The patch bay: "where does my OUTPUT go", the mirror image of
+                // the broadcast group just above it ("where does my typing go").
+                // Both are properties of the shell session rather than of the
+                // view, which is what puts them in the same menu. The ellipsis
+                // on the two Wire rows is the Mac convention said honestly: the
+                // row ARMS a wire and then waits for a second press in the pane
+                // at the other end, so it does not complete on its own.
+                Entry::Extra(Action::WireStdout, "Wire Stdout…"),
+                Entry::Extra(Action::WireStderr, "Wire Stderr…"),
+                Entry::Extra(Action::PipeInto, "Split and Pipe Stdout In"),
+                Entry::Extra(Action::Unwire, "Disconnect Wires"),
+                Entry::Sep,
                 Entry::Ctx(Action::CloseTerm),
                 Entry::Extra(Action::CloseWindow, "Close Window"),
             ],
@@ -205,6 +225,15 @@ fn categories() -> &'static [(&'static str, &'static [Entry])] {
                 Entry::Ctx(Action::ColumnsMore),
                 Entry::Ctx(Action::ColumnsFewer),
                 Entry::Sep,
+                // Background translucency. A View-menu matter for the same
+                // reason the zoom triple is: it changes how the same session
+                // LOOKS, not what it is. Apple's own wording for the direction
+                // pair is opaque/transparent, so that is the wording here (rt's
+                // manual says "more see-through", which is rt's voice, not the
+                // platform's).
+                Entry::Extra(Action::OpacityUp, "More Opaque"),
+                Entry::Extra(Action::OpacityDown, "More Transparent"),
+                Entry::Sep,
                 Entry::Ctx(Action::ToggleFocusFollowsMouse),
             ],
         ),
@@ -215,6 +244,23 @@ fn categories() -> &'static [(&'static str, &'static [Entry])] {
                 // what ToggleZoom does to a pane. The context menu's own wording
                 // is clearer about the scope, so it wins.
                 Entry::Ctx(Action::ToggleZoom),
+                Entry::Sep,
+                // Moving the FOCUS between panes. Apple's Window menu is where
+                // "go to another one of my views" lives (Terminal.app's own
+                // "Select Next Pane" is there), and iTerm2 files its
+                // Above/Below/Left/Right quad in the same place.
+                Entry::Extra(Action::GoUp, "Select Pane Above"),
+                Entry::Extra(Action::GoDown, "Select Pane Below"),
+                Entry::Extra(Action::GoLeft, "Select Pane Left"),
+                Entry::Extra(Action::GoRight, "Select Pane Right"),
+                Entry::Sep,
+                // Moving the DIVIDER. "Grow", not "Resize": the action grows the
+                // focused pane in that direction at its neighbour's expense, and
+                // "Resize Pane Left" does not say which of the two gets bigger.
+                Entry::Extra(Action::ResizeLeft, "Grow Pane Left"),
+                Entry::Extra(Action::ResizeRight, "Grow Pane Right"),
+                Entry::Extra(Action::ResizeUp, "Grow Pane Up"),
+                Entry::Extra(Action::ResizeDown, "Grow Pane Down"),
                 Entry::Sep,
                 Entry::Extra(Action::NextTab, "Next Tab"),
                 Entry::Extra(Action::PrevTab, "Previous Tab"),
@@ -403,32 +449,84 @@ mod tests {
         m.items().find(|i| i.label == label).unwrap_or_else(|| panic!("no item labelled {label:?}"))
     }
 
-    /// The load-bearing test: a new `Action` added to the right-click menu MUST
-    /// be filed under a menu-bar category or listed here on purpose. It cannot
-    /// silently vanish from the Mac menu bar.
+    /// The load-bearing test: **every** [`Action`] rt has must be filed under a
+    /// menu-bar category, or named here with a reason. Not "every action the
+    /// right-click menu offers" — that was the old guard, and it could only ever
+    /// catch a regression in rt's OWN menu; an `Action` that was in neither menu
+    /// was invisible to it, which is exactly how fourteen of them came to have no
+    /// place on the Mac menu bar at all.
     ///
-    /// The list is empty today: every actionable right-click row has a home.
-    const CONTEXT_ONLY_ACTIONS: &[Action] = &[];
+    /// It asserts against [`Action::ALL`], which is generated from the very list
+    /// that declares the enum (`rt_config`'s `actions!`), so a new variant is in
+    /// it the moment it exists and this test fails until somebody decides where
+    /// it goes. That is the whole point: the decision is forced, not remembered.
+    ///
+    /// Empty today — every action rt has reaches the bar.
+    const NOT_IN_THE_MENU_BAR: &[(Action, &str)] = &[];
 
     #[test]
-    fn every_context_menu_action_is_in_the_bar_or_declared_context_only() {
+    fn every_action_reaches_the_menu_bar_or_is_excluded_with_a_reason() {
         let km = Keymap::defaults();
         let m = model(&km, true, false);
         let in_bar: HashSet<Action> = m.items().filter_map(|i| i.action).collect();
-        let mut missing: Vec<String> = context_rows(&km, true)
-            .into_iter()
-            .map(|(a, ..)| a)
-            .filter(|a| !in_bar.contains(a) && !CONTEXT_ONLY_ACTIONS.contains(a))
+        let excluded: HashSet<Action> = NOT_IN_THE_MENU_BAR.iter().map(|(a, _)| *a).collect();
+        for (a, reason) in NOT_IN_THE_MENU_BAR {
+            assert!(!reason.trim().is_empty(), "{a:?} is excluded with no reason given");
+            assert!(!in_bar.contains(a), "{a:?} is declared excluded but IS in the menu bar");
+        }
+        let mut missing: Vec<String> = Action::ALL
+            .iter()
+            .filter(|a| !in_bar.contains(a) && !excluded.contains(a))
             .map(|a| format!("{a:?}"))
             .collect();
         missing.sort();
-        missing.dedup();
         assert!(
             missing.is_empty(),
-            "these right-click actions reach no menu-bar category and are not \
-             declared context-only: {missing:?} — file them in `categories()` or \
-             add them to CONTEXT_ONLY_ACTIONS with a reason"
+            "{} of rt's actions reach no menu-bar category and are not declared \
+             excluded: {missing:?} — file each in `categories()` or add it to \
+             NOT_IN_THE_MENU_BAR with a reason",
+            missing.len()
         );
+    }
+
+    /// Which menu an action is filed under is a decision, not an accident, so
+    /// it is pinned — with the label it carries. These fourteen were in NO menu
+    /// before (neither the bar nor rt's own right-click menu), which is what the
+    /// guard above now makes impossible; this is the other half, the answer to
+    /// "and where did they go".
+    #[test]
+    fn the_actions_that_had_no_menu_at_all_are_filed_where_a_mac_user_looks() {
+        let m = model(&Keymap::defaults(), true, false);
+        let placed = |a: Action| -> (&'static str, String) {
+            for menu in &m.menus {
+                if let Some(i) = menu.items.iter().find(|i| i.action == Some(a)) {
+                    return (menu.title, i.label.clone());
+                }
+            }
+            panic!("{a:?} is in no menu");
+        };
+        for (action, menu, label) in [
+            // The patch bay — "where does my output go", beside broadcast's
+            // "where does my typing go".
+            (Action::WireStdout, "Shell", "Wire Stdout…"),
+            (Action::WireStderr, "Shell", "Wire Stderr…"),
+            (Action::PipeInto, "Shell", "Split and Pipe Stdout In"),
+            (Action::Unwire, "Shell", "Disconnect Wires"),
+            // Translucency is a matter of how it looks.
+            (Action::OpacityUp, "View", "More Opaque"),
+            (Action::OpacityDown, "View", "More Transparent"),
+            // Moving the focus, and moving the divider.
+            (Action::GoUp, "Window", "Select Pane Above"),
+            (Action::GoDown, "Window", "Select Pane Below"),
+            (Action::GoLeft, "Window", "Select Pane Left"),
+            (Action::GoRight, "Window", "Select Pane Right"),
+            (Action::ResizeLeft, "Window", "Grow Pane Left"),
+            (Action::ResizeRight, "Window", "Grow Pane Right"),
+            (Action::ResizeUp, "Window", "Grow Pane Up"),
+            (Action::ResizeDown, "Window", "Grow Pane Down"),
+        ] {
+            assert_eq!(placed(action), (menu, label.to_string()), "{action:?} is filed somewhere else");
+        }
     }
 
     #[test]

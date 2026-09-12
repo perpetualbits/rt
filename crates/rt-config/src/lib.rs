@@ -14,6 +14,28 @@ pub mod keys; // Chord / Key / Mods normalisation and parsing
 
 pub use keys::{Chord, Key, Mods};
 
+/// Declare [`Action`] and, from the same list, [`Action::ALL`].
+///
+/// The list is written ONCE. A new variant therefore lands in `ALL` in the same
+/// keystroke that adds it to the enum — which is what makes
+/// `menubar_model`'s "every action reaches the macOS menu bar" guard a guard
+/// rather than a second list someone has to remember. Rust cannot count an
+/// enum's variants (no reflection, and no derive without a proc-macro crate),
+/// so generating both from one source is the only way `ALL` cannot drift.
+macro_rules! actions {
+    ($(#[$enum_meta:meta])* $vis:vis enum $name:ident { $($(#[$meta:meta])* $variant:ident),* $(,)? }) => {
+        $(#[$enum_meta])*
+        $vis enum $name { $($(#[$meta])* $variant),* }
+
+        impl $name {
+            /// Every variant, in declaration order. Generated from the very
+            /// list that declares the enum, so it is complete by construction.
+            pub const ALL: &'static [$name] = &[$($name::$variant),*];
+        }
+    };
+}
+
+actions! {
 /// A semantic editor action, decoupled from the physical keys that trigger it.
 ///
 /// This is the subset of Terminator's action list that rt implements (or will
@@ -118,6 +140,7 @@ pub enum Action {
     /// rt-specific: move the focused tab one position toward the end.
     MoveTabRight,
 }
+} // actions!
 
 /// How the macOS window blurs what is behind it: [`GlassMaterial::WindowBlur`]
 /// (a plain, untinted backdrop blur — what Terminal.app does), or one of
@@ -1437,6 +1460,27 @@ impl Keymap {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    /// `Action::ALL` is generated from the same list that declares the enum, so
+    /// there is nothing here that could have been forgotten. What this pins is
+    /// that the generation still HAPPENS — that nobody has quietly unwound the
+    /// `actions!` invocation back into a plain `enum`, taking the completeness
+    /// guarantee `menubar_model`'s menu-bar guard rests on with it.
+    #[test]
+    fn every_action_is_in_all_exactly_once() {
+        let mut seen = std::collections::HashSet::new();
+        for a in Action::ALL {
+            assert!(seen.insert(*a), "{a:?} appears twice in Action::ALL");
+        }
+        // Sanity anchors at both ends of the declaration order.
+        assert_eq!(Action::ALL.first(), Some(&Action::SplitHoriz));
+        assert_eq!(Action::ALL.last(), Some(&Action::MoveTabRight));
+        // Every action rt binds by default is one of them (a cheap cross-check
+        // that ALL is the real variant set and not a stale copy).
+        for (_, a) in Keymap::defaults().bindings() {
+            assert!(Action::ALL.contains(a), "{a:?} is bound but missing from Action::ALL");
+        }
+    }
 
     #[test]
     fn normalize_clamps_out_of_range_and_non_finite() {
