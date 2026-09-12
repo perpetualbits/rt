@@ -48,7 +48,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSColorSpace, NSColorWell, NSControl, NSFont, NSPopUpButton,
+    NSColor, NSColorSpace, NSColorWell, NSControl, NSFont, NSPopUpButton,
     NSScrollView, NSSlider, NSStepper, NSSwitch, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -262,15 +262,8 @@ impl SettingsWindow {
             | NSWindowStyleMask::Resizable;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIN_W, WIN_H));
         // SAFETY: the designated initialiser, with a style mask AppKit accepts.
-        let window: Retained<NSWindow> = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                frame,
-                style,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
+        // An RtPanelWindow, so ⌘W closes it — see native_window.rs.
+        let window: Retained<NSWindow> = crate::native_window::panel_window(mtm, frame, style);
         window.setTitle(&NSString::from_str("rt Settings"));
         // See the module docs: this struct holds the only strong reference.
         // SAFETY: the opposite of the hazard — see the module docs. Unsafe only

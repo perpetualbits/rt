@@ -38,7 +38,7 @@ use objc2::runtime::NSObjectProtocol;
 use objc2::runtime::Bool;
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightBold,
+    NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightBold,
     NSFontWeightRegular, NSMenuItem, NSScrollView, NSTextView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -134,15 +134,8 @@ impl ManualWindow {
             | NSWindowStyleMask::Resizable;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(win_w, win_h));
         // SAFETY: the designated initialiser, with a style mask AppKit accepts.
-        let window: Retained<NSWindow> = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                frame,
-                style,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
+        // An RtPanelWindow, so ⌘W closes it — see native_window.rs.
+        let window: Retained<NSWindow> = crate::native_window::panel_window(mtm, frame, style);
         window.setTitle(&NSString::from_str("rt Manual"));
         // See the module docs: this struct holds the only strong reference.
         // SAFETY: see `settings_window.rs` — this struct holds the only strong

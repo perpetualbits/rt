@@ -91,6 +91,8 @@ mod prefs_native; // which native macOS control each preferences row becomes
 mod settings_window; // the native macOS Settings window (NSWindow), built from prefs_native
 #[cfg(target_os = "macos")]
 mod manual_window; // the native macOS Manual window (NSScrollView + NSTextView)
+#[cfg(target_os = "macos")]
+mod native_window; // the shared NSWindow subclass: ⌘W closes the front window
 mod proc_info; // a process's cwd and program name (the derived title's inputs)
 mod proc_liveness; // portable "is this pid still alive?" for the patch-bay sweep
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
