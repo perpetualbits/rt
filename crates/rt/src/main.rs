@@ -86,6 +86,11 @@ mod menubar_model; // which row goes in which menu-bar menu, and what it adverti
 // it needs (a process's cwd and name, in `proc_info`) are per-platform.
 mod pane_title; // the pane titlebar's label: derived fallback + the truncation rule
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
+mod prefs_native; // which native macOS control each preferences row becomes
+#[cfg(target_os = "macos")]
+mod settings_window; // the native macOS Settings window (NSWindow), built from prefs_native
+#[cfg(target_os = "macos")]
+mod manual_window; // the native macOS Manual window (NSScrollView + NSTextView)
 mod proc_info; // a process's cwd and program name (the derived title's inputs)
 mod proc_liveness; // portable "is this pid still alive?" for the patch-bay sweep
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
@@ -964,6 +969,30 @@ struct App {
     /// looking at.
     #[cfg(target_os = "macos")]
     focused: Option<WindowId>,
+    /// The native Settings window (⌘,), built lazily the first time it is asked
+    /// for and kept for the life of the process — closing it orders it out, it
+    /// is never released (see `settings_window.rs`). `None` also covers every
+    /// failure path, exactly as `menubar` does: rt runs fine without it, it just
+    /// has no Settings window.
+    #[cfg(target_os = "macos")]
+    settings_window: Option<settings_window::SettingsWindow>,
+    /// Which terminal window the Settings window is editing. Settings are a
+    /// process-wide file but live on each `Active`, and a native window is not
+    /// anchored to one — so the window it was opened FROM is the one its edits
+    /// go to, until that window closes.
+    #[cfg(target_os = "macos")]
+    settings_owner: Option<WindowId>,
+    /// `(settings, cols)` the Settings window's controls were last filled from.
+    /// `about_to_wait` runs on every wake; rebuilding the row strings and
+    /// walking each popup's ring per wake would be real work for nothing, so the
+    /// refresh is skipped while neither has moved — the same reason
+    /// `menubar_state` exists.
+    #[cfg(target_os = "macos")]
+    settings_shown: Option<(rt_config::Settings, usize)>,
+    /// The native Manual window (Help -> rt Manual, F1). Same lifetime rules as
+    /// `settings_window`; it holds no state beyond its text.
+    #[cfg(target_os = "macos")]
+    manual_window: Option<manual_window::ManualWindow>,
     /// The wgpu `Instance`/`Adapter`/`Device`/`Queue` every window's backend draws with.
     /// App-level for the same reason `budget` is: the GPU is a process-wide resource, not
     /// a per-window one, and only the App sees every window. `None` until the first
@@ -2275,11 +2304,14 @@ impl ApplicationHandler for App {
             };
         }
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
-        // startup so it can be screenshotted without synthetic input.
+        // startup so it can be screenshotted without synthetic input. macOS has
+        // no such overlay any more — ⌘, opens a real window there.
+        #[cfg(not(target_os = "macos"))]
         if std::env::var("RT_PREFS").is_ok() {
             Self::open_prefs(&mut active);
         }
         // Debug/verification hook: RT_MANUAL opens the manual overlay at startup.
+        #[cfg(not(target_os = "macos"))]
         if std::env::var("RT_MANUAL").is_ok() {
             active.manual_open = true;
         }
@@ -3976,10 +4008,24 @@ impl ApplicationHandler for App {
     /// call per click.
     #[cfg(target_os = "macos")]
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
-        let bar: Vec<rt_config::Action> =
-            self.menubar.as_ref().map(|m| m.take_pending()).unwrap_or_default();
-        for action in bar {
-            self.run_menu_bar_action(event_loop, action);
+        if let Some(menubar) = &self.menubar {
+            for action in menubar.take_pending() {
+                self.run_menu_bar_action(event_loop, action);
+            }
+        }
+        // The second source: a control in the native Settings window. Each one
+        // is a REQUEST, applied here through `prefs_native` -> `prefs_model::step`
+        // into `prefs_pending` — so a slider drag lands in the debounce buffer
+        // and `PREFS_SETTLE` still pays for the reflow and the `config.toml`
+        // write exactly once, when the drag stops.
+        let edits = self.settings_window.as_ref().map(|w| w.take_pending()).unwrap_or_default();
+        if !edits.is_empty() {
+            let Some(id) = self.settings_owner.filter(|id| self.windows.contains_key(id)) else { return };
+            let Some(active) = self.windows.get_mut(&id) else { return };
+            for e in edits {
+                Self::apply_prefs_edit(active, e);
+            }
+            active.window.request_redraw();
         }
         for pick in self.popup_outbox.take() {
             self.run_popup_pick(event_loop, pick);
@@ -3999,6 +4045,10 @@ impl ApplicationHandler for App {
         // has to already be right — which means once per turn of the loop, here.
         #[cfg(target_os = "macos")]
         self.refresh_menu_bar();
+        // Same deal for the native Settings window: it is driven from the
+        // settings, and nothing tells it when they move.
+        #[cfg(target_os = "macos")]
+        self.refresh_settings_window();
         let mut to_close: Vec<WindowId> = Vec::new();
         let mut min_interval: Option<Duration> = None;
         // A pane inside the payload of a live drag can exit under the gesture
@@ -4653,6 +4703,19 @@ enum FramePlan {
 /// triple and quadruple buffering; each entry is a handful of rects.
 const HISTORY_DEPTH: u32 = 4;
 
+/// Everything the native macOS Settings window is filled from, as owned data.
+/// See [`App::prefs_view`].
+#[cfg(target_os = "macos")]
+struct PrefsView {
+    rows: Vec<chrome::prefs::Row>,
+    settings: rt_config::Settings,
+    families: Vec<String>,
+    terms: Vec<String>,
+    /// `[fg, bg, palette…]`, the order the colour wells are tagged in.
+    swatches: Vec<[u8; 3]>,
+    cols: usize,
+}
+
 /// What an action needs the App (window-owner) level to do afterwards.
 /// Active-level code can't create or close OS windows — it has no event loop.
 #[derive(Clone, Copy, PartialEq)]
@@ -4665,6 +4728,14 @@ enum WindowCmd {
     PickUpPane,           // pick the focused pane up into carry mode
     PickUpTab,            // pick the current tab up into carry mode
     MoveToWindow(WindowId), // "Move Pane to <window>" menu pick: send the focus pane there
+    /// macOS: put the native Settings window up. An `Active` cannot open an OS
+    /// window (it has no event loop, and the proxy the window's controls answer
+    /// through is the App's), so ⌘, travels up here exactly as `NewWindow` does.
+    #[cfg(target_os = "macos")]
+    OpenSettings,
+    /// macOS: put the native Manual window up. Same reason.
+    #[cfg(target_os = "macos")]
+    OpenManual,
 }
 
 /// Does this action open a MODAL overlay — one whose input shim (near the top of
@@ -4724,6 +4795,180 @@ impl App {
         (self.windows.len() == 1).then(|| *self.windows.keys().next().expect("len == 1"))
     }
 
+    /// Does one of rt's own NATIVE windows (Settings, the Manual) own the
+    /// keyboard right now?
+    ///
+    /// ## Why the `suspended` gate survives the port, with a new source
+    ///
+    /// On Linux `suspended` means "a modal overlay is drawn over the panes and
+    /// `on_key_press` is swallowing keystrokes", and the two overlays this task
+    /// replaced — preferences and the manual — were two of its seven sources.
+    /// The obvious reading is that a native window needs no such gate, because a
+    /// native window takes key focus itself and rt's `window_event` never sees
+    /// the keystrokes at all.
+    ///
+    /// That reading is wrong, and the reason is the half of the gate that was
+    /// never about `window_event`: **a menu item's key equivalent fires no
+    /// matter which window is key.** `NSMenu` key-equivalent matching happens in
+    /// `NSApplication`'s event dispatch, before the key window's responder chain
+    /// gets a look in, and rt's bar owns ⌘C, ⌘V, ⌘F and the rest. With the
+    /// Manual window key and a paragraph selected in it, an un-greyed ⌘C would
+    /// copy the TERMINAL's selection instead of the text under the cursor; ⌘F
+    /// would open the pane's scrollback search behind the window rather than the
+    /// manual's find bar; ⌘V would paste at the shell. Exactly the failure the
+    /// gate was built for, arriving by a different route.
+    ///
+    /// So the gate stays, and gains a source that is not a flag on `Active` but
+    /// a question for AppKit. `menu_bar_state` also returns early on it: with a
+    /// native window key there is no meaningful "selection" for the bar to
+    /// enable Copy against.
+    ///
+    /// The cost is that ⌘, and Help -> rt Manual are greyed while one of these
+    /// windows is key. That is the correct trade — both windows are already
+    /// open at that point, and re-opening either is one click on rt's own
+    /// window away.
+    #[cfg(target_os = "macos")]
+    fn native_window_has_key(&self) -> bool {
+        self.settings_window.as_ref().is_some_and(|w| w.is_key())
+            || self.manual_window.as_ref().is_some_and(|w| w.is_key())
+    }
+
+    /// Everything the native Settings window needs to draw itself, taken as
+    /// OWNED data so the borrow of `self.windows` ends before the window is
+    /// touched.
+    ///
+    /// The rows are `chrome::prefs::rows` — the very function the Linux dialog
+    /// builds from, read from the PENDING settings exactly as `paint_prefs`
+    /// does, so a control shows what you just asked for while the terminal
+    /// behind it waits for the settle.
+    /// The cheap half of [`App::prefs_view`]: what the window's contents
+    /// actually depend on. `refresh_settings_window` runs on every turn of the
+    /// loop, so this is what it compares before doing any real work — building
+    /// the rows and cloning the installed-family list per wake would be a
+    /// hundred allocations a frame for a window nothing has touched.
+    #[cfg(target_os = "macos")]
+    fn prefs_key(active: &mut Active) -> (rt_config::Settings, usize) {
+        let size = active.window.surface_size();
+        let (cw, _ch) = active.backend.cell_size();
+        let cols = (content_bounds(size, active.chrome_sc).w / cw).max(1.0) as usize;
+        (active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone()), cols)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prefs_view(active: &mut Active) -> PrefsView {
+        let size = active.window.surface_size();
+        let (cw, _ch) = active.backend.cell_size();
+        let cols = (content_bounds(size, active.chrome_sc).w / cw).max(1.0) as usize;
+        let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
+        let fam = cached_family_status(&mut active.font_status, &active.font_db, &s.font_family);
+        let rows = chrome::prefs::rows(&s, total_ram_bytes(), cols, fam);
+        // `[fg, bg, palette…]` — the order `Slot::from_swatch_index` decodes and
+        // the order `paint_prefs` builds its swatch row in.
+        let mut swatches = vec![s.foreground, s.background];
+        swatches.extend_from_slice(&s.palette);
+        let terms = rt_config::term_candidates(&s.term);
+        PrefsView { rows, settings: s, families: active.mono_families.clone(), terms, swatches, cols }
+    }
+
+    /// Put the native Settings window up for window `id`, building it the first
+    /// time. Failure is silent and harmless (`SettingsWindow::new` returns
+    /// `None` only off the main thread) — exactly like the menu bar.
+    #[cfg(target_os = "macos")]
+    fn open_settings_window(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId) {
+        let view = {
+            let Some(active) = self.windows.get_mut(&id) else { return };
+            Self::prefs_view(active)
+        };
+        let ch = settings_window::Choices {
+            settings: &view.settings,
+            families: &view.families,
+            terms: &view.terms,
+        };
+        match self.settings_window.as_mut() {
+            Some(w) => w.refresh(&view.rows, ch, &view.swatches),
+            None => {
+                self.settings_window =
+                    settings_window::SettingsWindow::new(&view.rows, ch, event_loop.create_proxy());
+                if self.settings_window.is_none() {
+                    log::debug!("settings window: could not be built; ⌘, does nothing");
+                    return;
+                }
+            }
+        }
+        self.settings_owner = Some(id);
+        self.settings_shown = Some((view.settings, view.cols));
+        if let Some(w) = &self.settings_window {
+            w.show();
+        }
+    }
+
+    /// Keep the Settings window's controls telling the truth: values, greying,
+    /// popup menus and the read-only advisory lines.
+    ///
+    /// Called once per turn of the loop, and skipped outright unless the
+    /// settings (or the column count the scrollback guardrail quotes) have
+    /// actually moved — the same reason `menubar_state` is cached.
+    #[cfg(target_os = "macos")]
+    fn refresh_settings_window(&mut self) {
+        if !self.settings_window.as_ref().is_some_and(|w| w.is_visible()) {
+            return;
+        }
+        // The window it was opened from has closed: there is nothing for its
+        // edits to reach any more.
+        let Some(id) = self.settings_owner.filter(|id| self.windows.contains_key(id)) else {
+            if let Some(w) = &self.settings_window {
+                w.hide();
+            }
+            self.settings_owner = None;
+            self.settings_shown = None;
+            return;
+        };
+        let key = {
+            let Some(active) = self.windows.get_mut(&id) else { return };
+            Self::prefs_key(active)
+        };
+        if self.settings_shown.as_ref() == Some(&key) {
+            return; // nothing the window shows has moved
+        }
+        let view = {
+            let Some(active) = self.windows.get_mut(&id) else { return };
+            Self::prefs_view(active)
+        };
+        let ch = settings_window::Choices {
+            settings: &view.settings,
+            families: &view.families,
+            terms: &view.terms,
+        };
+        if let Some(w) = self.settings_window.as_mut() {
+            w.refresh(&view.rows, ch, &view.swatches);
+        }
+        self.settings_shown = Some((view.settings, view.cols));
+    }
+
+    /// Put the native Manual window up, building it the first time.
+    #[cfg(target_os = "macos")]
+    fn open_manual_window(&mut self) {
+        if self.manual_window.is_none() {
+            self.manual_window = manual_window::ManualWindow::new();
+        }
+        match &self.manual_window {
+            Some(w) => w.show(),
+            None => log::debug!("manual window: could not be built; Help → rt Manual does nothing"),
+        }
+    }
+
+    /// Order rt's native windows out on the way to `exit()`, so neither is left
+    /// on screen for a frame after the terminal it belongs to has gone.
+    #[cfg(target_os = "macos")]
+    fn hide_native_windows(&self) {
+        if let Some(w) = &self.settings_window {
+            w.hide();
+        }
+        if let Some(w) = &self.manual_window {
+            w.hide();
+        }
+    }
+
     /// `(has_selection, suspended)` — the two booleans the enable snapshot is
     /// built from. See `menubar_model::model`.
     fn menu_bar_state(&self) -> (bool, bool) {
@@ -4731,6 +4976,9 @@ impl App {
         let Some(active) = self.menu_target_id().and_then(|id| self.windows.get(&id)) else {
             return (false, true);
         };
+        if self.native_window_has_key() {
+            return (false, true); // see `native_window_has_key`
+        }
         // `selection.is_some()` rather than `selected_text(..).is_some()`: this
         // runs on every turn of the loop, and the latter reads the pane's grid
         // and builds a `String` to answer a question the `Option` already
@@ -4749,6 +4997,11 @@ impl App {
     /// the search bar instead of pasting at the shell. For the right-click popup
     /// it is the same question asked at the same moment, from the one definition,
     /// so the two cannot come to disagree about what "rt is busy" means.
+    ///
+    /// `prefs_open` and `manual_open` are dead weight here on macOS — the
+    /// native Settings and Manual windows replaced both overlays — but the
+    /// REASON the gate exists survives, and `menu_bar_state` returns early on
+    /// `native_window_has_key` before ever reaching this.
     fn keyboard_suspended(active: &Active) -> bool {
         active.prefs_open
             || active.manual_open
@@ -5998,6 +6251,11 @@ impl App {
         }
         if self.windows.len() == 1 {
             // Last window: leave it in the map (its Drop never runs) and exit.
+            // The native Settings/Manual windows are ordered out first — they
+            // are `Retained` for the life of the process and would otherwise
+            // still be on screen as the terminal disappears.
+            #[cfg(target_os = "macos")]
+            self.hide_native_windows();
             exit_clean();
         }
         let active = self.windows.remove(&id);
@@ -6025,6 +6283,10 @@ impl App {
             WindowCmd::PickUpPane => self.pick_up(event_loop, id, false),
             WindowCmd::PickUpTab => self.pick_up(event_loop, id, true),
             WindowCmd::MoveToWindow(dest) => self.move_pane_to_window(id, dest),
+            #[cfg(target_os = "macos")]
+            WindowCmd::OpenSettings => self.open_settings_window(event_loop, id),
+            #[cfg(target_os = "macos")]
+            WindowCmd::OpenManual => self.open_manual_window(),
         }
     }
 
@@ -6287,6 +6549,13 @@ impl App {
                 Self::persist(&active.settings);
                 active.window.request_redraw();
             }
+            // macOS has a real Settings window (⌘,), so the self-drawn overlay
+            // is not built there at all — see `settings_window.rs`. A native
+            // window needs the App level to open it, so this becomes a
+            // `WindowCmd` rather than a flag on `Active`.
+            #[cfg(target_os = "macos")]
+            Action::Preferences => return (WindowCmd::OpenSettings, None),
+            #[cfg(not(target_os = "macos"))]
             Action::Preferences => {
                 // The keybinding only ever reaches here while the dialog is
                 // closed — once open, the input shim below intercepts every
@@ -6337,6 +6606,12 @@ impl App {
                 active.force_full = true; // clear the removed wires' ghosts (off the partial path)
                 active.window.request_redraw();
             }
+            // Same split as Preferences: macOS gets a real, selectable,
+            // ⌘F-searchable window; Linux keeps the overlay, which is its only
+            // interface.
+            #[cfg(target_os = "macos")]
+            Action::Manual => return (WindowCmd::OpenManual, None),
+            #[cfg(not(target_os = "macos"))]
             Action::Manual => {
                 active.manual_open = !active.manual_open; // toggle the manual overlay
                 active.window.request_redraw();
@@ -8785,6 +9060,28 @@ impl App {
         if pref == prefs_model::PrefRow::Close {
             return;
         }
+        Self::prefs_mutate(active, |s, fams, terms, usable| {
+            prefs_model::step(s, pref, dir, fams, terms, usable)
+        });
+    }
+
+    /// Run `f` over the PENDING settings and arm the settle.
+    ///
+    /// The single edit path for BOTH platforms' preferences UI: the Linux
+    /// dialog's arrow keys come through `prefs_step`, the macOS Settings
+    /// window's controls through `apply_prefs_edit`, and both end here. Nothing
+    /// is applied or persisted — that is `commit_settings`, once, after
+    /// `PREFS_SETTLE`. That is what lets an `NSSlider` fire on every pixel of a
+    /// drag without costing a palette rebuild and a `config.toml` write per
+    /// pixel.
+    ///
+    /// `f` is handed the installed monospace families, the terminal types this
+    /// machine has terminfo for, and the "can rt draw this family?" oracle —
+    /// exactly `prefs_model::step`'s last three arguments.
+    fn prefs_mutate(
+        active: &mut Active,
+        f: impl FnOnce(&mut rt_config::Settings, &[String], &[String], &mut dyn FnMut(&str) -> bool),
+    ) {
         let mut s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
         // The terminal-type list is re-derived per step rather than cached at startup: it
         // depends on what terminfo is installed, and `tic`-ing rt's own entry while rt is
@@ -8799,12 +9096,44 @@ impl App {
         // Destructured into disjoint field borrows: the family list is read while
         // the usability memo is written.
         let Active { font_db, font_status, mono_families, .. } = &mut *active;
-        prefs_model::step(&mut s, pref, dir, mono_families, &terms, &mut |f| {
-            cached_family_status(font_status, font_db, f) == prefs_model::FamilyStatus::Usable
+        f(&mut s, mono_families, &terms, &mut |fam| {
+            cached_family_status(font_status, font_db, fam) == prefs_model::FamilyStatus::Usable
         });
         active.prefs_pending = Some(s);
         active.prefs_edits += 1;
         active.last_prefs_edit = Instant::now();
+    }
+
+    /// Apply one request from a control in the native macOS Settings window.
+    ///
+    /// Every arm goes through `prefs_native`, which goes through
+    /// `prefs_model::step` — the same function the Linux dialog's arrow keys
+    /// call. The one arm that does not is the colour well, because a colour is
+    /// not a step: it writes through `set_slot`, which is the same function
+    /// `picker_write` uses for rt's own colour picker, `remember_custom` and all.
+    #[cfg(target_os = "macos")]
+    fn apply_prefs_edit(active: &mut Active, edit: settings_window::Edit) {
+        use settings_window::Edit;
+        Self::prefs_mutate(active, |s, fams, terms, usable| match edit {
+            Edit::Flag(row, on) => {
+                prefs_native::apply_flag(s, row, on, fams, terms, usable);
+            }
+            Edit::Number(row, v) => {
+                prefs_native::apply_number(s, row, v, fams, terms, usable);
+            }
+            Edit::Step(row, notches) => {
+                let dir = if notches > 0 { 1 } else { -1 };
+                for _ in 0..notches.unsigned_abs().min(64) {
+                    prefs_model::step(s, row, dir, fams, terms, usable);
+                }
+            }
+            Edit::Choice(row, ref name) => {
+                prefs_native::apply_choice(s, row, name, fams, terms, usable);
+            }
+            Edit::Colour(i, rgb) => {
+                set_slot(s, chrome::colour_picker::Slot::from_swatch_index(i), rgb);
+            }
+        });
     }
 
     /// Move bytes across every patch-bay wire: read each pane's output-stream
@@ -9735,6 +10064,14 @@ fn main() {
         menu_proxy: None,
         #[cfg(target_os = "macos")]
         focused: None,
+        #[cfg(target_os = "macos")]
+        settings_window: None, // built the first time ⌘, is pressed
+        #[cfg(target_os = "macos")]
+        settings_owner: None,
+        #[cfg(target_os = "macos")]
+        settings_shown: None,
+        #[cfg(target_os = "macos")]
+        manual_window: None,
     };
     if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
