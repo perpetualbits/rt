@@ -89,6 +89,8 @@ mod prefs_model; // which setting each preferences row edits, and how a step cla
 mod prefs_native; // which native macOS control each preferences row becomes
 #[cfg(target_os = "macos")]
 mod settings_window; // the native macOS Settings window (NSWindow), built from prefs_native
+#[cfg(target_os = "macos")]
+mod manual_window; // the native macOS Manual window (NSScrollView + NSTextView)
 mod proc_info; // a process's cwd and program name (the derived title's inputs)
 mod proc_liveness; // portable "is this pid still alive?" for the patch-bay sweep
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
@@ -969,6 +971,10 @@ struct App {
     /// `menubar_state` exists.
     #[cfg(target_os = "macos")]
     settings_shown: Option<(rt_config::Settings, usize)>,
+    /// The native Manual window (Help -> rt Manual, F1). Same lifetime rules as
+    /// `settings_window`; it holds no state beyond its text.
+    #[cfg(target_os = "macos")]
+    manual_window: Option<manual_window::ManualWindow>,
     /// The wgpu `Instance`/`Adapter`/`Device`/`Queue` every window's backend draws with.
     /// App-level for the same reason `budget` is: the GPU is a process-wide resource, not
     /// a per-window one, and only the App sees every window. `None` until the first
@@ -2287,6 +2293,7 @@ impl ApplicationHandler for App {
             Self::open_prefs(&mut active);
         }
         // Debug/verification hook: RT_MANUAL opens the manual overlay at startup.
+        #[cfg(not(target_os = "macos"))]
         if std::env::var("RT_MANUAL").is_ok() {
             active.manual_open = true;
         }
@@ -4702,6 +4709,9 @@ enum WindowCmd {
     /// through is the App's), so ⌘, travels up here exactly as `NewWindow` does.
     #[cfg(target_os = "macos")]
     OpenSettings,
+    /// macOS: put the native Manual window up. Same reason.
+    #[cfg(target_os = "macos")]
+    OpenManual,
 }
 
 /// Does this action open a MODAL overlay — one whose input shim (near the top of
@@ -4796,6 +4806,7 @@ impl App {
     #[cfg(target_os = "macos")]
     fn native_window_has_key(&self) -> bool {
         self.settings_window.as_ref().is_some_and(|w| w.is_key())
+            || self.manual_window.as_ref().is_some_and(|w| w.is_key())
     }
 
     /// Everything the native Settings window needs to draw itself, taken as
@@ -4910,11 +4921,26 @@ impl App {
         self.settings_shown = Some((view.settings, view.cols));
     }
 
+    /// Put the native Manual window up, building it the first time.
+    #[cfg(target_os = "macos")]
+    fn open_manual_window(&mut self) {
+        if self.manual_window.is_none() {
+            self.manual_window = manual_window::ManualWindow::new();
+        }
+        match &self.manual_window {
+            Some(w) => w.show(),
+            None => log::debug!("manual window: could not be built; Help → rt Manual does nothing"),
+        }
+    }
+
     /// Order rt's native windows out on the way to `exit()`, so neither is left
     /// on screen for a frame after the terminal it belongs to has gone.
     #[cfg(target_os = "macos")]
     fn hide_native_windows(&self) {
         if let Some(w) = &self.settings_window {
+            w.hide();
+        }
+        if let Some(w) = &self.manual_window {
             w.hide();
         }
     }
@@ -6121,6 +6147,8 @@ impl App {
             WindowCmd::MoveToWindow(dest) => self.move_pane_to_window(id, dest),
             #[cfg(target_os = "macos")]
             WindowCmd::OpenSettings => self.open_settings_window(event_loop, id),
+            #[cfg(target_os = "macos")]
+            WindowCmd::OpenManual => self.open_manual_window(),
         }
     }
 
@@ -6440,6 +6468,12 @@ impl App {
                 active.force_full = true; // clear the removed wires' ghosts (off the partial path)
                 active.window.request_redraw();
             }
+            // Same split as Preferences: macOS gets a real, selectable,
+            // ⌘F-searchable window; Linux keeps the overlay, which is its only
+            // interface.
+            #[cfg(target_os = "macos")]
+            Action::Manual => return (WindowCmd::OpenManual, None),
+            #[cfg(not(target_os = "macos"))]
             Action::Manual => {
                 active.manual_open = !active.manual_open; // toggle the manual overlay
                 active.window.request_redraw();
@@ -9892,6 +9926,8 @@ fn main() {
         settings_owner: None,
         #[cfg(target_os = "macos")]
         settings_shown: None,
+        #[cfg(target_os = "macos")]
+        manual_window: None,
     };
     if let Err(e) = event_loop.run_app(app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
