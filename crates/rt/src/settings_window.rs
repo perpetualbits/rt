@@ -397,7 +397,9 @@ impl SettingsWindow {
             let h = row_height(row);
             let ctrl = prefs_native::row_control(row.kind, row.pref);
             // The Close row is the one row a native window does not need: its
-            // title bar has a close button and ⌘W works.
+            // title bar has a close button. (Not ⌘W — that chord belongs to a
+            // menu item, and winit's default application menu has no Close row
+            // to lend. The red dot is the way out.)
             if ctrl == Some(Control::Dismiss) {
                 self.widgets.push(None);
                 y += h;
