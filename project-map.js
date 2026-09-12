@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-09-11"
+    updated: "2026-09-12"
   },
 
   statuses: {
@@ -204,12 +204,14 @@ window.PROJECT_MAP = {
       id: "chrome-prefs", label: "Preferences", layer: "chrome", status: "done",
       tags: ["native chrome"],
       desc: "A native (not egui) preferences dialog drawn with the same glyph pipeline as the terminal: toggles, steppers, and section headers over font, appearance, behaviour, scrollback, instruments, the arrow-key acceleration controls and the terminal type (which offers only names this machine has terminfo for). Persists through the rt-config store.",
-      files: ["crates/rt/src/chrome/prefs.rs", "crates/rt/src/prefs_model.rs"],
+      files: ["crates/rt/src/chrome/prefs.rs", "crates/rt/src/prefs_model.rs", "crates/rt/src/prefs_native.rs", "crates/rt/src/settings_window.rs"],
       specs: [
         { label: "Native preferences design", href: "docs/superpowers/specs/2026-07-15-native-preferences-design.md" },
         { label: "XRender chrome slice", href: "docs/superpowers/specs/2026-07-14-slice-2-xrender-chrome-design.md" }
       ],
-      parts: [],
+      parts: [
+        { label: "Native macOS Settings window", status: "active", desc: "On macOS ⌘, opens a real NSWindow instead of the self-drawn overlay, which is not built there at all: NSSwitch for every toggle, NSSlider for opacity and blur radius, NSStepper for font size / scrollback / arrow-speed cap, NSPopUpButton for the family, preset, chrome-theme, glass-material and TERM cycles, and NSColorWell (so the system NSColorPanel, with its eyedropper and palettes) for foreground, background and the sixteen ANSI colours — the control rt's own colour picker existed only to substitute for. The rows and their FROZEN order still come from chrome::prefs::rows(), the same function the Linux dialog builds from. Nothing in the native path assigns a setting: prefs_native.rs (pure, cfg-free, Linux-tested) turns every control's request into repeated prefs_model::step calls, so the clamps, the opacity floor that rides on the blur toggle, the family skip that refuses a font rt cannot rasterise and the scheme ring that keeps \"custom\" a position are all the model's, once. A popup's items are discovered by WALKING that ring rather than by naming ChromeTheme::ALL a second time, and a slider's travel is probed off the model rather than read from a constant, because the opacity floor moves with the blur toggle. Edits land in prefs_pending and re-arm PREFS_SETTLE, so a sixty-hertz slider drag still costs one reflow and one config.toml write. Awaiting on-screen verification." }
+      ],
       deps: ["rt-config", "chrome-theme"]
     },
     {
@@ -227,10 +229,11 @@ window.PROJECT_MAP = {
       id: "chrome-menu", label: "Menu & manual", layer: "chrome", status: "done",
       tags: ["native chrome"],
       desc: "The right-click context menu that drives rt actions, and the built-in F1 manual — both drawn natively. The menu shares its action table with the keymap so a binding and its menu item can never drift apart. On macOS a third renderer of that same table puts rt's menus in the system menu bar, where a Mac user looks for them.",
-      files: ["crates/rt/src/chrome/menu.rs", "crates/rt/src/chrome/manual.rs", "crates/rt/src/menu.rs", "crates/rt/src/menubar.rs", "crates/rt/src/menubar_model.rs"],
+      files: ["crates/rt/src/chrome/menu.rs", "crates/rt/src/chrome/manual.rs", "crates/rt/src/menu.rs", "crates/rt/src/menubar.rs", "crates/rt/src/menubar_model.rs", "crates/rt/src/manual_window.rs"],
       specs: [],
       parts: [
-        { label: "macOS menu bar", status: "active", desc: "A real NSMenu in the system menu bar — Shell / Edit / View / Window / Help, plus Settings… in the application menu winit already installs (⌘Q and ⌘H untouched). Rows, labels and enabled-state come verbatim from menu::rows(), so a click dispatches the same Action a keybinding does via App::apply_action; the pointer-dependent rows (Open Link, Copy Address, Move Pane to …) stay context-menu-only. Chords are shown as real AppKit key equivalents taken from the keymap. Enable/disable is live via -validateMenuItem: against a snapshot the run loop refreshes each turn, which also greys the bar (and kills its key equivalents) while a modal overlay owns the keyboard. The click reaches the loop through winit 0.31's EventLoopProxy::wake_up + proxy_wake_up. The AppKit calls are macOS-only; the STRUCTURE is plain data in menubar_model.rs, unit-tested on Linux like vibrancy_policy.rs. Awaiting on-screen verification." }
+        { label: "macOS menu bar", status: "active", desc: "A real NSMenu in the system menu bar — Shell / Edit / View / Window / Help, plus Settings… in the application menu winit already installs (⌘Q and ⌘H untouched). Rows, labels and enabled-state come verbatim from menu::rows(), so a click dispatches the same Action a keybinding does via App::apply_action; the pointer-dependent rows (Open Link, Copy Address, Move Pane to …) stay context-menu-only. Chords are shown as real AppKit key equivalents taken from the keymap. Enable/disable is live via -validateMenuItem: against a snapshot the run loop refreshes each turn, which also greys the bar (and kills its key equivalents) while a modal overlay owns the keyboard. The click reaches the loop through winit 0.31's EventLoopProxy::wake_up + proxy_wake_up. The AppKit calls are macOS-only; the STRUCTURE is plain data in menubar_model.rs, unit-tested on Linux like vibrancy_policy.rs. Awaiting on-screen verification." },
+        { label: "Native macOS Manual window", status: "active", desc: "On macOS F1 / Help → rt Manual opens an NSScrollView around an NSTextView instead of drawing the manual over the terminal's text — selectable, scrollable, resizable, and searchable with ⌘F (setUsesFindBar:, with the text view claiming the chord itself in performKeyEquivalent: because rt's own ⌘F is the terminal's scrollback search and is greyed while this window is key). The overlay is not built there at all. The typography is NOT re-done: chrome::manual::wrapped(measure_cap()) — the same pure function the Linux overlay draws from — still does the wrapping, the hanging indents, the derived key column and the heading classification, and each wrapped line is set as attributed runs with headings and the key column bold. Editing manual::MANUAL moves both platforms. Awaiting on-screen verification." }
       ],
       deps: ["rt-session", "chrome-theme"]
     },
