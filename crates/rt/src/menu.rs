@@ -1,6 +1,9 @@
-//! The right-click context menu model: the rows and their actions. Rendering
-//! and hit-testing are native (`crate::chrome::menu`) on both backends, so the
-//! menu shares a look with the preferences dialog and the manual.
+//! The right-click context menu model: the rows and their actions. On Linux,
+//! rendering and hit-testing are rt's own (`crate::chrome::menu`) on both
+//! backends, so the menu shares a look with the preferences dialog and the
+//! manual. On macOS the same rows are handed to AppKit and drawn as a real
+//! `NSMenu` (`crate::menubar_model::popup_model` + `crate::menubar::popup`) —
+//! rt draws no menu of its own there at all.
 //!
 //! It is rt's port of Terminator's right-click menu: the common pane actions
 //! (split/tab/close) plus rt-specific entries (newspaper columns, groups,
@@ -58,6 +61,13 @@ fn items() -> Vec<Item> {
 /// `MoveToWindow(i)` is an index into the CALLER's parallel `Vec<WindowId>`
 /// (built alongside the labels passed as `move_targets`, so the index always
 /// lines up) — `menu.rs` has no notion of a window id itself.
+///
+/// `Clone`/`Eq` so the macOS popup can carry one per `NSMenuItem` and hand it
+/// back across the run loop: an AppKit click lands with no `&mut App` in reach,
+/// so the pick is queued and drained on the next turn. It is the SAME pick type
+/// the self-drawn menu produces, which is what keeps the two renderers on one
+/// dispatch path instead of two.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuPick {
     Do(Action),
     OpenUrl(String),

@@ -355,6 +355,92 @@ pub fn model(keymap: &Keymap, has_selection: bool, suspended: bool) -> BarModel 
     }
 }
 
+/// One row of the macOS right-click popup.
+///
+/// A straight transcription of [`crate::menu::Row`] into what an `NSMenuItem`
+/// needs, with the one distinction `Row` expresses by convention rather than by
+/// type: a divider (empty label, no action) and the version footer (a real
+/// label, no action) are both "action is `None`" there, and AppKit needs them
+/// built by two different calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PopupItem {
+    /// `[NSMenuItem separatorItem]`.
+    Separator,
+    /// A real item. `pick == None` is informational and never clickable — the
+    /// version footer, the one such row rt has.
+    Row {
+        label: String,
+        key: Option<KeyEquivalent>,
+        enabled: bool,
+        pick: Option<crate::menu::MenuPick>,
+    },
+}
+
+impl PopupItem {
+    /// The pick a click on this row runs, if it runs one.
+    pub fn pick(&self) -> Option<&crate::menu::MenuPick> {
+        match self {
+            PopupItem::Separator => None,
+            PopupItem::Row { pick, .. } => pick.as_ref(),
+        }
+    }
+}
+
+/// The macOS right-click popup, as plain data.
+///
+/// **The rows are [`crate::menu::rows`] and nothing else** — same order, same
+/// labels, same separators, same enable rules, same version footer. There is no
+/// second table here and no filtering: the three POINTER-DEPENDENT rows the
+/// menu bar cannot have (`Open Link`, `Copy Address`, `Move Pane to …`) are
+/// exactly why a popup exists beside the bar, so they come through untouched,
+/// still carrying the `MenuPick` the self-drawn menu would have dispatched.
+///
+/// The two things this adds are AppKit's, not rt's:
+///
+/// * **Key equivalents.** `menu::rows` renders a chord into a string for rt's
+///   own renderer to draw; AppKit wants the character and the mask separately
+///   and draws the glyphs itself, so [`key_equivalent`] is applied here, exactly
+///   as the menu bar applies it. Only action rows can have one — the
+///   pointer-dependent picks name no `Action` and so name no chord.
+/// * **`suspended`.** The same gate the menu bar has (`model`'s third
+///   argument): while a modal overlay or an IME preedit owns the keyboard,
+///   nothing rt's menus own may fire. A disabled `NSMenuItem` neither clicks nor
+///   answers its key equivalent, so greying the popup is the whole mechanism —
+///   and `main.rs` additionally declines to open it at all in that state.
+pub fn popup_model(
+    keymap: &Keymap,
+    has_selection: bool,
+    url: Option<&str>,
+    move_targets: &[String],
+    suspended: bool,
+) -> Vec<PopupItem> {
+    crate::menu::rows(keymap, has_selection, url, move_targets)
+        .into_iter()
+        .map(|r| {
+            // A divider is the one row with neither a label nor an action.
+            if r.label.is_empty() && r.action.is_none() {
+                return PopupItem::Separator;
+            }
+            // `into_pick` is the SAME translation the self-drawn menu runs on a
+            // click, so the two renderers cannot dispatch differently.
+            let pick = r.action.map(|a| a.into_pick());
+            let key = match &pick {
+                Some(crate::menu::MenuPick::Do(a)) => key_equivalent(keymap, *a),
+                _ => None,
+            };
+            PopupItem::Row {
+                label: r.label,
+                key,
+                // An informational row (`pick == None`) is never live, whatever
+                // `menu::rows` said; everything else follows the row, gated by
+                // the suspended state on top.
+                enabled: r.enabled && pick.is_some() && !suspended,
+                pick,
+            }
+        })
+        .collect()
+}
+
 /// Every actionable row of the right-click menu, as `(action, label, enabled)`.
 ///
 /// Built from [`crate::menu::rows`] with no pointer and no move targets, so the
@@ -720,6 +806,120 @@ mod tests {
         );
         // …but a letter's Shift is a real, separate press and stays in the mask.
         assert!(find(&m, "Split Horizontally").key.as_ref().unwrap().shift);
+    }
+
+    // ---- the macOS right-click popup -------------------------------------
+    //
+    // `menubar::popup` turns these into an NSMenu and nothing else, so every
+    // decision the popup makes is checked here, on Linux.
+
+    /// The popup is `menu::rows` — all of it, in order, including the three
+    /// pointer-dependent row kinds the menu bar cannot have. If this drifts, the
+    /// Mac loses rows its Linux twin has.
+    #[test]
+    fn the_popup_is_exactly_the_context_menu() {
+        let km = Keymap::defaults();
+        let targets = ["2: htop".to_string(), "3: logs".to_string()];
+        let rows = crate::menu::rows(&km, true, Some("https://example.invalid"), &targets);
+        let popup = popup_model(&km, true, Some("https://example.invalid"), &targets, false);
+        assert_eq!(popup.len(), rows.len(), "the popup has a different number of rows");
+        for (item, row) in popup.iter().zip(rows.iter()) {
+            match item {
+                PopupItem::Separator => {
+                    assert!(row.label.is_empty() && row.action.is_none(), "{:?} is not a divider", row.label);
+                }
+                PopupItem::Row { label, .. } => assert_eq!(label, &row.label, "row labels drifted"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_popup_carries_the_rows_the_menu_bar_cannot_have() {
+        let km = Keymap::defaults();
+        let targets = ["2: htop".to_string()];
+        let popup = popup_model(&km, true, Some("https://example.invalid"), &targets, false);
+        let pick = |label: &str| {
+            popup
+                .iter()
+                .find(|i| matches!(i, PopupItem::Row { label: l, .. } if l == label))
+                .unwrap_or_else(|| panic!("no popup row {label:?}"))
+                .pick()
+                .cloned()
+        };
+        // The three pointer-dependent picks, each carrying what it acts on.
+        assert_eq!(pick("Open Link"), Some(crate::menu::MenuPick::OpenUrl("https://example.invalid".into())));
+        assert_eq!(pick("Copy Address"), Some(crate::menu::MenuPick::CopyUrl("https://example.invalid".into())));
+        assert_eq!(pick("Move Pane to 2: htop"), Some(crate::menu::MenuPick::MoveToWindow(0)));
+        // …and they are STILL absent from the menu bar, which has no pointer.
+        let bar = model(&km, true, false);
+        for i in bar.items() {
+            assert_ne!(i.label, "Open Link");
+            assert_ne!(i.label, "Copy Address");
+            assert!(!i.label.starts_with("Move Pane to "));
+        }
+    }
+
+    /// A popup click and the matching keystroke must be one code path. The pick
+    /// is the proof: an action row carries `MenuPick::Do(a)` for the same `a`
+    /// the keymap binds, which `main.rs` feeds to `run_menu_bar_action` →
+    /// `apply_action` — the very function a bound chord reaches.
+    #[test]
+    fn a_popup_action_row_dispatches_the_keystrokes_action() {
+        let km = mac_keymap();
+        let popup = popup_model(&km, true, None, &[], false);
+        let row = |label: &str| {
+            popup.iter().find(|i| matches!(i, PopupItem::Row { label: l, .. } if l == label)).unwrap()
+        };
+        assert_eq!(row("Copy").pick(), Some(&crate::menu::MenuPick::Do(Action::Copy)));
+        assert_eq!(row("Paste").pick(), Some(&crate::menu::MenuPick::Do(Action::Paste)));
+        assert_eq!(row("Preferences…").pick(), Some(&crate::menu::MenuPick::Do(Action::Preferences)));
+        // And the chord it advertises is the keymap's, in AppKit's own terms —
+        // the same conversion the menu bar uses, checked over every row.
+        for i in &popup {
+            let PopupItem::Row { label, key, pick, .. } = i else { continue };
+            let want = match pick {
+                Some(crate::menu::MenuPick::Do(a)) => km.chord_for(*a).and_then(|c| chord_key_equivalent(&c)),
+                _ => None,
+            };
+            assert_eq!(key, &want, "{label:?} advertises a chord the keymap does not hold");
+        }
+    }
+
+    #[test]
+    fn a_suspended_keyboard_greys_the_whole_popup() {
+        let km = Keymap::defaults();
+        let targets = ["2: htop".to_string()];
+        let live = popup_model(&km, true, Some("https://x"), &targets, false);
+        assert!(live.iter().any(|i| matches!(i, PopupItem::Row { enabled: true, .. })), "something is live normally");
+        let popup = popup_model(&km, true, Some("https://x"), &targets, true);
+        for i in &popup {
+            if let PopupItem::Row { label, enabled, .. } = i {
+                assert!(!enabled, "{label:?} must be greyed while the keyboard is not rt's");
+            }
+        }
+    }
+
+    #[test]
+    fn the_popups_selection_gate_and_its_footer_follow_the_context_menu() {
+        let km = Keymap::defaults();
+        let enabled = |popup: &[PopupItem], label: &str| {
+            popup
+                .iter()
+                .find_map(|i| match i {
+                    PopupItem::Row { label: l, enabled, .. } if l == label => Some(*enabled),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no popup row {label:?}"))
+        };
+        assert!(!enabled(&popup_model(&km, false, None, &[], false), "Copy"), "no selection: Copy is greyed");
+        assert!(enabled(&popup_model(&km, true, None, &[], false), "Copy"));
+        // The version footer is a labelled row that is neither a divider nor
+        // clickable — it must not become an inert item AppKit lets you pick.
+        let popup = popup_model(&km, true, None, &[], false);
+        let footer = popup.last().expect("a last row");
+        let PopupItem::Row { label, enabled, pick, key } = footer else { panic!("the footer is a divider") };
+        assert!(label.starts_with("rt "), "the last row names the build: {label:?}");
+        assert!(!enabled && pick.is_none() && key.is_none(), "the footer is informational");
     }
 
     #[test]

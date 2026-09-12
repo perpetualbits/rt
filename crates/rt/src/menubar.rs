@@ -1,8 +1,13 @@
-//! rt's native macOS menu bar: the AppKit half.
+//! rt's native macOS menus: the AppKit half. Two of them, one file.
 //!
-//! Mac users look for a program's menu on the top bar, not under a right-click.
-//! rt's right-click menu stays exactly as it is (it is what Linux uses, and what
-//! rt users know); this adds a real `NSMenu` in the system menu bar beside it.
+//! 1. **The menu bar** ([`install`]) — Mac users look for a program's menu on
+//!    the top bar, not under a right-click, and every [`Action`] rt has is up
+//!    there.
+//! 2. **The right-click popup** ([`popup`]) — the same rows rt's own menu has,
+//!    as a real `NSMenu`. On macOS rt draws no menu of its own at all:
+//!    `chrome::menu` is never reached, because `main.rs` never sets
+//!    `Active::menu` on this target. Linux keeps its self-drawn menu untouched;
+//!    it has no NSMenu to use.
 //!
 //! **This file contains no decisions.** Which row goes in which menu, which are
 //! separators, which are greyed and what chord each advertises is
@@ -55,17 +60,20 @@
 //! instead of pasting at the shell — the same swallow `App::on_key_press` does
 //! for a keystroke that reaches winit.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem, NSMenuItemValidation};
-use objc2_foundation::NSString;
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem, NSMenuItemValidation, NSView};
+use objc2_foundation::{NSArray, NSPoint, NSRunLoopCommonModes, NSString};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use rt_config::Action;
 use winit::event_loop::EventLoopProxy;
+use winit::window::Window;
 
-use crate::menubar_model::{BarItem, BarModel};
+use crate::menu::MenuPick;
+use crate::menubar_model::{BarItem, BarModel, KeyEquivalent, PopupItem};
 
 /// The shared state an `NSMenuItem` click and the winit run loop both touch.
 ///
@@ -283,26 +291,246 @@ fn build_item(mtm: MainThreadMarker, it: &BarItem, tag: isize, target: &MenuTarg
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &title, Some(sel!(rtMenuAction:)), &key)
     };
-    if let Some(k) = &it.key {
-        let mut mask = NSEventModifierFlags::empty();
-        if k.command {
-            mask |= NSEventModifierFlags::Command;
-        }
-        if k.shift {
-            mask |= NSEventModifierFlags::Shift;
-        }
-        if k.control {
-            mask |= NSEventModifierFlags::Control;
-        }
-        if k.option {
-            mask |= NSEventModifierFlags::Option;
-        }
-        item.setKeyEquivalentModifierMask(mask);
-    }
+    set_modifier_mask(&item, it.key.as_ref());
     item.setTag(tag);
     // SAFETY: `target` outlives every menu item — `MenuBar` holds the only
     // strong reference and lives on `App` for the whole process. This is the
     // reason it does: `target` is a weak (unretained) property.
     unsafe { item.setTarget(Some(target.as_ref())) };
     item
+}
+
+/// The ⌃⌥⇧⌘ half of a key equivalent. The character itself goes in at
+/// `initWithTitle:action:keyEquivalent:`; this is the mask that goes with it.
+/// Shared by the menu bar and the popup so one chord cannot be spelled two ways.
+fn set_modifier_mask(item: &NSMenuItem, key: Option<&KeyEquivalent>) {
+    let Some(k) = key else { return };
+    let mut mask = NSEventModifierFlags::empty();
+    if k.command {
+        mask |= NSEventModifierFlags::Command;
+    }
+    if k.shift {
+        mask |= NSEventModifierFlags::Shift;
+    }
+    if k.control {
+        mask |= NSEventModifierFlags::Control;
+    }
+    if k.option {
+        mask |= NSEventModifierFlags::Option;
+    }
+    item.setKeyEquivalentModifierMask(mask);
+}
+
+// ---------------------------------------------------------------------------
+// The right-click popup
+// ---------------------------------------------------------------------------
+//
+// On macOS rt does not draw a menu. `chrome::menu` — rt's own panel, its
+// hit-test, its scrolling — is never reached, because `main.rs` never sets
+// `Active::menu` on this target; a right-click pops a real `NSMenu` instead,
+// with the system's own appearance, shadow, scrolling and keyboard handling.
+// Linux keeps the self-drawn menu exactly as it is: it has no NSMenu to use.
+//
+// ## Why it is not shown from inside the right-click handler
+//
+// `popUpMenuPositioningItem:atLocation:inView:` is MODAL: it runs a nested event
+// loop and does not return until the menu is dismissed. Calling it from inside
+// `ApplicationHandler::window_event` would start that nested loop with winit's
+// handler already on the stack, and every event the nested loop pumps would
+// re-enter it — `&mut App` twice over.
+//
+// So the show is DEFERRED by one turn of the run loop, with
+// `-performSelector:withObject:afterDelay:0`. That fires from the run loop
+// itself, with no winit handler on the stack, which is exactly the position
+// AppKit is in when it drops a menu-bar menu down — a nested tracking loop rt
+// already runs safely today. `performSelector:` also RETAINS its receiver until
+// it fires, which is what keeps the target (and through it the rows) alive
+// across the gap without `App` having to own it.
+//
+// ## Getting the pick back
+//
+// Same route as the menu bar, and for the same reason: the click lands in
+// AppKit's loop with no `&mut App` in reach. The [`MenuPick`] goes into a shared
+// queue and `EventLoopProxy::wake_up` brings the loop round to drain it. The
+// queue is an `Arc` rather than an ivar because the target is freed as soon as
+// the deferred selector returns, while the pick still has to outlive it.
+
+/// Where popup picks wait for the event loop. Cloned into the AppKit target;
+/// `App` keeps the other end and drains it in `proxy_wake_up`.
+#[derive(Clone, Default)]
+pub struct PopupOutbox(Arc<Mutex<Vec<MenuPick>>>);
+
+impl PopupOutbox {
+    /// Take the picks made since the last call, oldest first.
+    pub fn take(&self) -> Vec<MenuPick> {
+        self.0.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+    }
+}
+
+/// The shared state one popup needs, from the moment it is scheduled to the
+/// moment its click is queued.
+struct PopupBridge {
+    /// The rows, in order. An item's tag is its index here.
+    items: Vec<PopupItem>,
+    /// The view the menu is positioned in, and where in it (view coordinates,
+    /// points). Retained: the window could in principle go away between the
+    /// scheduling and the show, and a freed view would be a dangling receiver.
+    view: Retained<NSView>,
+    at: NSPoint,
+    out: PopupOutbox,
+    proxy: EventLoopProxy,
+}
+
+define_class!(
+    // SAFETY:
+    // - NSObject has no subclassing requirements.
+    // - PopupTarget does not implement Drop.
+    // - MainThreadOnly because NSMenu and NSView are, and because both methods
+    //   below are only ever sent by AppKit on the main thread.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RtMenuPopupTarget"]
+    #[ivars = PopupBridge]
+    struct PopupTarget;
+
+    impl PopupTarget {
+        /// Build the `NSMenu` and pop it up. Runs one turn of the run loop after
+        /// the right-click, from `-performSelector:withObject:afterDelay:`, so
+        /// winit's handler is not on the stack when the modal tracking loop
+        /// starts. Blocks until the user picks or dismisses.
+        #[unsafe(method(rtPopupShow:))]
+        fn rt_popup_show(&self, _sender: Option<&NSObject>) {
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            let b = self.ivars();
+            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(""));
+            // Explicit: rt decides what is live from its own model, so AppKit
+            // must not second-guess it (this target answers no validation
+            // protocol, and autoenabling would enable every row with a target).
+            menu.setAutoenablesItems(false);
+            for (tag, it) in b.items.iter().enumerate() {
+                menu.addItem(&popup_item(mtm, it, tag as isize, self));
+            }
+            // `item: None` puts the menu's top-left corner at the point, which
+            // is where a context menu belongs relative to the click. AppKit
+            // clamps it onto the screen and scrolls it itself — the two things
+            // rt's own menu had to grow code for.
+            menu.popUpMenuPositioningItem_atLocation_inView(None, b.at, Some(&b.view));
+        }
+
+        /// A row was picked. Queue it and wake the loop — never act here.
+        #[unsafe(method(rtPopupAction:))]
+        fn rt_popup_action(&self, sender: Option<&NSMenuItem>) {
+            let tag = sender.map(|s| s.tag()).unwrap_or(-1);
+            let b = self.ivars();
+            let Some(pick) = usize::try_from(tag).ok().and_then(|i| b.items.get(i)).and_then(|i| i.pick()) else {
+                log::debug!("popup menu: pick on tag {tag} with no action");
+                return;
+            };
+            if let Ok(mut q) = b.out.0.lock() {
+                q.push(pick.clone());
+            }
+            // Payload first, then the wake-up — otherwise the loop can turn on
+            // an empty queue and the pick is lost.
+            b.proxy.wake_up();
+        }
+    }
+
+    unsafe impl NSObjectProtocol for PopupTarget {}
+);
+
+impl PopupTarget {
+    fn new(mtm: MainThreadMarker, bridge: PopupBridge) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(bridge);
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// One `NSMenuItem` (or a divider) from one popup row.
+fn popup_item(mtm: MainThreadMarker, it: &PopupItem, tag: isize, target: &PopupTarget) -> Retained<NSMenuItem> {
+    let PopupItem::Row { label, key, enabled, pick } = it else {
+        return NSMenuItem::separatorItem(mtm);
+    };
+    let title = NSString::from_str(label);
+    let equiv = NSString::from_str(key.as_ref().map(|k| k.key.as_str()).unwrap_or(""));
+    // An informational row (the version footer) gets NO action at all, so it is
+    // inert even if something later re-enables it.
+    let action = pick.as_ref().map(|_| sel!(rtPopupAction:));
+    // SAFETY: a plain designated initialiser; `rtPopupAction:` is implemented by
+    // `PopupTarget` just above, and every item carrying it is targeted at one.
+    let item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &title, action, &equiv) };
+    set_modifier_mask(&item, key.as_ref());
+    item.setTag(tag);
+    item.setEnabled(*enabled);
+    // SAFETY: `target` is alive for the whole of `rtPopupShow:` — it is the
+    // `&self` that built this item, and `performSelector:` holds it across the
+    // blocking pop-up. `NSMenuItem.target` is weak, which is why that matters.
+    unsafe { item.setTarget(Some(target.as_ref())) };
+    item
+}
+
+/// Schedule a native right-click menu for `window`, at `at` (window-local
+/// PHYSICAL pixels, winit's coordinates, origin top-left).
+///
+/// Returns `false` when AppKit could not be reached at all — off the main
+/// thread, or a window with no AppKit handle. Like `install` and `vibrancy.rs`,
+/// every failure path logs and returns; nothing here can panic, and a right-click
+/// that reaches nothing is the worst case.
+pub fn popup(items: Vec<PopupItem>, window: &dyn Window, at: (f32, f32), proxy: EventLoopProxy, out: &PopupOutbox) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::debug!("popup menu: not on the main thread; skipping");
+        return false;
+    };
+    let ns_view = match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::AppKit(h)) => h.ns_view,
+        _ => {
+            log::debug!("popup menu: no AppKit window handle; skipping");
+            return false;
+        }
+    };
+    // SAFETY: the handle comes straight from winit's live window and names a
+    // valid NSView; we are on the main thread (proven by `mtm`), which is where
+    // NSView lives, and we retain it for as long as we hold it.
+    let view: Retained<NSView> = unsafe { ns_view.cast::<NSView>().as_ref().retain() };
+
+    // winit talks in physical pixels from the top-left of the surface; AppKit
+    // wants points in the view's own coordinate system, whose origin is at the
+    // BOTTOM-left unless the view says otherwise. `isFlipped` is asked rather
+    // than assumed — it is winit's view, not rt's.
+    let scale = window.scale_factor().max(f64::MIN_POSITIVE);
+    let (lx, ly) = (f64::from(at.0) / scale, f64::from(at.1) / scale);
+    let height = view.bounds().size.height;
+    let y = if view.isFlipped() { ly } else { height - ly };
+    let target = PopupTarget::new(mtm, PopupBridge {
+        items,
+        view,
+        at: NSPoint::new(lx, y),
+        out: out.clone(),
+        proxy,
+    });
+    // Deferred by one turn of the run loop; see the section comment above.
+    // `performSelector:` retains `target` until it fires, so dropping the last
+    // Rust reference on the next line is correct.
+    //
+    // `inModes:` with the COMMON modes, not the plain three-argument form: that
+    // one schedules in `NSDefaultRunLoopMode` alone, and the right-click that
+    // gets us here is a mouse-DOWN — the run loop may sit in
+    // `NSEventTrackingRunLoopMode` until the button comes up, which would hold
+    // the menu back until the release. The common modes include event tracking,
+    // which is also the set winit's own run-loop observer and timer are
+    // registered in (`winit-appkit/src/observer.rs`), so the deferred show and
+    // the event loop agree about when "the next turn" is.
+    //
+    // SAFETY: `rtPopupShow:` is implemented by `PopupTarget` and takes one
+    // (ignored) object argument, which is what this selector family sends.
+    let modes = NSArray::from_slice(&[unsafe { NSRunLoopCommonModes }]);
+    unsafe {
+        let _: () = msg_send![
+            &*target,
+            performSelector: sel!(rtPopupShow:),
+            withObject: Option::<&NSObject>::None,
+            afterDelay: 0.0f64,
+            inModes: &*modes,
+        ];
+    }
+    true
 }

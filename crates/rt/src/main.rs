@@ -938,6 +938,24 @@ struct App {
     /// is only recomputed when one of those two booleans actually moves.
     #[cfg(target_os = "macos")]
     menubar_state: Option<(bool, bool)>,
+    /// Where the native right-click popup leaves what the user picked. An AppKit
+    /// menu click lands with no `&mut App` in reach (same gap the menu bar has),
+    /// so the [`menu::MenuPick`] is queued here and drained in `proxy_wake_up`.
+    #[cfg(target_os = "macos")]
+    popup_outbox: menubar::PopupOutbox,
+    /// The window whose right-click opened the popup that is currently up.
+    ///
+    /// Only the three POINTER-DEPENDENT picks need it: `MoveToWindow(i)` indexes
+    /// that window's `menu_windows` snapshot, and Open Link / Copy Address act on
+    /// what was under that window's cursor. An `Action` pick does not — it goes
+    /// through `run_menu_bar_action` exactly as a menu-bar click does.
+    #[cfg(target_os = "macos")]
+    popup_window: Option<WindowId>,
+    /// A proxy kept for the popup, which is opened from `window_event` where an
+    /// `ActiveEventLoop` is at hand but the popup's click is not. Taken once,
+    /// when the menu bar is installed.
+    #[cfg(target_os = "macos")]
+    menu_proxy: Option<winit::event_loop::EventLoopProxy>,
     /// The window that last took keyboard focus — the one a menu-bar click acts
     /// on. A macOS menu belongs to the APPLICATION, not to a window, so unlike
     /// the right-click menu (which arrives with the window id that was clicked)
@@ -2267,6 +2285,9 @@ impl ApplicationHandler for App {
         }
         // Debug/verification hook: RT_MENU opens the context menu at startup so
         // its rendering can be screenshotted without synthetic mouse input.
+        // Linux only: macOS has no self-drawn menu to screenshot — a right-click
+        // there pops a real NSMenu, which AppKit draws and rt cannot capture.
+        #[cfg(not(target_os = "macos"))]
         if std::env::var("RT_MENU").is_ok() {
             active.menu = Some((200.0, 150.0)); // fixed, visible spot
         }
@@ -3944,20 +3965,24 @@ impl ApplicationHandler for App {
 
     /// A wake-up asked for through the [`winit::event_loop::EventLoopProxy`].
     ///
-    /// rt has exactly one source of these: the macOS menu bar. An `NSMenuItem`
-    /// click lands on AppKit's terms in the middle of its run loop, with no
-    /// `&mut App` in reach, so `menubar.rs` queues the [`rt_config::Action`] and
-    /// wakes the loop; this is where it is collected and run — through the SAME
-    /// `apply_action` a keybinding and the right-click menu go through, never a
-    /// second path.
+    /// rt has exactly two sources of these, and they are the same source twice:
+    /// the macOS menu bar and the macOS right-click popup. An `NSMenuItem` click
+    /// lands on AppKit's terms in the middle of its run loop, with no `&mut App`
+    /// in reach, so `menubar.rs` queues the payload and wakes the loop; this is
+    /// where it is collected and run — through the SAME `apply_action` a
+    /// keybinding goes through, never a second path.
     ///
-    /// Wake-ups coalesce, so this drains the whole queue rather than assuming
-    /// one call per click.
+    /// Wake-ups coalesce, so this drains both queues rather than assuming one
+    /// call per click.
     #[cfg(target_os = "macos")]
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
-        let Some(menubar) = &self.menubar else { return };
-        for action in menubar.take_pending() {
+        let bar: Vec<rt_config::Action> =
+            self.menubar.as_ref().map(|m| m.take_pending()).unwrap_or_default();
+        for action in bar {
             self.run_menu_bar_action(event_loop, action);
+        }
+        for pick in self.popup_outbox.take() {
+            self.run_popup_pick(event_loop, pick);
         }
     }
 
@@ -4712,23 +4737,41 @@ impl App {
         // answers. The one case they differ in is a selection whose pane has
         // since died, where Copy would be offered and quietly do nothing.
         let has_selection = active.selection.is_some();
-        // Every state in which `on_key_press` swallows the keystroke instead of
-        // running the binding. Greying is what makes a disabled item's key
-        // equivalent inert, so this is what keeps ⌘V typing into the search bar.
-        let suspended = active.prefs_open
+        (has_selection, Self::keyboard_suspended(active))
+    }
+
+    /// Is the keyboard not rt's to interpret right now — a modal overlay or an
+    /// IME preedit owns it, and `on_key_press` would swallow the keystroke
+    /// instead of running the binding?
+    ///
+    /// The gate BOTH native menus answer to. For the menu bar it is what makes a
+    /// disabled item's key equivalent inert, which is what keeps ⌘V typing into
+    /// the search bar instead of pasting at the shell. For the right-click popup
+    /// it is the same question asked at the same moment, from the one definition,
+    /// so the two cannot come to disagree about what "rt is busy" means.
+    fn keyboard_suspended(active: &Active) -> bool {
+        active.prefs_open
             || active.manual_open
             || active.search_open
             || active.clip_overlay.is_some()
             || active.composing
+            // Always `None` on macOS — rt draws no menu there — but the menu bar
+            // must still grey out under Linux's self-drawn menu if that ever
+            // becomes reachable on this target.
             || active.menu.is_some()
-            || active.ime_preedit;
-        (has_selection, suspended)
+            || active.ime_preedit
     }
 
     /// Build the menus and hand them to AppKit. Idempotent; a no-op after the
     /// first success, and after a failure it simply leaves rt without a menu bar
     /// (every keybinding and the right-click menu are unaffected).
     fn install_menu_bar(&mut self, event_loop: &dyn ActiveEventLoop) {
+        // Kept whether or not the bar itself installs: the right-click popup
+        // needs a proxy too, and it is opened from `window_event`, which has an
+        // `ActiveEventLoop` but cannot hold on to one.
+        if self.menu_proxy.is_none() {
+            self.menu_proxy = Some(event_loop.create_proxy());
+        }
         if self.menubar.is_some() {
             return;
         }
@@ -4793,6 +4836,89 @@ impl App {
         if let Some((grp, bytes)) = group_echo {
             self.broadcast_group_paste(id, grp, &bytes);
         }
+    }
+
+    /// A right-click in window `id`, at `pos` (window-local physical px): pop a
+    /// native `NSMenu`.
+    ///
+    /// rt's own menu panel is never opened on this target — `Active::menu` stays
+    /// `None`, so `chrome::menu` neither draws nor hit-tests — and the rows come
+    /// from `menubar_model::popup_model`, which is `menu::rows` verbatim. Called
+    /// by `open_menu` with the "Move Pane to …" snapshot already stored on
+    /// `active`, exactly as the self-drawn menu has it.
+    ///
+    /// Declines in two cases, both of which leave the right-click doing nothing:
+    /// the keyboard is not rt's (the same [`App::keyboard_suspended`] gate the
+    /// menu bar greys out under), or AppKit could not be reached at all.
+    fn open_native_menu(&mut self, id: WindowId, pos: (f32, f32)) {
+        let Some(proxy) = self.menu_proxy.clone() else {
+            log::debug!("popup menu: no event-loop proxy yet; skipping");
+            return;
+        };
+        let Some(active) = self.windows.get(&id) else { return };
+        if Self::keyboard_suspended(active) {
+            log::debug!("popup menu: the keyboard is not rt's right now; not opening");
+            return;
+        }
+        let url = Self::cell_at(active, pos.0, pos.1)
+            .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
+        let has_sel = Self::selected_text(active).is_some();
+        let items = menubar_model::popup_model(
+            &active.keymap,
+            has_sel,
+            url.as_deref(),
+            &active.menu_move_labels,
+            false, // already refused above; nothing here re-greys what it just checked
+        );
+        if menubar::popup(items, &*active.window, pos, proxy, &self.popup_outbox) {
+            self.popup_window = Some(id);
+        }
+    }
+
+    /// Run what the native right-click popup was picked for.
+    ///
+    /// An action row goes through `run_menu_bar_action` — the same three lines a
+    /// keystroke runs, guards and all — so a popup click, a menu-bar click and a
+    /// keybinding are one code path with three front doors. Only the three
+    /// POINTER-DEPENDENT picks, which no keystroke can express, are handled here,
+    /// and each is the same handful of lines the self-drawn menu runs for them.
+    fn run_popup_pick(&mut self, event_loop: &dyn ActiveEventLoop, pick: menu::MenuPick) {
+        if let menu::MenuPick::Do(action) = pick {
+            self.run_menu_bar_action(event_loop, action);
+            return;
+        }
+        // The window that was right-clicked, not whichever is key now: the URL
+        // was read from ITS pane and `MoveToWindow` indexes ITS snapshot.
+        let Some(id) = self.popup_window else { return };
+        let Some(active) = self.windows.get_mut(&id) else { return };
+        let cmd = match pick {
+            menu::MenuPick::Do(_) => return, // handled above
+            menu::MenuPick::OpenUrl(u) => {
+                Self::open_url(&u);
+                WindowCmd::None
+            }
+            menu::MenuPick::CopyUrl(u) => {
+                if let Some(cb) = &active.clipboard {
+                    cb.store(u);
+                }
+                WindowCmd::None
+            }
+            // Index into the snapshot taken when the menu opened — stale-safe
+            // exactly as the self-drawn menu's is: an out-of-range index is a
+            // logged no-op, and a target that has since CLOSED is caught by
+            // `move_pane_to_window`.
+            menu::MenuPick::MoveToWindow(i) => match active.menu_windows.get(i).copied() {
+                Some(target) => WindowCmd::MoveToWindow(target),
+                None => {
+                    log::debug!("move-to-window: popup index {i} out of range ({} targets)", active.menu_windows.len());
+                    WindowCmd::None
+                }
+            },
+        };
+        // The popup's snapshot is done with either way.
+        active.menu_windows.clear();
+        active.menu_move_labels.clear();
+        self.run_window_cmd(event_loop, id, cmd);
     }
 }
 
@@ -5435,15 +5561,28 @@ impl App {
     /// window as of THIS moment) via [`App::menu_move_targets`], so `active`'s
     /// mutable borrow — needed to actually set `menu`/`menu_hover` — never has
     /// to coexist with a read of the rest of `self.windows`.
+    /// On macOS this opens a real `NSMenu` instead (see
+    /// [`App::open_native_menu`]) and `active.menu` stays `None`, so rt's own
+    /// panel is never drawn, hit-tested or scrolled there. Linux is unchanged.
     fn open_menu(&mut self, id: WindowId, pos: (f32, f32)) {
         let (menu_windows, menu_move_labels) = self.menu_move_targets(id);
-        let Some(active) = self.windows.get_mut(&id) else { return };
-        active.menu = Some(pos);
-        active.menu_hover = None; // no row highlighted until the pointer moves
-        active.menu_scroll = 0; // a freshly opened menu always starts at its top
-        active.menu_windows = menu_windows;
-        active.menu_move_labels = menu_move_labels;
-        active.window.request_redraw();
+        {
+            let Some(active) = self.windows.get_mut(&id) else { return };
+            // The "Move Pane to …" snapshot is shared: both renderers index it.
+            active.menu_windows = menu_windows;
+            active.menu_move_labels = menu_move_labels;
+            #[cfg(not(target_os = "macos"))]
+            {
+                active.menu = Some(pos);
+                active.menu_hover = None; // no row highlighted until the pointer moves
+                active.menu_scroll = 0; // a freshly opened menu always starts at its top
+                active.window.request_redraw();
+            }
+        }
+        // `active`'s borrow has ended: the popup needs `&mut self` (the proxy and
+        // the outbox live on `App`, not on the window).
+        #[cfg(target_os = "macos")]
+        self.open_native_menu(id, pos);
     }
 
     /// Build the "Move Pane to <window>" targets for a menu about to open in
@@ -9588,6 +9727,12 @@ fn main() {
         menubar: None, // installed once the first window exists
         #[cfg(target_os = "macos")]
         menubar_state: None,
+        #[cfg(target_os = "macos")]
+        popup_outbox: menubar::PopupOutbox::default(),
+        #[cfg(target_os = "macos")]
+        popup_window: None,
+        #[cfg(target_os = "macos")]
+        menu_proxy: None,
         #[cfg(target_os = "macos")]
         focused: None,
     };
