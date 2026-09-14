@@ -13,7 +13,7 @@ a Mac. Follow it in order; steps are marked with where they run.
   grep -h '^version' crates/*/Cargo.toml | sort -u
   ```
   This must print exactly one line, `version = "X.Y.Z"`, matching the tag. rt's
-  nine workspace crates are bumped in lockstep (see `ci/check-target-deps.sh`'s
+  ten workspace crates are bumped in lockstep (see `ci/check-target-deps.sh`'s
   normaliser, which was hardened against exactly this drifting the dependency
   gate) — if this prints more than one version, something did not get bumped.
 - Run the full gate: `cargo test --all && ./ci/check-target-deps.sh`. Both must
