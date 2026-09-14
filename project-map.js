@@ -10,7 +10,7 @@ window.PROJECT_MAP = {
     name: "rt",
     tagline: "A Wayland-native tiling terminal multiplexer on its own verified VT engine",
     repo: "github.com/perpetualbits/rt",
-    updated: "2026-09-12"
+    updated: "2026-09-14"
   },
 
   statuses: {
