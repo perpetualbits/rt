@@ -3390,23 +3390,35 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                } else if !active.mods.shift_key() && Self::forward_hover(active) {
-                    // The app under the pointer wants bare motion (mode 1003): it
-                    // owns the hover (Shift suspends forwarding). Nothing else here.
-                } else if active.settings.focus_follows_mouse {
-                    // Sloppy focus: focus the pane under the pointer. Only redraw
-                    // when focus actually changes (not on every motion), and only
-                    // when a pane is hit (over a gutter, focus sticks).
-                    let before = active.session.focus();
-                    active.session.focus_at(active.mouse.0, active.mouse.1);
-                    if active.session.focus() != before {
-                        // Focus-follows-mouse produces no engine cell-damage, so
-                        // nothing else would schedule a frame — ask for one. The
-                        // frame builder's central `focus != last_focus` check forces
-                        // it full (so the blue border clears off the old pane and
-                        // fully draws on the new); no per-site force_full needed, and
-                        // omitting it keeps the *following* keystroke frame scissored.
-                        active.window.request_redraw();
+                } else {
+                    // Sloppy focus and app-owned hover are independent concerns:
+                    // a pane's DECSET-1003 "any-motion" tracking must never block
+                    // the hover sample that would have focused it (that starved
+                    // focus-follows-mouse of the crossing event whenever the
+                    // under-cursor pane happened to have motion tracking on —
+                    // e.g. Claude Code toggles it — so rt's own keyboard focus
+                    // never followed the mouse into that pane; only a click did,
+                    // since click-to-focus runs unconditionally above). Run both.
+                    if active.settings.focus_follows_mouse {
+                        // Only redraw when focus actually changes (not on every
+                        // motion), and only when a pane is hit (over a gutter,
+                        // focus sticks).
+                        let before = active.session.focus();
+                        active.session.focus_at(active.mouse.0, active.mouse.1);
+                        if active.session.focus() != before {
+                            // Focus-follows-mouse produces no engine cell-damage, so
+                            // nothing else would schedule a frame — ask for one. The
+                            // frame builder's central `focus != last_focus` check forces
+                            // it full (so the blue border clears off the old pane and
+                            // fully draws on the new); no per-site force_full needed, and
+                            // omitting it keeps the *following* keystroke frame scissored.
+                            active.window.request_redraw();
+                        }
+                    }
+                    if !active.mods.shift_key() {
+                        // The app under the pointer wants bare motion (mode 1003):
+                        // it owns the hover (Shift suspends forwarding).
+                        Self::forward_hover(active);
                     }
                 }
             }
