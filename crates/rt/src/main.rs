@@ -4620,6 +4620,19 @@ mod clip_cull_tests {
 /// sliver of each disc and never erased the outer half — "halved jacks" and
 /// packets that flickered in place instead of orbiting. The titlebar strip is
 /// still covered in full when shown.
+///
+/// The four bands must not overlap one another. `end_frame` draws the frame's
+/// whole vertex batch once per damage rect (scissored to it each time), which
+/// is only idempotent for OPAQUE geometry — a pixel scissored into by two
+/// bands gets its fragment shader run twice. The titlebar strip is translucent
+/// (`chrome::theme::lift_fill`), so a corner square counted in both the top
+/// band and a side band got that lifted colour alpha-blended onto itself
+/// twice, a visibly different (over-saturated) colour baked into exactly the
+/// pane's four corners — the "ghost cursor" artefact reported against
+/// v0.3.22+. Left/right are trimmed to the strip BETWEEN top and bottom so
+/// the bands tile the perimeter (touching, not overlapping) instead of double-
+/// counting the corners; total coverage is unchanged; `top`/`bottom` still
+/// span the full width, so the corner discs stay fully covered by them alone.
 fn border_bands(rect: Rect, top_h: i32, margin: i32) -> [crate::damage::PxRect; 4] {
     use crate::damage::PxRect;
     let (x, y, w, h) = (rect.x as i32, rect.y as i32, rect.w as i32, rect.h as i32);
@@ -4629,8 +4642,8 @@ fn border_bands(rect: Rect, top_h: i32, margin: i32) -> [crate::damage::PxRect; 
     [
         PxRect { x: x - m, y: y - m, w: w + 2 * m, h: m + top },                  // top
         PxRect { x: x - m, y: y + h - inner, w: w + 2 * m, h: inner + m },        // bottom
-        PxRect { x: x - m, y: y - m, w: m + inner, h: h + 2 * m },                // left
-        PxRect { x: x + w - inner, y: y - m, w: inner + m, h: h + 2 * m },        // right
+        PxRect { x: x - m, y: y + top, w: m + inner, h: h - inner - top },        // left (between top & bottom)
+        PxRect { x: x + w - inner, y: y + top, w: inner + m, h: h - inner - top },// right (between top & bottom)
     ]
 }
 
@@ -4681,6 +4694,29 @@ mod instrument_band_tests {
         }
         // …while the middle of the pane is NOT in any band (bands stay bands).
         assert!(!covers(&bands, 300, 200));
+    }
+
+    /// No two bands may share pixels: `end_frame` draws the frame's whole
+    /// vertex batch once per damage rect, so a pixel counted in two bands gets
+    /// any translucent geometry over it (the titlebar's `lift_fill` tint)
+    /// alpha-blended onto itself twice — the "ghost cursor" corner artefact.
+    /// Touching (zero-area) is fine; overlapping is not.
+    #[test]
+    fn bands_do_not_overlap() {
+        for (rect, top_h) in [
+            (Rect { x: 100.0, y: 50.0, w: 400.0, h: 300.0 }, 24),
+            (Rect { x: 0.0, y: 0.0, w: 80.0, h: 60.0 }, 0), // titlebar off
+            (Rect { x: 8.0, y: 8.0, w: 1615.0, h: 898.0 }, 24),
+        ] {
+            let m = instrument_margin(1.0);
+            let bands = border_bands(rect, top_h, m);
+            for i in 0..bands.len() {
+                for j in (i + 1)..bands.len() {
+                    let area = bands[i].intersection_area(&bands[j]);
+                    assert_eq!(area, 0, "bands {i} and {j} overlap by {area}px² for rect {rect:?} top_h={top_h}");
+                }
+            }
+        }
     }
 
     #[test]

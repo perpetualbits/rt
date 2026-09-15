@@ -64,6 +64,34 @@ impl PxRect {
         let bottom = self.bottom().max(other.bottom());
         PxRect { x, y, w: right - x, h: bottom - y }
     }
+
+    /// `self` with `cut`'s area removed, as up to 4 axis-aligned fragments (a
+    /// "picture frame" split: top/bottom strips spanning the full width, then
+    /// left/right strips confined to the middle band). Empty fragments are
+    /// omitted. Used to make the final damage list pairwise disjoint: a wide
+    /// band and a tall band from two unrelated instruments (a pane's own
+    /// border band and the window's latency frame, say) can overlap in just
+    /// the corner square where both reach — too small a shared area for
+    /// `merges_tightly` to fold them into one rect (that threshold exists
+    /// precisely so thin bands don't balloon into a bounding box), so both
+    /// survive as separate scissor rects. `end_frame` draws the frame's whole
+    /// vertex batch once per rect, so that corner square got any translucent
+    /// fill over it (the titlebar's `lift_fill` tint) alpha-blended onto
+    /// itself twice — a visibly different colour baked into the corner. This
+    /// makes overlap structurally impossible rather than requiring every pair
+    /// of instrument bands to be hand-checked against each other.
+    fn subtract(&self, cut: &PxRect) -> [PxRect; 4] {
+        // The hole: self ∩ cut, always within self's bounds (each edge is a
+        // max/min against self's own edge).
+        let (ix0, ix1) = (self.x.max(cut.x), self.right().min(cut.right()));
+        let (iy0, iy1) = (self.y.max(cut.y), self.bottom().min(cut.bottom()));
+        [
+            PxRect { x: self.x, y: self.y, w: self.w, h: iy0 - self.y },              // above the hole (full width)
+            PxRect { x: self.x, y: iy1, w: self.w, h: self.bottom() - iy1 },          // below the hole (full width)
+            PxRect { x: self.x, y: iy0, w: ix0 - self.x, h: iy1 - iy0 },              // left of the hole
+            PxRect { x: ix1, y: iy0, w: self.right() - ix1, h: iy1 - iy0 },           // right of the hole
+        ]
+    }
 }
 
 /// The coalesced damage for one frame.
@@ -197,8 +225,43 @@ impl DamageAccumulator {
             }
             merged.push(cur);
         }
-        FrameDamage::Rects(merged)
+        FrameDamage::Rects(make_disjoint(merged))
     }
+}
+
+/// Split every pairwise overlap out of a rect list, without merging any of
+/// them into a bounding box. Two rects from UNRELATED sources — a pane's own
+/// border band and the window's latency frame, say — can each be individually
+/// too "thin-band-ish" for `merges_tightly` to fold them together (that
+/// threshold exists so a wide band and a tall band don't balloon into their
+/// shared bounding box), yet still share a small corner square where both
+/// reach. `end_frame` scissors to and redraws the frame's whole vertex batch
+/// once per rect, so a pixel in that shared square got any translucent fill
+/// over it (the titlebar's `lift_fill` tint) alpha-blended onto itself twice —
+/// a visibly different colour baked into the corner. Clipping each rect
+/// against every rect already placed (via `subtract`) guarantees the result
+/// is pairwise disjoint — same total coverage, just tiled instead of
+/// overlapping — so this holds for any future instrument's bands too, not
+/// just the specific pair that first exposed it.
+fn make_disjoint(rects: Vec<PxRect>) -> Vec<PxRect> {
+    let mut out: Vec<PxRect> = Vec::new();
+    for r in rects {
+        let mut pieces = vec![r];
+        for placed in &out {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|p| {
+                    if p.intersection_area(placed) > 0 {
+                        p.subtract(placed).into_iter().filter(|f| !f.is_empty()).collect()
+                    } else {
+                        vec![p]
+                    }
+                })
+                .collect();
+        }
+        out.extend(pieces);
+    }
+    out
 }
 
 impl Default for DamageAccumulator {
@@ -219,16 +282,51 @@ mod tests {
         let mut acc = DamageAccumulator::new();
         acc.begin_frame();
         let (x, y, w, h, t) = (8, 8, 1615, 898, 6);
-        acc.add_rect(PxRect { x, y, w, h: 24 }); // titlebar strip
+        let top = 24;
+        acc.add_rect(PxRect { x, y, w, h: top }); // titlebar strip
         acc.add_rect(PxRect { x, y: y + h - t, w, h: t }); // bottom
-        acc.add_rect(PxRect { x, y, w: t, h }); // left
-        acc.add_rect(PxRect { x: x + w - t, y, w: t, h }); // right
+        acc.add_rect(PxRect { x, y: y + top, w: t, h: h - top - t }); // left, between top & bottom
+        acc.add_rect(PxRect { x: x + w - t, y: y + top, w: t, h: h - top - t }); // right, between top & bottom
         acc.add_rect(PxRect { x: 400, y: 300, w: 10, h: 19 }); // a keystroke cell in the middle
         match acc.finish() {
             FrameDamage::Rects(rs) => {
                 assert_eq!(rs.len(), 5, "{rs:?}");
                 let total: i64 = rs.iter().map(|r| r.area()).sum();
                 assert!(total < 100_000, "damage area ballooned: {total}");
+            }
+            FrameDamage::Full => panic!("expected Rects"),
+        }
+    }
+
+    /// The bug this module exists to prevent: two bands from UNRELATED sources
+    /// (a pane's own top border band, full window width; the latency frame's
+    /// left band, full window height) that are each too "thin" relative to
+    /// their union for `merges_tightly` to fold together, yet share a small
+    /// corner square. Before `make_disjoint`, both survived as separate
+    /// scissor rects and `end_frame` redrew the frame's whole vertex batch
+    /// once per rect — double-blending any translucent fill in that shared
+    /// square (the titlebar's ghost-cursor corner artefact). The final list
+    /// must be pairwise disjoint and cover exactly the same total area as the
+    /// two rects' union.
+    #[test]
+    fn unrelated_bands_sharing_only_a_corner_end_up_disjoint() {
+        let mut acc = DamageAccumulator::new();
+        acc.begin_frame();
+        let top_band = PxRect { x: 0, y: 0, w: 1000, h: 30 }; // a pane's top border band
+        let left_band = PxRect { x: 0, y: 0, w: 8, h: 600 }; // the window's latency-frame left band
+        acc.add_rect(top_band);
+        acc.add_rect(left_band);
+        match acc.finish() {
+            FrameDamage::Rects(rs) => {
+                for i in 0..rs.len() {
+                    for j in (i + 1)..rs.len() {
+                        let a = rs[i].intersection_area(&rs[j]);
+                        assert_eq!(a, 0, "rects {i} and {j} overlap by {a}px²: {rs:?}");
+                    }
+                }
+                let total: i64 = rs.iter().map(|r| r.area()).sum();
+                let union_area = top_band.area() + left_band.area() - top_band.intersection_area(&left_band);
+                assert_eq!(total, union_area, "coverage changed: {rs:?}");
             }
             FrameDamage::Full => panic!("expected Rects"),
         }
