@@ -7882,15 +7882,15 @@ impl App {
         }
 
         let frame_damage = active.damage.finish();
-        // Diagnostic only (`RUST_LOG=rt::cursor_damage=warn`): a moved cursor's
+        // Diagnostic only (`RUST_LOG=rt::cursor_damage=debug`): a moved cursor's
         // vacated cell must appear in this frame's own damage, independent of
         // whatever the buffer-age union in `plan_frame` later adds — if it's
         // missing here, the bug is upstream (engine damage or the cursor-span
         // add_cell_span above), not in the buffer-age logic below.
-        if !cursor_moves.is_empty() && log::log_enabled!(target: "rt::cursor_damage", log::Level::Warn) {
+        if !cursor_moves.is_empty() && log::log_enabled!(target: "rt::cursor_damage", log::Level::Debug) {
             for (id, vacated) in &cursor_moves {
                 if !frame_damage.covers(*vacated) {
-                    log::warn!(
+                    log::debug!(
                         target: "rt::cursor_damage",
                         "pane {id:?}: cursor moved but THIS FRAME's own damage does not cover the vacated cell {vacated:?} — frame_damage={frame_damage:?}"
                     );
@@ -7899,14 +7899,14 @@ impl App {
         }
         // Fold in recent frames' damage per the back-buffer age, and decide.
         let plan = Self::plan_frame(active, frame_damage);
-        if !cursor_moves.is_empty() && log::log_enabled!(target: "rt::cursor_damage", log::Level::Warn) {
+        if !cursor_moves.is_empty() && log::log_enabled!(target: "rt::cursor_damage", log::Level::Debug) {
             let plan_damage = match &plan {
                 FramePlan::Full => crate::damage::FrameDamage::Full,
                 FramePlan::Partial(_, rs) => crate::damage::FrameDamage::Rects(rs.clone()),
             };
             for (id, vacated) in &cursor_moves {
                 if !plan_damage.covers(*vacated) {
-                    log::warn!(
+                    log::debug!(
                         target: "rt::cursor_damage",
                         "pane {id:?}: cursor moved but the FINAL redraw plan does not cover the vacated cell {vacated:?} — plan={plan_damage:?} age={}",
                         active.frame_age
@@ -7922,7 +7922,7 @@ impl App {
             let screen_h = size.height as i32;
             match &plan {
                 FramePlan::Full => {
-                    log::warn!(
+                    log::debug!(
                         target: "rt::cursor_damage",
                         "cursor moved, plan=FULL backend_gl={} sw={} win={}x{}",
                         active.backend.is_gl(), active.backend.is_software(), size.width, size.height
@@ -7931,7 +7931,7 @@ impl App {
                 FramePlan::Partial(bbox, rs) => {
                     let gl_boxes: Vec<(i32, i32, i32, i32)> =
                         rs.iter().map(|r| crate::render::scissor_box(*r, screen_h)).collect();
-                    log::warn!(
+                    log::debug!(
                         target: "rt::cursor_damage",
                         "cursor moved, plan=PARTIAL rects={} over_max24={} bbox={bbox:?} gl_boxes={gl_boxes:?} backend_gl={} sw={} win={}x{}",
                         rs.len(), rs.len() > 24, active.backend.is_gl(), active.backend.is_software(), size.width, size.height
@@ -8221,7 +8221,7 @@ impl App {
                         let cc = active.settings.foreground; // cursor colour = configured foreground
                         let ccol = Color::rgb(cc[0], cc[1], cc[2]);
                         let focused = id == focus; // is this the focused pane?
-                        // Diagnostic only (`RUST_LOG=rt::cursor_shape=warn`), unthrottled:
+                        // Diagnostic only (`RUST_LOG=rt::cursor_shape=debug`), unthrottled:
                         // the "underscore" ghost's shape/position (a thin bar at the cell
                         // bottom, at a just-vacated column on the cursor's own row) matches
                         // `cursor_underline` exactly, even though the user reports never
@@ -8230,7 +8230,7 @@ impl App {
                         // (e.g. a shell/prompt vi-mode escape) the 500ms-throttled
                         // `log_cursor_diag` above is too coarse to catch.
                         if focused && cur.shape != CursorShape::Block {
-                            log::warn!(
+                            log::debug!(
                                 target: "rt::cursor_shape",
                                 "non-Block cursor shape={:?} pane={id:?} line={} col={} t={:?}",
                                 cur.shape, cur.line, cur.col, Instant::now()
