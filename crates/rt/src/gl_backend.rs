@@ -195,7 +195,12 @@ impl Backend for GlBackend {
     }
     fn begin_frame_scissored_rects(&mut self, bg: Color, bbox: PxRect, rects: &[PxRect]) -> Vec<PxRect> {
         // Too many rects → the bbox: each rect is a scissored clear + a draw call,
-        // and past a point the per-draw overhead beats the fragment savings.
+        // and past a point the per-draw overhead beats the fragment savings. Also
+        // the fix for the cursor-trail ghost bug (see main.rs's border-band damage
+        // comment): several separate small scissored clear/draw passes in one
+        // frame left stale residue behind on at least one NVIDIA GL/Wayland
+        // driver, so callers now keep rect counts low (merging border bands into
+        // one rect) rather than relying on this cap alone.
         const MAX_SCISSOR_RECTS: usize = 24;
         if rects.is_empty() || rects.len() > MAX_SCISSOR_RECTS {
             self.begin_frame_scissored(bg, bbox);

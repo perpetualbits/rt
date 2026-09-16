@@ -1077,9 +1077,9 @@ impl Renderer {
             );
             self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
             if self.scissor_rects.len() > 1 {
+                let screen_h = self.screen.1 as i32;
                 // Multi-rect partial frame: the same batch once per rect, each
                 // scissored to that rect (vertex work is trivial; fragments are not).
-                let screen_h = self.screen.1 as i32;
                 for r in &self.scissor_rects {
                     let (sx, sy, sw, sh) = scissor_box(*r, screen_h);
                     self.gl.scissor(sx, sy, sw, sh);

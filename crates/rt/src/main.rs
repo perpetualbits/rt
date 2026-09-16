@@ -610,6 +610,19 @@ struct Active {
     font_status: std::collections::HashMap<String, prefs_model::FamilyStatus>,
     damage: crate::damage::DamageAccumulator, // this frame's accumulated pixel damage
     damage_history: std::collections::VecDeque<crate::damage::FrameDamage>, // recent frames' damage, for buffer-age
+    // The pixel rect of each pane's cursor cell as of the last frame painted.
+    // Engine cell-damage is content-diff based: typing a space onto a cell
+    // that is already blank (the common case once the cursor has run past
+    // the end of typed text) leaves that cell's content unchanged, so the
+    // engine never marks it damaged when the cursor moves off it — under a
+    // partial/scissored redraw the cursor decoration drawn there on a past
+    // frame is then never re-cleared, a frozen residue (root-caused via a
+    // live screenshot: a static underline several cells from the live
+    // cursor, on the row it last idled at underline shape). Tracked here so
+    // a move can be detected and the vacated cell force-damaged below,
+    // independent of whether the engine thinks the cell changed. Also read
+    // by the `rt::cursor_damage` diagnostic log.
+    cursor_track: std::collections::HashMap<rt_core::PaneId, crate::damage::PxRect>,
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
     last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
     resize_events: u64,                   // how many Resized events this session has paid for (diagnostics)
@@ -2153,6 +2166,7 @@ impl App {
             font_status: std::collections::HashMap::new(),
             damage: crate::damage::DamageAccumulator::new(),
             damage_history: std::collections::VecDeque::new(),
+            cursor_track: std::collections::HashMap::new(),
             force_full: true, // first frame is always a full redraw
             last_focus: init_focus,
             resize_events: 0,
@@ -7739,6 +7753,10 @@ impl App {
         {
             active.damage.mark_full();
         }
+        // Diagnostic only (see `rt::cursor_damage`, checked below once this
+        // frame's damage is final): pixel rect of each pane's cursor cell as
+        // of the PREVIOUS frame, for panes whose cursor moved since then.
+        let mut cursor_moves: Vec<(rt_core::PaneId, crate::damage::PxRect)> = Vec::new();
         for (id, rect) in active.session.visible_rects(bounds) {
             let content = active.session.content_rect(rect);
             // ONCE per pane. Wrapped in catch_unwind so a panic building ONE pane's snapshot
@@ -7763,11 +7781,25 @@ impl App {
                 if active.session.columns_of(id) > 1 {
                     active.damage.mark_full(); // newspaper columns: cell→px mapping ambiguous
                 } else {
-                    active.damage.add_cells(&snap.damage, content.x as i32, content.y as i32, cw, ch);
+                    active.damage.add_cells(&snap.damage, content.x as i32, content.y as i32, cell_w, cell_h);
                     // The cursor cell: its blink alpha changes with no cell damage
                     // (a move damages old+new cells in the engine; the pulse does not).
                     if let Some(c) = &snap.cursor {
-                        active.damage.add_cell_span(c.line, c.col, c.col, content.x as i32, content.y as i32, cw, ch);
+                        active.damage.add_cell_span(c.line, c.col, c.col, content.x as i32, content.y as i32, cell_w, cell_h);
+                        let cur_rect = crate::damage::DamageAccumulator::cell_span_rect(
+                            c.line, c.col, c.col, content.x as i32, content.y as i32, cell_w, cell_h,
+                        );
+                        if let Some(prev) = active.cursor_track.insert(id, cur_rect) {
+                            if prev != cur_rect {
+                                // Engine damage is content-diff based: if the vacated cell's
+                                // content didn't change (e.g. it was already blank), the engine
+                                // never marks it damaged, so a cursor decoration painted there on
+                                // a past frame (underline/beam shape, or a past blink phase) would
+                                // otherwise never be cleared under a partial/scissored redraw.
+                                active.damage.add_rect(prev);
+                                cursor_moves.push((id, prev)); // the cell it just vacated
+                            }
+                        }
                     }
                 }
             }
@@ -7797,10 +7829,24 @@ impl App {
         if !active.damage.is_full() && !x11_present_active {
             let margin = instrument_margin(active.chrome_sc);
             let win = crate::damage::PxRect { x: 0, y: 0, w: size.width as i32, h: size.height as i32 };
+            // Issuing several separate small scissored clear/draw passes in one
+            // frame — this pane's 4 border bands, forced into damage every
+            // partial frame regardless of whether their pixels changed (see
+            // above) — leaves stale residue behind on at least one NVIDIA
+            // GL/Wayland driver: a thin "ghost" of the cursor's previous cell,
+            // blinking in sync with the cursor. Reproduces identically whether
+            // the overwrite is `glClear` or an equivalent drawn quad, so it's
+            // not specific to either mechanism; a single bbox-scissored pass
+            // never shows it. Measured no frame-time cost from doing so (median
+            // frame time was, if anything, slightly lower). Scoped to this
+            // block only, so X11-present (ssh -X, e.g. milkv) is untouched —
+            // it already skips border-band damage entirely (see above).
             for (_id, (rect, _)) in &snapshots {
-                for band in border_bands(*rect, active.session.titlebar_h() as i32, margin) {
-                    active.damage.add_rect(clamp_rect(band, win)); // bands reach past the pane; never past the window
-                }
+                let bands = border_bands(*rect, active.session.titlebar_h() as i32, margin);
+                let mut it = bands.iter().map(|b| clamp_rect(*b, win));
+                let first = it.next().expect("border_bands returns 4 rects");
+                let merged = it.fold(first, |acc, r| acc.union(&r));
+                active.damage.add_rect(merged); // one scissored pass for all 4 bands, not 4
             }
             if active.settings.inst_latency {
                 let t = (active.chrome_sc * chrome_scale::logical::LATENCY_FRAME_T).ceil() as i32 + 1;
@@ -7836,8 +7882,63 @@ impl App {
         }
 
         let frame_damage = active.damage.finish();
+        // Diagnostic only (`RUST_LOG=rt::cursor_damage=warn`): a moved cursor's
+        // vacated cell must appear in this frame's own damage, independent of
+        // whatever the buffer-age union in `plan_frame` later adds — if it's
+        // missing here, the bug is upstream (engine damage or the cursor-span
+        // add_cell_span above), not in the buffer-age logic below.
+        if !cursor_moves.is_empty() && log::log_enabled!(target: "rt::cursor_damage", log::Level::Warn) {
+            for (id, vacated) in &cursor_moves {
+                if !frame_damage.covers(*vacated) {
+                    log::warn!(
+                        target: "rt::cursor_damage",
+                        "pane {id:?}: cursor moved but THIS FRAME's own damage does not cover the vacated cell {vacated:?} — frame_damage={frame_damage:?}"
+                    );
+                }
+            }
+        }
         // Fold in recent frames' damage per the back-buffer age, and decide.
         let plan = Self::plan_frame(active, frame_damage);
+        if !cursor_moves.is_empty() && log::log_enabled!(target: "rt::cursor_damage", log::Level::Warn) {
+            let plan_damage = match &plan {
+                FramePlan::Full => crate::damage::FrameDamage::Full,
+                FramePlan::Partial(_, rs) => crate::damage::FrameDamage::Rects(rs.clone()),
+            };
+            for (id, vacated) in &cursor_moves {
+                if !plan_damage.covers(*vacated) {
+                    log::warn!(
+                        target: "rt::cursor_damage",
+                        "pane {id:?}: cursor moved but the FINAL redraw plan does not cover the vacated cell {vacated:?} — plan={plan_damage:?} age={}",
+                        active.frame_age
+                    );
+                }
+            }
+            // Round 2: the logical plan/damage layer checked out (round 1 never
+            // fired), so log one layer lower — the actual GL scissor boxes the
+            // plan turns into, plus which backend/driver is in play — for every
+            // moved cursor, not just a covers() failure, so a real repro's log
+            // shows the concrete geometry sent to the GPU even when the logic
+            // above claims it's correct.
+            let screen_h = size.height as i32;
+            match &plan {
+                FramePlan::Full => {
+                    log::warn!(
+                        target: "rt::cursor_damage",
+                        "cursor moved, plan=FULL backend_gl={} sw={} win={}x{}",
+                        active.backend.is_gl(), active.backend.is_software(), size.width, size.height
+                    );
+                }
+                FramePlan::Partial(bbox, rs) => {
+                    let gl_boxes: Vec<(i32, i32, i32, i32)> =
+                        rs.iter().map(|r| crate::render::scissor_box(*r, screen_h)).collect();
+                    log::warn!(
+                        target: "rt::cursor_damage",
+                        "cursor moved, plan=PARTIAL rects={} over_max24={} bbox={bbox:?} gl_boxes={gl_boxes:?} backend_gl={} sw={} win={}x{}",
+                        rs.len(), rs.len() > 24, active.backend.is_gl(), active.backend.is_software(), size.width, size.height
+                    );
+                }
+            }
+        }
 
         // `rt::frame` debug log (RUST_LOG=rt::frame=debug): one line per presented
         // frame — plan, scissor box, rect count, vertices, wall time, and what asked
@@ -8120,6 +8221,21 @@ impl App {
                         let cc = active.settings.foreground; // cursor colour = configured foreground
                         let ccol = Color::rgb(cc[0], cc[1], cc[2]);
                         let focused = id == focus; // is this the focused pane?
+                        // Diagnostic only (`RUST_LOG=rt::cursor_shape=warn`), unthrottled:
+                        // the "underscore" ghost's shape/position (a thin bar at the cell
+                        // bottom, at a just-vacated column on the cursor's own row) matches
+                        // `cursor_underline` exactly, even though the user reports never
+                        // configuring an underline cursor — so log every frame the focused
+                        // cursor's shape isn't Block, to catch a transient DECSCUSR flip
+                        // (e.g. a shell/prompt vi-mode escape) the 500ms-throttled
+                        // `log_cursor_diag` above is too coarse to catch.
+                        if focused && cur.shape != CursorShape::Block {
+                            log::warn!(
+                                target: "rt::cursor_shape",
+                                "non-Block cursor shape={:?} pane={id:?} line={} col={} t={:?}",
+                                cur.shape, cur.line, cur.col, Instant::now()
+                            );
+                        }
                         if !focused {
                             // Unfocused: hollow outline regardless of shape, steady (no blink).
                             active.backend.cursor_hollow(ox, rect.y, cur.col, sub, ccol);

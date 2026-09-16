@@ -95,6 +95,7 @@ impl PxRect {
 }
 
 /// The coalesced damage for one frame.
+#[derive(Clone, Debug)]
 pub enum FrameDamage {
     Full,
     Rects(Vec<PxRect>),
@@ -111,6 +112,21 @@ impl FrameDamage {
                 let mut it = rs.iter().filter(|r| !r.is_empty());
                 let first = *it.next()?;
                 Some(it.fold(first, |acc, r| acc.union(r)))
+            }
+        }
+    }
+
+    /// Diagnostic only (see `rt::cursor_damage` in main.rs): is `target` fully
+    /// covered by this damage? `Rects` is assumed pairwise disjoint (true of
+    /// every `FrameDamage` this module hands out, via `finish()`'s
+    /// `make_disjoint`), so summing each rect's overlap with `target` can't
+    /// double-count and equals the real covered area.
+    pub fn covers(&self, target: PxRect) -> bool {
+        match self {
+            FrameDamage::Full => true,
+            FrameDamage::Rects(rs) => {
+                let covered: i64 = rs.iter().map(|r| target.intersection_area(r)).sum();
+                covered >= target.area()
             }
         }
     }
@@ -152,6 +168,21 @@ impl DamageAccumulator {
 
     /// Map one cell span (`left..=right` inclusive on row `line`) to a pixel
     /// rect at a pane's content origin and add it.
+    ///
+    /// `cell_w`/`cell_h` are the renderer's exact (fractional) per-cell size —
+    /// the same values `draw_panes` multiplies by column/row to position glyph
+    /// and cursor geometry. Truncating that to a whole-pixel cell size here
+    /// used to build a DIFFERENT (smaller) mapping from cell index to pixel
+    /// than the one geometry is actually drawn at; at high column/row indices
+    /// the two diverged by several pixels, and the GL scissor test — exact,
+    /// no margin — clipped a sliver of the true glyph away without ever
+    /// clearing the pixels the previous frame's glyph occupied there: a
+    /// stale residue (worst on the cursor cell, since it redraws every frame
+    /// for the blink and so keeps re-exposing the gap). Flooring the left/top
+    /// and ceiling the right/bottom, instead of truncating a per-cell size and
+    /// multiplying, guarantees the rect fully contains the true float span
+    /// regardless of how cell_w/cell_h round — same fix shape as `scissor_box`
+    /// rounding the other direction would risk shrinking it.
     pub fn add_cell_span(
         &mut self,
         line: usize,
@@ -159,19 +190,38 @@ impl DamageAccumulator {
         right: usize,
         origin_x: i32,
         origin_y: i32,
-        cell_w: i32,
-        cell_h: i32,
+        cell_w: f32,
+        cell_h: f32,
     ) {
         if right < left {
             return; // undamaged span
         }
-        let cols = (right - left + 1) as i32;
-        self.add_rect(PxRect {
-            x: origin_x + left as i32 * cell_w,
-            y: origin_y + line as i32 * cell_h,
-            w: cols * cell_w,
-            h: cell_h,
-        });
+        self.add_rect(Self::cell_span_rect(line, left, right, origin_x, origin_y, cell_w, cell_h));
+    }
+
+    /// The pixel rect `add_cell_span` would add, without adding it — lets a
+    /// caller track a cell span's rect (e.g. the cursor's, frame to frame)
+    /// using the exact same float-precise mapping the renderer draws with.
+    /// `right < left` (undamaged span) returns an empty rect.
+    pub fn cell_span_rect(
+        line: usize,
+        left: usize,
+        right: usize,
+        origin_x: i32,
+        origin_y: i32,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> PxRect {
+        if right < left {
+            return PxRect { x: 0, y: 0, w: 0, h: 0 };
+        }
+        let x0 = origin_x as f32 + left as f32 * cell_w;
+        let x1 = origin_x as f32 + (right + 1) as f32 * cell_w;
+        let y0 = origin_y as f32 + line as f32 * cell_h;
+        let y1 = y0 + cell_h;
+        let x = x0.floor() as i32;
+        let y = y0.floor() as i32;
+        PxRect { x, y, w: x1.ceil() as i32 - x, h: y1.ceil() as i32 - y }
     }
 
     /// Fold a pane's engine damage in. `Full` marks the whole frame full.
@@ -180,8 +230,8 @@ impl DamageAccumulator {
         damage: &Damage,
         origin_x: i32,
         origin_y: i32,
-        cell_w: i32,
-        cell_h: i32,
+        cell_w: f32,
+        cell_h: f32,
     ) {
         match damage {
             Damage::Full => self.mark_full(),
@@ -353,7 +403,7 @@ mod tests {
         let mut acc = DamageAccumulator::new();
         acc.begin_frame();
         // Row 2, cols 3..=5, pane at (10,20), 8x16 cells.
-        acc.add_cell_span(2, 3, 5, 10, 20, 8, 16);
+        acc.add_cell_span(2, 3, 5, 10, 20, 8.0, 16.0);
         match acc.finish() {
             FrameDamage::Rects(rs) => {
                 assert_eq!(rs.len(), 1);
@@ -371,7 +421,7 @@ mod tests {
     fn engine_full_propagates() {
         let mut acc = DamageAccumulator::new();
         acc.begin_frame();
-        acc.add_cells(&Damage::Full, 0, 0, 8, 16);
+        acc.add_cells(&Damage::Full, 0, 0, 8.0, 16.0);
         assert!(acc.is_full());
         assert!(matches!(acc.finish(), FrameDamage::Full));
     }
@@ -384,7 +434,7 @@ mod tests {
             CellDamage { line: 0, left: 0, right: 0 },
             CellDamage { line: 9, left: 2, right: 4 },
         ]);
-        acc.add_cells(&d, 0, 0, 8, 16);
+        acc.add_cells(&d, 0, 0, 8.0, 16.0);
         match acc.finish() {
             FrameDamage::Rects(rs) => assert_eq!(rs.len(), 2),
             FrameDamage::Full => panic!("expected Rects"),
@@ -454,6 +504,153 @@ mod tests {
                 assert_eq!(rs[0], PxRect { x: 0, y: 0, w: 30, h: 10 });
             }
             FrameDamage::Full => panic!("expected Rects"),
+        }
+    }
+
+    /// `covers` backs the `rt::cursor_damage` diagnostic: it must say yes only
+    /// when the target is ENTIRELY inside the damage, including the split case
+    /// `make_disjoint` produces (no single rect contains the target, but their
+    /// union does).
+    #[test]
+    fn covers_reports_full_and_partial_and_split_coverage() {
+        assert!(FrameDamage::Full.covers(PxRect { x: 5, y: 5, w: 8, h: 16 }));
+
+        let one_rect = FrameDamage::Rects(vec![PxRect { x: 0, y: 0, w: 100, h: 100 }]);
+        assert!(one_rect.covers(PxRect { x: 10, y: 10, w: 8, h: 16 }));
+        assert!(!one_rect.covers(PxRect { x: 90, y: 90, w: 20, h: 20 })); // hangs off the edge
+
+        // Target is split across two disjoint rects that together cover it,
+        // as `make_disjoint` would produce when something else overlapped it.
+        let split = FrameDamage::Rects(vec![
+            PxRect { x: 0, y: 0, w: 10, h: 16 },
+            PxRect { x: 10, y: 0, w: 10, h: 16 },
+        ]);
+        assert!(split.covers(PxRect { x: 5, y: 0, w: 10, h: 16 })); // straddles both
+    }
+
+    /// The cursor blinks in place: every frame while focused, `add_cell_span`
+    /// re-damages the SAME cell (6d158ce, "the focused cursor cell joins the
+    /// damage each frame so its blink pulse ... still repaints"), and a move
+    /// additionally damages the vacated cell (fix for the cursor-trail bug).
+    /// `cell_span_rect` floors the start and ceils the end independently on
+    /// each axis, so a single cell's rect can be up to 1px larger than its
+    /// true (fractional-cell-size) bounds. Check that a cursor blinking in
+    /// place, alone (nothing else damaged — the common idle-blink frame),
+    /// never produces a rect taller or wider than one cell: an oversized rect
+    /// would scissor 1px into a genuinely undamaged neighbour cell.
+    #[test]
+    fn lone_blinking_cursor_rect_does_not_exceed_one_cell() {
+        // Realistic fractional cell size (font_px / line-height rarely lands
+        // on an integer pixel boundary) — matches dop561's reported gl_boxes.
+        let (cell_w, cell_h) = (9.6_f32, 19.34_f32);
+        let (origin_x, origin_y) = (12_i32, 40_i32);
+        for line in 0..30 {
+            for col in 0..30 {
+                let mut acc = DamageAccumulator::new();
+                acc.begin_frame();
+                acc.add_cell_span(line, col, col, origin_x, origin_y, cell_w, cell_h);
+                match acc.finish() {
+                    FrameDamage::Rects(rs) => {
+                        assert_eq!(rs.len(), 1, "line={line} col={col}: {rs:?}");
+                        let r = rs[0];
+                        assert!(
+                            r.w as f32 <= cell_w.ceil() + 1.0 && r.h as f32 <= cell_h.ceil() + 1.0,
+                            "line={line} col={col}: rect {r:?} exceeds one cell ({cell_w}x{cell_h})"
+                        );
+                    }
+                    FrameDamage::Full => panic!("expected Rects"),
+                }
+            }
+        }
+    }
+
+    /// Two DIFFERENT frames' worth of lone cursor-blink damage (line 5 this
+    /// frame, line 6 last frame — e.g. the cursor moved down a row between
+    /// frames and each frame's damage was computed independently) can each
+    /// individually be up to 1px oversized at their shared boundary, and nothing
+    /// ties them together to trigger `make_disjoint`'s pairwise subtraction —
+    /// each was the ONLY rect in its own frame's accumulator. Confirms whether
+    /// a 1px sliver at the shared row boundary is a real, reachable case.
+    #[test]
+    fn adjacent_row_lone_cursor_rects_can_share_a_pixel_row() {
+        let (cell_w, cell_h) = (9.6_f32, 19.34_f32);
+        let (origin_x, origin_y) = (12_i32, 40_i32);
+        let rect_for_line = |line: usize| -> PxRect {
+            DamageAccumulator::cell_span_rect(line, 10, 10, origin_x, origin_y, cell_w, cell_h)
+        };
+        let mut touching = 0;
+        for line in 0..30 {
+            let a = rect_for_line(line);
+            let b = rect_for_line(line + 1);
+            if a.intersection_area(&b) > 0 {
+                touching += 1;
+            }
+        }
+        assert!(touching > 0, "expected at least one adjacent-row pair to overlap by 1px given fractional cell_h={cell_h}");
+    }
+
+    /// `plan_frame` (main.rs) unions each of the last `age` frames' ALREADY
+    /// -disjoint `FrameDamage::Rects` into a fresh accumulator and calls
+    /// `finish()` again, to catch up an EGL back buffer that is `age` swaps
+    /// stale. `covers()` assumes the result is still pairwise disjoint. This
+    /// reproduces a real typing sequence — each frame the cursor advances one
+    /// column, damaging the just-typed (now-vacated) cell plus the new cursor
+    /// cell, both re-finished per frame exactly as `main.rs`'s per-pane loop
+    /// does — then re-unions 3 such frames (buffer age 3) the way `plan_frame`
+    /// does, and checks the final rect list is still pairwise disjoint. A
+    /// human-confirmed regression test: this cursor-trail ghost bug was
+    /// eventually root-caused to issuing several separate small scissored GL
+    /// overwrite passes within one frame, which corrupts content on at least
+    /// one NVIDIA GL/Wayland driver (see main.rs's border-band damage merge
+    /// comment) — independent of whether the rects were disjoint. So if this
+    /// test ever finds an overlap, that overlap is `end_frame`'s double-blend
+    /// hazard (see `subtract`'s doc comment) reintroduced by history-union,
+    /// not just a same-frame one `finish()` already guards against.
+    #[test]
+    fn history_union_across_frames_stays_disjoint() {
+        let (cell_w, cell_h) = (9.6_f32, 19.34_f32);
+        let (origin_x, origin_y) = (12_i32, 40_i32);
+        let line = 5;
+        let mut history: Vec<FrameDamage> = Vec::new();
+        for col in 0..8 {
+            let mut acc = DamageAccumulator::new();
+            acc.begin_frame();
+            // The just-typed (now-vacated) cell: engine damage + cursor_track's
+            // vacated-rect both land here, identically, each frame col>0.
+            if col > 0 {
+                acc.add_cell_span(line, col - 1, col - 1, origin_x, origin_y, cell_w, cell_h);
+            }
+            // The cursor's new cell, re-damaged every frame for the blink pulse.
+            acc.add_cell_span(line, col, col, origin_x, origin_y, cell_w, cell_h);
+            history.insert(0, acc.finish()); // push_front, like `damage_history`
+        }
+        let age = 3;
+        let mut union_acc = DamageAccumulator::new();
+        union_acc.begin_frame();
+        for fd in history.iter().take(age) {
+            match fd {
+                FrameDamage::Full => panic!("expected Rects"),
+                FrameDamage::Rects(rs) => {
+                    for r in rs {
+                        union_acc.add_rect(*r);
+                    }
+                }
+            }
+        }
+        match union_acc.finish() {
+            FrameDamage::Full => panic!("expected Rects"),
+            FrameDamage::Rects(rs) => {
+                for i in 0..rs.len() {
+                    for j in (i + 1)..rs.len() {
+                        assert_eq!(
+                            rs[i].intersection_area(&rs[j]),
+                            0,
+                            "rects {} and {} overlap after history union: {:?} vs {:?} (full list: {rs:?})",
+                            i, j, rs[i], rs[j]
+                        );
+                    }
+                }
+            }
         }
     }
 }
