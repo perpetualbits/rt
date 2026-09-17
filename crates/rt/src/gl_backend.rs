@@ -68,12 +68,14 @@ fn proc_ticks() -> (u64, u64) {
     }
 }
 
+// The glibc `gettid()` wrapper only exists since glibc 2.30 — a plain `extern
+// "C" fn gettid()` declaration is a hard link-time symbol reference that
+// breaks the release build's older glibc-2.28 floor (cargo-zigbuild). The raw
+// syscall has been stable since Linux's earliest thread support, so call it
+// directly instead of through that wrapper.
 #[cfg(target_os = "linux")]
 unsafe fn libc_gettid() -> i64 {
-    extern "C" {
-        fn gettid() -> i32;
-    }
-    gettid() as i64
+    libc::syscall(libc::SYS_gettid)
 }
 
 impl GlBackend {
