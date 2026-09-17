@@ -96,8 +96,8 @@ never leaks a stray letter into the shell. `Ctrl` is untouched: `Ctrl+C` still i
 
 ### Newspaper columns — use that wide screen
 
-Modern displays are wide, but a terminal only fills them with *columns*, not
-*rows* — so `less`, a build log, or `git log` leaves the bottom two-thirds of a
+Modern displays are wide, but a terminal only fills them with *rows*, not
+*columns* — so `less`, a build log, or `git log` leaves the right two-thirds of a
 27-inch screen blank. rt's **newspaper columns** flow a single pane's output into
 two, three, or more side-by-side columns: text runs down the first column, then
 continues at the top of the next, exactly like a newspaper. One `Ctrl+.` doubles
