@@ -9905,14 +9905,20 @@ const ARROW_HOLD_GAP: std::time::Duration = std::time::Duration::from_millis(250
 
 /// Cursor moves to send for a held arrow at `repeats` consecutive repeats, capped at `max`. A
 /// tap or brief hold (`repeats < THRESHOLD`) stays 1:1 for precision; past that it ramps +1
-/// move per repeat up to `max`. `max == 1` disables acceleration.
+/// move per `RAMP_DIVISOR` repeats up to `max`. `max == 1` disables acceleration.
+///
+/// `THRESHOLD` and `RAMP_DIVISOR` were tuned up (from 4 and 1) after the original curve felt
+/// like it kicked in almost as soon as a key was held, then shot straight to top speed —
+/// `repeats` ticks at the OS's auto-repeat rate (commonly 25-40/s), so the old grace band was
+/// under 200ms and the old ramp reached `max` within a few hundred ms more.
 fn arrow_accel_step(repeats: u32, max: u32) -> usize {
-    const THRESHOLD: u32 = 4;
+    const THRESHOLD: u32 = 10;
+    const RAMP_DIVISOR: u32 = 2;
     let max = max.max(1) as usize;
     if max == 1 {
         return 1;
     }
-    (1 + repeats.saturating_sub(THRESHOLD) as usize).min(max)
+    (1 + (repeats.saturating_sub(THRESHOLD) / RAMP_DIVISOR) as usize).min(max)
 }
 
 /// Lines to scroll this drag-auto-scroll tick, and the next accel state. `state`
@@ -10417,8 +10423,8 @@ mod autoscroll_tests {
         let (s0, st1) = autoscroll_step((0, 0), 1, true, 10);
         assert_eq!(s0, 1);
         assert_eq!(st1, (1, 1));
-        // Held into the ramp: at ticks 5, arrow_accel_step(5,10) = 1 + (5-4) = 2.
-        assert_eq!(autoscroll_step((1, 5), 1, true, 10).0, 2);
+        // Held into the ramp: at ticks 12, arrow_accel_step(12,10) = 1 + (12-10)/2 = 2.
+        assert_eq!(autoscroll_step((1, 12), 1, true, 10).0, 2);
         // Capped at max regardless of how long it is held.
         assert_eq!(autoscroll_step((1, 100), 1, true, 10).0, 10);
     }
