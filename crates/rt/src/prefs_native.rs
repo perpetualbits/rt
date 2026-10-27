@@ -106,6 +106,7 @@ pub fn control(row: PrefRow) -> Control {
         PrefRow::InstRemote => Control::Switch,
         PrefRow::InstAnimate => Control::Switch,
         PrefRow::ArrowAccel => Control::Switch,
+        PrefRow::ArrowCruise => Control::Switch,
         // The dismiss row, which a native window does not need.
         PrefRow::Close => Control::Dismiss,
     }
@@ -141,6 +142,7 @@ pub fn flag(s: &Settings, row: PrefRow) -> Option<bool> {
         PrefRow::InstRemote => s.inst_remote,
         PrefRow::InstAnimate => s.inst_animate,
         PrefRow::ArrowAccel => s.arrow_accel,
+        PrefRow::ArrowCruise => s.arrow_cruise,
         _ => return None,
     })
 }
@@ -204,7 +206,7 @@ fn unlock(s: &mut Settings, row: PrefRow) {
             // is only ever reached for the material.
         }
         PrefRow::InstAnimate => s.inst_remote = true,
-        PrefRow::ArrowAccelMax => s.arrow_accel = true,
+        PrefRow::ArrowAccelMax | PrefRow::ArrowCruise => s.arrow_accel = true,
         _ => {}
     }
 }
@@ -460,6 +462,7 @@ mod tests {
         PrefRow::Scrollback,
         PrefRow::ArrowAccel,
         PrefRow::ArrowAccelMax,
+        PrefRow::ArrowCruise,
         PrefRow::Term,
         PrefRow::InstOutput,
         PrefRow::InstHeat,

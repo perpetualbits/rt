@@ -81,6 +81,7 @@ pub enum PrefRow {
     InstAnimate,
     ArrowAccel,
     ArrowAccelMax,
+    ArrowCruise,
     Term,
     Close,
 }
@@ -110,6 +111,7 @@ pub fn enabled(s: &Settings, row: PrefRow) -> bool {
     match row {
         PrefRow::InstAnimate => s.inst_remote,
         PrefRow::ArrowAccelMax => s.arrow_accel, // the cap is moot when acceleration is off
+        PrefRow::ArrowCruise => s.arrow_accel, // cruise keeps the speed a ramp reached; no ramp, no cruise
         // The one predicate every blur/glass backend shares; never a second copy.
         PrefRow::GlassMaterial => s.wants_background_blur(),
         // The radius is the same trap one level down: it is real only for the
@@ -274,6 +276,7 @@ pub fn step(
         PrefRow::InstRemote => s.inst_remote = !s.inst_remote,
         PrefRow::InstAnimate => s.inst_animate = !s.inst_animate,
         PrefRow::ArrowAccel => s.arrow_accel = !s.arrow_accel,
+        PrefRow::ArrowCruise => s.arrow_cruise = !s.arrow_cruise,
         PrefRow::ArrowAccelMax => {
             s.arrow_accel_max =
                 (s.arrow_accel_max as i32 + dir).clamp(1, Settings::MAX_ARROW_ACCEL as i32) as u32;
@@ -878,6 +881,19 @@ mod tests {
         assert!(enabled(&s, PrefRow::InstAnimate));
         // Everything else is always live.
         assert!(enabled(&s, PrefRow::FontSize));
+    }
+
+    #[test]
+    fn arrow_cruise_is_disabled_until_arrow_accel_is_on() {
+        let mut s = Settings::default();
+        s.arrow_accel = false;
+        assert!(!enabled(&s, PrefRow::ArrowCruise), "cruise keeps the speed a hold reached; no ramp, no speed");
+        step(&mut s, PrefRow::ArrowCruise, 1, &fams(), &terms());
+        assert!(!s.arrow_cruise, "a greyed row must not be steppable");
+        s.arrow_accel = true;
+        assert!(enabled(&s, PrefRow::ArrowCruise));
+        step(&mut s, PrefRow::ArrowCruise, -1, &fams(), &terms());
+        assert!(s.arrow_cruise, "a toggle flips on either direction");
     }
 
     #[test]

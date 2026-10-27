@@ -119,12 +119,18 @@ false); the Preferences row + manual text remain Task 4. As built:
 
 ## Task 4 — preference + manual
 
-- [ ] `arrow_cruise` in rt-config (default false, serde default so old configs load).
-- [ ] `PrefRow::ArrowCruise` (Switch), disabled when `arrow_accel` is off; prefs tests.
-- [ ] Manual KEYBOARD paragraph: time-based ramp, cruise opt-in, how to stop (tap any arrow;
+**Done 2026-10-27.** Row "Keep moving after release" sits under "Max arrow speed" in
+Behaviour; it is greyed (and refuses steps) while acceleration is off, like the cap. The
+manual's old line "the same curve drives ... drag auto-scroll" was corrected: drag
+auto-scroll still uses the repeat-count curve (`arrow_accel_step`), only the selection END
+shares the time ramp. The manual also says the repeat delay/rate are the desktop's.
+
+- [x] `arrow_cruise` in rt-config (default false, serde default so old configs load) — pulled into Task 2.
+- [x] `PrefRow::ArrowCruise` (Switch), disabled when `arrow_accel` is off; prefs tests.
+- [x] Manual KEYBOARD paragraph: time-based ramp, cruise opt-in, how to stop (tap any arrow;
       any other key stops and still types), 10s limit. Run
       `manual::tests::every_default_keybinding_is_documented`.
-- [ ] Commit.
+- [x] Commit.
 
 ## Task 5 — verify + deploy
 

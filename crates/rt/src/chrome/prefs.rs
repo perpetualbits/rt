@@ -216,6 +216,7 @@ pub fn rows(s: &Settings, mem_total: u64, cols: usize, family: FamilyStatus) -> 
         pref: Some(PrefRow::ArrowAccelMax),
         enabled: enabled(s, PrefRow::ArrowAccelMax), // dimmed while acceleration is off
     });
+    v.push(toggle("Keep moving after release", s.arrow_cruise, PrefRow::ArrowCruise, enabled(s, PrefRow::ArrowCruise)));
     // The guardrail, carried over from the egui dialog intact.
     let per_line = cols.max(1) as u64 * rt_engine::CELL_BYTES as u64 + 32; // + row overhead
     let full = (s.scrollback as u64).saturating_mul(per_line);
@@ -541,7 +542,7 @@ mod tests {
             PrefRow::BlurRadius,
             PrefRow::Chrome,
             PrefRow::Preset, PrefRow::Ffm, PrefRow::Titlebar, PrefRow::Scrollback,
-            PrefRow::ArrowAccel, PrefRow::ArrowAccelMax, PrefRow::Term,
+            PrefRow::ArrowAccel, PrefRow::ArrowAccelMax, PrefRow::ArrowCruise, PrefRow::Term,
             PrefRow::InstOutput, PrefRow::InstHeat, PrefRow::InstLatency, PrefRow::Jacks,
             PrefRow::InstRemote, PrefRow::InstAnimate, PrefRow::Close,
         ];
@@ -728,6 +729,19 @@ mod tests {
         let rows = rs(&s);
         let anim = rows.iter().find(|r| r.pref == Some(PrefRow::InstAnimate)).unwrap();
         assert!(anim.enabled);
+    }
+
+    #[test]
+    fn arrow_cruise_row_is_off_by_default_and_greyed_without_acceleration() {
+        let mut s = Settings::default();
+        let rows = rs(&s);
+        let cruise = rows.iter().find(|r| r.pref == Some(PrefRow::ArrowCruise)).unwrap();
+        assert_eq!(cruise.value, "[ ]", "opt-in");
+        assert!(cruise.enabled);
+        s.arrow_accel = false;
+        let rows = rs(&s);
+        let cruise = rows.iter().find(|r| r.pref == Some(PrefRow::ArrowCruise)).unwrap();
+        assert!(!cruise.enabled, "must grey out: cruise needs a ramped hold");
     }
 
     #[test]

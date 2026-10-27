@@ -233,11 +233,18 @@ KEYBOARD
   (arrows honour application-cursor mode, Alt prefixes ESC, Ctrl gives
   control codes; composed and dead keys send the text they produce).
   Hold-arrow acceleration: a single arrow TAP is always one move, but
-  HOLDING an arrow (key auto-repeat) sends progressively more moves per
-  repeat, up to "Max arrow speed" in Preferences — a long crawl along a
-  line, through history, or down a man page in less becomes a second or
-  two. Toggle it off in Preferences if you prefer the plain repeat rate.
-  The same curve drives the anchored-selection END and drag auto-scroll.
+  HOLDING an arrow (key auto-repeat) sends more moves per repeat the
+  longer you hold — one extra move per quarter second, up to "Max arrow
+  speed" in Preferences — so a long crawl along a line, through history,
+  or down a man page in less becomes a second or two. The repeat delay and
+  rate themselves are your desktop's keyboard settings, not rt's. Toggle
+  acceleration off in Preferences if you prefer the plain repeat rate. It
+  also drives the anchored-selection END.
+  Keep moving after release (Preferences, off by default): let go of a
+  held arrow once it has sped up and rt keeps moving at that speed. TAP
+  any arrow to stop (that tap does not move); any other key stops it and
+  types as usual; a click, switching pane or window, or 10 seconds also
+  stop it.
 
 
 BORDER INSTRUMENTS   (each pane's border is a live gauge; toggle in Preferences)
@@ -331,7 +338,8 @@ APPEARANCE  &  PREFERENCES   (right-click menu -> Preferences...)
                      Gruvbox Dark, Nord), then tweak foreground, background
                      and the 16 ANSI palette entries with the colour picker
   Behaviour          focus-follows-mouse, per-pane titlebars, scrollback
-                     size, hold-arrow acceleration and its max speed
+                     size, hold-arrow acceleration, its max speed, and
+                     keep-moving-after-release
   Terminal type      the $TERM exported to new panes (default xterm-256color).
                      Only names this machine has terminfo for are offered: a
                      TERM with no entry makes vim/less/htop refuse to start,
