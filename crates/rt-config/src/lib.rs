@@ -560,6 +560,12 @@ pub struct Settings {
     /// top speed ≈ this × the OS keyboard repeat rate. Clamped to `1..=MAX_ARROW_ACCEL`; `1`
     /// disables acceleration even with `arrow_accel` on.
     pub arrow_accel_max: u32,
+    /// Arrow cruise: after a HELD arrow (one that ramped past one move per repeat) is released,
+    /// keep moving at the speed it reached until any arrow is tapped (that tap only stops it),
+    /// another key is pressed (which still types), the mouse is pressed, the window loses
+    /// focus, or 10 seconds pass. Needs `arrow_accel`. Off by default — it surprises anyone
+    /// not expecting it.
+    pub arrow_cruise: bool,
     /// The `TERM` value exported into every pane's shell. Default [`DEFAULT_TERM`]
     /// (`xterm-256color`), and you almost certainly want to leave it there.
     ///
@@ -833,6 +839,7 @@ impl Default for Settings {
             scrollback: 10_000,            // matches rt_engine::DEFAULT_SCROLLBACK
             arrow_accel: true,             // hold-to-accelerate arrows on by default
             arrow_accel_max: 10,           // up to 10 cursor moves per held repeat
+            arrow_cruise: false,           // keep-moving-after-release is opt-in
             term: DEFAULT_TERM.to_string(), // the borrowed-but-universally-installed identity
             custom_scheme: None,           // nothing of the user's own to go back to yet
         }

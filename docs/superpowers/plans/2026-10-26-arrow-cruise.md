@@ -85,24 +85,37 @@ pub fn ramp(held: Duration, max: u32) -> usize; // 1 + held/250ms, capped; max<=
 
 ## Task 2 — wire keyboard arrows (shell path, main.rs ~7605)
 
-- [ ] Replace `arrow_hold` + `ARROW_HOLD_GAP` logic with `active.cruise.press(...)`; a 0 return
+**Done 2026-10-27, together with Task 3** — both used the one `arrow_hold` field, so
+replacing it for the shell alone would have let a selection-mode cruise send arrows to
+the shell. Also pulled forward from Task 4: the `arrow_cruise` config field (default
+false); the Preferences row + manual text remain Task 4. As built:
+  - `cruise_observe` (called at the top of `window_event`, ahead of the modal shims that
+    swallow keys) handles arrow releases and the stop events; bare modifier presses
+    (Shift/Ctrl/Alt/AltGr/Meta) do NOT stop a cruise — they type nothing.
+  - Brake: an arrow press while cruising is swallowed before the keymap lookup.
+  - `send_key` = the old typing tail of `on_key_press`, shared with `cruise_step`.
+  - `cruise_step` ends the cruise when focus is on another pane than where it started
+    (covers pane/tab switches by any route), compose mode changed, or IME preedit.
+  - `ARROW_HOLD_GAP` removed; `arrow_accel_step` kept for drag auto-scroll only.
+
+- [x] Replace `arrow_hold` + `ARROW_HOLD_GAP` logic with `active.cruise.press(...)`; a 0 return
       sends nothing. Non-arrow key → `cruise.stop()` then normal delivery.
-- [ ] Handle `KeyboardInput` Released for arrows → `cruise.release(...)`. Check that releases
+- [x] Handle `KeyboardInput` Released for arrows → `cruise.release(...)`. Check that releases
       actually reach this handler (today only Pressed is matched at ~2630/2652; the modal
       branches must not eat them).
-- [ ] Cruise tick: in the about-to-wait path, `if let Some((dir, n)) = cruise.tick(now)` encode
+- [x] Cruise tick: in the about-to-wait path, `if let Some((dir, n)) = cruise.tick(now)` encode
       the arrow exactly as the press path does (app-cursor mode, kitty flags, Group broadcast)
       — factor the encode+send out of the press path rather than duplicating it. Fold
       `cruise.next_deadline()` into `min_interval`.
-- [ ] Stop hooks: `Focused(false)`, focus-pane change, tab switch, any mouse press.
-- [ ] Keep `arrow_accel_step` only for drag auto-scroll (`autoscroll_step`); its tests stay.
-- [ ] Tests green; commit.
+- [x] Stop hooks: `Focused(false)`, focus-pane change, tab switch, any mouse press.
+- [x] Keep `arrow_accel_step` only for drag auto-scroll (`autoscroll_step`); its tests stay.
+- [x] Tests green; commit.
 
 ## Task 3 — selection END (`compose_nav`, main.rs ~7342)
 
-- [ ] Use the same `ArrowCruise` (tag = `nav as u8`); cruise ticks call `compose_nav` with the
+- [x] Use the same `ArrowCruise` (tag = `nav as u8`); cruise ticks call `compose_nav` with the
       stored nav while a selection is composing; selection end/cancel → `stop()`.
-- [ ] Commit.
+- [x] Commit.
 
 ## Task 4 — preference + manual
 

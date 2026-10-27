@@ -103,6 +103,7 @@ mod render; // the GL glyph-atlas renderer
 // too — a HiDPI Wayland/X11 output reports 2.0 and hits exactly the same path.
 mod scale_policy; // pure decision table for WindowEvent::ScaleFactorChanged
 mod select; // pure head-navigation logic for anchored selection
+mod arrow_cruise; // pure held-arrow ramp + cruise state machine
 mod textdrop; // pure policy for text dragged in from ANOTHER app (browser selection -> pane)
 // The macOS half of that feature: an NSDraggingDestination for
 // NSPasteboardTypeString. winit registers the NSWindow for FILE drops only and
@@ -582,9 +583,10 @@ struct Active {
     drag_cursor: Option<(f32, f32)>,      // live cursor (physical px) while dragging a wire
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
-    // Arrow-key acceleration: (which arrow 0..4, last-press time, consecutive-repeat count).
-    // While an arrow is held, the count grows and `arrow_accel_step` sends more moves/repeat.
-    arrow_hold: Option<(u8, Instant, u32)>,
+    // Held-arrow ramp + cruise (see arrow_cruise.rs). Fed presses in `on_key_press`,
+    // releases and stop events in `cruise_observe`, ticks in `about_to_wait`.
+    cruise: arrow_cruise::ArrowCruise,
+    cruise_key: Option<CruiseKey>, // what a cruise tick re-sends: the last ramped arrow
     prefs_open: bool,                     // whether the preferences dialog is showing
     prefs_sel: usize,                     // selected row index into chrome::prefs::rows()
     prefs_scroll: usize,                  // first visible row (the panel scrolls when it doesn't fit)
@@ -724,6 +726,15 @@ struct Active {
 /// absolute line `l` draws at screen row `l + d`. Selection endpoints are stored
 /// as `r - d` at the moment they are set, so a later change in `d` moves the
 /// highlight with the text.
+/// What an arrow-cruise tick repeats: the shell keystroke (re-encoded per pane
+/// each tick, like a real press) or a selection-head move. `pane` is the focus
+/// the cruise started in — a tick finding a different focus ends the cruise.
+#[derive(Clone)]
+enum CruiseKey {
+    Shell { key: Key, text: Option<String>, mods: ModifiersState, pane: rt_core::PaneId },
+    Select(select::Nav),
+}
+
 #[derive(Clone, Copy)]
 struct Selection {
     pane: rt_core::PaneId,  // the pane the selection lives in
@@ -2144,7 +2155,8 @@ impl App {
             drag_cursor: None,
             last_click: None,
             click_count: 0,
-            arrow_hold: None,
+            cruise: arrow_cruise::ArrowCruise::default(),
+            cruise_key: None,
             prefs_open: false,
             prefs_sel: 0,
             prefs_scroll: 0,
@@ -2541,6 +2553,10 @@ impl ApplicationHandler for App {
         if let WindowEvent::PointerButton { position, .. } = &event {
             active.mouse = (position.x as f32, position.y as f32);
         }
+        // Arrow cruise: releases end a hold (possibly into a cruise) and stop events
+        // end a cruise. Observed here, ahead of every modal shim below, because those
+        // swallow key events before `on_key_press` sees them.
+        Self::cruise_observe(active, &event);
         if active.ld_on && matches!(&event, WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed) {
             active.ld_keys += 1; // RT_XDIAG: key presses actually delivered to rt this second
         }
@@ -4097,6 +4113,7 @@ impl ApplicationHandler for App {
             .chain(self.carry.iter().flat_map(|c| c.payload_panes.iter().copied()))
             .collect();
         let mut drag_payload_died = false;
+        let mut cruise_due: Vec<(WindowId, usize)> = Vec::new();
         // Snapshotted before the loop below borrows `self.windows` mutably:
         // `chrome_busy` needs the App-level drag/carry state, which is not
         // reachable from inside that borrow.
@@ -4144,8 +4161,17 @@ impl ApplicationHandler for App {
             if active.text_drop_wl.dragging() {
                 active.active_until = Instant::now() + ACTIVE_TAIL;
             }
-            let (close, interval, died) = Self::tick_active(active, &drag_panes);
+            let (close, mut interval, died) = Self::tick_active(active, &drag_panes);
             drag_payload_died |= died;
+            // Arrow cruise: send a due step after the loop (it needs `&mut self` for
+            // group broadcast) and wake in time for the next one.
+            let now = Instant::now();
+            if let Some((_, n)) = active.cruise.tick(now) {
+                cruise_due.push((wid, n));
+            }
+            if let Some(deadline) = active.cruise.next_deadline() {
+                interval = interval.min(deadline.saturating_duration_since(now));
+            }
             if close {
                 to_close.push(wid);
             }
@@ -4160,6 +4186,9 @@ impl ApplicationHandler for App {
         }
         for wid in to_close {
             self.close_window(wid);
+        }
+        for (wid, steps) in cruise_due {
+            self.cruise_step(wid, steps);
         }
         // Process-wide scrollback rebalance, on a ~1s timer — NOT per wake/frame (see
         // `budget_last_rebalance`'s doc). What this call site is and is not: `Budget::
@@ -7332,28 +7361,69 @@ impl App {
         }
     }
 
+    /// Feed arrow-cruise the events it reacts to outside `on_key_press`: an arrow
+    /// RELEASE ends a hold (into a cruise when the pref is on and the hold ramped);
+    /// a non-arrow key press (bare modifiers excepted — they type nothing), any
+    /// pointer press, or losing focus ends a cruise.
+    fn cruise_observe(active: &mut Active, event: &WindowEvent) {
+        match event {
+            WindowEvent::KeyboardInput { event: ke, .. } => match (ke.state, arrow_dir(&ke.logical_key)) {
+                (ElementState::Released, Some(dir)) => {
+                    let on = active.settings.arrow_accel && active.settings.arrow_cruise;
+                    active.cruise.release(dir, Instant::now(), on);
+                }
+                (ElementState::Pressed, None) if !is_modifier_key(&ke.logical_key) => active.cruise.stop(),
+                _ => {}
+            },
+            WindowEvent::PointerButton { state: ElementState::Pressed, .. } | WindowEvent::Focused(false) => {
+                active.cruise.stop()
+            }
+            _ => {}
+        }
+    }
+
+    /// One arrow-cruise step of `steps` moves in window `id`: re-send the cruised
+    /// keystroke, or move the selection head. Ends the cruise instead when its
+    /// target is gone — focus moved to another pane/tab, compose mode was entered
+    /// or left, or an IME composition started.
+    fn cruise_step(&mut self, id: WindowId, steps: usize) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
+        active.active_until = Instant::now() + ACTIVE_TAIL;
+        match active.cruise_key.clone() {
+            Some(CruiseKey::Select(nav)) if active.composing => Self::compose_move(active, nav, steps),
+            Some(CruiseKey::Shell { key, text, mods, pane })
+                if !active.composing && !active.ime_preedit && active.session.focus() == pane =>
+            {
+                self.send_key(id, &key, text.as_deref(), mods, steps)
+            }
+            _ => active.cruise.stop(),
+        }
+    }
+
     /// Apply a head navigation while composing. Arrow moves (accelerate = true)
     /// repeat per the held-arrow acceleration the user configured; jumps apply
     /// once. Then scroll to keep the head visible and repaint.
     fn compose_nav(active: &mut Active, nav: select::Nav, accelerate: bool) {
+        // Held-arrow ramp + cruise, shared with the shell path. The arrow Navs'
+        // discriminants equal `arrow_dir` (pinned by a test), so the release seen
+        // by `cruise_observe` matches the hold started here.
+        let steps = if accelerate && active.settings.arrow_accel {
+            active.cruise_key = Some(CruiseKey::Select(nav));
+            active.cruise.press(nav as u8, Instant::now(), active.settings.arrow_accel_max)
+        } else {
+            active.cruise.stop();
+            1
+        };
+        if steps > 0 {
+            Self::compose_move(active, nav, steps); // 0: the press braked a cruise
+        }
+    }
+
+    /// Move the selection head `steps` times by `nav`, keep it visible, repaint.
+    fn compose_move(active: &mut Active, nav: select::Nav, steps: usize) {
         let Some(sel) = active.selection else { return };
         let pane = sel.pane;
         let Some(bounds) = Self::compose_bounds(active, pane) else { return };
-        // Held-arrow acceleration: reuse arrow_hold/arrow_accel_step. `arrow` is a
-        // per-direction tag so a change of direction resets the run.
-        let now = Instant::now();
-        let steps = if accelerate && active.settings.arrow_accel {
-            let tag = nav as u8; // stable per Nav variant
-            let repeats = match active.arrow_hold {
-                Some((prev, t, n)) if prev == tag && now.duration_since(t) < ARROW_HOLD_GAP => n + 1,
-                _ => 0,
-            };
-            active.arrow_hold = Some((tag, now, repeats));
-            arrow_accel_step(repeats, active.settings.arrow_accel_max)
-        } else {
-            active.arrow_hold = None;
-            1
-        };
         let mut head = sel.head;
         for _ in 0..steps {
             head = select::move_head(head, nav, bounds);
@@ -7543,11 +7613,19 @@ impl App {
             return;
         }
         let mods = active.mods; // current modifier state
+        // An arrow pressed during a cruise is the brake: it ends the cruise and does
+        // nothing else — not even a bound arrow chord.
+        let arrow = arrow_dir(&key_event.logical_key);
+        if arrow.is_some() && active.cruise.is_cruising() {
+            active.cruise.stop();
+            return;
+        }
         // Is this chord bound to an rt action?
         if let Some(chord) = input::chord_from_winit(&key_event.logical_key, mods) {
             match active.keymap.action_for(&chord) {
                 Some(action) => {
                     log::debug!("keymap: chord={chord:?} -> action={action:?}");
+                    active.cruise.stop(); // a bound chord is not a hold to ramp
                     let (cmd, group_echo) = Self::apply_action(active, action); // shared with the menu
                     // The `active` borrow ends here; window-level commands (close/
                     // new window/detach) re-borrow the map via &mut self.
@@ -7570,6 +7648,34 @@ impl App {
             log::debug!("swallowing unbound Command chord: {:?}", key_event.logical_key);
             return;
         }
+        // Held-arrow ramp: while an arrow is HELD (a run of auto-repeats) send more
+        // cursor moves per repeat the longer it is held (see arrow_cruise.rs). A tap,
+        // any other key, or acceleration off → exactly one. The keystroke is kept for
+        // a cruise to re-send after release.
+        let step = match (active.settings.arrow_accel, arrow) {
+            (true, Some(a)) => {
+                active.cruise_key = Some(CruiseKey::Shell {
+                    key: key_event.logical_key.clone(),
+                    text: key_event.text.as_deref().map(str::to_owned),
+                    mods,
+                    pane: active.session.focus(),
+                });
+                // Never 0 here: a press during a cruise already returned above.
+                active.cruise.press(a, Instant::now(), active.settings.arrow_accel_max).max(1)
+            }
+            _ => {
+                active.cruise.stop();
+                1
+            }
+        };
+        self.send_key(id, &key_event.logical_key, key_event.text.as_deref(), mods, step);
+    }
+
+    /// Send one typed keystroke, `step` times over, to the focused pane and
+    /// whatever its broadcast mode reaches. Shared by a real key press and an
+    /// arrow-cruise tick, which re-sends the cruised arrow exactly as a press would.
+    fn send_key(&mut self, id: WindowId, logical_key: &Key, text: Option<&str>, mods: ModifiersState, step: usize) {
+        let Some(active) = self.windows.get_mut(&id) else { return };
         // Not a binding: ordinary typing. Navigation/editing/function keys become
         // ANSI escape sequences; everything else sends the key's *produced text*
         // (`key_event.text`), which already contains dead-key / compose results
@@ -7586,7 +7692,7 @@ impl App {
         // `\x1b[13;2u` where it used to get `\r` (the line never submits) and
         // `\x1b[99;5u` where it used to get the 0x03 that raises SIGINT.
         let encode_for = |app_cursor: bool, kbd_flags: u8| {
-            input::encode_key_event(&key_event.logical_key, key_event.text.as_deref(), mods, app_cursor, kbd_flags)
+            input::encode_key_event(logical_key, text, mods, app_cursor, kbd_flags)
         };
         // The focused pane's own state, and its own encode. The encode decides
         // whether this key produces input at all (the gate below) and drives the
@@ -7602,31 +7708,7 @@ impl App {
             .unwrap_or((false, 0)); // no pane: normal cursor keys, nothing negotiated
         let bytes = encode_for(focus_state.0, focus_state.1);
         if let Some(bytes) = bytes {
-            // Arrow-key acceleration: while an arrow is HELD (a run of auto-repeats), send
-            // several cursor moves per repeat so it speeds up the longer you hold. A single
-            // tap, a pause, or any other key resets it to exactly one move. Off → always one.
-            let arrow = match &key_event.logical_key {
-                Key::Named(NamedKey::ArrowLeft) => Some(0u8),
-                Key::Named(NamedKey::ArrowRight) => Some(1u8),
-                Key::Named(NamedKey::ArrowUp) => Some(2u8),
-                Key::Named(NamedKey::ArrowDown) => Some(3u8),
-                _ => None,
-            };
             let now = Instant::now();
-            let step = match (active.settings.arrow_accel, arrow) {
-                (true, Some(a)) => {
-                    let repeats = match active.arrow_hold {
-                        Some((prev, t, n)) if prev == a && now.duration_since(t) < ARROW_HOLD_GAP => n + 1,
-                        _ => 0, // fresh press, different arrow, or a gap → start over
-                    };
-                    active.arrow_hold = Some((a, now, repeats));
-                    arrow_accel_step(repeats, active.settings.arrow_accel_max)
-                }
-                _ => {
-                    active.arrow_hold = None; // a non-arrow key (or accel off) breaks the hold
-                    1
-                }
-            };
             // `Group` also reaches matching panes in every OTHER window (see
             // `App::broadcast_group_input_with`'s doc); `None` here covers both
             // Off/All (unaffected: `feed_input_with` below stays local for them,
@@ -9894,16 +9976,34 @@ fn fmt_lines(n: usize) -> String {
     }
 }
 
-/// Scrollbar geometry for a pane whose grid area is `rect` and whose scroll
-/// state is `(offset, history, screen)` — returns `(bx, width, thumb_y,
-/// thumb_h)` in pixels. Shared by the renderer (which draws the thumb) and the
-/// drag hit-test (which grabs it), so the visible thumb and the grabbable region
-/// are always the same rectangle. Only meaningful when `history > 0`.
-/// How close two arrow-key presses must be to count as the same HELD run (rather than a fresh
-/// tap). A touch longer than a slow auto-repeat interval so consecutive repeats always chain.
-const ARROW_HOLD_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+/// Which arrow `key` is, as arrow-cruise's direction tag: Left 0, Right 1, Up 2,
+/// Down 3 — the same values as the arrow `select::Nav`s (pinned by a test).
+fn arrow_dir(key: &Key) -> Option<u8> {
+    match key {
+        Key::Named(NamedKey::ArrowLeft) => Some(0),
+        Key::Named(NamedKey::ArrowRight) => Some(1),
+        Key::Named(NamedKey::ArrowUp) => Some(2),
+        Key::Named(NamedKey::ArrowDown) => Some(3),
+        _ => None,
+    }
+}
 
-/// Cursor moves to send for a held arrow at `repeats` consecutive repeats, capped at `max`. A
+/// A bare modifier key: pressing one types nothing, so it doesn't end a cruise.
+fn is_modifier_key(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Meta // winit 0.31's Super/logo key
+        )
+    )
+}
+
+/// Drag auto-scroll lines per tick at `repeats` consecutive ticks (keyboard arrows
+/// now ramp by time, in arrow_cruise.rs). Originally the held-arrow curve: cursor moves to send for a held arrow at `repeats` consecutive repeats, capped at `max`. A
 /// tap or brief hold (`repeats < THRESHOLD`) stays 1:1 for precision; past that it ramps +1
 /// move per `RAMP_DIVISOR` repeats up to `max`. `max == 1` disables acceleration.
 ///
@@ -9935,6 +10035,11 @@ fn autoscroll_step(state: (isize, u32), dir: isize, accel: bool, max: u32) -> (u
     (step, (dir, ticks + 1))
 }
 
+/// Scrollbar geometry for a pane whose grid area is `rect` and whose scroll
+/// state is `(offset, history, screen)` — returns `(bx, width, thumb_y,
+/// thumb_h)` in pixels. Shared by the renderer (which draws the thumb) and the
+/// drag hit-test (which grabs it), so the visible thumb and the grabbable region
+/// are always the same rectangle. Only meaningful when `history > 0`.
 fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize, sc: f32) -> (f32, f32, f32, f32) {
     let total = (history + screen) as f32; // whole buffer height in lines
     // Draw the scrollbar in the pane's right PADDING gutter (PANE_PAD = 5px, just RIGHT of
@@ -10262,6 +10367,23 @@ fn main() {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    /// `cruise_observe` matches a released arrow by `arrow_dir`; `compose_nav`
+    /// starts the hold with `nav as u8`. The two must agree or a selection-mode
+    /// release never ends its hold.
+    #[test]
+    fn arrow_dir_matches_nav_discriminants() {
+        use select::Nav;
+        for (key, nav) in [
+            (NamedKey::ArrowLeft, Nav::Left),
+            (NamedKey::ArrowRight, Nav::Right),
+            (NamedKey::ArrowUp, Nav::Up),
+            (NamedKey::ArrowDown, Nav::Down),
+        ] {
+            assert_eq!(arrow_dir(&Key::Named(key)), Some(nav as u8));
+        }
+        assert_eq!(arrow_dir(&Key::Named(NamedKey::Home)), None);
+    }
 
     fn sel(anchor: (usize, i32), head: (usize, i32), block: bool) -> Selection {
         Selection { pane: rt_core::PaneId(1), anchor, head, block }
