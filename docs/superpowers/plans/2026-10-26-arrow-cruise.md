@@ -134,15 +134,22 @@ shares the time ramp. The manual also says the repeat delay/rate are the desktop
 
 ## Task 5 — verify + deploy
 
-- [ ] `cargo test --workspace`, `cargo clippy`; `ci/verify.sh` (see memory
-      rt-verify-milkv-silent-green for milkv).
+**Run 2026-10-27 on 3e4bd9c:** `cargo test --workspace` 1105 passed / 0 failed; clippy: no
+findings in `arrow_cruise.rs`, and the only ones in touched files are the
+`field_reassign_with_default` test idiom those files already use throughout; `ci/verify.sh
+apollo` ALL GREEN (local x86_64 + apollo). milkv and kiku were unreachable, so there is no
+riscv64 or macOS run yet. The verify battery covers the engine crates only, which this branch
+doesn't touch. Deployed to dop561/apollo/dionysus/dogstar.
+
+- [x] `cargo test --workspace`, `cargo clippy`; `ci/verify.sh` (see memory
+      rt-verify-milkv-silent-green for milkv). milkv leg pending: host down.
 - [ ] Deploy to the five machines per standing order (dop561/apollo/dionysus/milkv/kiku);
-      skip unreachable ones and SAY which.
-- [ ] Give Roland a numbered PASS/FAIL checklist (memory rt-user-test-checklists): tap = 1 move;
+      skip unreachable ones and SAY which. Done except milkv + kiku (down).
+- [x] Give Roland a numbered PASS/FAIL checklist (memory rt-user-test-checklists): tap = 1 move;
       hold ramps smoothly; cruise OFF by default; with cruise ON release keeps going, arrow tap
       stops without moving, letter key stops and types, focus-away stops, 10s cap; selection
       END cruises; drag auto-scroll unchanged.
-- [ ] Do NOT run rt on the live desktop to test (memory never-run-gui-on-live-desktop).
+- [x] Do NOT run rt on the live desktop to test (memory never-run-gui-on-live-desktop).
 
 ## Tuning constants (Roland tunes after feel test)
 
