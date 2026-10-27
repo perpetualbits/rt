@@ -48,7 +48,7 @@ speed and rt keeps moving at it (cruise) until a stop event.
 
 ## Task 1 — pure state machine `arrow_cruise.rs`
 
-- [ ] Write failing tests first. API sketch:
+- [x] Write failing tests first. API sketch:
 
 ```rust
 pub enum Phase { Idle, Holding { dir: u8, since: Instant, last: Instant, interval: Duration },
@@ -73,7 +73,15 @@ pub fn ramp(held: Duration, max: u32) -> usize; // 1 + held/250ms, capped; max<=
   cruise_on=false → Idle; arrow press while cruising → returns 0 and Idle; `stop()` → Idle;
   tick past `until` (10s) → None and Idle; direction change while holding restarts ramp;
   repeat interval learned from successive repeats (fallback 33ms).
-- [ ] Implement; `cargo test -p rt arrow_cruise`; commit.
+- [x] Implement; `cargo test -p rt arrow_cruise`; commit. **Done 2026-10-27** — 13 tests,
+      each guard checked by a deliberate break (mutation) of the code. As built, deviating from the sketch:
+  - `release(dir, now, cruise_on)` — no `max` (the speed reached is frozen, not recomputed).
+  - Ramp clock starts at the FIRST AUTO-REPEAT, not the key press, so the OS repeat delay
+    doesn't count as ramp time.
+  - `HOLD_GAP = 1s` (was 250ms in the old code): a backstop for a lost release only. 250ms is
+    shorter than the OS repeat delay (500-600ms), so the first repeat looked like a fresh
+    press and every hold restarted one repeat late — an old quirk the mutation check exposed.
+  - Module is declared in `lib.rs` only so far; Task 2 adds `mod arrow_cruise;` to main.rs.
 
 ## Task 2 — wire keyboard arrows (shell path, main.rs ~7605)
 

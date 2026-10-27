@@ -13,6 +13,7 @@ pub mod input; // winit key/modifiers -> Chord, and typed-key -> PTY bytes
 pub mod raster; // CPU anti-aliased coverage masks (disc/ring/bar), used by render.rs
 pub mod render; // GL glyph-atlas renderer (also declared in main.rs for the bin);
                 // exposed here so the offscreen pixel-identity gate can drive it
+pub mod arrow_cruise; // held-arrow ramp + cruise state machine — pure logic, no I/O
 pub mod select; // anchored text selection mode — pure logic, no I/O
 pub mod touch; // multi-touch gesture state (also declared in main.rs for the bin) — pure logic
 
